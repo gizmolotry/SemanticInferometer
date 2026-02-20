@@ -1635,7 +1635,7 @@ def render_phantom_paths_3d(
         return []
 
     traces = []
-    fast_render = os.environ.get("MONOLITH_FAST_RENDER", "1").strip() == "1"
+    fast_render = os.environ.get("MONOLITH_FAST_RENDER", "0").strip() == "1"
     n_articles = min(len(phantom_verdicts), len(positions_3d))
 
     # Compute centroid as the "low energy attractor" (downhill direction)
@@ -3517,7 +3517,7 @@ def create_monolith_cockpit(
     # =========================================
     # DIAGNOSTICS + ANALYSIS MODE TRACES
     # =========================================
-    render_all_modes = (physics_mode == "analysis") or (os.environ.get("MONOLITH_RENDER_ALL_MODES", "0").strip() == "1")
+    render_all_modes = (physics_mode == "analysis") or (os.environ.get("MONOLITH_RENDER_ALL_MODES", "1").strip() == "1")
     diagnostics_trace_start = len(fig.data)
     analysis_nmi_scores = {}
 
