@@ -1,0 +1,125 @@
+"""cross_article_attention.py
+
+Cross-article attention (frozen random observer).
+
+This module intentionally contains ONLY the modern, import-safe primitive used by
+`complete_pipeline.py`:
+
+    CrossArticleAttention
+
+Rationale
+---------
+Earlier versions of this repo contained a "MonthlyPipeline" harness here that:
+- imported legacy NLI extractor APIs eagerly (fragile)
+- optionally fused provenance embeddings into semantic features (methodologically risky)
+
+That harness has been removed to avoid accidental use and import-time breakage.
+If you want a monthly orchestrator, use `complete_pipeline.py`.
+
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+
+class CrossArticleAttention(nn.Module):
+    """Frozen random cross-article attention.
+
+    This module is NOT trained. Different random seeds = different "observer"
+    attention lenses over the same article-token space.
+
+    Parameters
+    ----------
+    feature_dim:
+        Dimensionality of article token features.
+    num_heads:
+        Number of attention heads.
+    """
+
+    def __init__(self, feature_dim: int, num_heads: int = 8):
+        super().__init__()
+
+        self.feature_dim = int(feature_dim)
+        self.num_heads = int(num_heads)
+
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.feature_dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+        )
+
+        # Explicitly freeze: this is an inference-only, random observer lens.
+        self.eval()
+        for p in self.parameters():
+            p.requires_grad = False
+
+        # Keep prints minimal but informative for long experiment logs.
+        print(
+            "Cross-article attention initialized (FROZEN): "
+            f"feature_dim={self.feature_dim}, num_heads={self.num_heads}"
+        )
+
+    @torch.no_grad()
+    def forward(self, article_tokens: torch.Tensor) -> torch.Tensor:
+        """Compute attention matrix between articles.
+
+        Parameters
+        ----------
+        article_tokens:
+            Tensor of shape (n_articles, feature_dim).
+
+        Returns
+        -------
+        Tensor of shape (n_articles, n_articles).
+        Entry [i, j] = how much article i attends to article j.
+
+        Notes
+        -----
+        We average attention weights across heads for visualization stability.
+        """
+        if article_tokens.ndim != 2:
+            raise ValueError(
+                f"article_tokens must be 2D (n_articles, feature_dim); got shape {tuple(article_tokens.shape)}"
+            )
+        if int(article_tokens.shape[1]) != self.feature_dim:
+            raise ValueError(
+                f"feature_dim mismatch: expected {self.feature_dim}, got {int(article_tokens.shape[1])}"
+            )
+
+        x = article_tokens.unsqueeze(0)  # (1, n_articles, feature_dim)
+
+        _, attn_weights = self.attention(
+            x,
+            x,
+            x,
+            need_weights=True,
+            average_attn_weights=True,  # average heads for visualization
+        )
+
+        return attn_weights.squeeze(0)
+
+
+def set_cross_article_attention_seed(seed: Optional[int]) -> None:
+    """Convenience helper for deterministic observer attention.
+
+    If you want stable 'observer lenses' across runs, set the seed before
+    constructing CrossArticleAttention.
+
+    This helper is intentionally tiny and doesn't pull in numpy.
+    """
+    if seed is None:
+        return
+    torch.manual_seed(int(seed))
+
+
+if __name__ == "__main__":
+    # Minimal self-test for CrossArticleAttention only
+    set_cross_article_attention_seed(0)
+    X = torch.randn(10, 128)
+    attn = CrossArticleAttention(feature_dim=128, num_heads=8)
+    A = attn(X)
+    print("Attention:", A.shape, "min/max", float(A.min()), float(A.max()))

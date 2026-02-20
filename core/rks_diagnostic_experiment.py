@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""
+rks_diagnostic_experiment.py
+
+THE SINGLE MOST IMPORTANT EXPERIMENT for validating your thesis.
+
+This script answers:
+1. Is RFF approximation good enough? (correlation > 0.95)
+2. Do "observer residuals" shrink as D → ∞? (if yes, they're Monte Carlo noise)
+3. Is your geometry sensitive to sigma? (if highly sensitive, it's an artifact)
+
+If residuals persist as D grows AND approximation is good, you have a real phenomenon.
+If residuals vanish as D grows, seeds were never observers — just Monte Carlo noise.
+
+Usage:
+    python rks_diagnostic_experiment.py --data-path experiments/rbf/logits/real/
+    python rks_diagnostic_experiment.py --synthetic --input-dim 24 --n-samples 500
+"""
+
+import argparse
+import json
+import torch
+import numpy as np
+from pathlib import Path
+from typing import Dict, List, Optional
+from dataclasses import dataclass, asdict
+import matplotlib.pyplot as plt
+
+# Handle imports
+try:
+    from kernel_library import create_kernel, SUPPORTED_KERNELS, run_approximation_diagnostics
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from kernel_library import create_kernel, SUPPORTED_KERNELS, run_approximation_diagnostics
+
+
+@dataclass
+class DiagnosticResult:
+    kernel_type: str
+    output_dim: int
+    sigma: float
+    correlation: float
+    mae: float
+    rmse: float
+    
+    def is_acceptable(self, threshold: float = 0.95) -> bool:
+        return self.correlation >= threshold
+
+
+def load_nli_features(data_path: Path) -> torch.Tensor:
+    """Load NLI features from observer files."""
+    files = sorted(data_path.glob("observer_*.pt"))
+    if not files:
+        files = sorted(data_path.glob("seed_*.pt"))
+    
+    if not files:
+        raise FileNotFoundError(f"No observer files in {data_path}")
+    
+    # Load first file to get features
+    data = torch.load(files[0], map_location='cpu', weights_only=False)
+    
+    if isinstance(data, dict):
+        for key in ['features', 'embeddings', 'nli_features']:
+            if key in data:
+                return torch.FloatTensor(data[key])
+    
+    if torch.is_tensor(data):
+        return data.float()
+    
+    raise ValueError(f"Could not extract features from {files[0]}")
+
+
+def compute_observer_residuals(
+    X: torch.Tensor,
+    kernel_type: str,
+    output_dim: int,
+    sigma: float,
+    seeds: List[int],
+) -> Dict:
+    """
+    Compute residuals between observers (different seeds).
+    
+    This measures: how much does geometry change with seed?
+    """
+    from scipy.linalg import orthogonal_procrustes
+    
+    embeddings = []
+    for seed in seeds:
+        kernel = create_kernel(kernel_type, X.shape[1], output_dim, sigma, seed)
+        phi = kernel.transform(X)
+        embeddings.append(phi.cpu().numpy())
+    
+    # Use first observer as reference
+    ref = embeddings[0]
+    
+    # Align others to reference via Procrustes
+    residuals = []
+    for i, emb in enumerate(embeddings[1:], 1):
+        R, _ = orthogonal_procrustes(emb, ref)
+        aligned = emb @ R
+        
+        # Frobenius distance after alignment
+        residual = np.linalg.norm(aligned - ref, ord='fro')
+        residuals.append(residual)
+    
+    return {
+        'mean_residual': float(np.mean(residuals)),
+        'std_residual': float(np.std(residuals)),
+        'residuals': residuals,
+        'n_observers': len(seeds),
+    }
+
+
+def run_d_sweep_experiment(
+    X: torch.Tensor,
+    kernel_type: str = 'rbf',
+    output_dims: List[int] = None,
+    sigma: float = None,
+    seeds: List[int] = None,
+) -> Dict:
+    """
+    THE KEY EXPERIMENT: How do observer residuals change with D?
+    
+    If residuals → 0 as D → ∞: seeds are just Monte Carlo noise
+    If residuals persist: there might be real observer structure
+    """
+    if output_dims is None:
+        output_dims = [256, 512, 1024, 2048, 4096]
+    
+    if seeds is None:
+        seeds = list(range(42, 52))  # 10 observers
+    
+    if sigma is None:
+        dists = torch.cdist(X[:100], X[:100])
+        sigma = float(dists.median())
+    
+    results = {
+        'kernel_type': kernel_type,
+        'sigma': sigma,
+        'n_samples': len(X),
+        'input_dim': X.shape[1],
+        'seeds': seeds,
+        'by_dim': {},
+    }
+    
+    print(f"\n{'='*60}")
+    print(f"D-SWEEP EXPERIMENT: {kernel_type}, σ={sigma:.4f}")
+    print(f"{'='*60}")
+    print(f"{'D':<8} {'Corr':<10} {'Residual':<12} {'Residual/D':<12}")
+    print("-" * 45)
+    
+    for D in output_dims:
+        # Approximation quality
+        kernel = create_kernel(kernel_type, X.shape[1], D, sigma, seed=42)
+        diag = kernel.approximation_diagnostic(X)
+        
+        # Observer residuals
+        resid = compute_observer_residuals(X, kernel_type, D, sigma, seeds)
+        
+        # Normalized residual (should → 0 if just Monte Carlo noise)
+        normalized = resid['mean_residual'] / np.sqrt(D)
+        
+        results['by_dim'][D] = {
+            'correlation': diag['correlation'],
+            'mae': diag['mae'],
+            'rmse': diag['rmse'],
+            'mean_residual': resid['mean_residual'],
+            'std_residual': resid['std_residual'],
+            'normalized_residual': normalized,
+        }
+        
+        print(f"{D:<8} {diag['correlation']:<10.4f} {resid['mean_residual']:<12.4f} {normalized:<12.6f}")
+    
+    # Analysis: do residuals shrink with D?
+    dims = sorted(results['by_dim'].keys())
+    residuals = [results['by_dim'][d]['mean_residual'] for d in dims]
+    normalized = [results['by_dim'][d]['normalized_residual'] for d in dims]
+    
+    # Fit power law: residual ~ D^(-alpha)
+    log_d = np.log(dims)
+    log_r = np.log(residuals)
+    slope, intercept = np.polyfit(log_d, log_r, 1)
+    
+    results['analysis'] = {
+        'power_law_exponent': float(slope),
+        'residuals_shrinking': slope < -0.3,  # Should be ~ -0.5 for pure Monte Carlo
+        'interpretation': (
+            "MONTE CARLO NOISE: Residuals shrink as D^{:.2f}".format(slope)
+            if slope < -0.3 else
+            "POSSIBLE SIGNAL: Residuals persist (exponent = {:.2f})".format(slope)
+        ),
+    }
+    
+    print(f"\n{'='*60}")
+    print(f"ANALYSIS: Residual ~ D^{slope:.3f}")
+    print(f"{'='*60}")
+    print(results['analysis']['interpretation'])
+    
+    return results
+
+
+def run_sigma_sweep_experiment(
+    X: torch.Tensor,
+    kernel_type: str = 'rbf',
+    output_dim: int = 1024,
+    sigma_multipliers: List[float] = None,
+    seeds: List[int] = None,
+) -> Dict:
+    """
+    Test sensitivity to sigma choice.
+    
+    If geometry changes dramatically with sigma, it's an artifact.
+    """
+    if sigma_multipliers is None:
+        sigma_multipliers = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0]
+    
+    if seeds is None:
+        seeds = list(range(42, 52))
+    
+    # Base sigma from data
+    dists = torch.cdist(X[:100], X[:100])
+    base_sigma = float(dists.median())
+    
+    results = {
+        'kernel_type': kernel_type,
+        'output_dim': output_dim,
+        'base_sigma': base_sigma,
+        'by_sigma': {},
+    }
+    
+    print(f"\n{'='*60}")
+    print(f"SIGMA SWEEP: {kernel_type}, D={output_dim}")
+    print(f"{'='*60}")
+    print(f"{'σ mult':<10} {'σ':<12} {'Corr':<10} {'Residual':<12}")
+    print("-" * 45)
+    
+    for mult in sigma_multipliers:
+        sigma = base_sigma * mult
+        
+        kernel = create_kernel(kernel_type, X.shape[1], output_dim, sigma, seed=42)
+        diag = kernel.approximation_diagnostic(X)
+        resid = compute_observer_residuals(X, kernel_type, output_dim, sigma, seeds)
+        
+        results['by_sigma'][mult] = {
+            'sigma': sigma,
+            'correlation': diag['correlation'],
+            'mean_residual': resid['mean_residual'],
+        }
+        
+        print(f"{mult:<10.2f} {sigma:<12.4f} {diag['correlation']:<10.4f} {resid['mean_residual']:<12.4f}")
+    
+    # Check sensitivity
+    residuals = [results['by_sigma'][m]['mean_residual'] for m in sigma_multipliers]
+    cv = np.std(residuals) / np.mean(residuals)  # Coefficient of variation
+    
+    results['analysis'] = {
+        'residual_cv': float(cv),
+        'highly_sensitive': cv > 0.5,
+        'interpretation': (
+            "WARNING: Geometry highly sensitive to σ (CV={:.2f})".format(cv)
+            if cv > 0.5 else
+            "OK: Geometry stable across σ range (CV={:.2f})".format(cv)
+        ),
+    }
+    
+    print(f"\n{results['analysis']['interpretation']}")
+    
+    return results
+
+
+def run_kernel_discrimination_experiment(
+    X: torch.Tensor,
+    kernel_types: List[str] = None,
+    output_dim: int = 2048,
+    sigma: float = None,
+    seed: int = 42,
+) -> Dict:
+    """
+    Test if different kernels produce distinguishable geometry.
+    
+    If YES: kernel choice = genuine observer difference
+    If NO: all kernels see the same geometry (kernel is not an "observer")
+    """
+    from scipy.linalg import orthogonal_procrustes
+    
+    if kernel_types is None:
+        kernel_types = ['rbf', 'laplacian', 'rq', 'imq', 'matern']
+    
+    if sigma is None:
+        dists = torch.cdist(X[:100], X[:100])
+        sigma = float(dists.median())
+    
+    # Compute embeddings for each kernel
+    embeddings = {}
+    for kt in kernel_types:
+        kernel = create_kernel(kt, X.shape[1], output_dim, sigma, seed)
+        embeddings[kt] = kernel.transform(X).cpu().numpy()
+    
+    # Compute pairwise Procrustes distances
+    distances = {}
+    ref_kernel = kernel_types[0]
+    ref = embeddings[ref_kernel]
+    
+    print(f"\n{'='*60}")
+    print(f"KERNEL DISCRIMINATION: D={output_dim}, σ={sigma:.4f}")
+    print(f"{'='*60}")
+    print(f"Reference: {ref_kernel}")
+    print(f"{'Kernel':<12} {'Procrustes Dist':<15} {'Correlation':<12}")
+    print("-" * 40)
+    
+    for kt in kernel_types:
+        emb = embeddings[kt]
+        
+        # Align to reference
+        R, _ = orthogonal_procrustes(emb, ref)
+        aligned = emb @ R
+        
+        # Distance and correlation
+        dist = np.linalg.norm(aligned - ref, ord='fro')
+        corr = np.corrcoef(aligned.flatten(), ref.flatten())[0, 1]
+        
+        distances[kt] = {
+            'procrustes_distance': float(dist),
+            'correlation': float(corr),
+        }
+        
+        print(f"{kt:<12} {dist:<15.4f} {corr:<12.4f}")
+    
+    # Analysis
+    dists_from_ref = [distances[kt]['procrustes_distance'] for kt in kernel_types[1:]]
+    mean_dist = np.mean(dists_from_ref)
+    
+    results = {
+        'kernel_types': kernel_types,
+        'distances': distances,
+        'analysis': {
+            'mean_distance_from_ref': float(mean_dist),
+            'kernels_distinguishable': mean_dist > 1.0,  # Threshold is data-dependent
+            'interpretation': (
+                "Kernels produce distinguishable geometry"
+                if mean_dist > 1.0 else
+                "WARNING: All kernels produce similar geometry"
+            ),
+        },
+    }
+    
+    print(f"\n{results['analysis']['interpretation']}")
+    
+    return results
+
+
+def plot_d_sweep_results(results: Dict, output_path: Path = None):
+    """Visualize D-sweep experiment."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    dims = sorted(results['by_dim'].keys())
+    corrs = [results['by_dim'][d]['correlation'] for d in dims]
+    residuals = [results['by_dim'][d]['mean_residual'] for d in dims]
+    normalized = [results['by_dim'][d]['normalized_residual'] for d in dims]
+    
+    # Plot 1: Approximation quality
+    ax1 = axes[0]
+    ax1.semilogx(dims, corrs, 'bo-', linewidth=2, markersize=8, base=2)
+    ax1.axhline(0.95, color='g', linestyle='--', alpha=0.7, label='Target (0.95)')
+    ax1.set_xlabel('Output Dimension D')
+    ax1.set_ylabel('Correlation(K, ZZᵀ)')
+    ax1.set_title('RFF Approximation Quality')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Residuals vs D
+    ax2 = axes[1]
+    ax2.loglog(dims, residuals, 'ro-', linewidth=2, markersize=8, base=2, label='Raw residual')
+    ax2.loglog(dims, normalized, 'g^--', linewidth=2, markersize=8, base=2, label='Normalized (÷√D)')
+    
+    # Reference line: D^(-0.5) scaling
+    ref_line = [residuals[0] * (dims[0] / d) ** 0.5 for d in dims]
+    ax2.loglog(dims, ref_line, 'k:', alpha=0.5, label='D⁻⁰·⁵ reference')
+    
+    ax2.set_xlabel('Output Dimension D')
+    ax2.set_ylabel('Procrustes Residual')
+    ax2.set_title('Observer Residuals vs D')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"\nSaved plot: {output_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RKS Diagnostic Experiments")
+    parser.add_argument('--data-path', type=str, help='Path to observer files')
+    parser.add_argument('--synthetic', action='store_true', help='Use synthetic data')
+    parser.add_argument('--input-dim', type=int, default=24, help='Input dimension for synthetic')
+    parser.add_argument('--n-samples', type=int, default=500, help='Number of samples')
+    parser.add_argument('--kernel', type=str, default='rbf', help='Kernel type')
+    parser.add_argument('--output-dir', type=str, default='diagnostics', help='Output directory')
+    parser.add_argument('--all', action='store_true', help='Run all experiments')
+    
+    args = parser.parse_args()
+    
+    # Load or generate data
+    if args.synthetic or args.data_path is None:
+        print(f"Using synthetic data: {args.n_samples} × {args.input_dim}")
+        torch.manual_seed(42)
+        X = torch.randn(args.n_samples, args.input_dim)
+    else:
+        X = load_nli_features(Path(args.data_path))
+        print(f"Loaded data: {X.shape}")
+    
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Run experiments
+    results = {}
+    
+    # 1. D-sweep (always run)
+    print("\n" + "=" * 70)
+    print("EXPERIMENT 1: D-SWEEP")
+    print("=" * 70)
+    d_results = run_d_sweep_experiment(X, kernel_type=args.kernel)
+    results['d_sweep'] = d_results
+    plot_d_sweep_results(d_results, output_dir / 'd_sweep.png')
+    
+    if args.all:
+        # 2. Sigma sweep
+        print("\n" + "=" * 70)
+        print("EXPERIMENT 2: SIGMA SWEEP")
+        print("=" * 70)
+        sigma_results = run_sigma_sweep_experiment(X, kernel_type=args.kernel)
+        results['sigma_sweep'] = sigma_results
+        
+        # 3. Kernel discrimination
+        print("\n" + "=" * 70)
+        print("EXPERIMENT 3: KERNEL DISCRIMINATION")
+        print("=" * 70)
+        kernel_results = run_kernel_discrimination_experiment(X)
+        results['kernel_discrimination'] = kernel_results
+    
+    # Save results
+    results_path = output_dir / 'diagnostic_results.json'
+    
+    # Convert to JSON-serializable
+    def sanitize(obj):
+        if isinstance(obj, dict):
+            return {k: sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [sanitize(v) for v in obj]
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+    
+    with open(results_path, 'w') as f:
+        json.dump(sanitize(results), f, indent=2)
+    
+    print(f"\n{'='*70}")
+    print(f"Results saved to: {results_path}")
+    print(f"{'='*70}")
+    
+    # Final verdict
+    print("\n" + "=" * 70)
+    print("VERDICT")
+    print("=" * 70)
+    
+    if 'd_sweep' in results:
+        analysis = results['d_sweep']['analysis']
+        if analysis['residuals_shrinking']:
+            print("⚠️  Observer residuals are likely MONTE CARLO NOISE")
+            print("    Seeds are not observers - they're just RNG variation")
+        else:
+            print("✓  Observer residuals PERSIST with increasing D")
+            print("    This could indicate genuine observer structure")
+
+
+if __name__ == "__main__":
+    main()
