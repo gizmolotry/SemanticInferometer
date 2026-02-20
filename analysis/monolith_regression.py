@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""MONOLITH visual regression harness (Phase 1 + Phase 2 hardening)."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict
+
+
+CANONICAL_ZONES = ("Bridge", "Swamp", "Tightrope", "Void")
+MODE_KEYS = (
+    "SYNTHESIS_START",
+    "SYNTHESIS_END",
+    "DIAGNOSTICS_START",
+    "DIAGNOSTICS_END",
+    "ANALYSIS_START",
+    "ANALYSIS_END",
+)
+KEY_TRACE_NAMES = (
+    "Energy Terrain",
+    "Articles",
+    "Phantom (Magenta Knot)",
+    "Honest (Cyan River)",
+    "Rupture (Red Spark)",
+    "Tautology (Spinning)",
+)
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _sha256_bytes(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _extract_hud_nmi(html_text: str) -> float | None:
+    m = re.search(r"NMI:\s*<span[^>]*>([0-9]+\.[0-9]+)</span>", html_text)
+    if not m:
+        return None
+    return float(m.group(1))
+
+
+def _extract_mode_bounds(html_text: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for k in MODE_KEYS:
+        m = re.search(rf"var\s+{k}\s*=\s*(\d+)\s*;", html_text)
+        if m:
+            out[k] = int(m.group(1))
+    return out
+
+
+def _extract_fig_data(html_text: str) -> dict[str, Any] | None:
+    # Kept narrow to avoid over-capturing giant blobs.
+    m = re.search(r"var figData = (\{.*?\});\s*Plotly\.newPlot", html_text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def _fingerprint_html(html_path: Path) -> Dict[str, Any]:
+    html_text = _read_text(html_path)
+    fig_data = _extract_fig_data(html_text)
+    traces = fig_data.get("data", []) if fig_data else []
+
+    name_counts = Counter((t.get("name") or "") for t in traces if isinstance(t, dict))
+    key_name_counts = {k: int(name_counts.get(k, 0)) for k in KEY_TRACE_NAMES}
+
+    zone_presence = {z: (z in html_text) for z in CANONICAL_ZONES}
+    mode_bounds = _extract_mode_bounds(html_text)
+
+    return {
+        "html_path": str(html_path),
+        "size_bytes": html_path.stat().st_size,
+        "sha256": _sha256_bytes(html_path),
+        "trace_count": len(traces),
+        "mode_bounds": mode_bounds,
+        "key_trace_counts": key_name_counts,
+        "contains_fault_label": ("Fault" in html_text),
+        "zone_presence": zone_presence,
+        "contains_hott_obstruction_icon": ("⛔" in html_text),
+        "contains_hott_nonequivalence_icon": ("≠" in html_text),
+        "contains_mode_buttons": all(s in html_text for s in ("SYNTHESIS", "DIAGNOSTICS", "ANALYSIS")),
+        "hud_nmi": _extract_hud_nmi(html_text),
+    }
+
+
+def _load_expected_nmi(experiment_dir: Path) -> float | None:
+    validation_path = experiment_dir / "validation.json"
+    if not validation_path.exists():
+        return None
+    data = json.loads(validation_path.read_text(encoding="utf-8"))
+    nmi = data.get("nmi", data.get("normalized_mutual_info"))
+    if nmi is None:
+        return None
+    return float(nmi)
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    baseline_html = args.baseline_html.resolve()
+    if not baseline_html.exists():
+        print(f"[FAIL] Baseline HTML not found: {baseline_html}")
+        return 1
+
+    fingerprint = _fingerprint_html(baseline_html)
+    payload = {
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "baseline": fingerprint,
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    print("[PASS] Baseline snapshot written.")
+    print(f"[PASS] File: {args.out}")
+    print(f"[PASS] SHA256: {fingerprint['sha256']}")
+    print(f"[PASS] Traces: {fingerprint['trace_count']}")
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    candidate_html = args.candidate_html.resolve()
+    baseline_json = args.baseline_json.resolve()
+
+    if not candidate_html.exists():
+        print(f"[FAIL] Candidate HTML not found: {candidate_html}")
+        return 1
+    if not baseline_json.exists():
+        print(f"[FAIL] Baseline snapshot not found: {baseline_json}")
+        return 1
+
+    baseline_payload = json.loads(baseline_json.read_text(encoding="utf-8"))
+    baseline = baseline_payload["baseline"]
+    candidate = _fingerprint_html(candidate_html)
+
+    failures: list[str] = []
+
+    # Phase 1 lock: exact visual payload (optional strict gate).
+    if args.exact_html and candidate["sha256"] != baseline["sha256"]:
+        failures.append("HTML SHA256 differs from locked baseline.")
+
+    # Structural drift checks.
+    if candidate["mode_bounds"] != baseline["mode_bounds"]:
+        failures.append(
+            f"Mode bounds changed: baseline={baseline['mode_bounds']} candidate={candidate['mode_bounds']}"
+        )
+    if candidate["trace_count"] != baseline["trace_count"]:
+        failures.append(
+            f"Trace count changed: baseline={baseline['trace_count']} candidate={candidate['trace_count']}"
+        )
+    if candidate["key_trace_counts"] != baseline["key_trace_counts"]:
+        failures.append(
+            f"Key trace counts changed: baseline={baseline['key_trace_counts']} candidate={candidate['key_trace_counts']}"
+        )
+
+    # Safety invariants.
+    if candidate["contains_fault_label"]:
+        failures.append("Found legacy zone label 'Fault' in candidate HTML.")
+    if not all(candidate["zone_presence"].values()):
+        failures.append(f"Missing canonical zone labels: {candidate['zone_presence']}")
+    if (
+        candidate["contains_hott_obstruction_icon"] != baseline["contains_hott_obstruction_icon"]
+        or candidate["contains_hott_nonequivalence_icon"] != baseline["contains_hott_nonequivalence_icon"]
+    ):
+        failures.append(
+            "HoTT icon presence drifted from baseline."
+        )
+    if not candidate["contains_mode_buttons"]:
+        failures.append("Mode buttons missing (SYNTHESIS/DIAGNOSTICS/ANALYSIS).")
+
+    # Phase 2 gate: Track 5 NMI agreement with experiment validation.
+    if args.experiment_dir:
+        expected_nmi = _load_expected_nmi(args.experiment_dir.resolve())
+        if expected_nmi is None:
+            failures.append(f"Missing expected NMI in {args.experiment_dir / 'validation.json'}")
+        elif candidate["hud_nmi"] is None:
+            failures.append("HUD NMI missing in candidate HTML.")
+        elif round(candidate["hud_nmi"], 3) != round(expected_nmi, 3):
+            failures.append(
+                f"HUD NMI mismatch: html={candidate['hud_nmi']:.3f} expected={expected_nmi:.3f}"
+            )
+
+    if failures:
+        def _safe(s: str) -> str:
+            return s.encode("ascii", errors="replace").decode("ascii")
+        print("[FAIL] MONOLITH regression check failed.")
+        for item in failures:
+            print(f"[FAIL] {_safe(item)}")
+        return 1
+
+    print("[PASS] MONOLITH regression check passed.")
+    print(f"[PASS] Candidate: {candidate_html}")
+    print(f"[PASS] Trace count: {candidate['trace_count']}")
+    print(f"[PASS] Mode bounds: {candidate['mode_bounds']}")
+    if candidate["hud_nmi"] is not None:
+        print(f"[PASS] HUD NMI: {candidate['hud_nmi']:.3f}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="MONOLITH visual regression harness.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_snapshot = sub.add_parser("snapshot", help="Create baseline snapshot JSON from a known-good HTML.")
+    p_snapshot.add_argument(
+        "--baseline-html",
+        type=Path,
+        default=Path("monolith_cockpit_restored_exact.html"),
+        help="Known-good baseline HTML path.",
+    )
+    p_snapshot.add_argument(
+        "--out",
+        type=Path,
+        default=Path("analysis/regression/monolith_baseline_snapshot.json"),
+        help="Output JSON fingerprint path.",
+    )
+    p_snapshot.set_defaults(func=cmd_snapshot)
+
+    p_check = sub.add_parser("check", help="Compare candidate HTML against baseline snapshot.")
+    p_check.add_argument("candidate_html", type=Path, help="Candidate MONOLITH HTML path.")
+    p_check.add_argument(
+        "--baseline-json",
+        type=Path,
+        default=Path("analysis/regression/monolith_baseline_snapshot.json"),
+        help="Baseline snapshot JSON.",
+    )
+    p_check.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=None,
+        help="Experiment dir containing validation.json for NMI gate.",
+    )
+    p_check.add_argument(
+        "--exact-html",
+        action="store_true",
+        help="Require exact byte-for-byte baseline match (SHA256).",
+    )
+    p_check.set_defaults(func=cmd_check)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
