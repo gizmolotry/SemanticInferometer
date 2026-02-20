@@ -82,11 +82,24 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-try:
-    import umap
-    HAS_UMAP = True
-except ImportError:
-    HAS_UMAP = False
+# Lazy-loaded to avoid startup stalls in environments where importing umap
+# can hang for a long time. We only import if a fresh projection is needed.
+umap = None
+HAS_UMAP = None
+
+
+def get_umap_module():
+    """Import umap on demand; cache success/failure."""
+    global umap, HAS_UMAP
+    if HAS_UMAP is None:
+        try:
+            import umap as _umap
+            umap = _umap
+            HAS_UMAP = True
+        except Exception:
+            umap = None
+            HAS_UMAP = False
+    return umap
 
 
 # =============================================================================
@@ -618,14 +631,8 @@ def compute_umap_3d(
     random_state: int = 42,
 ) -> np.ndarray:
     """Compute 3D UMAP projection."""
-    fast_projection = os.environ.get("MONOLITH_FAST_PROJECTION", "0").strip() == "1"
-    if fast_projection:
-        if HAS_SCIPY:
-            pca = PCA(n_components=3, random_state=random_state)
-            return pca.fit_transform(features)
-        return features[:, :3]
-
-    if not HAS_UMAP:
+    umap_mod = get_umap_module()
+    if umap_mod is None:
         # Fallback to PCA
         if HAS_SCIPY:
             pca = PCA(n_components=3, random_state=random_state)
@@ -644,7 +651,7 @@ def compute_umap_3d(
         metric = 'euclidean'
         data = features
 
-    reducer = umap.UMAP(
+    reducer = umap_mod.UMAP(
         n_components=3,
         n_neighbors=min(n_neighbors, features.shape[0] - 1),
         min_dist=min_dist,
@@ -662,14 +669,8 @@ def compute_umap_2d(
     random_state: int = 42,
 ) -> np.ndarray:
     """Compute 2D UMAP projection."""
-    fast_projection = os.environ.get("MONOLITH_FAST_PROJECTION", "0").strip() == "1"
-    if fast_projection:
-        if HAS_SCIPY:
-            pca = PCA(n_components=2, random_state=random_state)
-            return pca.fit_transform(features)
-        return features[:, :2]
-
-    if not HAS_UMAP:
+    umap_mod = get_umap_module()
+    if umap_mod is None:
         if HAS_SCIPY:
             pca = PCA(n_components=2, random_state=random_state)
             return pca.fit_transform(features)
@@ -687,7 +688,7 @@ def compute_umap_2d(
         metric = 'euclidean'
         data = features
 
-    reducer = umap.UMAP(
+    reducer = umap_mod.UMAP(
         n_components=2,
         n_neighbors=min(n_neighbors, features.shape[0] - 1),
         min_dist=min_dist,
@@ -1634,6 +1635,7 @@ def render_phantom_paths_3d(
         return []
 
     traces = []
+    fast_render = os.environ.get("MONOLITH_FAST_RENDER", "1").strip() == "1"
     n_articles = min(len(phantom_verdicts), len(positions_3d))
 
     # Compute centroid as the "low energy attractor" (downhill direction)
@@ -1706,7 +1708,7 @@ def render_phantom_paths_3d(
         if verdict == "TAUTOLOGY":
             # TAUTOLOGY: Small gray circle — walker spun in place, no real movement
             # Generate circular path around the article position
-            n_pts = 20
+            n_pts = 12 if fast_render else 20
             radius = 0.08
             theta = np.linspace(0, 2 * np.pi, n_pts)
             circle_x = pos[0] + radius * np.cos(theta)
@@ -1743,22 +1745,23 @@ def render_phantom_paths_3d(
                 showlegend=len([t for t in traces if 'Honest' in (getattr(t, 'name', '') or '')]) == 0,
             ))
 
-            # Glow effect
-            traces.append(go.Scatter3d(
-                x=[pos[0], end_pos[0]],
-                y=[pos[1], end_pos[1]],
-                z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.02),
-                mode='lines',
-                line=dict(color=PALETTE.honest_cyan, width=8),
-                opacity=0.15,
-                showlegend=False,
-                hoverinfo='skip',
-            ))
+            # Optional glow layer for full-quality render.
+            if not fast_render:
+                traces.append(go.Scatter3d(
+                    x=[pos[0], end_pos[0]],
+                    y=[pos[1], end_pos[1]],
+                    z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.02),
+                    mode='lines',
+                    line=dict(color=PALETTE.honest_cyan, width=8),
+                    opacity=0.15,
+                    showlegend=False,
+                    hoverinfo='skip',
+                ))
 
         elif verdict == "PHANTOM":
             # MAGENTA KNOT: Twisted spiral showing hysteresis/turbulence
             # The walkers split up and swirled around
-            n_pts = 30
+            n_pts = 18 if fast_render else 30
             t = np.linspace(0, 3 * np.pi, n_pts)
             spiral_radius = 0.12
             spiral_stretch = path_length * 0.8
@@ -1768,17 +1771,18 @@ def render_phantom_paths_3d(
             helix_y = pos[1] + spiral_radius * np.sin(t) + direction[1] * t / (3 * np.pi) * spiral_stretch
             helix_z = interpolate_z_from_terrain(helix_x, helix_y, offset=0.03) # Clamp to terrain
 
-            # Glow layer
-            traces.append(go.Scatter3d(
-                x=helix_x,
-                y=helix_y,
-                z=helix_z,
-                mode='lines',
-                line=dict(color='#9900FF', width=10),
-                opacity=0.2,
-                showlegend=False,
-                hoverinfo='skip',
-            ))
+            # Optional glow layer for full-quality render.
+            if not fast_render:
+                traces.append(go.Scatter3d(
+                    x=helix_x,
+                    y=helix_y,
+                    z=helix_z,
+                    mode='lines',
+                    line=dict(color='#9900FF', width=10),
+                    opacity=0.2,
+                    showlegend=False,
+                    hoverinfo='skip',
+                ))
 
             # Core spiral
             traces.append(go.Scatter3d(
@@ -1811,24 +1815,25 @@ def render_phantom_paths_3d(
                 showlegend=len([t for t in traces if 'Rupture' in (getattr(t, 'name', '') or '')]) == 0,
             ))
 
-            # Spark particles at termination point
-            n_sparks = 4
-            for _ in range(n_sparks):
-                spark_offset = np.array([
-                    random.uniform(-0.03, 0.03),
-                    random.uniform(-0.03, 0.03),
-                    random.uniform(-0.03, 0.03),
-                ])
-                spark_pos = stub_end + spark_offset
-                traces.append(go.Scatter3d(
-                    x=[spark_pos[0]],
-                    y=[spark_pos[1]],
-                    z=[interpolate_z_from_terrain(np.array([spark_pos[0]]), np.array([spark_pos[1]]), offset=0.04)],
-                    mode='markers',
-                    marker=dict(size=4, color='#FF4400', opacity=0.8),
-                    showlegend=False,
-                    hoverinfo='skip',
-                ))
+            # Spark particles are expensive to serialize; skip in fast render.
+            if not fast_render:
+                n_sparks = 4
+                for _ in range(n_sparks):
+                    spark_offset = np.array([
+                        random.uniform(-0.03, 0.03),
+                        random.uniform(-0.03, 0.03),
+                        random.uniform(-0.03, 0.03),
+                    ])
+                    spark_pos = stub_end + spark_offset
+                    traces.append(go.Scatter3d(
+                        x=[spark_pos[0]],
+                        y=[spark_pos[1]],
+                        z=[interpolate_z_from_terrain(np.array([spark_pos[0]]), np.array([spark_pos[1]]), offset=0.04)],
+                        mode='markers',
+                        marker=dict(size=4, color='#FF4400', opacity=0.8),
+                        showlegend=False,
+                        hoverinfo='skip',
+                    ))
 
     return traces
 
@@ -3229,8 +3234,24 @@ def create_monolith_cockpit(
         unified_color_codes = np.array(unified_color_codes)
 
     # Compute 2D projection
-    print(f"[MONOLITH] Computing 2D UMAP for {n_articles} articles...")
-    positions_2d = compute_umap_2d(features, n_neighbors=min(15, n_articles - 1))
+    # Prefer cached MONOLITH_DATA.csv projection if present to avoid
+    # expensive re-embedding on every render.
+    if (
+        'monolith_df' in locals()
+        and 'x_proj' in monolith_df.columns
+        and 'y_proj' in monolith_df.columns
+    ):
+        x_vals = pd.to_numeric(monolith_df['x_proj'], errors='coerce').to_numpy()
+        y_vals = pd.to_numeric(monolith_df['y_proj'], errors='coerce').to_numpy()
+        if np.all(np.isfinite(x_vals)) and np.all(np.isfinite(y_vals)):
+            positions_2d = np.column_stack([x_vals, y_vals])
+            print(f"[MONOLITH] Using cached 2D projection from MONOLITH_DATA.csv ({n_articles} articles).")
+        else:
+            print(f"[MONOLITH] Cached projection invalid; recomputing 2D UMAP for {n_articles} articles...")
+            positions_2d = compute_umap_2d(features, n_neighbors=min(15, n_articles - 1))
+    else:
+        print(f"[MONOLITH] Computing 2D UMAP for {n_articles} articles...")
+        positions_2d = compute_umap_2d(features, n_neighbors=min(15, n_articles - 1))
 
     # Project points ONTO the terrain surface
     print(f"[MONOLITH] Projecting articles onto terrain manifold...")
@@ -3494,110 +3515,109 @@ def create_monolith_cockpit(
     synthesis_trace_end = len(fig.data)
 
     # =========================================
-    # DIAGNOSTICS MODE TRACES (Default: hidden)
+    # DIAGNOSTICS + ANALYSIS MODE TRACES
     # =========================================
+    render_all_modes = (physics_mode == "analysis") or (os.environ.get("MONOLITH_RENDER_ALL_MODES", "0").strip() == "1")
     diagnostics_trace_start = len(fig.data)
-    print("[MONOLITH] Rendering DIAGNOSTICS mode traces...")
-
-    # DIAGNOSTIC Layer 1: Wind Streamlines (Track 1.5 antagonism vectors)
-    # Shows narrative pressure field from spectral polarity gradient
-    if exp.antagonism is not None:
-        print("[MONOLITH] Rendering wind streamlines from Track 1.5 antagonism...")
-        wind_traces = render_wind_streamlines(positions_3d, exp.antagonism, n_streamlines=40)
-        for t in wind_traces:
-            t.visible = False  # Hidden by default
-            fig.add_trace(t)
-
-    # DIAGNOSTIC Layer 2: Slime Trails (replaces walker diamonds)
-    if walker_work is not None and len(walker_work) > 0:
-        print("[MONOLITH] Rendering slime trails (Diagnostics)...")
-        slime_traces = render_slime_trails(
-            positions_3d, walker_work, n_neighbors=4,
-            get_surface_z_func=get_surface_z, # Pass helper function
-            positions_2d=positions_2d,       # Pass 2D positions
-        )
-        for t in slime_traces:
-            t.visible = False  # Hidden by default
-            fig.add_trace(t)
-
-    # DIAGNOSTIC Layer 3: Chromatic Ghosts (shows uncertainty as RGB split)
-    print("[MONOLITH] Rendering chromatic ghosts (Diagnostics)...")
-    ghost_traces = render_chromatic_ghosts(positions_3d, features, spectral_evr)
-    for t in ghost_traces:
-        t.visible = False  # Hidden by default
-        fig.add_trace(t)
-
-    # DIAGNOSTIC Layer 4: Confidence Halos (Track 1 logit confidence)
-    # Bigger halo = less confident NLI model (more uncertainty in surface claim)
-    print("[MONOLITH] Rendering confidence halos from Track 1 logit confidence...")
-    halo_sizes = sizes * 3 * (1.0 - logit_confidence)  # Low confidence = big halo
-    halo_trace = go.Scatter3d(
-        x=positions_3d[:, 0],
-        y=positions_3d[:, 1],
-        z=positions_3d[:, 2],
-        mode='markers',
-        marker=dict(
-            size=halo_sizes,
-            color='rgba(255,255,255,0.1)',
-            line=dict(color=PALETTE.cyan, width=1),
-        ),
-        name='Confidence Halos',
-        hoverinfo='skip',
-        visible=False,
-    )
-    fig.add_trace(halo_trace)
-
-    # DIAGNOSTIC Layer 5: Hysteresis Highways (Track 4 Path Memory)
-    # Default OFF to preserve the cleaner test-cockpit profile.
-    # Enable explicitly with MONOLITH_ENABLE_HYSTERESIS=1.
-    enable_hysteresis_overlay = os.environ.get("MONOLITH_ENABLE_HYSTERESIS", "0").strip() == "1"
-    if exp.hysteresis_memory is not None and enable_hysteresis_overlay:
-        print("[MONOLITH] Rendering hysteresis highways from Track 4 path memory...")
-        highway_traces = render_hysteresis_highways_3d(
-            positions_3d=positions_3d,
-            hysteresis_memory=exp.hysteresis_memory,
-            probe_labels=PROBE_LABELS,
-        )
-        for t in highway_traces:
-            t.visible = False  # Hidden by default (DIAGNOSTICS mode)
-            fig.add_trace(t)
-        print(f"  Added {len(highway_traces)} hysteresis traces")
-    elif exp.hysteresis_memory is not None:
-        print("[MONOLITH] Skipping hysteresis highways (set MONOLITH_ENABLE_HYSTERESIS=1 to enable)")
-
-    # DIAGNOSTIC Layer 6: Walker Diamonds (Track 4 walker states)
-    # Shows tautology/honest/phantom/rupture states as colored diamonds
-    if walker_states and len(walker_states) > 0:
-        print("[MONOLITH] Rendering walker diamonds from Track 4 states...")
-        walker_diamond_traces = render_walker_diamonds_3d(
-            positions_3d=positions_3d,
-            walker_states=walker_states,
-            walker_work=walker_work,
-            article_metadata=metadata,  # Use 'metadata' variable from scope
-            phantom_verdicts=phantom_verdicts,
-            spectral_evr=spectral_evr,
-            show_all_states=True,  # Show all 4 states
-        )
-        for t in walker_diamond_traces:
-            t.visible = False  # Hidden by default (DIAGNOSTICS mode)
-            fig.add_trace(t)
-        print(f"  Added {len(walker_diamond_traces)} walker diamond traces")
-
-    diagnostics_trace_end = len(fig.data)
-
-    # =========================================
-    # ANALYSIS MODE TRACES (Stacked Track Planes)
-    # =========================================
-    analysis_trace_start = len(fig.data)
     analysis_nmi_scores = {}
 
-    print("[MONOLITH] Rendering ANALYSIS mode traces (stacked track planes)...")
-    analysis_traces, analysis_nmi_scores = render_analysis_planes(exp)
-    for t in analysis_traces:
-        t.visible = False  # Hidden by default
-        fig.add_trace(t)
+    if render_all_modes:
+        print("[MONOLITH] Rendering DIAGNOSTICS mode traces...")
 
-    analysis_trace_end = len(fig.data)
+        # DIAGNOSTIC Layer 1: Wind Streamlines (Track 1.5 antagonism vectors)
+        if exp.antagonism is not None:
+            print("[MONOLITH] Rendering wind streamlines from Track 1.5 antagonism...")
+            wind_traces = render_wind_streamlines(positions_3d, exp.antagonism, n_streamlines=40)
+            for t in wind_traces:
+                t.visible = False
+                fig.add_trace(t)
+
+        # DIAGNOSTIC Layer 2: Slime Trails
+        if walker_work is not None and len(walker_work) > 0:
+            print("[MONOLITH] Rendering slime trails (Diagnostics)...")
+            slime_traces = render_slime_trails(
+                positions_3d, walker_work, n_neighbors=4,
+                get_surface_z_func=get_surface_z,
+                positions_2d=positions_2d,
+            )
+            for t in slime_traces:
+                t.visible = False
+                fig.add_trace(t)
+
+        # DIAGNOSTIC Layer 3: Chromatic Ghosts
+        print("[MONOLITH] Rendering chromatic ghosts (Diagnostics)...")
+        ghost_traces = render_chromatic_ghosts(positions_3d, features, spectral_evr)
+        for t in ghost_traces:
+            t.visible = False
+            fig.add_trace(t)
+
+        # DIAGNOSTIC Layer 4: Confidence Halos
+        print("[MONOLITH] Rendering confidence halos from Track 1 logit confidence...")
+        halo_sizes = sizes * 3 * (1.0 - logit_confidence)
+        halo_trace = go.Scatter3d(
+            x=positions_3d[:, 0],
+            y=positions_3d[:, 1],
+            z=positions_3d[:, 2],
+            mode='markers',
+            marker=dict(
+                size=halo_sizes,
+                color='rgba(255,255,255,0.1)',
+                line=dict(color=PALETTE.cyan, width=1),
+            ),
+            name='Confidence Halos',
+            hoverinfo='skip',
+            visible=False,
+        )
+        fig.add_trace(halo_trace)
+
+        # DIAGNOSTIC Layer 5: Hysteresis Highways (optional)
+        enable_hysteresis_overlay = os.environ.get("MONOLITH_ENABLE_HYSTERESIS", "0").strip() == "1"
+        if exp.hysteresis_memory is not None and enable_hysteresis_overlay:
+            print("[MONOLITH] Rendering hysteresis highways from Track 4 path memory...")
+            highway_traces = render_hysteresis_highways_3d(
+                positions_3d=positions_3d,
+                hysteresis_memory=exp.hysteresis_memory,
+                probe_labels=PROBE_LABELS,
+            )
+            for t in highway_traces:
+                t.visible = False
+                fig.add_trace(t)
+            print(f"  Added {len(highway_traces)} hysteresis traces")
+        elif exp.hysteresis_memory is not None:
+            print("[MONOLITH] Skipping hysteresis highways (set MONOLITH_ENABLE_HYSTERESIS=1 to enable)")
+
+        # DIAGNOSTIC Layer 6: Walker Diamonds
+        if walker_states and len(walker_states) > 0:
+            print("[MONOLITH] Rendering walker diamonds from Track 4 states...")
+            walker_diamond_traces = render_walker_diamonds_3d(
+                positions_3d=positions_3d,
+                walker_states=walker_states,
+                walker_work=walker_work,
+                article_metadata=metadata,
+                phantom_verdicts=phantom_verdicts,
+                spectral_evr=spectral_evr,
+                show_all_states=True,
+            )
+            for t in walker_diamond_traces:
+                t.visible = False
+                fig.add_trace(t)
+            print(f"  Added {len(walker_diamond_traces)} walker diamond traces")
+
+        diagnostics_trace_end = len(fig.data)
+
+        # ANALYSIS mode traces
+        analysis_trace_start = len(fig.data)
+        print("[MONOLITH] Rendering ANALYSIS mode traces (stacked track planes)...")
+        analysis_traces, analysis_nmi_scores = render_analysis_planes(exp)
+        for t in analysis_traces:
+            t.visible = False
+            fig.add_trace(t)
+        analysis_trace_end = len(fig.data)
+    else:
+        diagnostics_trace_end = diagnostics_trace_start
+        analysis_trace_start = diagnostics_trace_end
+        analysis_trace_end = analysis_trace_start
+        print("[MONOLITH] Fast synthesis render: skipped diagnostics/analysis traces (set MONOLITH_RENDER_ALL_MODES=1 for full cockpit).")
 
     # Count traces per mode for JS toggle
     n_synthesis = synthesis_trace_end - synthesis_trace_start
