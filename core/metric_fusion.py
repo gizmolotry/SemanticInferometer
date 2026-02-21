@@ -18,6 +18,7 @@ from sklearn.neighbors import NearestNeighbors
 from typing import Tuple, List
 import json
 import argparse
+from .thermo_config import ThermodynamicConfig
 
 def calculate_unified_metric(
     embeddings_path: Path,
@@ -44,6 +45,7 @@ def calculate_unified_metric(
         A pandas DataFrame with the original metadata and appended unified metric columns.
     """
     print(f"Loading data: {embeddings_path}, {gradients_path}, {metadata_path}")
+    thermo_config = ThermodynamicConfig()
 
     # 1. Load 'embeddings.npy', 'gradients.npy', and 'articles.csv'
     embeddings = np.load(embeddings_path)
@@ -66,8 +68,11 @@ def calculate_unified_metric(
         # Density is inversely proportional to average distance to k-th neighbor
         # We take the distance to the k-th neighbor (knn_k index, as 0th is self)
         k_distances = distances[:, knn_k]
-        density = 1.0 / (k_distances + 1e-8)  # Add epsilon to prevent division by zero
-        density = (density - density.min()) / (density.max() - density.min() + 1e-8) # Normalize 0-1
+        density = 1.0 / (k_distances + thermo_config.density_clamp_min)  # Add epsilon to prevent division by zero
+        density = (
+            (density - density.min()) /
+            (density.max() - density.min() + thermo_config.density_clamp_min)
+        )  # Normalize 0-1
     else:
         print(f"Warning: Not enough samples ({len(embeddings)}) for KNN k={knn_k}. Assigning uniform density.")
         density = np.ones(len(embeddings)) * 0.5 # Default to mid-density
@@ -75,7 +80,10 @@ def calculate_unified_metric(
     # 3. Calculate STRESS (grad_norm) as the L2 norm of the gradient vectors. Normalize 0-1.
     print("Calculating stress (L2 norm of gradients)...")
     stress = np.linalg.norm(gradients, axis=1)
-    stress = (stress - stress.min()) / (stress.max() - stress.min() + 1e-8) # Normalize 0-1
+    stress = (
+        (stress - stress.min()) /
+        (stress.max() - stress.min() + thermo_config.density_clamp_min)
+    )  # Normalize 0-1
 
     # 4. Calculate Z_HEIGHT using the physics formula:
     #    z = stress * 1.2 + (1.0 - density) * 0.8 # Updated formula

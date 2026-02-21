@@ -45,6 +45,7 @@ import numpy as np
 from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
+from .thermo_config import ThermodynamicConfig
 
 
 class WalkerState(Enum):
@@ -151,6 +152,7 @@ class SemanticWalker:
         memory_decay: float = 0.95,
         reinforcement_rate: float = 0.1,
         memory_sensitivity: float = 1.0,
+        thermo_config: Optional[ThermodynamicConfig] = None,
     ):
         """
         Args:
@@ -172,6 +174,7 @@ class SemanticWalker:
         self.T = temperature
         self.n_bots = embeddings.shape[0]
         self.u_axis = u_axis.float() if u_axis is not None else None
+        self.thermo_config = thermo_config or ThermodynamicConfig()
 
         # =========================================
         # HYSTERESIS STATE (Path Memory)
@@ -206,12 +209,12 @@ class SemanticWalker:
         # - RUPTURE: Δ ≥ 25.0 (impossible, topological barrier)
         #
         # Calibrated for W = ∫ (1/ρ) ds in 256-1536D embedding space.
-        self.tautology_threshold = 1.0   # Below = tautology (null path)
+        self.tautology_threshold = self.thermo_config.tautology_work_threshold
         self.honest_threshold = 15.0     # Below = honest (efficient)
         self.rupture_threshold = 25.0    # Above = rupture (blocked)
 
         # Spectral distance threshold for tautology detection
-        self.min_spectral_distance = 0.1
+        self.min_spectral_distance = self.thermo_config.tautology_disp_threshold
 
     def _compute_energy(self, weights: torch.Tensor) -> torch.Tensor:
         """
@@ -401,7 +404,7 @@ class SemanticWalker:
         # The Walk Loop (with Hysteresis)
         for t in range(n_steps):
             # A. Propose a step (perturb weights)
-            noise = torch.randn_like(current_weights) * 0.1
+            noise = torch.randn_like(current_weights) * self.thermo_config.noise_sigma
             proposal = torch.abs(current_weights + noise)
             proposal = proposal / proposal.sum(dim=-1, keepdim=True)
 
@@ -455,7 +458,7 @@ class SemanticWalker:
         Returns:
             density: [...] local density (> epsilon, always finite)
         """
-        DENSITY_EPSILON = 1e-6  # Minimum density to prevent 1/ρ → ∞
+        DENSITY_EPSILON = self.thermo_config.density_clamp_min
 
         # Fused gradient magnitude at this position
         fused_grad = torch.matmul(weights, self.gradients)  # [..., H]
@@ -530,9 +533,11 @@ class SemanticWalker:
 
         # Physical friction model: inverse density.
         # Clamp to keep extreme voids finite and avoid INF work explosions.
-        DENSITY_EPSILON = 1e-6
+        DENSITY_EPSILON = self.thermo_config.density_clamp_min
         MAX_FRICTION = 1e3
-        terrain_friction = (1.0 / density.clamp(min=DENSITY_EPSILON)).clamp(max=MAX_FRICTION)
+        terrain_friction = (
+            self.thermo_config.friction_coefficient / density.clamp(min=DENSITY_EPSILON)
+        ).clamp(max=MAX_FRICTION)
 
         # =========================================
         # 3. WORK INTEGRAL: W = ∫ (1/ρ) ds
@@ -715,6 +720,7 @@ def compute_walker_resistance(
     reinforcement_rate: float = 0.1,
     memory_sensitivity: float = 1.0,
     existing_memory: Optional[torch.Tensor] = None,  # [n_bots, n_bots] to continue from
+    thermo_config: Optional[ThermodynamicConfig] = None,
 ) -> Dict[str, Any]:
     """
     Compute walker resistance for a single article.
@@ -769,6 +775,7 @@ def compute_walker_resistance(
         memory_decay=memory_decay,
         reinforcement_rate=reinforcement_rate,
         memory_sensitivity=memory_sensitivity,
+        thermo_config=thermo_config,
     )
 
     # If continuing from existing memory, load it

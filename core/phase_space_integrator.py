@@ -50,6 +50,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 
 from .pca_removal import fit_whitening_matrix, apply_whitening_fixed
+from .thermo_config import ThermodynamicConfig
 
 
 # =============================================================================
@@ -427,6 +428,7 @@ class PhaseSpaceIntegrator:
         #   3. Spectral embedding: recover vector space for Walker
         hadamard_diagnostics = None
         if use_hadamard_fusion:
+            thermo_config = ThermodynamicConfig()
             t2 = scaled_tracks.get('hologram')
             t15 = scaled_tracks.get('antagonism')
             t3 = scaled_tracks.get('blinker')
@@ -439,6 +441,8 @@ class PhaseSpaceIntegrator:
                 hf_config = HadamardFusionConfig(
                     output_dim=t2.shape[-1],  # Match hologram dimension
                     dark_manifold_rescue=True,
+                    hadamard_softening=thermo_config.hadamard_floor,
+                    kernel_floor=thermo_config.hadamard_floor,
                 )
 
                 if t3 is not None:

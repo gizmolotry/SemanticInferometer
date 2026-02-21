@@ -57,6 +57,7 @@ import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
+from .thermo_config import ThermodynamicConfig
 
 
 @dataclass
@@ -76,14 +77,18 @@ class HadamardFusionConfig:
     # Dark manifold protection
     dark_manifold_threshold: float = 0.01  # Min row-sum to prevent isolated nodes
     dark_manifold_rescue: bool = True      # Whether to rescue isolated nodes
-    hadamard_softening: float = 0.15       # 0=strict product, 1=max-kernel blend
+    hadamard_softening: float = field(
+        default_factory=lambda: ThermodynamicConfig().hadamard_floor
+    )  # 0=strict product, 1=max-kernel blend
 
     # Conformal metric parameters
     temperature_scale: float = 1.0         # Scale factor for blinker variance
 
     # Numerical stability
     eigenvalue_floor: float = 1e-10        # Min eigenvalue for spectral embedding
-    kernel_floor: float = 1e-10            # Min kernel value
+    kernel_floor: float = field(
+        default_factory=lambda: ThermodynamicConfig().hadamard_floor
+    )  # Min kernel value
 
     # Performance
     use_nystrom: bool = False              # Use Nystrom approximation for large N
@@ -181,8 +186,8 @@ class HadamardFusion:
             sigma_spectral = self._median_heuristic(dist_spectral_sq)
 
         # Compute RBF kernels: K(x,y) = exp(-||x-y||^2 / (2*sigma^2))
-        K_rks = torch.exp(-dist_rks_sq / (2 * sigma_rks**2 + 1e-10))
-        K_spectral = torch.exp(-dist_spectral_sq / (2 * sigma_spectral**2 + 1e-10))
+        K_rks = torch.exp(-dist_rks_sq / (2 * sigma_rks**2 + self.config.kernel_floor))
+        K_spectral = torch.exp(-dist_spectral_sq / (2 * sigma_spectral**2 + self.config.kernel_floor))
 
         return K_rks, K_spectral
 
@@ -347,7 +352,7 @@ class HadamardFusion:
         """Estimate kernel bandwidth via median heuristic."""
         # Take upper triangle (exclude diagonal)
         triu_idx = torch.triu_indices(dist_sq.shape[0], dist_sq.shape[1], offset=1)
-        distances = torch.sqrt(dist_sq[triu_idx[0], triu_idx[1]] + 1e-10)
+        distances = torch.sqrt(dist_sq[triu_idx[0], triu_idx[1]] + self.config.kernel_floor)
 
         if distances.numel() == 0:
             return 1.0
