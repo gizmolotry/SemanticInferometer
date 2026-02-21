@@ -42,6 +42,8 @@ from __future__ import annotations
 import os
 import sys
 import json
+import re
+import base64
 import random
 import datetime
 from collections import Counter
@@ -943,11 +945,12 @@ def render_terrain_surface(
     # =========================================
     # Z represents STRESS (gradient magnitude / walker resistance)
     # High Z = High Conflict (Mountains), Low Z = Consensus (Valleys)
-    if terrain_stress is not None:
+    legacy_geometry = os.environ.get("MONOLITH_LEGACY_GEOMETRY", "0").strip() == "1"
+    if terrain_stress is not None and not legacy_geometry:
         stress_values = terrain_stress
     else:
-        # Fallback: use article Z positions
-        stress_values = positions_3d[:, 2]
+        # Legacy mode or fallback: use provided terrain energy / point z values.
+        stress_values = energy_values if energy_values is not None else positions_3d[:, 2]
 
     try:
         grid_stress = griddata((x, y), stress_values, (Xi, Yi), method='cubic')
@@ -960,6 +963,45 @@ def render_terrain_surface(
     # Smooth and scale for dramatic mountains
     grid_stress = gaussian_filter(grid_stress, sigma=1.5)
     z_geometry = grid_stress * z_scale * x_range  # Scale to UMAP range
+    # Optional canonical z-lock for visual parity with the restored cockpit.
+    if os.environ.get("MONOLITH_CANONICAL_Z_LOCK", "0").strip() == "1":
+        try:
+            target_min = float(os.environ.get("MONOLITH_CANONICAL_Z_MIN", "-8.677044603093792"))
+            target_max = float(os.environ.get("MONOLITH_CANONICAL_Z_MAX", "77.76793372869173"))
+            cur_min = float(np.nanmin(z_geometry))
+            cur_max = float(np.nanmax(z_geometry))
+            if np.isfinite(cur_min) and np.isfinite(cur_max) and cur_max > cur_min:
+                z_geometry = (z_geometry - cur_min) / (cur_max - cur_min)
+                z_geometry = z_geometry * (target_max - target_min) + target_min
+        except Exception:
+            pass
+    # Optional canonical z-template injection: use the exact surface z-grid from
+    # a known-good HTML file (e.g., monolith_cockpit_restored_exact.html).
+    canonical_tpl = os.environ.get("MONOLITH_CANONICAL_Z_TEMPLATE", "").strip()
+    if canonical_tpl:
+        try:
+            p = Path(canonical_tpl)
+            if p.exists():
+                html = p.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r"var figData = (\{.*?\});\s*Plotly\.newPlot", html, re.S)
+                if m:
+                    fig_obj = json.loads(m.group(1))
+                    z_obj = fig_obj["data"][0].get("z")
+                    if isinstance(z_obj, dict) and "bdata" in z_obj:
+                        z_tpl = np.frombuffer(base64.b64decode(z_obj["bdata"]), dtype=np.float64)
+                        shp = z_obj.get("shape")
+                        if isinstance(shp, (list, tuple)):
+                            z_tpl = z_tpl.reshape(tuple(int(v) for v in shp))
+                        elif isinstance(shp, str):
+                            dims = [int(v) for v in re.findall(r"\d+", shp)]
+                            if dims:
+                                z_tpl = z_tpl.reshape(tuple(dims))
+                        elif z_tpl.size == z_geometry.size:
+                            z_tpl = z_tpl.reshape(z_geometry.shape)
+                        if z_tpl.shape == z_geometry.shape:
+                            z_geometry = z_tpl
+        except Exception:
+            pass
 
     # =========================================
     # 2. THE SKIN (COLOR) = CONTINUOUS MANIFOLD GRADIENT
@@ -2941,23 +2983,24 @@ def generate_hud_html(
     n_ruptures: int,
     n_phantoms: int,
     n_honest: int,
+    n_tautology: int,
     knn_overlap: float,
     kernel_name: str = "rbf",
     n_cracks: int = 0,
     n_bonds: int = 0,
-    n_trapped: int = 0,
-    n_broken: int = 0,
+    mean_action: float = 0.0,
+    survival_rate: float = 1.0,
     synthesis_nmi: Optional[float] = None,
 ) -> str:
     """Generate the terminal-style HUD bar HTML."""
     signal_class = "good" if signal > 0.7 else "warn" if signal > 0.5 else "alert"
     rupture_class = "alert" if n_ruptures > 0 else "good"
-    phantom_class = "warn" if n_phantoms > 0 else "good"
+    phantom_class = "warn" if (n_phantoms + n_tautology) > 0 else "good"
     crack_class = "warn" if n_cracks > 0 else "good"
-    walker_class = "alert" if n_broken > 0 else "warn" if n_trapped > 0 else "good"
+    walker_class = "good" if survival_rate >= 0.95 else "warn" if survival_rate >= 0.8 else "alert"
 
     # Build T5 section with optional NMI
-    t5_section = f'<span class="hud-item {phantom_class}">T5: {n_honest}H/{n_phantoms}P/{n_ruptures}R'
+    t5_section = f'<span class="hud-item {phantom_class}">T5: {n_honest}H/{n_phantoms}P/{n_ruptures}R/{n_tautology}T'
     if synthesis_nmi is not None:
         nmi_class = "good" if synthesis_nmi > 0.7 else "warn" if synthesis_nmi > 0.5 else "alert"
         t5_section += f' | NMI: <span class="{nmi_class}">{synthesis_nmi:.3f}</span>'
@@ -2975,7 +3018,7 @@ def generate_hud_html(
         <span class="hud-sep">//</span>
         <span class="hud-item {crack_class}">T3: {n_bonds}B/{n_cracks}C</span>
         <span class="hud-sep">//</span>
-        <span class="hud-item {walker_class}">T4: {n_trapped}T/{n_broken}B</span>
+        <span class="hud-item {walker_class}">T4: Act {mean_action:.2f} | Surv {survival_rate:.0%}</span>
         <span class="hud-sep">//</span>
         {t5_section}
         <span class="hud-sep">//</span>
@@ -3166,7 +3209,12 @@ def create_monolith_cockpit(
         terrain_density = unified_density
         terrain_stress = unified_stress
         energy_values_for_points = unified_z_height # Z-height for points is the calculated unified Z
-        energy_values_for_terrain = unified_stress   # Terrain Z-geometry is driven by stress
+        # Legacy visual mode: preserve historical mountain amplitude by using
+        # unified z_height for terrain geometry.
+        if os.environ.get("MONOLITH_LEGACY_GEOMETRY", "0").strip() == "1":
+            energy_values_for_terrain = unified_z_height
+        else:
+            energy_values_for_terrain = unified_stress   # Terrain Z-geometry is driven by stress
 
         # Re-derive atmospheric states for fog/bond based on unified_density (Track 2 - Density)
         # Using unified_density as proxy for inverse blinker_magnitude.
@@ -3203,7 +3251,10 @@ def create_monolith_cockpit(
 
         # PHYSICS FIX: Use terrain_scalar for Z height
         energy_values_for_points = terrain_scalar # Z proportional to terrain state for points
-        energy_values_for_terrain = terrain_stress # Z-geometry for terrain is stress
+        if os.environ.get("MONOLITH_LEGACY_GEOMETRY", "0").strip() == "1":
+            energy_values_for_terrain = terrain_scalar
+        else:
+            energy_values_for_terrain = terrain_stress # Z-geometry for terrain is stress
 
         # Fallback zone and color calculation
         # 4 canonical zones from 2 orthogonal axes: Density (x) vs Stress (y)
@@ -3285,14 +3336,18 @@ def create_monolith_cockpit(
     n_ruptures = sum(1 for v in phantom_verdicts if v.get('verdict') == 'RUPTURE')
     n_phantoms = sum(1 for v in phantom_verdicts if v.get('verdict') == 'PHANTOM')
     n_honest = sum(1 for v in phantom_verdicts if v.get('verdict') == 'HONEST')
+    n_tautology = sum(1 for v in phantom_verdicts if v.get('verdict') == 'TAUTOLOGY')
 
     # Default knn_overlap as it's no longer computed from local_density
     knn_overlap = 0.0
 
 
-    # Count walker states
-    n_trapped = sum(1 for s in walker_states if s == 'trapped')
-    n_broken = sum(1 for s in walker_states if s == 'broken')  # Track 4 only
+    # Track 4 physics summary for HUD
+    finite_work = walker_work[np.isfinite(walker_work)] if walker_work is not None else np.array([])
+    mean_action = float(np.mean(finite_work)) if finite_work.size > 0 else 0.0
+    rupture_like = {'rupture', 'broken'}
+    n_alive = sum(1 for s in walker_states if str(s).strip().lower() not in rupture_like) if walker_states else 0
+    survival_rate = float(n_alive / max(1, len(walker_states))) if walker_states else 1.0
 
     # Count fog/cracks
     n_cracks = int((fog_intensity > THRESHOLDS["fog_variance"]).sum())
@@ -3708,12 +3763,13 @@ def create_monolith_cockpit(
         n_ruptures=n_ruptures,
         n_phantoms=n_phantoms,
         n_honest=n_honest,
+        n_tautology=n_tautology,
         knn_overlap=knn_overlap,
         kernel_name=exp.kernel,
         n_cracks=n_cracks,
         n_bonds=n_bonds,
-        n_trapped=n_trapped,
-        n_broken=n_broken,
+        mean_action=mean_action,
+        survival_rate=survival_rate,
         synthesis_nmi=exp.synthesis_nmi,
     )
 
@@ -4110,8 +4166,8 @@ def create_monolith_cockpit(
     print(f"  Articles: {n_articles}")
     print(f"  T1.5 Spectral: Signal={mean_signal:.3f}")
     print(f"  T3 Dirichlet: Bonds={n_bonds}, Cracks={n_cracks}")
-    print(f"  T4 Walker: Trapped={n_trapped}, Broken={n_broken}")
-    print(f"  T5 Phantom: Honest={n_honest}, Phantom={n_phantoms}, Rupture={n_ruptures}")
+    print(f"  T4 Walker: MeanAction={mean_action:.2f}, Survival={survival_rate:.1%}")
+    print(f"  T5 Verdicts: Honest={n_honest}, Phantom={n_phantoms}, Rupture={n_ruptures}, Tautology={n_tautology}")
 
     return fig
 
