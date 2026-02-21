@@ -76,6 +76,7 @@ class HadamardFusionConfig:
     # Dark manifold protection
     dark_manifold_threshold: float = 0.01  # Min row-sum to prevent isolated nodes
     dark_manifold_rescue: bool = True      # Whether to rescue isolated nodes
+    hadamard_softening: float = 0.15       # 0=strict product, 1=max-kernel blend
 
     # Conformal metric parameters
     temperature_scale: float = 1.0         # Scale factor for blinker variance
@@ -205,8 +206,20 @@ class HadamardFusion:
             n_rescued: Number of isolated nodes rescued
             isolated_indices: Indices of rescued nodes (or None)
         """
-        # Element-wise multiplication
-        K_hadamard = K_rks * K_spectral
+        # Element-wise multiplication (strict logical AND in kernel space).
+        K_product = K_rks * K_spectral
+
+        # Optional softening: blend strict product with max-kernel envelope.
+        # This recovers weak bridges lost by hard AND while preserving structure.
+        alpha = float(self.config.hadamard_softening)
+        alpha = min(max(alpha, 0.0), 1.0)
+        if alpha > 0.0:
+            K_envelope = torch.max(K_rks, K_spectral)
+            K_hadamard = (1.0 - alpha) * K_product + alpha * K_envelope
+        else:
+            K_hadamard = K_product
+
+        K_hadamard = K_hadamard.clamp(min=self.config.kernel_floor, max=1.0)
 
         n_rescued = 0
         isolated_indices = None

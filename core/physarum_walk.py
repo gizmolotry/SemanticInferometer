@@ -523,12 +523,16 @@ class SemanticWalker:
         step_distances = torch.norm(deltas, p=2, dim=-1)  # [n_steps, n_walkers]
 
         # =========================================
-        # 2. TERRAIN FRICTION: Cost = 1/ρ (no wind!)
+        # 2. TERRAIN FRICTION: Cost = 1/rho (no wind!)
         # =========================================
         midpoint_weights = (trajectory_weights[1:] + trajectory_weights[:-1]) / 2
         density = self._compute_density(midpoint_weights)  # [n_steps, n_walkers]
-        # New: terrain_friction = 1 - sigmoid(density)
-        terrain_friction = 1.0 - torch.sigmoid(density)
+
+        # Physical friction model: inverse density.
+        # Clamp to keep extreme voids finite and avoid INF work explosions.
+        DENSITY_EPSILON = 1e-6
+        MAX_FRICTION = 1e3
+        terrain_friction = (1.0 / density.clamp(min=DENSITY_EPSILON)).clamp(max=MAX_FRICTION)
 
         # =========================================
         # 3. WORK INTEGRAL: W = ∫ (1/ρ) ds
