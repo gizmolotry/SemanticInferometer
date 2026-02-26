@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 run_full_experiment_suite.py
 
 ONE COMMAND TO RULE THEM ALL
 
-Runs all experiments (Real + 3 Controls) ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â (N seeds)
+Runs all experiments (Real + 3 Controls)  (N seeds)
 Outputs to a timestamped folder with clear structure
 Optionally runs an NLI minimal-pair probe after each corpus (synthetic + optional corpus perturbations)
 Tracks variance at each pipeline stage (if supported by run_experiments.py)
@@ -233,7 +233,7 @@ def run_alpha_sweep(
     """
     Run Dirichlet alpha sweep on pre-extracted CLS embeddings.
     
-    This is the O-observer probing: Î± is the probe distribution parameter.
+    This is the O-observer probing:  is the probe distribution parameter.
     """
     if not TORCH_AVAILABLE:
         return {"status": "skipped", "reason": "torch not available"}
@@ -432,7 +432,7 @@ def _safe_standardize_seed_file(source_file: Path, dest_file: Path) -> None:
             i += 1
             archived = dest_file.with_name(f"{dest_file.stem}__dup{i}{dest_file.suffix}")
         source_file.replace(archived)
-        print(f"  Warning: {dest_file.name} exists; archived {source_file.name} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {archived.name}")
+        print(f"  Warning: {dest_file.name} exists; archived {source_file.name}  {archived.name}")
         return
 
     # Normal move (replace is Windows-friendly and overwrites only if target doesn't exist here)
@@ -461,7 +461,8 @@ def run_single_corpus(
     mode: str = "enhanced",
     track_variance: bool = True,
     kernel_type: str = None,
-    nli_cache_path: str = None
+    nli_cache_path: str = None,
+    extra_flags: List[str] = None
 ) -> Dict:
     """Run experiments for one corpus via run_experiments.py, then move per-seed output files into output_dir."""
 
@@ -491,6 +492,9 @@ def run_single_corpus(
         cmd.extend(["--kernel-type", kernel_type])
     
     # Add NLI cache path for reuse across kernels (4x speedup)
+    if extra_flags:
+        cmd.extend(extra_flags)
+
     if nli_cache_path:
         cmd.extend(["--nli-cache-path", str(nli_cache_path)])
     
@@ -514,7 +518,7 @@ def run_single_corpus(
     sys.stdout.flush()
 
     if result.returncode != 0:
-        print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ‚ÂÃƒâ€¦Ã¢â‚¬â„¢ FAILED: {corpus}")
+        print(f" FAILED: {corpus}")
         # Note: stdout/stderr not captured when streaming
         return {
             "corpus": corpus,
@@ -1024,10 +1028,10 @@ def run_alpha_stability_analysis(
     Run alpha-sweep geometric stability analysis on CLS embeddings.
 
     This is the "Modern System" Track 3: measures how the article manifold
-    deforms as we change the Dirichlet concentration parameter α.
+    deforms as we change the Dirichlet concentration parameter .
 
-    The gradient ∂S/∂α tells us where geometry "breaks" - high gradient
-    means small α change causes large geometric shift (phase transition).
+    The gradient S/ tells us where geometry "breaks" - high gradient
+    means small  change causes large geometric shift (phase transition).
 
     Args:
         cls_observer_path: Path to observer_*.pt file from CLS channel
@@ -1154,7 +1158,7 @@ def run_alpha_stability_analysis(
 
 
 # -----------------------------
-# Probe integration (Option B + optional shuffle probes)
+# NLI Probe integration (Option B + optional shuffle probes)
 # -----------------------------
 
 def _first_existing(path_candidates: List[Path]) -> Optional[Path]:
@@ -1234,7 +1238,7 @@ def run_nli_probe_for_corpus(
     result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
 
     if result.returncode != 0:
-        print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ‚ÂÃƒâ€¦Ã¢â‚¬â„¢ PROBE FAILED: {corpus}")
+        print(f" PROBE FAILED: {corpus}")
         print(f"STDERR: {result.stderr}")
         return {
             "status": "failed",
@@ -1245,7 +1249,7 @@ def run_nli_probe_for_corpus(
             "output": str(out_path),
         }
 
-    print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ PROBE COMPLETED: {corpus}")
+    print(f" PROBE COMPLETED: {corpus}")
     # Keep stdout in the log (useful summary)
     if result.stdout.strip():
         print(result.stdout)
@@ -1283,7 +1287,7 @@ def save_manifest(exp_dir: Path, results: List[Dict], config: Dict):
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"\nÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Saved manifest: {manifest_path}")
+    print(f"\n Saved manifest: {manifest_path}")
 
 
 def run_comparison(exp_dir: Path, seeds: List[int], kernels: List[str] = None, channels: List[str] = None) -> bool:
@@ -1443,6 +1447,12 @@ def main():
         type=int,
         default=42,
         help="Seed for RKS basis (M-observer control, default: 42)"
+    )
+
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Run verification harness after experiment suite"
     )
     parser.add_argument(
         "--crn-seed",
@@ -1612,12 +1622,12 @@ def main():
     
     probe_enabled = True
     if not probe_hyp_path.exists():
-        print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â  WARNING: Probe hypotheses not found: {probe_hyp_path}")
-        print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â  Probe will be DISABLED")
+        print(f"  WARNING: Probe hypotheses not found: {probe_hyp_path}")
+        print(f"  Probe will be DISABLED")
         probe_enabled = False
     elif not probe_script_path.exists():
-        print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â  WARNING: Probe script not found: {probe_script_path}")
-        print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â  Probe will be DISABLED")
+        print(f"  WARNING: Probe script not found: {probe_script_path}")
+        print(f"  Probe will be DISABLED")
         probe_enabled = False
 
     # Create or resume experiment directory
@@ -1626,7 +1636,7 @@ def main():
         if not exp_dir.exists():
             raise SystemExit(f"ERROR: Resume directory not found: {exp_dir}")
         print(f"\n{'='*80}")
-        print("ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ RESUMING EXPERIMENT SUITE")
+        print(" RESUMING EXPERIMENT SUITE")
         print(f"{'='*80}")
         print(f"Resuming from: {exp_dir.absolute()}")
     else:
@@ -1788,30 +1798,32 @@ def main():
     corpora = args.corpora
     results: List[Dict] = []
     
-    # ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒâ€šÃ‚Â CHECKPOINT DETECTION - Skip already completed corpora
+    #  CHECKPOINT DETECTION - Skip already completed corpora
     completed_corpora = set()
     seeds_to_run = {}  # corpus -> list of remaining seeds
     
     if args.resume:
         print(f"\n{'='*80}")
-        print("ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒâ€šÃ‚Â SCANNING FOR CHECKPOINTS")
+        print(" SCANNING FOR CHECKPOINTS")
         print(f"{'='*80}")
         
         for corpus in corpora:
-            corpus_dir = exp_dir / corpus
-            if not corpus_dir.exists():
-                seeds_to_run[corpus] = args.seeds
-                print(f"  {corpus}: NOT STARTED (will run all seeds: {args.seeds})")
-                continue
-            
-            # Check which seeds are done
+            # For modern layout, a corpus is complete only if all kernel/channel combos
+            # have observer_{seed}.pt for all requested seeds.
+            combo_dirs = []
+            for channel in args.channels:
+                if channel == "gradient":
+                    combo_dirs.append(exp_dir / "gradient" / corpus)
+                else:
+                    for kernel in args.kernels:
+                        combo_dirs.append(exp_dir / kernel / channel / corpus)
+
             completed_seeds = []
             missing_seeds = []
-            
             for seed in args.seeds:
-                patterns = [f"seed_{seed}.pt", f"observer_{seed}.pt"]
-                found = any((corpus_dir / p).exists() for p in patterns)
-                if found:
+                expected_name = f"observer_{seed}.pt"
+                found_all = all((combo_dir / expected_name).exists() for combo_dir in combo_dirs)
+                if found_all:
                     completed_seeds.append(seed)
                 else:
                     missing_seeds.append(seed)
@@ -1819,18 +1831,20 @@ def main():
             if missing_seeds:
                 seeds_to_run[corpus] = missing_seeds
                 print(f"  {corpus}: PARTIAL ({len(completed_seeds)}/{len(args.seeds)} seeds done)")
-                print(f"    ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Completed: {completed_seeds}")
-                print(f"    ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ‚ÂÃƒâ€šÃ‚Â³ Remaining: {missing_seeds}")
+                print(f"     Completed: {completed_seeds}")
+                print(f"     Remaining: {missing_seeds}")
             else:
                 completed_corpora.add(corpus)
-                print(f"  {corpus}: ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ COMPLETE (all {len(args.seeds)} seeds done)")
+                print(f"  {corpus}:  COMPLETE (all {len(args.seeds)} seeds done)")
         
         print(f"{'='*80}")
         
         if completed_corpora == set(corpora):
-            print("\nÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ALL CORPORA COMPLETE! Nothing to resume.")
-            print("Run comparison analysis or start a new experiment.")
-            return
+            print("\n ALL CORPORA COMPLETE! Nothing to resume.")
+            if not getattr(args, "verify", False):
+                print("Run comparison analysis or start a new experiment.")
+                return
+            print("Proceeding to verification/reporting as requested by --verify.")
     else:
         # Fresh run - all seeds for all corpora
         for corpus in corpora:
@@ -1904,12 +1918,12 @@ def main():
 
                 if result["status"] == "failed":
                     results.append(result)
-                    print(f"\n✗ Gradient analysis failed: {corpus}")
+                    print(f"\n Gradient analysis failed: {corpus}")
                     print("Stopping experiment suite.")
                     break
 
                 results.append(result)
-                print(f"\n✓ Gradient analysis completed: {corpus}")
+                print(f"\n Gradient analysis completed: {corpus}")
                 continue  # Skip kernel loop for gradient channel
 
             # EMBEDDING CHANNELS (logits, cls): Normal processing with kernels
@@ -1955,7 +1969,7 @@ def main():
                 # Stop early on failure
                 if result["status"] == "failed":
                     results.append(result)
-                    print(f"\nÃƒÆ’Ã‚Â¢Ãƒâ€šÃ‚ÂÃƒâ€¦Ã¢â‚¬â„¢ Experiment failed: {corpus}")
+                    print(f"\n Experiment failed: {corpus}")
                     print("Stopping experiment suite.")
                     break
         
@@ -1989,7 +2003,7 @@ def main():
                         # If probe failed and nonfatal is off, stop suite
                         if probe_result.get("status") != "success" and not args.probe_nonfatal:
                             results.append(result)
-                            print("\nÃƒÆ’Ã‚Â¢Ãƒâ€šÃ‚ÂÃƒâ€¦Ã¢â‚¬â„¢ Probe failed and --probe-nonfatal is not set.")
+                            print("\n Probe failed and --probe-nonfatal is not set.")
                             print("Stopping experiment suite.")
                             break
         
@@ -2002,11 +2016,11 @@ def main():
                         }
                         if not args.probe_nonfatal:
                             results.append(result)
-                            print(f"\nÃƒÆ’Ã‚Â¢Ãƒâ€šÃ‚ÂÃƒâ€¦Ã¢â‚¬â„¢ Probe exception: {e}")
+                            print(f"\n Probe exception: {e}")
                             print("Stopping experiment suite.")
                             break
                         else:
-                            print(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â  Probe exception (nonfatal): {e}")
+                            print(f" Probe exception (nonfatal): {e}")
         
                 # Alpha Stability Analysis (Track 3 Modern - CLS channel only)
                 if getattr(args, 'alpha_sweep', False) and channel == 'cls':
@@ -2343,7 +2357,7 @@ def main():
                 Here, 'Bots' (B) are replaced by 'Anchors' (framing concepts).
                 """
                 if verbose:
-                    print(f"  Extracting gradients: {len(articles)} articles × {len(anchors)} anchors...")
+                    print(f"  Extracting gradients: {len(articles)} articles  {len(anchors)} anchors...")
                 
                 tensor_list = []
                 
@@ -2661,6 +2675,70 @@ def main():
     else:
         print("\n[WARN] Skipping comparison due to earlier failures.")
 
+    
+    # =========================================================================
+    # VERIFICATION HARNESS
+    # =========================================================================
+    if getattr(args, 'verify', False):
+        print("\n" + "="*80)
+        print("RUNNING VERIFICATION HARNESS")
+        print("="*80)
+        try:
+            # Ensure analysis is in path
+            analysis_path = Path("analysis").resolve()
+            if str(analysis_path) not in sys.path:
+                sys.path.append(str(analysis_path))
+            
+            from verification.verify_run import discover_all_layers, verify_layer_data, write_report
+            
+            reports = []
+            # -----------------------------
+            # RUNNING AUTOMATED ABLATIONS
+            # -----------------------------
+            # Pick first representative layer for ablation
+            rep_channel = [c for c in args.channels if c != 'gradient'][0]
+            rep_kernel = args.kernels[0]
+            
+            print(f"\n[VERIFY] Running Ablation A1: CRN OFF ({rep_kernel}/{rep_channel})")
+            for corpus in args.corpora:
+                a1_out = exp_dir / "ablation" / "crn_off" / rep_kernel / rep_channel / corpus
+                a1_out.mkdir(parents=True, exist_ok=True)
+                run_single_corpus(corpus, args.seeds, args.limit, a1_out, 
+                                 mode=get_mode_for_channel(rep_channel, args.mode), 
+                                 track_variance=False, kernel_type=rep_kernel,
+                                 extra_flags=["--no-crn"])
+            
+            if getattr(args, 'alpha_sweep', False):
+                print(f"\n[VERIFY] Running Ablation A2: ALPHA COLLAPSE ({rep_kernel}/{rep_channel})")
+                for corpus in args.corpora:
+                    a2_out = exp_dir / "ablation" / "alpha_collapse" / rep_kernel / rep_channel / corpus
+                    a2_out.mkdir(parents=True, exist_ok=True)
+                    run_single_corpus(corpus, args.seeds, args.limit, a2_out, 
+                                     mode=get_mode_for_channel(rep_channel, args.mode), 
+                                     track_variance=False, kernel_type=rep_kernel,
+                                     extra_flags=["--alpha-collapse"])
+
+            # Verify each discovered layer in the current experiment layout.
+            all_layers = discover_all_layers(exp_dir)
+            for layer in all_layers:
+                print(f"Verifying Layer: {layer['layer_id']}")
+                report = verify_layer_data(
+                    layer['layer_id'],
+                    layer['layer_name'],
+                    layer['artifacts'],
+                    layer['layer_dir'],
+                    exp_dir,
+                )
+                reports.append(report)
+            
+            if reports:
+                write_report(reports, exp_dir)
+                print(f"[VERIFY] Verification report saved to: {exp_dir / 'verification_report.json'}")
+        except Exception as e:
+            print(f"[VERIFY] Error during verification: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Summary
     print(f"\n{'='*80}")
     print("SUITE COMPLETE")
@@ -2684,6 +2762,8 @@ def main():
     print(f"4. View probe results: cat */nli_probe_results.json")
     if args.alpha_sweep:
         print(f"5. View alpha sweep: cat alpha_sweep_summary.json")
+    if getattr(args, 'verify', False):
+        print(f"11. View verification report: cat {exp_dir / 'verification_report.json'}")
     if args.physarum:
         print(f"6. View atmospheric annealing analysis: cat physarum/annealing_summary.json")
         print(f"7. View crack/bond topology: ls physarum/*/")
@@ -2700,3 +2780,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+

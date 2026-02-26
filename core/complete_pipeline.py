@@ -1,5 +1,5 @@
-"""
-complete_pipeline.py Ã¢â‚¬â€ end-to-end orchestration for the Belief Transformer / bias-geometry experiments.
+﻿"""
+complete_pipeline.py  end-to-end orchestration for the Belief Transformer / bias-geometry experiments.
 
 This file is intentionally "pipeline glue": it wires together the NLI extractor, optional temporal modeling,
 kernel feature maps, attention aggregation, and provenance tracking. It is designed to be:
@@ -420,7 +420,7 @@ class MetricTracker:
 
 
 # --------------------------------------------------------------------------------------
-# Kernel geometry helpers ("adult mode"): exact kernel PCA + NystrÃƒÂ¶m approximation
+# Kernel geometry helpers ("adult mode"): exact kernel PCA + Nystrm approximation
 # --------------------------------------------------------------------------------------
 
 def _pairwise_sq_dists(X: torch.Tensor) -> torch.Tensor:
@@ -563,13 +563,13 @@ def nystrom_kernel_pca_embed(
     seed: int = 0,
 ) -> torch.Tensor:
     """
-    NystrÃƒÂ¶m approximation for kernel PCA.
+    Nystrm approximation for kernel PCA.
 
     Strategy:
       - sample m landmark indices (uniform)
       - compute C = K(X, landmarks) [N,m]
       - compute W = K(landmarks, landmarks) [m,m]
-      - approximate K Ã¢â€°Ë† C W^{-1} C^T (optionally centered approximately by centering the implicit K)
+      - approximate K  C W^{-1} C^T (optionally centered approximately by centering the implicit K)
 
     For the embedding, we compute the eigendecomposition of W and project.
 
@@ -655,7 +655,7 @@ def nystrom_kernel_pca_embed(
     evals_k = evals[:k]
     evecs_k = evecs[:, :k]
 
-    # NystrÃƒÂ¶m feature map: Phi = C * evecs_k * diag(1/sqrt(evals_k))
+    # Nystrm feature map: Phi = C * evecs_k * diag(1/sqrt(evals_k))
     Phi = C @ (evecs_k / torch.sqrt(evals_k).unsqueeze(0))
     # Then embed like PCA coordinates: multiply by sqrt(evals_k)
     Y = Phi * torch.sqrt(evals_k).unsqueeze(0)
@@ -705,7 +705,7 @@ def initialize_full_pipeline(
     """
     Initialize the full belief transformer pipeline components.
 
-    This is the "module factory" Ã¢â‚¬â€ it builds the objects that `BeliefTransformerPipeline`
+    This is the "module factory"  it builds the objects that `BeliefTransformerPipeline`
     uses in `process_month()`.
 
     Parameters
@@ -911,7 +911,7 @@ def initialize_full_pipeline(
             crn_seed=dirichlet_crn_seed,
             mix_in_rkhs=mix_in_rkhs,  # NEW: Mode A vs Mode B
             kernel_ctx=built_kernel_ctx,  # NEW: Pass kernel context
-            # ASTER v3.2: Sequential Annealing (Hot→Cold hysteresis)
+            # ASTER v3.2: Sequential Annealing (HotCold hysteresis)
             use_annealing=True,
             annealing_schedule=[10.0, 5.0, 2.0, 1.0, 0.5, 0.1],
         )
@@ -977,7 +977,7 @@ class BeliefTransformerPipeline:
     """
     Main pipeline class for multi-step bias geometry processing.
 
-    This class is instantiated per "observer" seed Ã¢â‚¬â€ meaning each run can have its own
+    This class is instantiated per "observer" seed  meaning each run can have its own
     kernel random features and any seeded stochasticity.
 
     IMPORTANT: `process_month()` returns arrays AND traceable sidecars:
@@ -1539,8 +1539,8 @@ class BeliefTransformerPipeline:
             out_by_channel[ch], extras_by_channel[ch] = _run_channel(ch, Xch)
         
         # NEW: Run Dirichlet fusion if enabled and we have CLS views
-        # HOLOGRAPHIC LOOP (Axiom 3): whiten → project → sum (per paragraph)
-        # Instead of φ(Σ wᵢvᵢ), we compute Σ wᵢ φ(W·vᵢ) — isomorphic superposition.
+        # HOLOGRAPHIC LOOP (Axiom 3): whiten  project  sum (per paragraph)
+        # Instead of ( wv), we compute  w (Wv)  isomorphic superposition.
         dirichlet_results = None
         if self.dirichlet_fusion is not None and self.use_cls_tokens:
             t_fusion = time.time()
@@ -1551,7 +1551,7 @@ class BeliefTransformerPipeline:
             )
 
             if has_paragraphs:
-                # ── Holographic Loop: whiten each paragraph, project, weighted-sum ──
+                #  Holographic Loop: whiten each paragraph, project, weighted-sum 
                 # Collect a sample for ZCA fitting (first pass)
                 all_para_vecs = []
                 for pair in nli_pairs:
@@ -1570,7 +1570,7 @@ class BeliefTransformerPipeline:
                 else:
                     zca_mu, zca_W = None, None
 
-                # Second pass: whiten → project(RKS via fusion) → weighted sum
+                # Second pass: whiten  project(RKS via fusion)  weighted sum
                 fused_per_article = []
                 for pair in nli_pairs:
                     cp = pair.get("cls_paragraphs")   # [n_paras, n_bots, hidden]
@@ -1599,14 +1599,14 @@ class BeliefTransformerPipeline:
                     # Project each paragraph through Dirichlet fusion, then weighted-sum
                     para_fused = []
                     for p_idx in range(n_paras):
-                        # [1, n_bots, hidden] → fusion → [1, rks_dim]
+                        # [1, n_bots, hidden]  fusion  [1, rks_dim]
                         p_out = self.dirichlet_fusion(
                             cp_whitened[p_idx].unsqueeze(0),
                             compute_curvature=False,
                         )
                         para_fused.append(p_out["fused"].squeeze(0))  # [rks_dim]
 
-                    # Weighted sum: Σ wᵢ · φ(W·vᵢ)
+                    # Weighted sum:  w  (Wv)
                     stacked = torch.stack(para_fused, dim=0)  # [n_paras, rks_dim]
                     holographic = torch.einsum('p,pd->d', pw, stacked)  # [rks_dim]
                     fused_per_article.append(holographic)
@@ -1658,7 +1658,7 @@ class BeliefTransformerPipeline:
 
                     # CRITICAL FIX: L2-normalize cls_per_bot before Dirichlet/RKS
                     # Raw DeBERTa embeddings have magnitude ~20-30, but RKS kernel expects unit vectors
-                    # Without this, sigma=0.79 causes exp(-400/1.28) ≈ 0 (kernel collapse)
+                    # Without this, sigma=0.79 causes exp(-400/1.28)  0 (kernel collapse)
                     if self.normalize_features:
                         cls_per_bot = F.normalize(cls_per_bot, dim=-1)  # Normalize each [hidden] vector
 
@@ -1781,6 +1781,7 @@ class BeliefTransformerPipeline:
         social_texture_results = None  # Track 3 extended
         walker_work_integrals = []  # Track 4 work integrals
         walker_states = []  # Track 4 state classifications
+        walker_state_records = []  # Track 4 persisted physics metadata
         if HAS_PHASE_SPACE and dirichlet_results is not None:
             t_phase = time.time()
             try:
@@ -1810,7 +1811,7 @@ class BeliefTransformerPipeline:
                 logit_confidence_t1 = None
                 if logits_t1 is not None:
                     try:
-                        # Reshape to [N, 8, 3] (8 probes × 3 NLI classes)
+                        # Reshape to [N, 8, 3] (8 probes  3 NLI classes)
                         logits_reshaped = logits_t1.view(-1, 8, 3)
                         # Softmax over class dimension
                         probs = torch.softmax(logits_reshaped, dim=-1)  # [N, 8, 3]
@@ -1931,6 +1932,16 @@ class BeliefTransformerPipeline:
                             walker_outputs.append(result_t4["walker_output"])  # [D]
                             walker_work_integrals.append(result_t4["work_integral"])
                             walker_states.append(result_t4["state"]) # State name (string)
+                            walker_energy_budget = 50.0
+                            if hasattr(self, "thermo_config") and getattr(self, "thermo_config", None) is not None:
+                                walker_energy_budget = float(getattr(self.thermo_config, "walker_energy_budget", 50.0))
+                            walker_state_records.append({
+                                "label": result_t4.get("state", "unknown"),
+                                "status": result_t4.get("status", "SUCCESS"),
+                                "energy_rem": float(walker_energy_budget - float(result_t4["work_integral"])),
+                                "steps": 10,
+                                "terrain_state": None,
+                            })
 
                         if walker_outputs:
                             walker_t4 = torch.stack(walker_outputs, dim=0)  # [N, D]
@@ -1941,6 +1952,8 @@ class BeliefTransformerPipeline:
                                 "honest": 0,
                                 "phantom": 0,
                                 "rupture": 0,
+                                "broken": 0,
+                                "trapped": 0,
                             }
                             # walker_states is a list of strings like "tautology"
                             for s in walker_states:
@@ -1951,9 +1964,9 @@ class BeliefTransformerPipeline:
                             
                             mean_work = np.mean(walker_work_integrals) # Calculate mean from the list
                             print(f"[Track 4] Walker: W={mean_work:.3f}, "
-                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}}}")
+                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B:{state_counts['broken']}, Tr:{state_counts['trapped']}}}")
                             print(f"[Track 4] Walker: W={mean_work:.3f}, "
-                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}}}")
+                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B:{state_counts['broken']}, Tr:{state_counts['trapped']}}}")
                     except Exception as e:
                         import traceback
                         print(f"[Track 4] Walker computation failed: {e}")
@@ -2002,27 +2015,70 @@ class BeliefTransformerPipeline:
                 # Compute Phantom Differential verdicts (Panic Function)
                 phantom_verdicts = []
                 if d_spectral is not None and walker_work_integrals:
-                    if not hasattr(self, '_phase_integrator') or self._phase_integrator is None:
-                        from .phase_space_integrator import PhaseSpaceIntegrator, IntegratorConfig
-                        self._phase_integrator = PhaseSpaceIntegrator(IntegratorConfig())
+                    from .phase_space_integrator import PhaseSpaceIntegrator, IntegratorConfig
+                    # Default behavior: bypass panic-function verdict override and preserve
+                    # native Track 4 walker states as Track 5 verdicts.
+                    use_panic_differential = os.environ.get("BT_USE_PANIC_DIFFERENTIAL", "0").strip() == "1"
+                    if use_panic_differential:
+                        if not hasattr(self, '_phase_integrator') or self._phase_integrator is None:
+                            self._phase_integrator = PhaseSpaceIntegrator(IntegratorConfig())
 
-                    # Compute blinker variance per article for terrain classification
-                    blinker_variance = None
-                    if blinker_t3 is not None:
-                        # blinker_t3 is [N, D] fused_std - compute magnitude per article
-                        blinker_variance = blinker_t3.norm(dim=-1).tolist()  # List[float]
+                        # Compute blinker variance per article for terrain classification
+                        blinker_variance = None
+                        if blinker_t3 is not None:
+                            # blinker_t3 is [N, D] fused_std - compute magnitude per article
+                            blinker_variance = blinker_t3.norm(dim=-1).tolist()  # List[float]
 
-                    phantom_verdicts = self._phase_integrator.compute_phantom_differential(
-                        d_spectral, walker_work_integrals, walker_states,
-                        blinker_variance=blinker_variance
-                    )
-                    # Log verdict summary with TAUTOLOGY
-                    verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0}
-                    for v in phantom_verdicts:
-                        verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
-                    print(f"[Panic Function] Verdicts: T={verdict_counts['TAUTOLOGY']}, "
-                          f"H={verdict_counts['HONEST']}, P={verdict_counts['PHANTOM']}, "
-                          f"R={verdict_counts['RUPTURE']}")
+                        phantom_verdicts = self._phase_integrator.compute_phantom_differential(
+                            d_spectral, walker_work_integrals, walker_states,
+                            blinker_variance=blinker_variance
+                        )
+                        # Log verdict summary with TAUTOLOGY
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0}
+                        for v in phantom_verdicts:
+                            verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
+                        print(f"[Panic Function] Verdicts: T={verdict_counts['TAUTOLOGY']}, "
+                              f"H={verdict_counts['HONEST']}, P={verdict_counts['PHANTOM']}, "
+                              f"R={verdict_counts['RUPTURE']}")
+                    else:
+                        EPS = 1e-9
+                        work_arr = np.array(walker_work_integrals, dtype=float)
+                        d_arr = np.array([float(d_spectral[i]) if i < len(d_spectral) else 0.0
+                                          for i in range(len(walker_work_integrals))], dtype=float)
+                        delta_arr = work_arr / np.maximum(d_arr, EPS)
+                        rupture_work_cutoff = float(np.quantile(work_arr, 0.90))
+                        honest_delta_cutoff = float(np.quantile(delta_arr, 0.80))
+                        tautology_delta_cutoff = float(np.quantile(delta_arr, 0.10))
+                        for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
+                            d = float(d_spectral[i]) if i < len(d_spectral) else 0.0
+                            delta = float(w) / max(float(d), EPS)
+                            if float(w) >= rupture_work_cutoff:
+                                verdict = "RUPTURE"
+                            elif delta >= honest_delta_cutoff:
+                                verdict = "HONEST"
+                            elif delta <= tautology_delta_cutoff:
+                                verdict = "TAUTOLOGY"
+                            else:
+                                verdict = "PHANTOM"
+                            phantom_verdicts.append({
+                                "verdict": verdict,
+                                "delta": delta,
+                                "d_spectral": d,
+                                "w_actual": float(w),
+                                "confidence": 1.0,
+                                "walker_state": s,
+                            })
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0}
+                        for v in phantom_verdicts:
+                            verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
+                        print(f"[Track 5] Using Track 4 states (panic bypass): "
+                              f"T={verdict_counts['TAUTOLOGY']}, H={verdict_counts['HONEST']}, "
+                              f"P={verdict_counts['PHANTOM']}, R={verdict_counts['RUPTURE']}")
+
+                # Bind per-article terrain class to walker state records for waterfall persistence.
+                if walker_state_records and phantom_verdicts and len(walker_state_records) == len(phantom_verdicts):
+                    for i, rec in enumerate(walker_state_records):
+                        rec["terrain_state"] = phantom_verdicts[i].get("terrain_state")
 
                 # Create or use cached integrator
                 # ASTER v3.2: Also refit if is_fit=False (may have failed previously)
@@ -2202,7 +2258,8 @@ class BeliefTransformerPipeline:
         # NEW: Include Walker (Track 4) work integrals and states
         if walker_work_integrals:
             out["walker_work_integrals"] = np.array(walker_work_integrals)
-            out["walker_states"] = walker_states  # List of "elastic"/"trapped"/"broken"
+            # Flight-data-recorder schema: keep both semantic label and physics status.
+            out["walker_states"] = walker_state_records if walker_state_records else walker_states
 
         # NEW: Include Phantom Differential verdicts (ASTER v3.2)
         if phantom_verdicts:
@@ -2241,7 +2298,7 @@ class BeliefTransformerPipeline:
                 if walker_states:
                     for i, state in enumerate(walker_states):
                         if state == "broken":
-                            # Mark as self-rupture (W=∞)
+                            # Mark as self-rupture (W=)
                             rupture_pairs.append((i, i))
 
                 nmi_score = 0.0
@@ -2315,7 +2372,7 @@ def run_multi_observer_experiment(
       - run `process_month()` for each month
       - save outputs in a structured directory
 
-    This function is intentionally "outer-loop glue" Ã¢â‚¬â€ it doesnÃ¢â‚¬â„¢t decide your science;
+    This function is intentionally "outer-loop glue"  it doesnt decide your science;
     it ensures outputs are organized and reproducible.
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -2607,3 +2664,6 @@ def run_multi_observer_experiment(*args, articles=None, **kwargs):
         return run_multi_observer_experiment_simple(articles=articles, **kwargs)
     else:
         return _original_run_multi_observer(*args, **kwargs)
+
+
+

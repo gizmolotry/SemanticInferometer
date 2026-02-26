@@ -103,6 +103,8 @@ class WalkerResult:
     # HYSTERESIS (Path Memory) statistics
     hysteresis_stats: Optional[Dict[str, Any]] = None
     memory_matrix: Optional[torch.Tensor] = None  # [n_bots, n_bots] rut depths
+    # Energy Tank (Track 4 Thermodynamics)
+    energy_survival_rate: Optional[float] = None  # Fraction of walkers that didn't exhaust budget
 
 
 class SemanticWalker:
@@ -358,7 +360,7 @@ class SemanticWalker:
         n_steps: int = 50,
         start_seed: Optional[int] = None,
         start_from_poles: bool = False,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Release a swarm of walkers to explore the simplex.
 
@@ -370,9 +372,14 @@ class SemanticWalker:
 
         Returns:
             trajectory_weights: [n_steps+1, n_walkers, n_bots] — weight paths
+            broken_mask: [n_walkers] True where kinetic energy was exhausted before target
+            reached_target: [n_walkers] True where walker reached target region
         """
         if start_seed is not None:
             torch.manual_seed(start_seed)
+
+        target_weights = None
+        target_reach_threshold = 0.25
 
         if start_from_poles and self.u_axis is not None:
             # Start half walkers at positive pole, half at negative
@@ -391,11 +398,27 @@ class SemanticWalker:
             current_weights[half:, neg_bot] = 0.8
             current_weights[half:] += 0.2 / self.n_bots
             current_weights = current_weights / current_weights.sum(dim=-1, keepdim=True)
+
+            # Target for each walker is the opposite pole.
+            target_weights = torch.zeros_like(current_weights)
+            target_weights[:half, neg_bot] = 0.8
+            target_weights[:half] += 0.2 / self.n_bots
+            target_weights[half:, pos_bot] = 0.8
+            target_weights[half:] += 0.2 / self.n_bots
+            target_weights = target_weights / target_weights.sum(dim=-1, keepdim=True)
         else:
             # Spawn at center (neutral uniform weights)
             current_weights = torch.ones(n_walkers, self.n_bots) / self.n_bots
 
         current_energy = self._compute_energy(current_weights)
+        energy_tank = torch.full(
+            (n_walkers,),
+            float(self.thermo_config.walker_energy_budget),
+            dtype=current_weights.dtype,
+            device=current_weights.device,
+        )
+        broken_mask = torch.zeros(n_walkers, dtype=torch.bool, device=current_weights.device)
+        reached_target = torch.zeros(n_walkers, dtype=torch.bool, device=current_weights.device)
 
         # History: [Steps, Walkers, Weights]
         trajectory_weights = [current_weights.clone()]
@@ -427,19 +450,45 @@ class SemanticWalker:
             dice_roll = torch.rand(n_walkers)
             mask_accept = dice_roll < acceptance_prob
 
+            # Dead walkers cannot move any further.
+            mask_accept = mask_accept & (~broken_mask)
+
             # D. Update memory BEFORE state (reinforce accepted transitions)
             if self.enable_hysteresis:
                 self._update_memory(current_weights, proposal, mask_accept)
 
             # E. Update state
             mask_expanded = mask_accept.unsqueeze(-1).expand_as(current_weights)
-            current_weights = torch.where(mask_expanded, proposal, current_weights)
-            current_energy = torch.where(mask_accept, proposal_energy, current_energy)
+            next_weights = torch.where(mask_expanded, proposal, current_weights)
+            next_energy = torch.where(mask_accept, proposal_energy, current_energy)
+
+            # Kinetic energy tank: deduct terrain-friction work for accepted moves.
+            current_pos = torch.matmul(current_weights, self.embeddings)
+            next_pos = torch.matmul(next_weights, self.embeddings)
+            step_distance = torch.norm(next_pos - current_pos, p=2, dim=-1)
+
+            midpoint_weights = (current_weights + next_weights) / 2.0
+            local_density = self._compute_density(midpoint_weights)
+            local_friction = self.thermo_config.friction_coefficient / local_density.clamp(
+                min=self.thermo_config.density_clamp_min
+            )
+            energy_cost = local_friction * step_distance
+            energy_tank = energy_tank - torch.where(mask_accept, energy_cost, torch.zeros_like(energy_cost))
+
+            if target_weights is not None:
+                to_target = torch.norm(next_weights - target_weights, p=2, dim=-1)
+                reached_target = reached_target | (to_target <= target_reach_threshold)
+
+            newly_broken = (energy_tank <= 0) & (~reached_target)
+            broken_mask = broken_mask | newly_broken
+
+            current_weights = next_weights
+            current_energy = next_energy
 
             trajectory_weights.append(current_weights.clone())
             trajectory_energies.append(current_energy.clone())
 
-        return torch.stack(trajectory_weights)
+        return torch.stack(trajectory_weights), broken_mask, reached_target
 
     def _compute_density(self, weights: torch.Tensor) -> torch.Tensor:
         """
@@ -621,10 +670,12 @@ class SemanticWalker:
         # State 1: HONEST (top 20% efficiency)
         state = torch.where(efficiency >= honest_thresh, torch.ones_like(state), state)
 
-        # State 3: RUPTURE (detected via stall or teleport)
-        # Keep existing rupture detection based on fixed threshold for extreme cases
-        # Rupture = divergence_ratio is extremely high (walker completely stuck)
-        is_rupture = divergence_ratio >= self.rupture_threshold
+        # State 3: RUPTURE (adaptive tail of divergence distribution).
+        # Use per-swarm high-divergence tail so ruptures remain detectable even when
+        # absolute delta scales shift across datasets.
+        rupture_quantile = torch.quantile(divergence_ratio, 0.90)
+        rupture_cutoff = min(float(self.rupture_threshold), float(rupture_quantile))
+        is_rupture = divergence_ratio >= rupture_cutoff
         state = torch.where(is_rupture, 3 * torch.ones_like(state), state)
 
         return state
@@ -663,8 +714,8 @@ class SemanticWalker:
         Returns:
             WalkerResult with work integral, divergence ratio, state, and trajectory info
         """
-        # Run the swarm
-        trajectory = self.run_swarm(
+        # Run the swarm and track per-walker kinetic failures.
+        trajectory, broken_mask, reached_target = self.run_swarm(
             n_walkers=n_walkers,
             n_steps=n_steps,
             start_seed=start_seed,
@@ -674,9 +725,18 @@ class SemanticWalker:
         # Compute work integral with calibration metrics
         work, path_length, spectral_distance, divergence_ratio = self.compute_work_integral(trajectory)
 
+        # Topological death: walker ran max_steps and stayed near origin.
+        trapped_distance_threshold = self.thermo_config.tautology_disp_threshold
+        trapped_mask = (~broken_mask) & (~reached_target) & (spectral_distance < trapped_distance_threshold)
+        survived = (~broken_mask) & (~trapped_mask)
+        energy_survival_rate = float(survived.float().mean())
+
         # Classify states using DIVERGENCE RATIO and SPECTRAL DISTANCE
         # Now includes TAUTOLOGY detection (4-state system)
         states = self.classify_state(divergence_ratio, spectral_distance)
+
+        # Kinetic death => RUPTURE bucket in 4-state map.
+        states = torch.where(broken_mask, torch.tensor(3, dtype=torch.long, device=states.device), states)
 
         # Project trajectory endpoint
         projected = self.project_trajectory(trajectory)
@@ -690,7 +750,19 @@ class SemanticWalker:
         mean_work = work.mean()
         mean_divergence = divergence_ratio.mean()
         mean_spectral_dist = spectral_distance.mean()
-        majority_state = states.mode().values
+        # Aggregate walker states to an article-level state.
+        # Preserve rupture evidence instead of erasing it via pure majority vote.
+        broken_fraction = broken_mask.float().mean()
+        trapped_fraction = trapped_mask.float().mean()
+        rupture_fraction = (states == 3).float().mean()
+        if broken_fraction >= 0.20:
+            majority_state = torch.tensor(4, dtype=torch.long, device=states.device)  # broken
+        elif trapped_fraction >= 0.20:
+            majority_state = torch.tensor(5, dtype=torch.long, device=states.device)  # trapped
+        elif rupture_fraction >= 0.20:
+            majority_state = torch.tensor(3, dtype=torch.long, device=states.device)
+        else:
+            majority_state = states.mode().values
 
         return WalkerResult(
             work_integral=mean_work,
@@ -704,6 +776,8 @@ class SemanticWalker:
             # HYSTERESIS: Include path memory state
             hysteresis_stats=self.hysteresis_stats.copy() if self.enable_hysteresis else None,
             memory_matrix=self.get_memory_matrix() if self.enable_hysteresis else None,
+            # ENERGY TANK: fraction of walkers that survived the terrain
+            energy_survival_rate=energy_survival_rate,
         )
 
 
@@ -755,6 +829,7 @@ def compute_walker_resistance(
         - work_integral: Raw work W (terrain-sensitive)
         - divergence_ratio: Δ = W / d_spectral (terrain-invariant)
         - spectral_distance: Straight-line distance start→end
+        - status: "SUCCESS" / "BROKEN" / "TRAPPED" (thermodynamic/topologic outcome)
         - state: "tautology" / "honest" / "phantom" / "rupture"
         - state_code: 0 / 1 / 2 / 3
         - walker_output: [D] trajectory endpoint for Track 5
@@ -788,11 +863,18 @@ def compute_walker_resistance(
     )
 
     # 4-state system: TAUTOLOGY / HONEST / PHANTOM / RUPTURE
-    state_names = ["tautology", "honest", "phantom", "rupture"]
+    state_names = ["tautology", "honest", "phantom", "rupture", "broken", "trapped"]
     state_code = result.state.item()
-    state_name = state_names[min(state_code, 3)]  # Safety clamp
+    state_name = state_names[min(state_code, len(state_names) - 1)]  # Safety clamp
+    if state_name == "broken":
+        walker_status = "BROKEN"
+    elif state_name == "trapped":
+        walker_status = "TRAPPED"
+    else:
+        walker_status = "SUCCESS"
 
     output = {
+        "status": walker_status,
         "work_integral": result.work_integral.item(),
         "divergence_ratio": result.divergence_ratio.item(),
         "spectral_distance": result.spectral_distance.item(),

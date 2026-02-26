@@ -5,6 +5,8 @@ Calculates Clustering Quality (NMI) across three evolutionary stages to compare
 Physics-Informed Manifold (Stage 3) clustering against raw Euclidean geometry (Stage 1).
 """
 
+import os
+import json
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -19,18 +21,18 @@ def get_tribe(publication: str) -> int:
     """
     if not isinstance(publication, str):
         return 2 # GRAY TEAM for non-string (e.g., NaN) inputs
-        
+
     publication = publication.lower()
-    
+
     red_team = [
-        "al jazeera", "electronic intifada", "haaretz", "guardian", 
+        "al jazeera", "electronic intifada", "haaretz", "guardian",
         "intercept", "mondoweiss", "middle east eye", "mintpress news"
     ]
     blue_team = [
-        "arutz sheva", "jpost", "israel hayom", "fox news", "kohelet policy forum",
+        "arutz sheva", "jpost", " israel hayom", "fox news", "kohelet policy forum",
         "breitbart", "daily wire", "townhall"
     ]
-    
+
     if any(p in publication for p in red_team):
         return 0  # RED TEAM
     elif any(p in publication for p in blue_team):
@@ -56,6 +58,54 @@ def run_ablation_analysis(data_path: Path) -> Dict[str, Any]:
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
 
+    # Load verification report once from nearest parent experiment directory.
+    verify_report_path = None
+    for parent in data_path.parents:
+        candidate = parent / "verification_report.json"
+        if candidate.exists():
+            verify_report_path = candidate
+            break
+    verify_status = "UNKNOWN"
+    is_verified = False
+    fail_reasons = []
+    
+    if verify_report_path is not None:
+        try:
+            with open(verify_report_path, "r") as f:
+                vdata = json.load(f)
+            
+            # Find the status for the current layer
+            # data_path structure: .../exp_dir/kernel/channel/real/MONOLITH_DATA.csv
+            # Supports both layout A (.../<kernel>/<channel>/<corpus>/MONOLITH_DATA.csv)
+            # and layout B (.../<group>/<seed_dir>/MONOLITH_DATA.csv) via fallback matching.
+            current_layer_id = f"{data_path.parents[2].name}/{data_path.parents[1].name}"
+            
+            layer_entry = next((l for l in vdata.get("layers", []) if l.get("layer_id") == current_layer_id), None)
+            if layer_entry:
+                verify_status = layer_entry.get("status")
+                is_verified = (verify_status == "VERIFIED")
+                fail_reasons = layer_entry.get("fail_reasons", [])
+            else:
+                fallback_key = f"{data_path.parents[1].name}/{data_path.parents[0].name.split('_seed')[0]}"
+                layer_entry = next((l for l in vdata.get("layers", []) if l.get("layer_id") == fallback_key), None)
+                if layer_entry:
+                    verify_status = layer_entry.get("status")
+                    is_verified = (verify_status == "VERIFIED")
+                    fail_reasons = layer_entry.get("fail_reasons", [])
+                else:
+                    verify_status = "LAYER_NOT_FOUND_IN_REPORT"
+        except Exception as e:
+            verify_status = f"ERROR_READING_REPORT: {str(e)}"
+
+    print("\n" + "="*70)
+    print(f"TITAN PROTOCOL ABLATION ANALYSIS: {data_path.parents[2].name}/{data_path.parents[1].name}")
+    print(f"Verification Status: {verify_status}")
+    if not is_verified:
+        print(f"WARNING: LAYER INTEGRITY NOT VERIFIED.")
+        for reason in fail_reasons:
+            print(f"  - {reason}")
+    print("="*70)
+
     df = pd.read_csv(data_path)
 
     # Filter out rows with NaN in critical columns
@@ -69,62 +119,21 @@ def run_ablation_analysis(data_path: Path) -> Dict[str, Any]:
             "stage_3_nmi": 0.0,
             "delta_nmi": 0.0,
             "retained_percentage": 0.0,
+            "verification_status": verify_status,
+            "is_verified": is_verified
         }
 
     # Define Ground Truth
-    # Need to get publication from the original metadata.json or ensure it's in MONOLITH_DATA.csv
-    # Assuming 'publication' or 'source' is available in the DataFrame.
-    # We will prioritize 'publication', then 'source'.
-    # If not found, a dummy tribe will be assigned or row dropped.
-    
-    # Check for 'publication' column. If not found, use 'source'.
     if 'publication' in df_clean.columns:
         df_clean['tribe_label'] = df_clean['publication'].apply(get_tribe)
     elif 'source' in df_clean.columns:
         df_clean['tribe_label'] = df_clean['source'].apply(get_tribe)
     else:
         print("Warning: 'publication' or 'source' column not found for ground truth. Assigning dummy tribe labels.")
-        df_clean['tribe_label'] = np.random.randint(0, 3, size=len(df_clean)) # Dummy labels
-
-    print("\n--- Ground Truth Tribe Distribution ---")
-    print(df_clean['tribe_label'].value_counts())
+        df_clean['tribe_label'] = np.random.randint(0, 3, size=len(df_clean))
 
     y = df_clean['tribe_label'].values
 
-    # Extract base coordinates (Assuming x_3d, y_3d, z_height are in the CSV)
-    # The MONOLITH_DATA.csv currently does not contain x_3d, y_3d.
-    # It contains the original data from article_metadata.json and the added columns.
-    # The actual coordinates are generated in MONOLITH_VIZ.py via UMAP.
-    # So, I need to pass coordinates or ensure they are saved to MONOLITH_DATA.csv.
-    # Let's assume for now that MONOLITH_DATA.csv will be updated to include 'x_3d', 'y_3d'.
-    # For now, I'll use placeholders for coordinates. This needs to be resolved.
-    
-    # For now, I will assume the coordinates are in the dataframe as 'x_proj', 'y_proj', 'z_height'.
-    # These coordinates are generated by UMAP in MONOLITH_VIZ.py
-    # I need to ensure these are saved to MONOLITH_DATA.csv or passed correctly.
-    # The prompt implies 'x_3d', 'y_3d', 'z_height' are loaded.
-    
-    # To avoid immediate dependency breakage, I'll use placeholders
-    # If MONOLITH_DATA.csv doesn't contain x_proj, y_proj, this needs to be addressed in metric_fusion.py or MONOLITH_VIZ.py
-    # For a robust solution, the UMAP coordinates (x,y) should be stored in MONOLITH_DATA.csv
-    # The z_height is already there.
-
-    # TEMPORARY PLACEHOLDER FOR X_3D, Y_3D:
-    # Assuming features are in the df, and we can get x_proj, y_proj from them using a simple PCA for now.
-    # This needs to be properly passed from MONOLITH_VIZ.py
-    if 'x_proj' not in df_clean.columns or 'y_proj' not in df_clean.columns:
-        print("Warning: 'x_proj' or 'y_proj' not found in DataFrame. Using dummy projections.")
-        # Fallback to some projection from existing features
-        if 'features' in df_clean.columns: # If raw features are somehow stored
-            from sklearn.decomposition import PCA
-            pca = PCA(n_components=2, random_state=42)
-            projected_features = pca.fit_transform(np.array(df_clean['features'].tolist()))
-            df_clean['x_proj'] = projected_features[:, 0]
-            df_clean['y_proj'] = projected_features[:, 1]
-        else:
-            df_clean['x_proj'] = np.random.rand(len(df_clean))
-            df_clean['y_proj'] = np.random.rand(len(df_clean))
-            
     x_coords = df_clean['x_proj'].values
     y_coords = df_clean['y_proj'].values
     z_coords = df_clean['z_height'].values
@@ -138,17 +147,15 @@ def run_ablation_analysis(data_path: Path) -> Dict[str, Any]:
     nmi_stage_1 = calculate_nmi_score(X_baseline, y)
 
     # 4. Compute Stage 2 NMI (The Stress Test)
-    # Transformation: coord_new = coord_old * (1 + stress * 5.0)
     X_weighted = np.copy(X_baseline)
     X_weighted[:, 0] = x_coords * (1 + stress_values * 5.0)
     X_weighted[:, 1] = y_coords * (1 + stress_values * 5.0)
-    X_weighted[:, 2] = z_coords * (1 + stress_values * 5.0) # Apply to Z as well
+    X_weighted[:, 2] = z_coords * (1 + stress_values * 5.0)
     nmi_stage_2 = calculate_nmi_score(X_weighted, y)
 
     # 5. Compute Stage 3 NMI (The Reality Check)
-    # Condition: if density < 0.2: drop_row()
     df_stage_3 = df_clean[df_clean['density'] >= 0.2]
-    
+
     if df_stage_3.empty:
         print("Warning: Stage 3 DataFrame is empty after filtering by density. Cannot perform analysis.")
         nmi_stage_3 = 0.0
@@ -158,13 +165,15 @@ def run_ablation_analysis(data_path: Path) -> Dict[str, Any]:
         x_coords_stage_3 = df_stage_3['x_proj'].values
         y_coords_stage_3 = df_stage_3['y_proj'].values
         z_coords_stage_3 = df_stage_3['z_height'].values
-        
+
         X_stage_3 = np.column_stack([x_coords_stage_3, y_coords_stage_3, z_coords_stage_3])
         nmi_stage_3 = calculate_nmi_score(X_stage_3, y_stage_3)
         retained_percentage = len(df_stage_3) / len(df_clean) * 100
 
     # 6. Reporting
-    print("\n--- Ablation Analysis Results (NMI Scores) ---")
+    comparability_label = f"[{verify_status}]"
+    
+    print(f"\n--- Ablation Analysis Results (NMI Scores) {comparability_label} ---")
     print(f"Stage 1 (Baseline - Raw Euclidean): {nmi_stage_1:.3f}")
     print(f"Stage 2 (Stress Test - Weighted Coords): {nmi_stage_2:.3f}")
     print(f"Stage 3 (Reality Check - Density Filtered): {nmi_stage_3:.3f}")
@@ -177,12 +186,19 @@ def run_ablation_analysis(data_path: Path) -> Dict[str, Any]:
         "stage_3_nmi": nmi_stage_3,
         "delta_nmi": nmi_stage_3 - nmi_stage_1,
         "retained_percentage": retained_percentage,
+        "verification_status": verify_status,
+        "is_verified": is_verified,
+        "comparability_label": comparability_label
     }
 
 if __name__ == "__main__":
-    # Assuming MONOLITH_DATA.csv is in analysis/outputs/
-    root_path = Path(__file__).resolve().parent.parent # V3
-    data_path = root_path / "experiments_20260213_072109" / "synthetic" / "rbf_seed43" / "MONOLITH_DATA.csv"
+    # Standard entry point
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("data_path", type=Path, help="Path to MONOLITH_DATA.csv")
+    args = parser.parse_args()
     
-    results = run_ablation_analysis(data_path)
-    print("\nFull Results:", results)
+    if args.data_path.exists():
+        run_ablation_analysis(args.data_path)
+    else:
+        print(f"Error: Path not found: {args.data_path}")

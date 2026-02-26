@@ -422,6 +422,7 @@ class WaterfallCheckpoint:
         x_tsne: Optional[np.ndarray] = None,
         x_metric_umap: Optional[np.ndarray] = None,
         metric_kernel: str = "rbf",
+        terrain_states: Optional[List[str]] = None,
     ) -> Path:
         """
         Save T4: 2D visualization coordinates.
@@ -439,6 +440,8 @@ class WaterfallCheckpoint:
                 "x_umap": x_umap[i, 0],
                 "y_umap": x_umap[i, 1],
             }
+            if terrain_states is not None and i < len(terrain_states):
+                row["terrain_state"] = str(terrain_states[i])
             if x_tsne is not None:
                 row["x_tsne"] = x_tsne[i, 0]
                 row["y_tsne"] = x_tsne[i, 1]
@@ -456,6 +459,8 @@ class WaterfallCheckpoint:
         # Also save as NPZ for convenience
         npz_path = self.checkpoint_dir / "T4_viz_coords.npz"
         arrays = {"x_umap": x_umap}
+        if terrain_states is not None:
+            arrays["terrain_state"] = np.asarray(terrain_states, dtype=object)
         if x_tsne is not None:
             arrays["x_tsne"] = x_tsne
         if x_metric_umap is not None:

@@ -338,11 +338,133 @@ class ExperimentData:
     hysteresis_stats: Optional[Dict] = None           # max_rut, highway_count, etc.
     # Track 5 Synthesis NMI
     synthesis_nmi: Optional[float] = None             # NMI score from validation.json
+    # Epistemic UI contract data
+    verification_status: str = "UNVERIFIED"           # VERIFIED/NON_COMPARABLE/MISSING_ARTIFACTS/UNVERIFIED
+    verification_global_pass: Optional[bool] = None
+    verification_seed_stability: Optional[bool] = None
+    verification_crn_locked: Optional[bool] = None
+    provenance: Optional[Dict[str, Any]] = None       # weights_hash, basis_hash, alpha, crn_seed
 
 
 # =============================================================================
 # DATA LOADING
 # =============================================================================
+def _find_nested_value(obj: Any, keys: List[str]) -> Optional[Any]:
+    """Find first matching key in nested dict/list structures."""
+    target = {k.lower() for k in keys}
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if str(k).lower() in target:
+                    return v
+                stack.append(v)
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def _discover_file_near_experiment(experiment_dir: Path, filename: str) -> Optional[Path]:
+    """Look for filename at experiment dir and a few ancestors/canonical subfolders."""
+    candidates = [
+        experiment_dir / filename,
+        experiment_dir.parent / filename,
+        experiment_dir.parent.parent / filename,
+        experiment_dir.parent.parent.parent / filename,
+        experiment_dir.parent / "verification" / filename,
+        experiment_dir.parent.parent / "verification" / filename,
+    ]
+    for pth in candidates:
+        if pth.exists():
+            return pth
+    return None
+
+
+def _short_hash(value: Any) -> str:
+    sval = str(value).strip()
+    if not sval:
+        return "missing"
+    return sval[:8]
+
+
+def load_epistemic_contract_data(experiment_dir: Path) -> Dict[str, Any]:
+    """Load verification/provenance contract data with conservative fallbacks."""
+    status = "UNVERIFIED"
+    global_pass = None
+    seed_stability = None
+    crn_locked = None
+    provenance = {
+        "weights_hash": "missing",
+        "basis_hash": "missing",
+        "alpha": "missing",
+        "crn_seed": "missing",
+    }
+
+    verification_report = _discover_file_near_experiment(experiment_dir, "verification_report.json")
+    if verification_report is not None:
+        try:
+            payload = json.loads(verification_report.read_text(encoding="utf-8"))
+            gp = _find_nested_value(payload, ["global_pass"])
+            if isinstance(gp, bool):
+                global_pass = gp
+            ss = _find_nested_value(payload, ["seed_stability", "seed_stability_pass", "seed_stable"])
+            if isinstance(ss, bool):
+                seed_stability = ss
+            cs = _find_nested_value(payload, ["crn_locked", "crn_lock_pass", "crn_pass"])
+            if isinstance(cs, bool):
+                crn_locked = cs
+
+            status_val = _find_nested_value(payload, ["status", "verification_status", "comparability_status"])
+            if isinstance(status_val, str) and status_val.strip():
+                status_norm = status_val.strip().upper()
+                if status_norm in {"VERIFIED", "NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"}:
+                    status = status_norm
+
+            w_hash = _find_nested_value(payload, ["weights_hash", "weights_fingerprint", "model_hash"])
+            b_hash = _find_nested_value(payload, ["basis_hash", "basis_fingerprint"])
+            alpha = _find_nested_value(payload, ["alpha"])
+            crn_seed_val = _find_nested_value(payload, ["crn_seed", "seed"])
+            if w_hash is not None:
+                provenance["weights_hash"] = _short_hash(w_hash)
+            if b_hash is not None:
+                provenance["basis_hash"] = _short_hash(b_hash)
+            if alpha is not None:
+                provenance["alpha"] = str(alpha)
+            if crn_seed_val is not None:
+                provenance["crn_seed"] = str(crn_seed_val)
+        except Exception:
+            pass
+
+    validation_json = experiment_dir / "validation.json"
+    if validation_json.exists():
+        try:
+            payload = json.loads(validation_json.read_text(encoding="utf-8"))
+            if provenance["alpha"] == "missing":
+                alpha = payload.get("alpha")
+                if alpha is not None:
+                    provenance["alpha"] = str(alpha)
+            if provenance["crn_seed"] == "missing":
+                crn_seed_val = payload.get("crn_seed")
+                if crn_seed_val is not None:
+                    provenance["crn_seed"] = str(crn_seed_val)
+        except Exception:
+            pass
+
+    if status == "UNVERIFIED" and global_pass is True:
+        status = "VERIFIED"
+    if status == "UNVERIFIED" and global_pass is False:
+        status = "NON_COMPARABLE"
+
+    return {
+        "status": status,
+        "global_pass": global_pass,
+        "seed_stability": seed_stability,
+        "crn_locked": crn_locked,
+        "provenance": provenance,
+    }
+
+
 def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     """Load all experiment data from a seed directory."""
     experiment_dir = Path(experiment_dir)
@@ -588,6 +710,9 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         except Exception as e:
             print(f"[MONOLITH] Failed to load validation.json: {e}")
 
+    # Epistemic contract data (verification/provenance)
+    epistemic = load_epistemic_contract_data(experiment_dir)
+
     return ExperimentData(
         kernel=kernel,
         seed=seed,
@@ -619,6 +744,11 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         hysteresis_memory=hysteresis_memory,
         hysteresis_stats=hysteresis_stats,
         synthesis_nmi=synthesis_nmi,
+        verification_status=str(epistemic.get("status", "UNVERIFIED")),
+        verification_global_pass=epistemic.get("global_pass"),
+        verification_seed_stability=epistemic.get("seed_stability"),
+        verification_crn_locked=epistemic.get("crn_locked"),
+        provenance=epistemic.get("provenance"),
     )
 
 
@@ -1910,7 +2040,19 @@ def render_walker_diamonds_3d(
     n = min(len(positions_3d), len(walker_states))
 
     for i in range(n):
-        state = walker_states[i]
+        state_raw = walker_states[i]
+        if isinstance(state_raw, dict):
+            state = str(state_raw.get("status") or state_raw.get("state") or "unknown").strip().lower()
+        else:
+            state = str(state_raw).strip().lower()
+
+        # Normalize status-style values to existing walker color/state families.
+        if state == "success":
+            state = "honest"
+        elif state == "broken":
+            state = "broken"
+        elif state == "trapped":
+            state = "trapped"
 
         # Skip states based on mode
         if not show_all_states:
@@ -3092,6 +3234,69 @@ HUD_CSS = '''
     .legend-item { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
     .legend-line { width: 20px; height: 2px; }
+
+    .epistemic-panel {
+        position: fixed;
+        top: 96px;
+        left: 20px;
+        width: 360px;
+        background: rgba(8, 8, 8, 0.94);
+        border: 1px solid #26474f;
+        border-radius: 6px;
+        padding: 12px;
+        z-index: 1002;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
+        line-height: 1.45;
+        color: #cde6ec;
+    }
+    .ep-title { color: #00F0FF; font-weight: 600; margin-bottom: 6px; }
+    .ep-sub { color: #8eb3ba; margin-bottom: 8px; }
+    .ep-row { margin: 4px 0; }
+    .ep-row .k { color: #6ea0aa; }
+    .ep-row .v { color: #e3f5ff; }
+    .ep-warn { color: #FF5555; font-weight: 600; }
+    .ep-good { color: #00FF41; font-weight: 600; }
+    .provenance-line {
+        margin-top: 8px;
+        padding-top: 7px;
+        border-top: 1px solid #20353a;
+        color: #9dbec6;
+    }
+    .verification-badge {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 3px 8px;
+        border-radius: 4px;
+        border: 1px solid #444;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+    }
+    .verification-badge.good {
+        color: #00FF41;
+        border-color: #00FF41;
+        background: rgba(0,255,65,0.12);
+    }
+    .verification-badge.bad {
+        color: #FF3333;
+        border-color: #FF3333;
+        background: rgba(255,51,51,0.12);
+    }
+    .noncomparable-watermark {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%) rotate(-20deg);
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 56px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        color: rgba(255, 68, 68, 0.10);
+        pointer-events: none;
+        z-index: 900;
+        user-select: none;
+    }
 </style>
 '''
 
@@ -3342,12 +3547,35 @@ def create_monolith_cockpit(
     knn_overlap = 0.0
 
 
-    # Track 4 physics summary for HUD
+    # Track 4 physics summary for HUD (status comes from persisted physics metadata)
+    def _normalize_walker_status(s_raw: Any) -> str:
+        """Normalize legacy/new walker-state formats into SUCCESS/BROKEN/TRAPPED/UNKNOWN."""
+        if isinstance(s_raw, dict):
+            s = str(s_raw.get("status") or s_raw.get("state") or "").strip().upper()
+        else:
+            s = str(s_raw).strip().upper()
+
+        # Canonical persisted physics statuses
+        if s in {"SUCCESS", "BROKEN", "TRAPPED"}:
+            return s
+        # Legacy labels fallback
+        if s in {"HONEST"}:
+            return "SUCCESS"
+        if s in {"RUPTURE", "BROKEN"}:
+            return "BROKEN"
+        if s in {"TRAPPED", "TAUTOLOGY", "PHANTOM"}:
+            return "TRAPPED"
+        return "UNKNOWN"
+
+    walker_statuses = [_normalize_walker_status(s) for s in walker_states] if walker_states else []
+    n_total_walkers = len(walker_statuses)
+    n_success = sum(1 for s in walker_statuses if s == "SUCCESS")
+    n_broken = sum(1 for s in walker_statuses if s == "BROKEN")
+    n_trapped = sum(1 for s in walker_statuses if s == "TRAPPED")
+
     finite_work = walker_work[np.isfinite(walker_work)] if walker_work is not None else np.array([])
     mean_action = float(np.mean(finite_work)) if finite_work.size > 0 else 0.0
-    rupture_like = {'rupture', 'broken'}
-    n_alive = sum(1 for s in walker_states if str(s).strip().lower() not in rupture_like) if walker_states else 0
-    survival_rate = float(n_alive / max(1, len(walker_states))) if walker_states else 1.0
+    survival_rate = float(n_success / max(1, n_total_walkers)) if n_total_walkers > 0 else 1.0
 
     # Count fog/cracks
     n_cracks = int((fog_intensity > THRESHOLDS["fog_variance"]).sum())
@@ -3773,6 +4001,75 @@ def create_monolith_cockpit(
         synthesis_nmi=exp.synthesis_nmi,
     )
 
+    # ==========================================================================
+    # EPISTEMIC UI CONTRACT (Interpretation + Provenance + Trust Status)
+    # ==========================================================================
+    verification_status = str(exp.verification_status or "UNVERIFIED").upper()
+    if verification_status not in {"VERIFIED", "NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"}:
+        verification_status = "UNVERIFIED"
+    verification_global_pass = exp.verification_global_pass
+    verification_seed_stability = exp.verification_seed_stability
+    verification_crn_locked = exp.verification_crn_locked
+    provenance = exp.provenance or {}
+    weights_hash_short = _short_hash(provenance.get("weights_hash", "missing"))
+    basis_hash_short = _short_hash(provenance.get("basis_hash", "missing"))
+    alpha_display = str(provenance.get("alpha", "missing"))
+    crn_seed_display = str(provenance.get("crn_seed", "missing"))
+    provenance_missing = any(
+        x in {"missing", "", "None", "none"} for x in
+        [weights_hash_short, basis_hash_short, alpha_display, crn_seed_display]
+    )
+
+    topology_text = "connection exists" if (n_bonds > 0 or knn_overlap > 0.0) else "absent"
+    geometry_text = (
+        f"work={mean_action:.2f} ({'low' if mean_action < 1.0 else 'moderate' if mean_action < 3.0 else 'high'})"
+        if finite_work.size > 0 else "unknown"
+    )
+
+    n_total = n_total_walkers
+
+    if n_total == 0:
+        stability_text = "unknown"
+    elif survival_rate >= 0.95:
+        stability_text = "persists under annealing"
+    else:
+        stability_text = "unstable"
+
+    if provenance_missing and verification_status == "VERIFIED":
+        verification_status = "UNVERIFIED"
+    badge_good = verification_status == "VERIFIED" and (verification_global_pass is not False)
+    verification_badge_class = "good" if badge_good else "bad"
+    verification_badge_text = "VERIFIED" if badge_good else verification_status
+    if provenance_missing:
+        verification_badge_text = "UNVERIFIED"
+
+    interpretation_panel_html = f'''
+    <div class="epistemic-panel">
+        <div class="ep-title">Interpretation Panel</div>
+        <div class="ep-sub">Shadow View: Projection-only geometry. Not causal metric truth.</div>
+        <div class="ep-row"><span class="k">Topology:</span> <span class="v">{topology_text}</span></div>
+        <div class="ep-row"><span class="k">Geometry:</span> <span class="v">{geometry_text}</span></div>
+        <div class="ep-row"><span class="k">Stability:</span> <span class="v">{stability_text}</span></div>
+        <div class="ep-row"><span class="k">Status:</span> <span class="v">{verification_status}</span></div>
+        <div class="ep-title" style="margin-top:8px;">Instrument Readout</div>
+        <div class="ep-row"><span class="k">Seed Stability:</span> <span class="v">{verification_seed_stability if verification_seed_stability is not None else 'unknown'}</span></div>
+        <div class="ep-row"><span class="k">CRN Locked:</span> <span class="v">{verification_crn_locked if verification_crn_locked is not None else 'unknown'}</span></div>
+        <div class="ep-row"><span class="k">T4 Survival:</span> <span class="v">{survival_rate:.0%}</span></div>
+        <div class="ep-row"><span class="k">Broken/Trapped:</span> <span class="v">{n_broken}/{n_trapped if n_total > 0 else 'unknown'}</span></div>
+        <div class="provenance-line">
+            <div><span class="k">Provenance:</span>
+            <span class="v">weights_hash={weights_hash_short} | basis_hash={basis_hash_short} | alpha={alpha_display} | crn_seed={crn_seed_display}</span></div>
+            <div class="verification-badge {verification_badge_class}">{verification_badge_text}</div>
+            {"<div class='ep-warn'>UNVERIFIED: provenance fingerprint incomplete</div>" if provenance_missing else ""}
+        </div>
+    </div>
+    '''
+
+    trust_watermark_html = ""
+    if verification_status in {"NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"} or verification_global_pass is False:
+        watermark_text = "NON-COMPARABLE" if verification_status != "MISSING_ARTIFACTS" else "MISSING ARTIFACTS"
+        trust_watermark_html = f'<div class="noncomparable-watermark">{watermark_text}</div>'
+
     # Legend HTML - Synthesis Mode
     legend_synthesis = f'''
     <div class="legend-panel" id="legend-synthesis">
@@ -3987,7 +4284,21 @@ def create_monolith_cockpit(
     </style>
     '''
 
-    layer_panel = ''
+    layer_panel = '''
+    <div class="layer-panel" id="layer-panel">
+        <div class="layer-title">VIEW CONTRACT</div>
+        <div class="layer-row">
+            <span><b>Shadow View</b> active (projection)</span>
+        </div>
+        <div class="layer-row">
+            <label><input type="checkbox" id="toggle-failures" checked onchange="applyFailureFilter()"> Show failure cases</label>
+        </div>
+        <div class="layer-help">
+            Failure cases = BROKEN/TRAPPED paths and rupture overlays. If unavailable: unknown.
+        </div>
+    </div>
+    '''
+
 
     html_template = f'''<!DOCTYPE html>
 <html>
@@ -4010,6 +4321,8 @@ def create_monolith_cockpit(
     </div>
     {layer_panel}
 
+    {interpretation_panel_html}
+    {trust_watermark_html}
     {legend_synthesis}
     {legend_analysis}
     {legend_diagnostics}
@@ -4034,6 +4347,11 @@ def create_monolith_cockpit(
         }});
 
 
+
+        function applyFailureFilter() {{
+            // Recompute complete mode visibility under current toggle state.
+            setMode(currentMode);
+        }}
 
         function setMode(mode) {{
             currentMode = mode;
@@ -4090,6 +4408,23 @@ def create_monolith_cockpit(
                     }} else {{
                         visibility.push(true);
                     }}
+                }}
+            }}
+
+            // Apply failure filter policy (BROKEN/TRAPPED/RUPTURE families)
+            var showFailuresEl = document.getElementById('toggle-failures');
+            var showFailures = showFailuresEl ? showFailuresEl.checked : true;
+            for (var k = 0; k < numTraces; k++) {{
+                if (!visibility[k]) continue;
+                var tname = (figData.data[k].name || '').toUpperCase();
+                var isFailure = (
+                    tname.indexOf('BROKEN') >= 0 ||
+                    tname.indexOf('TRAPPED') >= 0 ||
+                    tname.indexOf('RUPTURE') >= 0 ||
+                    tname.indexOf('CRASH') >= 0
+                );
+                if (isFailure && !showFailures) {{
+                    visibility[k] = false;
                 }}
             }}
 

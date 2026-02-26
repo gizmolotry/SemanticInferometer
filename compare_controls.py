@@ -36,7 +36,12 @@ if sys.platform == 'win32':
 import torch
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    plt = None
+    HAS_MPL = False
 from pathlib import Path
 from scipy.stats import ttest_ind, spearmanr
 from scipy.linalg import orthogonal_procrustes as scipy_procrustes
@@ -996,6 +1001,9 @@ def interpret_results(results_dict: Dict[str, Dict[str, Any]]) -> Dict[str, Any]
 def plot_comprehensive_comparison(results_dict: Dict[str, Dict[str, Any]], 
                                   output_dir: Path):
     """Generate comprehensive comparison plots."""
+    if not HAS_MPL:
+        print("  [WARN] matplotlib unavailable; skipping comparison plots.")
+        return
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -1064,6 +1072,9 @@ def plot_kernel_summary(kernel_summaries: Dict[str, Dict[str, Any]], output_dir:
     """
     Multi-kernel summary plot: for each kernel, show Real-vs-controls Procrustes ratio (if available).
     """
+    if not HAS_MPL:
+        print("  [WARN] matplotlib unavailable; skipping multi-kernel summary plot.")
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for kname, summary in kernel_summaries.items():
@@ -1163,6 +1174,91 @@ def save_comprehensive_results(results_dict: Dict[str, Dict[str, Any]],
 
 
 # =============================================================================
+# VERIFICATION REPORTING
+# =============================================================================
+def _find_verification_report(start_dir: Path) -> Optional[Path]:
+    """Find verification_report.json at start_dir or any parent directory."""
+    for parent in [start_dir, *list(start_dir.parents)]:
+        candidate = parent / "verification_report.json"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _verification_layer_keys(data_dir: Path) -> List[str]:
+    """Build candidate layer_id keys from a data directory path."""
+    keys: List[str] = []
+    parts = data_dir.parts
+    for i in range(len(parts) - 1):
+        keys.append(f"{parts[i]}/{parts[i + 1]}")
+
+    if len(parts) >= 2:
+        keys.append(f"{parts[-2]}/{parts[-1].split('_seed')[0]}")
+
+    seen = set()
+    out: List[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def print_verification_status(data_dir: Path) -> None:
+    """Print verification status for the current run path if present."""
+    verify_path = _find_verification_report(data_dir)
+    if verify_path is None:
+        return
+
+    print("\n" + "=" * 70)
+    print("VERIFICATION STATUS (RING 1)")
+    print("=" * 70)
+    try:
+        with open(verify_path, "r") as f:
+            vdata = json.load(f)
+
+        print(f"Global Integrity Pass: {'[PASS]' if vdata.get('global_pass') else '[FAIL]'}")
+        print(f"Run ID: {vdata.get('run_id', 'unknown')}")
+
+        layers = vdata.get("layers", [])
+        key_set = set(_verification_layer_keys(data_dir))
+        layer = next((l for l in layers if l.get("layer_id") in key_set), None)
+        if layer is None:
+            print(f"\n  [!] Layer [NOT_FOUND] for run path: {data_dir}")
+            return
+
+        lid = layer.get("layer_id", layer.get("layer_name", "unknown"))
+        lstatus = layer.get("status", "UNVERIFIED")
+        status_icon = "[V]" if lstatus == "VERIFIED" else "[!]" if lstatus == "UNVERIFIED" else "[X]"
+        print(f"\n  {status_icon} Layer {lid:25s} [{lstatus}]")
+
+        fail_reasons = layer.get("fail_reasons") or []
+        if fail_reasons:
+            print("    FAIL REASONS:")
+            for reason in fail_reasons:
+                print(f"      - {reason}")
+
+        checks = layer.get("checks") or []
+        if checks:
+            print("    CHECKS:")
+            for check in checks:
+                cname = check.get("name")
+                cpass = check.get("pass")
+                cval = check.get("value")
+
+                cstatus = "OK" if cpass is True else "!!" if cpass is False else "--"
+                cval_str = ""
+                if isinstance(cval, (float, int)):
+                    cval_str = f"({cval:.3f})"
+                elif isinstance(cval, list) and all(isinstance(x, (float, int)) for x in cval):
+                    cval_str = f"({', '.join([f'{x:.2f}' for x in cval[:3]])}...)"
+
+                print(f"      - {cname:25s} [{cstatus}] {cval_str}")
+    except Exception as e:
+        print(f"  Warning: Could not parse verification report: {e}")
+
+
+# =============================================================================
 # SINGLE-RUN ANALYSIS (one data_dir containing real + controls)
 # =============================================================================
 
@@ -1238,6 +1334,12 @@ def run_single_analysis(data_dir: Path,
 
     # Interpretation
     print(f"\n{'='*70}")
+    
+    
+
+    
+    print_verification_status(data_dir)
+
     print("INTERPRETATION")
     print(f"{'='*70}")
     
@@ -1517,6 +1619,12 @@ def main():
     
     # Interpretation
     print(f"\n{'='*70}")
+    
+    
+
+    
+    print_verification_status(data_dir)
+
     print("INTERPRETATION")
     print(f"{'='*70}")
     

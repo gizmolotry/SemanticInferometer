@@ -129,6 +129,7 @@ class IntegratedParticle:
             'phantom_confidence': self.phantom_confidence,
             'walker_state': self.walker_state,
             'hadamard_diagnostics': self.hadamard_diagnostics,
+            'u_axis': self.track_contributions.get('antagonism', torch.zeros(1)).cpu().numpy().tolist(),
         }
 
 

@@ -23,9 +23,43 @@ This is a useful baseline but not yet a full canonical matrix (single run key on
 
 ## Canonical Run Registry
 
-| Run ID | Date | Purpose | Command Class | Status | Notes |
-|---|---|---|---|---|---|
-| experiments_20260225_225508 | 2026-02-25 | Synthetic baseline | Synthetic | Success | Single `rbf_seed42`; expand to full matrix |
+_Auto-generated from manifests on 2026-02-26T07:23:26._
+
+| Run ID | Date | Purpose | Command Class | Status | Canonical | Notes |
+|---|---|---|---|---|---|---|
+| experiments_20260207_202618 | 2026-02-07 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260209_142804 | 2026-02-09 | Synthetic | Synthetic | Success | Yes | successful_runs=3/3; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260209_143857 | 2026-02-09 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260209_154147 | 2026-02-09 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260209_162905 | 2026-02-12 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260209_174027 | 2026-02-09 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=index 1 is out of bounds for dimension 1 with size 1 |
+| experiments_20260213_071824 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260213_072109 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260213_123413 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260213_185408 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260213_193103 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0285; mean_ari=-0.0158 |
+| experiments_20260213_195028 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.1002; mean_ari=0.0665 |
+| experiments_20260213_195959 | 2026-02-13 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.1002; mean_ari=0.0665 |
+| experiments_20260214_153246 | 2026-02-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.2778; mean_ari=0.0322 |
+| experiments_20260214_175004 | 2026-02-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.3184; mean_ari=-0.0957 |
+| experiments_20260215_154054 | 2026-02-15 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260215_154640 | 2026-02-15 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.3546; mean_ari=0.1436 |
+| experiments_20260216_142922 | 2026-02-16 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=stack expects a non-empty TensorList |
+| experiments_20260216_143014 | 2026-02-16 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.3120; mean_ari=0.1186 |
+| experiments_20260216_152810 | 2026-02-16 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.3120; mean_ari=0.1186 |
+| experiments_20260216_163814 | 2026-02-16 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260216_171548 | 2026-02-16 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260217_162351 | 2026-02-17 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260221_074741 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260221_092012 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.3120; mean_ari=0.1186 |
+| experiments_20260221_110129 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260221_174034 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260221_174340 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260221_174709 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260221_175416 | 2026-02-21 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7325; mean_ari=0.4581 |
+| experiments_20260225_034558 | 2026-02-25 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7124; mean_ari=0.4178 |
+| experiments_20260225_225508 | 2026-02-25 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7124; mean_ari=0.4178 |
+| experiments_20260225_230337 | 2026-02-26 | Corpus matrix | Suite | Unknown/Empty | No | no experiments[] entries; config_keys=kernels,channels,corpora,seeds |
 
 ## Thesis Tables To Populate
 

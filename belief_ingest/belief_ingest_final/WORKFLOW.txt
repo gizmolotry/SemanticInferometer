@@ -1,0 +1,295 @@
+╔══════════════════════════════════════════════════════════════════════════╗
+║         BELIEF TRANSFORMER 12-MONTH SCRAPER - WORKFLOW DIAGRAM           ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+DEPLOYMENT WORKFLOW
+═══════════════════════════════════════════════════════════════════════════
+
+ ┌─────────────────┐
+ │ Extract Package │
+ └────────┬────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ tar -xzf belief_ingest_12mo.tar.gz      │
+ │ cd belief_ingest                         │
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ bash setup.sh                            │  ← Install dependencies
+ │   - Installs Python packages             │
+ │   - Optional: Playwright for JS sites    │
+ │   - Creates directory structure          │
+ │   - Runs test suite                      │
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ python test.py                           │  ← Verify everything works
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ Quick Test (1 week)                      │  ← Test run
+ │ python scrape_12_months.py \             │
+ │   --start 2024-12-15 --end 2024-12-21    │
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ Production Run (12 months)               │  ← Main scrape
+ │ python scrape_12_months.py               │    4-8 hours
+ │                                          │
+ │ [Checkpoint saves after each batch]      │
+ │ [Safe to Ctrl+C and resume]              │
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ Merge Output Files                       │
+ │ cat data/processed/batch_*.jsonl \       │
+ │   > articles_12mo.jsonl                  │
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ Copy to Belief Transformer V2            │
+ │ cp articles_12mo.jsonl \                 │
+ │   ../../V2/data/raw/                     │
+ └────────┬────────────────────────────────┘
+          │
+          ▼
+ ┌─────────────────────────────────────────┐
+ │ Compute θ Fingerprints                   │
+ │ cd ../../V2                              │
+ │ python -m belief_transformer...          │
+ └─────────────────────────────────────────┘
+
+
+DATA FLOW DIAGRAM
+═══════════════════════════════════════════════════════════════════════════
+
+                         GDELT Historical Archives
+                         (2+ years of news data)
+                                  │
+                                  │ 15-min files
+                                  ▼
+                    ┌──────────────────────────┐
+                    │ GDELT Historical Fetcher │
+                    │  - Date filtering        │
+                    │  - Theme filtering       │
+                    │  - Location filtering    │
+                    │  - URL keyword filtering │
+                    └──────────┬───────────────┘
+                               │
+                               │ Article metadata
+                               │ (URL, themes, locations, sentiment)
+                               ▼
+                    ┌──────────────────────────┐
+                    │   URL Deduplicator       │
+                    │  - xxhash-based          │
+                    │  - Disk-backed cache     │
+                    │  - 200k URL capacity     │
+                    └──────────┬───────────────┘
+                               │
+                               │ Unique URLs
+                               ▼
+                    ┌──────────────────────────┐
+                    │   Content Extractor      │
+                    │  1. trafilatura          │
+                    │  2. newspaper3k          │
+                    │  3. readability          │
+                    │  4. playwright (JS sites)│
+                    └──────────┬───────────────┘
+                               │
+                               │ Full articles
+                               ▼
+                    ┌──────────────────────────┐
+                    │   Text Segmentation      │
+                    │  - 100 words/segment     │
+                    │  - For Belief Transformer│
+                    └──────────┬───────────────┘
+                               │
+                               │ Segmented articles
+                               ▼
+                    ┌──────────────────────────┐
+                    │   JSONL Output           │
+                    │  - Batch files           │
+                    │  - GDELT metadata        │
+                    │  - Article content       │
+                    │  - Text segments         │
+                    └──────────────────────────┘
+
+
+BATCH PROCESSING WORKFLOW
+═══════════════════════════════════════════════════════════════════════════
+
+  Day 1-7     ──→  [Fetch] → [Dedup] → [Extract] → batch_0001.jsonl
+                                                    ↓
+                                                [Checkpoint saved]
+
+  Day 8-14    ──→  [Fetch] → [Dedup] → [Extract] → batch_0002.jsonl
+                                                    ↓
+                                                [Checkpoint saved]
+
+  Day 15-21   ──→  [Fetch] → [Dedup] → [Extract] → batch_0003.jsonl
+                                                    ↓
+                                                [Checkpoint saved]
+
+  ...
+
+  Day 358-365 ──→  [Fetch] → [Dedup] → [Extract] → batch_0052.jsonl
+                                                    ↓
+                                                [Complete!]
+
+  Benefits:
+  - Memory efficient (process 7 days at a time)
+  - Resumable (checkpoint after each batch)
+  - Progress tracking (see completion %)
+
+
+CHECKPOINT/RESUME SYSTEM
+═══════════════════════════════════════════════════════════════════════════
+
+  ┌─────────────────────────────────────────────────┐
+  │  Scrape Running                                 │
+  │  ├─ Batch 1: Complete → checkpoint.json         │
+  │  ├─ Batch 2: Complete → checkpoint.json         │
+  │  ├─ Batch 3: Running...                         │
+  │  └─ [Ctrl+C pressed]                            │
+  └─────────────────────────────────────────────────┘
+                      │
+                      ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Checkpoint Saved:                              │
+  │  {                                              │
+  │    "current_date": "2024-01-15",                │
+  │    "batch_num": 2,                              │
+  │    "stats": {                                   │
+  │      "articles_fetched": 1250,                  │
+  │      "articles_extracted": 1180,                │
+  │      "batches_complete": 2                      │
+  │    }                                            │
+  │  }                                              │
+  └─────────────────────────────────────────────────┘
+                      │
+                      ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Resume Later:                                  │
+  │  $ python scrape_12_months.py --resume          │
+  │                                                 │
+  │  ✓ Loads checkpoint                             │
+  │  ✓ Skips completed batches                      │
+  │  ✓ Continues from batch 3                       │
+  │  ✓ Preserves statistics                         │
+  └─────────────────────────────────────────────────┘
+
+
+OUTPUT STRUCTURE
+═══════════════════════════════════════════════════════════════════════════
+
+  belief_ingest/
+  │
+  ├── data/
+  │   ├── cache/
+  │   │   ├── checkpoint.json              ← Resume state
+  │   │   ├── seen_urls_12mo.txt          ← Dedup cache
+  │   │   └── gdelt/                      ← GDELT file cache
+  │   │       ├── 20240101000000.json
+  │   │       ├── 20240101001500.json
+  │   │       └── ...
+  │   │
+  │   └── processed/
+  │       ├── batch_0001_20240101-20240107.jsonl  ← ~200-400 articles
+  │       ├── batch_0002_20240108-20240114.jsonl
+  │       ├── batch_0003_20240115-20240121.jsonl
+  │       └── ...
+  │
+  └── logs/
+      └── scraper.log                     ← Detailed logs
+
+
+ARTICLE JSON SCHEMA
+═══════════════════════════════════════════════════════════════════════════
+
+  {
+    "id": "a1b2c3d4e5f6g7h8",              ← Unique hash
+    "url": "https://...",                  ← Source URL
+    "title": "Article Title",
+    "content": "Full text...",             ← Main content
+    "snippets": [                          ← For Belief Transformer
+      "segment 1 (100 words)...",
+      "segment 2 (100 words)...",
+      ...
+    ],
+    
+    "publisher": "reuters.com",            ← Clean domain
+    "author": "John Doe",
+    "published_at": "2024-01-15T10:30:00", ← ISO format
+    "fetched_at": "2024-12-21T13:45:00",
+    
+    "source_type": "gdelt",                ← Data source
+    "extraction_method": "trafilatura",    ← How extracted
+    
+    "word_count": 842,
+    "char_count": 5234,
+    
+    "themes": [                            ← GDELT metadata
+      "ARMED_CONFLICT",
+      "MIDDLE_EAST",
+      "HUMANITARIAN"
+    ],
+    "locations": [
+      "Gaza Strip",
+      "Israel"
+    ],
+    "sentiment_score": -12.5               ← GDELT tone (negative = conflict)
+  }
+
+
+PROGRESS MONITORING
+═══════════════════════════════════════════════════════════════════════════
+
+  Terminal Output Example:
+
+  🚀 Starting 12-month production scrape...
+     Period: 2024-01-01 to 2024-12-31
+     Batch size: 7 days
+
+  [Batch 1/52] 2024-01-01 to 2024-01-07
+    ✓ Fetched 412 articles from GDELT
+    ✓ Extracted 389 articles
+    ✓ Written to batch_0001_20240101-20240107.jsonl
+    Progress: 1.9% | Elapsed: 0.3h | Remaining: ~14.7h
+
+  [Batch 2/52] 2024-01-08 to 2024-01-14
+    ✓ Fetched 438 articles from GDELT
+    ✓ Extracted 415 articles
+    ✓ Written to batch_0002_20240108-20240114.jsonl
+    Progress: 3.8% | Elapsed: 0.6h | Remaining: ~14.4h
+
+  ...
+
+
+TROUBLESHOOTING DECISION TREE
+═══════════════════════════════════════════════════════════════════════════
+
+  Scraper fails?
+    │
+    ├─ Missing pandas? ────────→ pip install pandas --break-system-packages
+    │
+    ├─ Network timeout? ───────→ Edit config.py: REQUEST_TIMEOUT = 60
+    │
+    ├─ High failure rate? ─────→ pip install playwright --break-system-packages
+    │                             playwright install chromium
+    │
+    ├─ Memory issues? ─────────→ python scrape_12_months.py --batch-days 3
+    │
+    └─ Other errors? ──────────→ python test.py
+                                  Check logs/scraper.log
+
+
+═══════════════════════════════════════════════════════════════════════════
+                                END WORKFLOW
+═══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,137 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║              BELIEF TRANSFORMER - QUICK REFERENCE                    ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+SETUP (One Time)
+════════════════════════════════════════════════════════════════════════
+  bash setup.sh                    # Install dependencies & test
+
+
+PRODUCTION COMMANDS
+════════════════════════════════════════════════════════════════════════
+  # Full 12-month scrape (default)
+  python scrape_12_months.py
+
+  # Custom date range
+  python scrape_12_months.py --start 2024-01-01 --end 2024-12-31
+
+  # Resume after interruption
+  python scrape_12_months.py --resume
+
+
+TEST COMMANDS (Recommended Before Full Scrape)
+════════════════════════════════════════════════════════════════════════
+  # Test suite
+  python test.py
+
+  # Quick 1-week test
+  python scrape_12_months.py --start 2024-12-15 --end 2024-12-21
+
+  # 1-day test
+  python scrape_12_months.py --start 2024-12-20 --end 2024-12-21 --batch-days 1
+
+
+POST-PROCESSING
+════════════════════════════════════════════════════════════════════════
+  # Merge batches into single file
+  cat data/processed/batch_*.jsonl > articles_12mo.jsonl
+
+  # Count articles
+  wc -l articles_12mo.jsonl
+
+  # Top publishers
+  cat articles_12mo.jsonl | jq -r '.publisher' | sort | uniq -c | sort -rn | head -20
+
+  # Articles by month
+  cat articles_12mo.jsonl | jq -r '.published_at[:7]' | sort | uniq -c
+
+
+TROUBLESHOOTING
+════════════════════════════════════════════════════════════════════════
+  # Check checkpoint status
+  cat data/cache/checkpoint.json
+
+  # View logs
+  tail -f logs/*.log
+
+  # Test GDELT connection
+  python -c "from gdelt_historical_fetcher import *; import asyncio; asyncio.run(test())"
+
+
+EXPECTED PERFORMANCE
+════════════════════════════════════════════════════════════════════════
+  Throughput:       50-100 articles/minute
+  12-month strict:  ~20,000-40,000 articles (4-8 hours)
+  12-month lenient: ~40,000-80,000 articles (8-16 hours)
+
+
+FILE LOCATIONS
+════════════════════════════════════════════════════════════════════════
+  Output:       data/processed/batch_*.jsonl
+  Checkpoint:   data/cache/checkpoint.json
+  URL cache:    data/cache/seen_urls_12mo.txt
+  Logs:         logs/
+
+
+ACQUISITION STUDY EXAMPLES
+════════════════════════════════════════════════════════════════════════
+  # Irish Independent: Pre (Jan 2018 - Jun 2019)
+  python scrape_12_months.py --start 2018-01-01 --end 2019-06-30 \
+      --output data/processed/irish_pre
+
+  # Irish Independent: Post (Jul 2019 - Dec 2020)
+  python scrape_12_months.py --start 2019-07-01 --end 2020-12-31 \
+      --output data/processed/irish_post
+
+
+INTEGRATION WITH BELIEF TRANSFORMER V2
+════════════════════════════════════════════════════════════════════════
+  # 1. Scrape
+  python scrape_12_months.py
+  cat data/processed/batch_*.jsonl > articles_12mo.jsonl
+
+  # 2. Copy to V2
+  cp articles_12mo.jsonl ../V2/data/raw/
+
+  # 3. Compute θ fingerprints
+  cd ../V2
+  python -m belief_transformer.compute_embeddings \
+      --input data/raw/articles_12mo.jsonl
+
+
+COMMON ISSUES
+════════════════════════════════════════════════════════════════════════
+  Problem: "ModuleNotFoundError: No module named 'pandas'"
+  Fix:     pip install pandas --break-system-packages
+
+  Problem: High extraction failure rate
+  Fix:     pip install playwright --break-system-packages
+           playwright install chromium
+
+  Problem: Memory issues
+  Fix:     python scrape_12_months.py --batch-days 3
+
+  Problem: Network timeouts
+  Fix:     Edit config.py: REQUEST_TIMEOUT = 60
+
+
+MONITORING PROGRESS
+════════════════════════════════════════════════════════════════════════
+  The scraper logs progress after each batch:
+  
+  - Batches complete / total
+  - Articles fetched / extracted / failed
+  - Percent complete
+  - Estimated time remaining
+
+  Progress is saved to checkpoint.json after each batch.
+  Safe to interrupt with Ctrl+C - resume with --resume flag.
+
+
+GETTING HELP
+════════════════════════════════════════════════════════════════════════
+  1. Check README.md for detailed docs
+  2. Run test.py to diagnose issues
+  3. Check logs in data/logs/
+  4. Review checkpoint: cat data/cache/checkpoint.json
+

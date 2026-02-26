@@ -1,4 +1,4 @@
-"""
+﻿"""
 Integration test for Phantom Path Differential implementation.
 Tests all modified components to ensure they work together correctly.
 """
@@ -27,8 +27,8 @@ def test_spectral_distance():
     assert not torch.any(torch.isnan(distance)), "Spectral distance contains NaN"
     assert not torch.any(torch.isinf(distance)), "Spectral distance contains Inf"
 
-    print(f"✓ Spectral distance shape: {distance.shape}")
-    print(f"✓ Distance range: [{distance.min().item():.4f}, {distance.max().item():.4f}]")
+    print(f" Spectral distance shape: {distance.shape}")
+    print(f" Distance range: [{distance.min().item():.4f}, {distance.max().item():.4f}]")
     print()
 
 def test_phase_space_integrator_phantom():
@@ -46,7 +46,7 @@ def test_phase_space_integrator_phantom():
     phase_1 = integrator(phase_0, belief_0, h_t)
 
     assert phase_1.shape == phase_0.shape, f"Phase shape mismatch: {phase_1.shape} vs {phase_0.shape}"
-    print(f"✓ Phase evolution output shape: {phase_1.shape}")
+    print(f" Phase evolution output shape: {phase_1.shape}")
 
     # Test phantom differential computation
     differential = integrator.compute_phantom_differential(phase_0, phase_1)
@@ -56,8 +56,8 @@ def test_phase_space_integrator_phantom():
     assert not torch.any(torch.isnan(differential)), "Phantom differential contains NaN"
     assert not torch.any(torch.isinf(differential)), "Phantom differential contains Inf"
 
-    print(f"✓ Phantom differential shape: {differential.shape}")
-    print(f"✓ Differential range: [{differential.min().item():.4f}, {differential.max().item():.4f}]")
+    print(f" Phantom differential shape: {differential.shape}")
+    print(f" Differential range: [{differential.min().item():.4f}, {differential.max().item():.4f}]")
     print()
 
 def test_hott_verifier_phantom_parameter():
@@ -76,14 +76,14 @@ def test_hott_verifier_phantom_parameter():
     output1 = verifier(belief_mu, belief_prec, h_t)
     assert 'verdict' in output1, "Output should contain 'verdict' key"
     assert 'coherence_score' in output1, "Output should contain 'coherence_score' key"
-    print(f"✓ HoTTVerifier output keys (no phantom): {list(output1.keys())}")
+    print(f" HoTTVerifier output keys (no phantom): {list(output1.keys())}")
 
     # Test with phantom verdict
     phantom_diff = torch.rand(batch_size)
     output2 = verifier(belief_mu, belief_prec, h_t, phantom_verdict=phantom_diff)
     assert 'verdict' in output2, "Output should contain 'verdict' key"
     assert 'coherence_score' in output2, "Output should contain 'coherence_score' key"
-    print(f"✓ HoTTVerifier output keys (with phantom): {list(output2.keys())}")
+    print(f" HoTTVerifier output keys (with phantom): {list(output2.keys())}")
     print()
 
 def test_complete_pipeline_integration():
@@ -120,20 +120,20 @@ def test_complete_pipeline_integration():
     assert 'fog_gate' in output, "Output should contain 'fog_gate' (phantom path gating)"
     assert 'phantom_differential' in output, "Output should contain 'phantom_differential'"
 
-    print(f"✓ Pipeline output keys: {list(output.keys())}")
-    print(f"✓ Logits shape: {output['logits'].shape}")
-    print(f"✓ Fog gate shape: {output['fog_gate'].shape}")
-    print(f"✓ Phantom differential shape: {output['phantom_differential'].shape}")
+    print(f" Pipeline output keys: {list(output.keys())}")
+    print(f" Logits shape: {output['logits'].shape}")
+    print(f" Fog gate shape: {output['fog_gate'].shape}")
+    print(f" Phantom differential shape: {output['phantom_differential'].shape}")
 
     # Verify fog gate properties
     fog_gate = output['fog_gate']
     assert torch.all((fog_gate >= 0) & (fog_gate <= 1)), "Fog gate should be in [0, 1]"
-    print(f"✓ Fog gate range: [{fog_gate.min().item():.4f}, {fog_gate.max().item():.4f}]")
+    print(f" Fog gate range: [{fog_gate.min().item():.4f}, {fog_gate.max().item():.4f}]")
 
     # Verify phantom differential properties
     phantom_diff = output['phantom_differential']
     assert torch.all(phantom_diff >= 0), "Phantom differential should be non-negative"
-    print(f"✓ Phantom differential range: [{phantom_diff.min().item():.4f}, {phantom_diff.max().item():.4f}]")
+    print(f" Phantom differential range: [{phantom_diff.min().item():.4f}, {phantom_diff.max().item():.4f}]")
 
     print()
 
@@ -150,22 +150,22 @@ def main():
         test_complete_pipeline_integration()
 
         print("=" * 70)
-        print("✓ ALL INTEGRATION TESTS PASSED")
+        print(" ALL INTEGRATION TESTS PASSED")
         print("=" * 70)
         print()
         print("Summary:")
-        print("  • compute_spectral_distance() working correctly")
-        print("  • PhaseSpaceIntegrator.compute_phantom_differential() working correctly")
-        print("  • HoTTVerifier phantom_verdict parameter working correctly")
-        print("  • Complete pipeline fog gating and phantom differential working correctly")
-        print("  • All outputs have correct shapes and valid ranges")
+        print("   compute_spectral_distance() working correctly")
+        print("   PhaseSpaceIntegrator.compute_phantom_differential() working correctly")
+        print("   HoTTVerifier phantom_verdict parameter working correctly")
+        print("   Complete pipeline fog gating and phantom differential working correctly")
+        print("   All outputs have correct shapes and valid ranges")
         print()
 
         return 0
 
     except Exception as e:
         print("=" * 70)
-        print("✗ INTEGRATION TEST FAILED")
+        print(" INTEGRATION TEST FAILED")
         print("=" * 70)
         print(f"\nError: {e}")
         import traceback
@@ -174,3 +174,6 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
+
+

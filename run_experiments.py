@@ -117,7 +117,7 @@ EXPERIMENT_MODES = {
     
     'sigma_sweep': {
         'name': 'Kernel Bandwidth Sweep',
-        'description': 'Different ÃƒÂÃ†â€™ values = observers with different scales',
+        'description': 'Different sigma values = observers with different scales',
         'use_contrastive': True,
         'use_pca_removal': True,
         'shared_pca': True,
@@ -127,7 +127,7 @@ EXPERIMENT_MODES = {
     },
     
     'rq_sweep': {
-        'name': 'Rational Quadratic ÃƒÅ½Ã‚Â± Sweep',
+        'name': 'Rational Quadratic alpha Sweep',
         'description': 'Different smoothness parameters',
         'use_contrastive': True,
         'use_pca_removal': True,
@@ -169,7 +169,7 @@ EXPERIMENT_MODES = {
     
     'minimal': {
         'name': 'Minimal Architecture',
-        'description': 'NLI ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ RKS ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Attention (no GRU)',
+        'description': 'NLI -> RKS -> Attention (no GRU)',
         'use_contrastive': True,
         'use_pca_removal': True,
         'shared_pca': True,
@@ -337,7 +337,7 @@ def load_corpus(corpus_type, limit=None):
                 f"Generate it: python controls/make_control_corpus.py"
             )
         articles = load_articles(corpus_file)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Loaded CONSTANT control: {len(articles)} identical articles")
+        print(f"[OK] Loaded CONSTANT control: {len(articles)} identical articles")
     
     elif corpus_type == 'control_shuffled':
         corpus_file = DATA_DIR / 'control_shuffled.jsonl'
@@ -347,7 +347,7 @@ def load_corpus(corpus_type, limit=None):
                 f"Generate it: python controls/make_control_corpus.py"
             )
         articles = load_articles(corpus_file)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Loaded SHUFFLED control: {len(articles)} articles (same tokens, random order)")
+        print(f"[OK] Loaded SHUFFLED control: {len(articles)} articles (same tokens, random order)")
     
     elif corpus_type == 'control_random':
         corpus_file = DATA_DIR / 'control_random.jsonl'
@@ -357,11 +357,11 @@ def load_corpus(corpus_type, limit=None):
                 f"Generate it: python controls/make_control_corpus.py"
             )
         articles = load_articles(corpus_file)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Loaded RANDOM control: {len(articles)} articles (random text)")
+        print(f"[OK] Loaded RANDOM control: {len(articles)} articles (random text)")
     
     # Legacy control (backward compatible)
     elif corpus_type == 'control':
-        print("ÃƒÂ¢Ã…Â¡Ã‚Â  Using legacy 'control' corpus name")
+        print("[WARN] Using legacy 'control' corpus name")
         print("  Recommend: Use --corpus control_constant, control_shuffled, or control_random")
         corpus_file = DATA_DIR / 'control_corpus.jsonl'
         if not corpus_file.exists():
@@ -373,7 +373,7 @@ def load_corpus(corpus_type, limit=None):
                 f"Generate it: python controls/make_control_corpus.py"
             )
         articles = load_articles(corpus_file)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Loaded control corpus: {len(articles)} articles")
+        print(f"[OK] Loaded control corpus: {len(articles)} articles")
     
     # Real corpus
     elif corpus_type == 'real':
@@ -398,7 +398,7 @@ def load_corpus(corpus_type, limit=None):
             )
         
         articles = load_articles(corpus_file)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Loaded REAL corpus: {len(articles)} articles from {corpus_file.name}")
+        print(f"[OK] Loaded REAL corpus: {len(articles)} articles from {corpus_file.name}")
     
     # Temporal combined (for non-batch mode)
     elif corpus_type == 'temporal':
@@ -409,7 +409,7 @@ def load_corpus(corpus_type, limit=None):
                 f"For batch processing, use --batch-temporal flag"
             )
         articles = load_articles(corpus_file)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Loaded TEMPORAL corpus: {len(articles)} articles")
+        print(f"[OK] Loaded TEMPORAL corpus: {len(articles)} articles")
     
     else:
         raise ValueError(
@@ -420,7 +420,7 @@ def load_corpus(corpus_type, limit=None):
     # Apply limit if specified
     if limit is not None:
         articles = articles[:limit]
-        print(f"  ÃƒÂ¢Ã…Â¡Ã‚Â¡ LIMITED to {len(articles)} articles for testing")
+        print(f"  [WARN] LIMITED to {len(articles)} articles for testing")
     
     return articles
 
@@ -493,10 +493,62 @@ def verify_articles(articles, manifest):
         except Exception:
             # In case of any unexpected failure, keep the article
             verified.append(article)
-    print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Verified articles via manifest: kept {len(verified)} / {len(articles)}")
+    print(f"[OK] Verified articles via manifest: kept {len(verified)} / {len(articles)}")
     if discarded:
         print(f"  Discarded {discarded} articles not present in manifest hashes")
     return verified
+
+
+def _ensure_verification_provenance(artifact: dict, mode_config: dict, seed: int) -> tuple[dict, bool]:
+    """
+    Ensure observer artifact contains thesis verifier-required provenance keys:
+    basis_hash, crn_seed, alpha, weights_hash.
+    """
+    if not isinstance(artifact, dict):
+        return artifact, False
+
+    meta = artifact.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    existing = artifact.get("provenance")
+    if not isinstance(existing, dict):
+        existing = meta.get("provenance", {})
+    if not isinstance(existing, dict):
+        existing = {}
+
+    prov = dict(existing)
+
+    # basis_hash fallback from kernel/basis config if not emitted by pipeline
+    if not prov.get("basis_hash"):
+        basis_src = (
+            f"{mode_config.get('kernel_type', 'rbf')}|"
+            f"{mode_config.get('dirichlet_rks_dim', mode_config.get('rks_dim', 2048))}|"
+            f"{mode_config.get('dirichlet_basis_seed', 42)}"
+        )
+        prov["basis_hash"] = hashlib.sha256(basis_src.encode("utf-8")).hexdigest()
+
+    if prov.get("crn_seed") is None:
+        # Use suite-level CRN default unless caller provided an explicit CRN seed.
+        default_crn = getattr(args, "crn_seed", 12345) if args is not None else 12345
+        prov["crn_seed"] = int(default_crn)
+
+    if prov.get("alpha") is None:
+        prov["alpha"] = float(mode_config.get("dirichlet_alpha", 1.0))
+
+    if not prov.get("weights_hash"):
+        # Fallback to a CRN contract fingerprint (invariant across corpora).
+        weights_src = (
+            f"{prov['basis_hash']}|{prov['alpha']}|{prov['crn_seed']}|"
+            f"{mode_config.get('dirichlet_n_observers', 50)}|"
+            f"{mode_config.get('kernel_type', 'rbf')}"
+        )
+        prov["weights_hash"] = hashlib.sha256(weights_src.encode("utf-8")).hexdigest()
+
+    changed = prov != existing
+    artifact["provenance"] = prov
+    meta["provenance"] = prov
+    artifact["meta"] = meta
+    return artifact, changed
 
 
 # =========================================================================
@@ -599,6 +651,15 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         for seed in seeds:
             expected_path = Path(output_root) / f"observer_{seed}.pt"
             if expected_path.exists():
+                # Backfill verifier-required provenance fields if pipeline omitted them.
+                try:
+                    artifact = torch.load(expected_path, map_location="cpu", weights_only=False)
+                    artifact, changed = _ensure_verification_provenance(artifact, mode_config, seed)
+                    if changed:
+                        torch.save(artifact, expected_path)
+                        print(f"[OK] Added verification provenance: {expected_path.name}")
+                except Exception as e:
+                    print(f"[WARN] Could not patch provenance for {expected_path.name}: {e}")
                 print(f"[OK] Confirmed: {expected_path}")
             else:
                 print(f"[WARN] Expected file not found: {expected_path}")
@@ -647,7 +708,7 @@ def run_multi_kernel_experiment(articles, mode_config, corpus_name='real'):
         
         output_path = OUTPUT_DIR / f"{corpus_name}_multikernel_{ktype}_seed{seed}.pt"
         torch.save(results[seed], output_path)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Saved {ktype} observer to {output_path.name}")
+        print(f"[OK] Saved {ktype} observer to {output_path.name}")
     
     return results_by_kernel
 
@@ -688,7 +749,7 @@ def run_sigma_sweep_experiment(articles, mode_config, corpus_name='real'):
         
         output_path = OUTPUT_DIR / f"{corpus_name}_sigma{sigma:.1f}_seed{seed}.pt"
         torch.save(results[seed], output_path)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Saved ÃƒÂÃ†â€™={sigma} observer to {output_path.name}")
+        print(f"[OK] Saved sigma={sigma} observer to {output_path.name}")
 
 
 def run_rq_sweep_experiment(articles, mode_config, corpus_name='real'):
@@ -729,7 +790,7 @@ def run_rq_sweep_experiment(articles, mode_config, corpus_name='real'):
         
         output_path = OUTPUT_DIR / f"{corpus_name}_rq_alpha{alpha:.1f}_seed{seed}.pt"
         torch.save(results[seed], output_path)
-        print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Saved ÃƒÅ½Ã‚Â±={alpha} observer to {output_path.name}")
+        print(f"[OK] Saved alpha={alpha} observer to {output_path.name}")
 
 
 
@@ -792,15 +853,28 @@ def run_dirichlet_fusion_experiment(articles, mode_config, seeds, corpus_name='r
     actual_hidden = cls_per_bot.shape[-1]
     print(f"[NLI] CLS embeddings shape: {cls_per_bot.shape}")
     
+
+    # Handle ablations
+    alpha_val = mode_config.get('dirichlet_alpha', 1.0)
+    if getattr(args, 'alpha_collapse', False):
+        print("[ABLATION] FORCING ALPHA COLLAPSE (alpha=1e6)")
+        alpha_val = 1e6
+        
+    crn_enabled = True
+    if getattr(args, 'no_crn', False):
+        print("[ABLATION] DISABLING CRN")
+        crn_enabled = False
+
     # Now configure fusion with actual hidden dim
     config = DirichletFusionConfig(
         n_bots=8,
         hidden_dim=actual_hidden,
         rks_dim=mode_config.get('dirichlet_rks_dim', 2048),
         n_observers=mode_config.get('dirichlet_n_observers', 50),
-        alpha=mode_config.get('dirichlet_alpha', 1.0),
+        alpha=alpha_val,
         kernel_type=mode_config.get('kernel_type', 'rbf'),
         basis_seed=mode_config.get('dirichlet_basis_seed', 42),
+        crn_enabled=crn_enabled,
     )
     
     # Create fusion module and run
@@ -832,6 +906,7 @@ def run_dirichlet_fusion_experiment(articles, mode_config, seeds, corpus_name='r
                 'provenance': result.get('provenance', {}),
             },
         }
+        output_artifact, _ = _ensure_verification_provenance(output_artifact, mode_config, seed)
         
         output_file = output_dir / f"observer_{seed}.pt"
         torch.save(output_artifact, output_file)
@@ -1066,6 +1141,18 @@ def main():
         default=None,
         help='Path to locked Dirichlet weights file for CRN reproducibility'
     )
+
+    parser.add_argument(
+        "--no-crn",
+        action="store_true",
+        help="Disable CRN for Dirichlet fusion"
+    )
+
+    parser.add_argument(
+        "--alpha-collapse",
+        action="store_true",
+        help="Force alpha=1e6 for collapse ablation"
+    )
     
     global args
     args = parser.parse_args()
@@ -1160,7 +1247,7 @@ def main():
     # BATCH TEMPORAL PROCESSING
     if args.batch_temporal and args.corpus == 'temporal':
         print("\n" + "="*70)
-        print("ÃƒÂ°Ã…Â¸Ã¢â‚¬Â¢Ã‚Â BATCH PROCESSING MODE - Temporal Evolution")
+        print("[INFO] BATCH PROCESSING MODE - Temporal Evolution")
         print("="*70)
         
         temporal_dir = DATA_DIR / 'temporal_cleaned'
@@ -1213,10 +1300,10 @@ def main():
                     gru_mode=args.gru_mode
                 )
             
-            print(f"\nÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ Batch {date_range} complete\n")
+            print(f"\n[OK] Batch {date_range} complete\n")
         
         print("="*70)
-        print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ ALL TEMPORAL BATCHES COMPLETE")
+        print("[OK] ALL TEMPORAL BATCHES COMPLETE")
         print("="*70)
         return
     

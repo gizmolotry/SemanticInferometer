@@ -1,0 +1,51 @@
+{
+  "variance_decomposition": {
+    "total_variance": 0.0018908294150605798,
+    "consensus_variance": 0.0018589308019727468,
+    "mean_residual_variance": 3.1898554880172014e-05,
+    "consensus_fraction": 0.9831298303095147,
+    "residual_fraction": 0.01687013890629051,
+    "per_observer_residual_variance": [
+      3.1898554880172014e-05,
+      3.1898554880172014e-05
+    ],
+    "n_observers": 2,
+    "n_items": 6953,
+    "dim": 512
+  },
+  "alignment_distances": {
+    "before": [
+      0.0,
+      115.85786437988281
+    ],
+    "after": [
+      0.0,
+      21.312095642089844
+    ]
+  },
+  "observer_info": [
+    {
+      "file": "temporal_20250107-20250114_enhanced_mode_observer_42.pt",
+      "seed": 42,
+      "shape": [
+        6953,
+        512
+      ],
+      "norm": 81.95025634765625
+    },
+    {
+      "file": "temporal_20250107-20250114_enhanced_mode_observer_43.pt",
+      "seed": 43,
+      "shape": [
+        6953,
+        512
+      ],
+      "norm": 82.18842315673828
+    }
+  ],
+  "reference_idx": 0,
+  "centered": false,
+  "n_observers": 2,
+  "n_items": 6953,
+  "dim": 512
+}

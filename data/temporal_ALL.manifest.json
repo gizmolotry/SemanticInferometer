@@ -1,0 +1,39 @@
+{
+  "input_path": "D:\\belief-transformer\\V3\\data\\temporal_ALL.jsonl",
+  "output_path": "D:\\belief-transformer\\V3\\data\\temporal_ALL.preprocessed.jsonl",
+  "manifest_path": "D:\\belief-transformer\\V3\\data\\temporal_ALL.manifest.json",
+  "started_at": "2026-01-09T05:05:17.879519+00:00",
+  "finished_at": "2026-01-09T05:05:28.205415+00:00",
+  "loaded_lines": 58841,
+  "parsed_articles": 58841,
+  "json_errors": 0,
+  "valid_articles": 58841,
+  "dropped_articles": 0,
+  "issues": {
+    "title_too_short": 1017
+  },
+  "require_timestamp": true,
+  "timestamp_valid": 58841,
+  "timestamp_missing": 0,
+  "timestamp_invalid": 0,
+  "dedupe_strategy": "first",
+  "canonical_generated": 58841,
+  "unique_canonical": 58756,
+  "duplicates_collapsed": 85,
+  "time_min_date": "1998-07-20",
+  "time_max_date": "2025-12-26",
+  "notes": {
+    "schema": "Original fields preserved; added source, published_ts, published_date, canonical_id, url_normalized.",
+    "dedupe": {
+      "strategy": "first",
+      "keep_all": false
+    },
+    "url_normalization": {
+      "max_query_params": 25,
+      "max_url_len": 2048,
+      "drop_query_if_too_many": true,
+      "strip_www": true
+    },
+    "generated_at": "2026-01-09T05:05:28.205415+00:00"
+  }
+}

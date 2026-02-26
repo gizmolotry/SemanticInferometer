@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from typing import Tuple, List
 import json
 import argparse
@@ -77,18 +78,28 @@ def calculate_unified_metric(
         print(f"Warning: Not enough samples ({len(embeddings)}) for KNN k={knn_k}. Assigning uniform density.")
         density = np.ones(len(embeddings)) * 0.5 # Default to mid-density
 
-    # 3. Calculate STRESS (grad_norm) as the L2 norm of the gradient vectors. Normalize 0-1.
+    # 3. Calculate STRESS (grad_norm) as the L2 norm of the gradient vectors.
+    # Use robust scaling + power-law stretch so high-friction extremes are visible.
     print("Calculating stress (L2 norm of gradients)...")
-    stress = np.linalg.norm(gradients, axis=1)
+    raw_stress = np.linalg.norm(gradients, axis=1).astype(float)
+    stress_scaler = RobustScaler()
+    stress_robust = stress_scaler.fit_transform(raw_stress.reshape(-1, 1)).reshape(-1)
+    # Shift to non-negative before power transform.
+    stress_shifted = stress_robust - stress_robust.min()
+    stress_power = np.power(stress_shifted + thermo_config.density_clamp_min, 0.75)
     stress = (
-        (stress - stress.min()) /
-        (stress.max() - stress.min() + thermo_config.density_clamp_min)
-    )  # Normalize 0-1
+        (stress_power - stress_power.min()) /
+        (stress_power.max() - stress_power.min() + thermo_config.density_clamp_min)
+    )
 
-    # 4. Calculate Z_HEIGHT using the physics formula:
-    #    z = stress * 1.2 + (1.0 - density) * 0.8 # Updated formula
+    # 4. Calculate Z_HEIGHT from clamped log-density potential:
+    #    Z = -log(rho + epsilon), then min-max scale to [0, max_z].
     print("Calculating Z_HEIGHT...")
-    z_height = stress * z_stress_factor + (1.0 - density) * z_density_factor
+    epsilon = thermo_config.density_clamp_min
+    z_potential = -np.log(np.clip(density, epsilon, None))
+    max_z = float(z_stress_factor + z_density_factor)
+    z_scaler = MinMaxScaler(feature_range=(0.0, max_z))
+    z_height = z_scaler.fit_transform(z_potential.reshape(-1, 1)).reshape(-1)
 
     # 5. Calculate ZONES (Bridge/Swamp/Tightrope/Void) using DYNAMIC MEDIAN THRESHOLDS
     print("Classifying zones (Bridge/Swamp/Tightrope/Void)...")
