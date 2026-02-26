@@ -1,6 +1,10 @@
 # Data / experiment artifacts
 experiments/
 experiments_*/
+outputs/*
+!outputs/README.md
+archive/*
+!archive/README.md
 analysis/outputs/
 analysis/viz_output/
 analysis/reports/
@@ -37,3 +41,8 @@ venv/
 .claude/
 .omc/
 oh-my-claudecode/
+
+# Thesis / release housekeeping
+thesis_release/*/scratch/
+thesis_release/*/tmp/
+thesis_release/*/validation_report.json
