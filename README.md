@@ -38,6 +38,9 @@ python run_full_experiment_suite.py --mode enhanced --seeds 42 420 4200 --kernel
 python run_full_experiment_suite.py --synthetic --mode enhanced --seeds 42 420 4200 --kernels rbf laplacian rq imq --channels cls --limit 60
 ```
 
+Note: `run_full_experiment_suite.py` now auto-syncs the `RESULTS.md` run registry after completion.
+Use `--no-post-sync-results` to disable, and `--post-validate-thesis` to also run thesis artifact validation.
+
 ## Notes
 - Keep exploratory runs out of thesis claims unless promoted to canonical.
 - Keep the root clean; write generated files to `outputs/`.

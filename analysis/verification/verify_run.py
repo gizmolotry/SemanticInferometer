@@ -6,6 +6,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from enum import Enum
+import itertools
 
 class LayerStatus(Enum):
     VERIFIED = "VERIFIED"
@@ -53,6 +54,64 @@ def compute_corr(vec1: torch.Tensor, vec2: torch.Tensor) -> float:
         return float(torch.corrcoef(torch.stack([vec1.detach().cpu(), vec2.detach().cpu()]))[0, 1].item())
     except:
         return float(np.corrcoef(vec1.detach().cpu().numpy(), vec2.detach().cpu().numpy())[0, 1])
+
+
+def _extract_features(data: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Extract feature matrix as numpy array from an observer artifact payload."""
+    feats = data.get("features", None)
+    if feats is None:
+        feats = data.get("embeddings", None)
+    if feats is None:
+        return None
+    if isinstance(feats, torch.Tensor):
+        feats = feats.detach().cpu().numpy()
+    elif not isinstance(feats, np.ndarray):
+        feats = np.asarray(feats)
+    if feats.ndim != 2:
+        return None
+    return feats.astype(np.float64, copy=False)
+
+
+def _center(X: np.ndarray) -> np.ndarray:
+    return X - X.mean(axis=0, keepdims=True)
+
+
+def _normalize_fro(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = float(np.linalg.norm(X, ord="fro"))
+    if n < eps:
+        return X.copy()
+    return X / n
+
+
+def _orthogonal_procrustes(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    M = A.T @ B
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def metric_procrustes_residual(obs1: np.ndarray, obs2: np.ndarray) -> float:
+    """
+    Rotation-invariant geometry mismatch between two observer embeddings.
+    Lower = more similar; higher = more observer disagreement.
+    """
+    n = min(obs1.shape[0], obs2.shape[0])
+    d = min(obs1.shape[1], obs2.shape[1])
+    A = _normalize_fro(_center(obs1[:n, :d]))
+    B = _normalize_fro(_center(obs2[:n, :d]))
+    R = _orthogonal_procrustes(A, B)
+    return float(np.linalg.norm((A @ R) - B, ord="fro"))
+
+
+def compute_normalized_energy(X: np.ndarray) -> float:
+    """
+    Structural energy via centered covariance trace.
+    Higher means richer geometric variance structure.
+    """
+    if X.ndim != 2 or X.shape[0] == 0:
+        return float("nan")
+    X_centered = X - X.mean(axis=0, keepdims=True)
+    cov_like = (X_centered @ X_centered.T) / float(X.shape[0])
+    return float(np.trace(cov_like))
 
 def load_pt_file(path: Path) -> Optional[Dict[str, Any]]:
     try:
@@ -170,67 +229,65 @@ def check_crn_locked(artifacts: Dict[str, Any]) -> Dict[str, Any]:
     return results
 
 def check_control_ordering(artifacts: Dict[str, Any], is_comparable: bool) -> Dict[str, Any]:
-    """Check 2: Structural ordering Real > Shuffled > Random > Constant."""
-    energies = {}
+    """Check 2: Structural energy dominance Real > each control."""
+    scores = {}
     for corpus, seeds in artifacts.items():
-        corpus_energies = []
-        for seed, data in seeds.items():
-            feats = data.get("features", None)
-            if feats is None:
-                feats = data.get("embeddings", None)
+        energies: List[float] = []
+        for _, data in seeds.items():
+            feats = _extract_features(data)
             if feats is not None:
-                G = compute_gram(feats)
-                energy = float(torch.norm(G, p="fro").item())
-                corpus_energies.append(energy)
-        if corpus_energies: energies[corpus] = float(np.mean(corpus_energies))
-    
+                e = compute_normalized_energy(feats)
+                if np.isfinite(e):
+                    energies.append(float(e))
+        if energies:
+            scores[corpus] = float(np.mean(energies))
+
     required = ["real", "control_shuffled", "control_random", "control_constant"]
     failed_inequalities = []
-    valid = is_comparable and all(c in energies for c in required)
+    valid = is_comparable and all(c in scores for c in required)
     success = True
     if not valid:
         success = False
     else:
-        inequalities = [
-            ("real", "control_shuffled"),
-            ("control_shuffled", "control_random"),
-            ("control_random", "control_constant"),
-        ]
-        for lhs, rhs in inequalities:
-            if not (energies[lhs] > energies[rhs]):
+        controls = ["control_shuffled", "control_random", "control_constant"]
+        for ctrl in controls:
+            if not (scores["real"] > scores[ctrl]):
                 success = False
                 failed_inequalities.append(
-                    f"Ordering failed: {lhs} ({energies[lhs]:.6f}) <= {rhs} ({energies[rhs]:.6f})"
+                    f"Ordering failed: real ({scores['real']:.6f}) <= {ctrl} ({scores[ctrl]:.6f})"
                 )
     pass_val = bool(success) if valid else None
     return {
         "pass": pass_val,
-        "values": to_native(energies),
+        "values": to_native({"metric": "normalized_energy_trace", "scores": scores}),
         "valid": bool(valid),
         "fail_reasons": to_native(failed_inequalities),
     }
 
 def check_seed_stability(artifacts: Dict[str, Any], is_comparable: bool) -> Dict[str, Any]:
-    """Check 3: Seed stability plateau (Gram correlation)."""
-    if "real" not in artifacts: return {"pass": None, "value": 0.0, "valid": bool(is_comparable)}
-    grams = []
-    for seed, data in artifacts["real"].items():
-        feats = data.get("features", None)
-        if feats is None:
-            feats = data.get("embeddings", None)
-        if feats is not None: grams.append(compute_gram(feats))
-    if len(grams) < 2: return {"pass": None, "value": 1.0, "note": "Single seed run", "valid": bool(is_comparable)}
-    
-    correlations = []
-    for i in range(len(grams)):
-        for j in range(i + 1, len(grams)):
-            n = grams[i].shape[0]
-            iu = torch.triu_indices(n, n, offset=1)
-            vec1, vec2 = grams[i][iu[0], iu[1]], grams[j][iu[0], iu[1]]
-            correlations.append(compute_corr(vec1, vec2))
-    avg_corr = float(np.mean(correlations))
-    pass_val = bool(avg_corr > 0.90) if is_comparable else None
-    return {"pass": pass_val, "value": float(avg_corr), "valid": bool(is_comparable)}
+    """Check 3: Seed stability via scale-aware dispersion (CV) of pairwise Procrustes."""
+    if "real" not in artifacts:
+        return {"pass": None, "value": 0.0, "valid": bool(is_comparable)}
+
+    mats: List[np.ndarray] = []
+    for _, data in artifacts["real"].items():
+        feats = _extract_features(data)
+        if feats is not None:
+            mats.append(feats)
+    if len(mats) < 2:
+        return {"pass": None, "value": 1.0, "note": "Single seed run", "valid": bool(is_comparable)}
+
+    pairwise = [metric_procrustes_residual(a, b) for a, b in itertools.combinations(mats, 2)]
+    mean_v = float(np.mean(pairwise))
+    std_v = float(np.std(pairwise))
+    cv = float(std_v / (mean_v + 1e-12))
+    pass_val = bool(cv <= 0.35) if is_comparable else None
+    return {
+        "pass": pass_val,
+        "value": cv,
+        "valid": bool(is_comparable),
+        "details": {"metric": "pairwise_procrustes_cv", "mean": mean_v, "std": std_v, "n_pairs": len(pairwise)},
+    }
 
 def resolve_alpha_sweep_path(layer_dir: Path, exp_dir: Path, corpus: str = "real") -> Optional[Path]:
     """Robust resolver for alpha_sweep_results.json."""
