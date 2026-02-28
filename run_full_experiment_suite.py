@@ -562,6 +562,85 @@ def run_single_corpus(
     }
 
 
+def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str, Any]:
+    """
+    Emit thesis-facing baseline artifacts for Dash browsing:
+      - MONOLITH.html
+      - observer_manifest.json
+      - observer_<idx>/MONOLITH.html links (or copies)
+    """
+    run_dir = Path(run_dir)
+    monolith_out = run_dir / "MONOLITH.html"
+    monolith_csv = run_dir / "MONOLITH_DATA.csv"
+    if not monolith_csv.exists():
+        return {
+            "status": "skipped",
+            "reason": f"missing MONOLITH_DATA.csv at {monolith_csv}",
+            "run_dir": str(run_dir),
+        }
+
+    viz_cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "analysis" / "MONOLITH_VIZ.py"),
+        str(run_dir),
+        "--output",
+        str(monolith_out),
+        "--mode",
+        "synthesis",
+    ]
+    if strict:
+        viz_cmd.append("--strict")
+
+    precompute_cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "analysis" / "precompute_observer_artifacts.py"),
+        str(run_dir),
+        "--variant",
+        "MONOLITH.html",
+        "--mode",
+        "link",
+    ]
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    try:
+        print(f"[BUNDLE] Rendering MONOLITH baseline for {run_dir}...")
+        viz_res = subprocess.run(viz_cmd, env=env)
+        if viz_res.returncode != 0:
+            return {
+                "status": "failed",
+                "stage": "monolith_render",
+                "returncode": viz_res.returncode,
+                "run_dir": str(run_dir),
+            }
+
+        print(f"[BUNDLE] Materializing observer manifest for {run_dir}...")
+        pre_res = subprocess.run(precompute_cmd, env=env)
+        if pre_res.returncode != 0:
+            return {
+                "status": "failed",
+                "stage": "observer_manifest",
+                "returncode": pre_res.returncode,
+                "run_dir": str(run_dir),
+            }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "stage": "exception",
+            "error": str(exc),
+            "run_dir": str(run_dir),
+        }
+
+    return {
+        "status": "success",
+        "run_dir": str(run_dir),
+        "monolith": str(monolith_out),
+        "observer_manifest": str(run_dir / "observer_manifest.json"),
+    }
+
+
 # -----------------------------
 # Gradient Channel Runner (Track 3)
 # -----------------------------
@@ -1290,6 +1369,63 @@ def save_manifest(exp_dir: Path, results: List[Dict], config: Dict):
     print(f"\n Saved manifest: {manifest_path}")
 
 
+def run_post_thesis_sync(run_validation: bool = False) -> None:
+    """
+    Sync thesis-facing registry/docs after a suite run.
+
+    - Always tries to refresh RESULTS.md from manifest files.
+    - Optionally runs thesis artifact validation.
+    - Never raises hard exceptions (post-run convenience only).
+    """
+    print(f"\n{'='*80}")
+    print("POST-RUN THESIS SYNC")
+    print(f"{'='*80}")
+
+    builder = Path("scripts/build_results_registry.py")
+    if builder.exists():
+        print("Syncing RESULTS.md registry from manifests...")
+        res = subprocess.run(
+            [sys.executable, str(builder)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.returncode == 0:
+            if res.stdout.strip():
+                print(res.stdout.strip())
+            else:
+                print("[OK] RESULTS.md sync complete.")
+        else:
+            print("[WARN] RESULTS.md sync failed.")
+            if res.stdout.strip():
+                print(res.stdout.strip())
+            if res.stderr.strip():
+                print(res.stderr.strip())
+    else:
+        print("[WARN] scripts/build_results_registry.py not found; skipping registry sync.")
+
+    if not run_validation:
+        return
+
+    validator = Path("scripts/validate_thesis_artifacts.py")
+    if validator.exists():
+        print("Running thesis artifact validation...")
+        res = subprocess.run(
+            [sys.executable, str(validator), "--no-registry-sync"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.stdout.strip():
+            print(res.stdout.strip())
+        if res.returncode != 0 and res.stderr.strip():
+            print(res.stderr.strip())
+    else:
+        print("[WARN] scripts/validate_thesis_artifacts.py not found; skipping validation.")
+
+
 def run_comparison(exp_dir: Path, seeds: List[int], kernels: List[str] = None, channels: List[str] = None) -> bool:
     """Run comparison analysis via compare_controls.py.
 
@@ -1453,6 +1589,16 @@ def main():
         "--verify",
         action="store_true",
         help="Run verification harness after experiment suite"
+    )
+    parser.add_argument(
+        "--no-post-sync-results",
+        action="store_true",
+        help="Skip automatic RESULTS.md registry sync after suite completion."
+    )
+    parser.add_argument(
+        "--post-validate-thesis",
+        action="store_true",
+        help="Also run thesis artifact validator after post-run registry sync."
     )
     parser.add_argument(
         "--crn-seed",
@@ -1793,6 +1939,8 @@ def main():
         print("SYNTHETIC EXPERIMENT COMPLETE")
         print(f"{'='*80}")
         print(f"Results saved to: {exp_dir.absolute()}")
+        if not args.no_post_sync_results:
+            run_post_thesis_sync(run_validation=args.post_validate_thesis)
         return
 
     corpora = args.corpora
@@ -1972,6 +2120,14 @@ def main():
                     print(f"\n Experiment failed: {corpus}")
                     print("Stopping experiment suite.")
                     break
+
+                # Emit baseline + observer manifest artifacts (no online recompute in Dash).
+                bundle_result = materialize_baseline_bundle(output_dir, strict=True)
+                result["baseline_bundle"] = bundle_result
+                if bundle_result.get("status") != "success":
+                    print(f"[BUNDLE][WARN] {bundle_result}")
+                else:
+                    print(f"[BUNDLE][OK] {bundle_result.get('observer_manifest')}")
         
                 # Probe (OPTIONAL - only if hypotheses provided)
                 if probe_enabled:
@@ -2738,6 +2894,9 @@ def main():
             print(f"[VERIFY] Error during verification: {e}")
             import traceback
             traceback.print_exc()
+
+    if not args.no_post_sync_results:
+        run_post_thesis_sync(run_validation=args.post_validate_thesis)
 
     # Summary
     print(f"\n{'='*80}")

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -29,7 +31,28 @@ def main() -> int:
         default="thesis_release/2026-02-26",
         help="Release directory to validate (default: %(default)s)",
     )
+    parser.add_argument(
+        "--no-registry-sync",
+        action="store_true",
+        help="Skip automatic RESULTS.md registry refresh before validation.",
+    )
     args = parser.parse_args()
+
+    if not args.no_registry_sync:
+        builder = Path("scripts/build_results_registry.py")
+        if builder.exists():
+            print("Syncing RESULTS.md registry from manifests...")
+            res = subprocess.run([sys.executable, str(builder)], capture_output=True, text=True)
+            if res.returncode != 0:
+                print("VALIDATION FAILED")
+                print("- Registry sync failed")
+                if res.stdout.strip():
+                    print(res.stdout.strip())
+                if res.stderr.strip():
+                    print(res.stderr.strip())
+                return 1
+            if res.stdout.strip():
+                print(res.stdout.strip())
 
     release_dir = Path(args.release_dir)
 

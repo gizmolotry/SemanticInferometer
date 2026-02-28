@@ -23,7 +23,7 @@ This is a useful baseline but not yet a full canonical matrix (single run key on
 
 ## Canonical Run Registry
 
-_Auto-generated from manifests on 2026-02-26T07:23:26._
+_Auto-generated from manifests on 2026-02-26T07:31:12._
 
 | Run ID | Date | Purpose | Command Class | Status | Canonical | Notes |
 |---|---|---|---|---|---|---|
