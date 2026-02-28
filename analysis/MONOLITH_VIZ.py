@@ -1787,268 +1787,61 @@ def render_phantom_paths_3d(
     positions_3d: np.ndarray,
     article_metadata: Optional[List[Dict]] = None,
     spectral_evr: Optional[np.ndarray] = None,
-    terrain_grid_x: Optional[np.ndarray] = None, # New parameter for terrain clamping
-    terrain_grid_y: Optional[np.ndarray] = None, # New parameter for terrain clamping
-    terrain_grid_z: Optional[np.ndarray] = None, # New parameter for terrain clamping
+    terrain_grid_x: Optional[np.ndarray] = None, 
+    terrain_grid_y: Optional[np.ndarray] = None, 
+    terrain_grid_z: Optional[np.ndarray] = None, 
 ) -> List[Any]:
-    """
-    Render walker flow paths emanating from each article based on verdict.
-    NOW INCLUDES FULL ARTICLE METADATA ON HOVER.
-
-    These are the "water flow" lines showing how walkers navigate the terrain:
-
-    HONEST (Cyan Rivers): Smooth lines flowing toward low-energy centroid.
-        The 50 walkers found the path of least resistance. Laminar flow.
-
-    PHANTOM (Magenta Knots): Twisted spiral loops that swirl around.
-        The walkers split up and spun in circles. Hysteresis/turbulence.
-
-    RUPTURE (Red Sparks): Short stubs that terminate abruptly.
-        The walker hit a singularity (Void) and crashed.
-
-    TAUTOLOGY (Gray Circles): Thin loops that go nowhere.
-        The walker claimed movement but just spun in place on a Bridge.
-    """
-    if not HAS_PLOTLY:
-        return []
-
+    """3+2+1 EPISTEMIC OVERHAUL: Families A (Paths) and B (Breaks)."""
+    if not HAS_PLOTLY: return []
     traces = []
     fast_render = os.environ.get("MONOLITH_FAST_RENDER", "0").strip() == "1"
     n_articles = min(len(phantom_verdicts), len(positions_3d))
-
-    # Compute centroid as the "low energy attractor" (downhill direction)
     centroid = positions_3d.mean(axis=0)
 
-    # Helper function to interpolate Z from terrain grid
-    if terrain_grid_x is not None and terrain_grid_y is not None and terrain_grid_z is not None:
-        points_to_interpolate = (terrain_grid_x.flatten(), terrain_grid_y.flatten())
-        values_to_interpolate = terrain_grid_z.flatten()
-        # griddata is already imported at the top level
-        
-        def interpolate_z_from_terrain(x_coords, y_coords, offset=0.05):
-            interp_z = griddata(points_to_interpolate, values_to_interpolate,
-                                (x_coords, y_coords), method='linear', fill_value=0)
-            return interp_z + offset # Add a small offset to sit on top
-    else:
-        # Fallback if terrain grid not provided (should not happen now)
-        def interpolate_z_from_terrain(x_coords, y_coords, offset=0.05):
-            # Use a constant Z near the points' average Z
-            mean_z = positions_3d[:, 2].mean() if len(positions_3d) > 0 else 0
-            return np.full_like(x_coords, mean_z + offset)
+    from scipy.interpolate import griddata
+    def interpolate_z_from_terrain(x_coords, y_coords, offset=0.05):
+        if terrain_grid_x is not None:
+            interp_z = griddata((terrain_grid_x.flatten(), terrain_grid_y.flatten()), 
+                                terrain_grid_z.flatten(), (x_coords, y_coords), method='linear', fill_value=0)
+            return interp_z + offset
+        return np.full_like(x_coords, positions_3d[:, 2].mean() + offset)
 
+    import numpy as np
+    import random
     for i in range(n_articles):
-        verdict_info = phantom_verdicts[i]
-        verdict = verdict_info.get("verdict", "UNKNOWN")
-        terrain = verdict_info.get("terrain_state", "unknown")
+        v_info = phantom_verdicts[i]
+        verdict = v_info.get("verdict", "UNKNOWN")
+        walker_state = str(v_info.get("walker_state", "success")).lower()
         pos = positions_3d[i]
-
-        d_val = verdict_info.get("d", verdict_info.get("d_spectral", 0.0))
-        w_val = verdict_info.get("w", verdict_info.get("w_actual", 0.0))
-        delta = verdict_info.get("delta", 0.0)
-
-        # Get article metadata
         meta = article_metadata[i] if article_metadata and i < len(article_metadata) else {}
         title = str(meta.get('title', f'Article {i}'))[:60]
-        bt_uid = str(meta.get('bt_uid', ''))[:16]
-        evr = spectral_evr[i] if spectral_evr is not None and i < len(spectral_evr) else 0.5
+        hover_text = f'TRACE #{i} [{verdict}]<br>{title}'
 
-        # Handle infinity values for display
-        d_str = f"{d_val:.2f}" if np.isfinite(d_val) else "inf"
-        w_str = f"{w_val:.2f}" if np.isfinite(w_val) else "inf"
-        delta_str = f"{delta:.2f}" if np.isfinite(delta) else "inf"
-
-        # Verdict color
-        verdict_color = "#00F0FF" if verdict == "HONEST" else "#FF00FF" if verdict == "PHANTOM" else "#FF2222" if verdict == "RUPTURE" else "#888"
-
-        hover_text = (
-            f'<b style="font-size:14px">FLOW #{i} [{verdict}]</b><br>'
-            f'<span style="color:#00F0FF">{title}</span><br>'
-            f'<span style="color:#888">UID: {bt_uid}</span><br>'
-            f'<b>═══════════════════════</b><br>'
-            f'<b>EVR:</b> {evr:.3f} | <b>Terrain:</b> {terrain}<br>'
-            f'<b>T5 Verdict:</b> <span style="color:{verdict_color}">{verdict}</span><br>'
-            f'<b>  d={d_str}, W={w_str}, Delta={delta_str}</b><br>'
-            f'<b>Delta = {delta_str}x</b><br>'
-            f'<b>Verdict: {verdict}</b>'
-        )
-
-        # Direction toward centroid (downhill)
         to_center = centroid - pos
-        dist_to_center = np.linalg.norm(to_center)
-        if dist_to_center > 0:
-            direction = to_center / dist_to_center
-        else:
-            direction = np.array([1, 0, 0])
+        direction = to_center / (np.linalg.norm(to_center) + 1e-6)
+        path_length = min(np.linalg.norm(to_center) * 0.4, 0.5)
 
-        # Path length scales with distance to center
-        path_length = min(dist_to_center * 0.4, 0.5)
+        # FAMILY A: THE SPECTRAL PATHS (H/P/T)
+        if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
+            path_color = ("#00F0FF" if verdict == "HONEST" else "#FF00FF" if verdict == "PHANTOM" else "#FFFF00")
+            t = np.linspace(0, 1.0, 12 if fast_render else 24)
+            curve_radius = 0.10 
+            curve_x = pos[0] + direction[0] * t * path_length + curve_radius * np.sin(t * np.pi)
+            curve_y = pos[1] + direction[1] * t * path_length + curve_radius * np.cos(t * np.pi)
+            curve_z = interpolate_z_from_terrain(curve_x, curve_y, offset=0.03)
+            traces.append(go.Scatter3d(x=curve_x, y=curve_y, z=curve_z, mode='lines', line=dict(color=path_color, width=3), opacity=0.8, name=f'{verdict.capitalize()} Path'))
 
-        if verdict == "TAUTOLOGY":
-            # TAUTOLOGY: Small gray circle — walker spun in place, no real movement
-            # Generate circular path around the article position
-            n_pts = 12 if fast_render else 20
-            radius = 0.08
-            theta = np.linspace(0, 2 * np.pi, n_pts)
-            circle_x = pos[0] + radius * np.cos(theta)
-            circle_y = pos[1] + radius * np.sin(theta)
-            circle_z = interpolate_z_from_terrain(circle_x, circle_y)
-
-            traces.append(go.Scatter3d(
-                x=circle_x,
-                y=circle_y,
-                z=circle_z,
-                mode='lines',
-                line=dict(color='#666666', width=1, dash='dot'),
-                opacity=0.4,
-                name='Tautology (Spinning)',
-                hovertemplate=hover_text + '<extra></extra>',
-                showlegend=len([t for t in traces if 'Tautology' in (getattr(t, 'name', '') or '')]) == 0,
-            ))
-
-        elif verdict == "HONEST":
-            # CYAN RIVER: Smooth line flowing toward centroid (downhill)
-            # Laminar flow - the walker found the easy path
-            end_pos = pos + direction * path_length
-
-            # Main flow line
-            traces.append(go.Scatter3d(
-                x=[pos[0], end_pos[0]],
-                y=[pos[1], end_pos[1]],
-                z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03),
-                mode='lines',
-                line=dict(color=PALETTE.honest_cyan, width=3),
-                opacity=0.85,
-                name='Honest (Cyan River)',
-                hovertemplate=hover_text + '<extra></extra>',
-                showlegend=len([t for t in traces if 'Honest' in (getattr(t, 'name', '') or '')]) == 0,
-            ))
-
-            # Optional glow layer for full-quality render.
-            if not fast_render:
-                traces.append(go.Scatter3d(
-                    x=[pos[0], end_pos[0]],
-                    y=[pos[1], end_pos[1]],
-                    z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.02),
-                    mode='lines',
-                    line=dict(color=PALETTE.honest_cyan, width=8),
-                    opacity=0.15,
-                    showlegend=False,
-                    hoverinfo='skip',
-                ))
-
-        elif verdict == "PHANTOM":
-            # MAGENTA KNOT: Twisted spiral showing hysteresis/turbulence
-            # The walkers split up and swirled around
-            n_pts = 18 if fast_render else 30
-            t = np.linspace(0, 3 * np.pi, n_pts)
-            spiral_radius = 0.12
-            spiral_stretch = path_length * 0.8
-
-            # Create helical path
-            helix_x = pos[0] + spiral_radius * np.cos(t) + direction[0] * t / (3 * np.pi) * spiral_stretch
-            helix_y = pos[1] + spiral_radius * np.sin(t) + direction[1] * t / (3 * np.pi) * spiral_stretch
-            helix_z = interpolate_z_from_terrain(helix_x, helix_y, offset=0.03) # Clamp to terrain
-
-            # Optional glow layer for full-quality render.
-            if not fast_render:
-                traces.append(go.Scatter3d(
-                    x=helix_x,
-                    y=helix_y,
-                    z=helix_z,
-                    mode='lines',
-                    line=dict(color='#9900FF', width=10),
-                    opacity=0.2,
-                    showlegend=False,
-                    hoverinfo='skip',
-                ))
-
-            # Core spiral
-            traces.append(go.Scatter3d(
-                x=helix_x,
-                y=helix_y,
-                z=helix_z,
-                mode='lines',
-                line=dict(color='#CC00FF', width=4),
-                opacity=0.7,
-                name='Phantom (Magenta Knot)',
-                hovertemplate=hover_text + '<extra></extra>',
-                showlegend=len([t for t in traces if 'Phantom' in (getattr(t, 'name', '') or '')]) == 0,
-            ))
-
+        # FAMILY B: THE TOPOLOGICAL BREAKS (B/F)
         elif verdict == "RUPTURE":
-            # RED SPARK: Short stub that terminates - walker crashed into Void
-            stub_length = 0.15
-            stub_end = pos + direction * stub_length
-
-            # The stub (short red line)
-            traces.append(go.Scatter3d(
-                x=[pos[0], stub_end[0]],
-                y=[pos[1], stub_end[1]],
-                z=interpolate_z_from_terrain(np.array([pos[0], stub_end[0]]), np.array([pos[1], stub_end[1]]), offset=0.03),
-                mode='lines',
-                line=dict(color=PALETTE.rupture_red, width=5),
-                opacity=0.9,
-                name='Rupture (Red Spark)',
-                hovertemplate=hover_text + '<extra></extra>',
-                showlegend=len([t for t in traces if 'Rupture' in (getattr(t, 'name', '') or '')]) == 0,
-            ))
-
-            # Spark particles are expensive to serialize; skip in fast render.
-            if not fast_render:
-                n_sparks = 4
-                for _ in range(n_sparks):
-                    spark_offset = np.array([
-                        random.uniform(-0.03, 0.03),
-                        random.uniform(-0.03, 0.03),
-                        random.uniform(-0.03, 0.03),
-                    ])
-                    spark_pos = stub_end + spark_offset
-                    traces.append(go.Scatter3d(
-                        x=[spark_pos[0]],
-                        y=[spark_pos[1]],
-                        z=[interpolate_z_from_terrain(np.array([spark_pos[0]]), np.array([spark_pos[1]]), offset=0.04)],
-                        mode='markers',
-                        marker=dict(size=4, color='#FF4400', opacity=0.8),
-                        showlegend=False,
-                        hoverinfo='skip',
-                    ))
-
-        elif verdict == "BROKEN":
-            # BROKEN: Dotted red line indicating kinetic energy exhaustion
-            end_pos = pos + direction * 0.25
-            traces.append(go.Scatter3d(
-                x=[pos[0], end_pos[0]],
-                y=[pos[1], end_pos[1]],
-                z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03),
-                mode='lines',
-                line=dict(color='#FF5555', width=2, dash='dot'),
-                opacity=0.8,
-                name='Broken (Kinetic Death)',
-                hovertemplate=hover_text + '<extra></extra>',
-                showlegend=len([t for t in traces if 'Broken' in (getattr(t, 'name', '') or '')]) == 0,
-            ))
-
-        elif verdict == "TRAPPED":
-            # TRAPPED: Jittery dim phantom path (topological stall)
-            n_jitter = 5
-            jitter_x, jitter_y, jitter_z = [], [], []
-            for _ in range(n_jitter):
-                jp = pos + np.random.randn(3) * 0.015
-                jitter_x.append(jp[0])
-                jitter_y.append(jp[1])
-                # Ensure z is a flat array for interpolate_z
-                jz = interpolate_z_from_terrain(np.array([jp[0]]), np.array([jp[1]]), offset=0.02)
-                jitter_z.append(jz[0] if hasattr(jz, "__len__") else jz)
-
-            traces.append(go.Scatter3d(
-                x=jitter_x, y=jitter_y, z=jitter_z,
-                mode='markers',
-                marker=dict(size=3, color='#888888', opacity=0.4),
-                name='Trapped (Stall)',
-                hovertemplate=hover_text + '<extra></extra>',
-                showlegend=len([t for t in traces if 'Trapped' in (getattr(t, 'name', '') or '')]) == 0,
-            ))
-
+            if walker_state == "broken":
+                end_pos = pos + direction * 0.3
+                traces.append(go.Scatter3d(x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]], z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03), mode='lines', line=dict(color="#FF2222", width=4), name='Walker Break (Laser)'))
+            else:
+                n_jag = 6
+                jx = np.linspace(pos[0], pos[0] + direction[0] * 0.2, n_jag) + np.random.uniform(-0.04, 0.04, n_jag)
+                jy = np.linspace(pos[1], pos[1] + direction[1] * 0.2, n_jag) + np.random.uniform(-0.04, 0.04, n_jag)
+                jz = interpolate_z_from_terrain(jx, jy, offset=0.04)
+                traces.append(go.Scatter3d(x=jx, y=jy, z=jz, mode='lines', line=dict(color='#FF00FF', width=2), name='Fault Line (Lightning)'))
     return traces
 
 
@@ -2822,6 +2615,11 @@ def render_data_points_3d(
         glow_opacity_val = 0.3  # Default glow opacity
         glow_size_factor_val = 1.0 # Default glow size factor for points
 
+                # FAMILY C: NODE FAILURES (Internal Singularity)
+        if evr < 0.5:
+            glow_opacity_val = 0.8
+            glow_size_factor_val = 2.5
+            r, g, b = (255, 0, 0) # Pulsing Red
         if is_fog is not None and i < len(is_fog) and is_fog[i]:
             # Decoherent (Fog): glow is minimal
             glow_opacity_val = 0.05
@@ -3184,7 +2982,7 @@ def generate_hud_html(
     walker_class = "good" if survival_rate >= 0.95 else "warn" if survival_rate >= 0.8 else "alert"
 
     # Build T5 section with optional NMI
-    t5_section = f'<span class="hud-item {phantom_class}">T5: {n_honest}H/{n_phantoms}P/{n_ruptures}R/{n_tautology}T'
+    t5_section = f'<span class="hud-item {phantom_class}">T5 SPECTRAL: {n_honest}H/{n_phantoms}P/{n_tautology}T'
     if synthesis_nmi is not None:
         nmi_class = "good" if synthesis_nmi > 0.7 else "warn" if synthesis_nmi > 0.5 else "alert"
         t5_section += f' | NMI: <span class="{nmi_class}">{synthesis_nmi:.3f}</span>'

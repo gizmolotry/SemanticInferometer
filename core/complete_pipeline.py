@@ -2034,7 +2034,7 @@ class BeliefTransformerPipeline:
                             blinker_variance=blinker_variance
                         )
                         # Log verdict summary with TAUTOLOGY
-                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0}
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0, "BROKEN": 0, "TRAPPED": 0}
                         for v in phantom_verdicts:
                             verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
                         print(f"[Panic Function] Verdicts: T={verdict_counts['TAUTOLOGY']}, "
@@ -2052,7 +2052,13 @@ class BeliefTransformerPipeline:
                         for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
                             d = float(d_spectral[i]) if i < len(d_spectral) else 0.0
                             delta = float(w) / max(float(d), EPS)
-                            if float(w) >= rupture_work_cutoff:
+                            
+                            # PRIORITIZE kinematic/topological failure states
+                            if s == "broken":
+                                verdict = "BROKEN"
+                            elif s == "trapped":
+                                verdict = "TRAPPED"
+                            elif float(w) >= rupture_work_cutoff:
                                 verdict = "RUPTURE"
                             elif delta >= honest_delta_cutoff:
                                 verdict = "HONEST"
@@ -2068,12 +2074,13 @@ class BeliefTransformerPipeline:
                                 "confidence": 1.0,
                                 "walker_state": s,
                             })
-                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0}
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0, "BROKEN": 0, "TRAPPED": 0}
                         for v in phantom_verdicts:
                             verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
                         print(f"[Track 5] Using Track 4 states (panic bypass): "
                               f"T={verdict_counts['TAUTOLOGY']}, H={verdict_counts['HONEST']}, "
-                              f"P={verdict_counts['PHANTOM']}, R={verdict_counts['RUPTURE']}")
+                              f"P={verdict_counts['PHANTOM']}, R={verdict_counts['RUPTURE']}, "
+                              f"B={verdict_counts['BROKEN']}, Tr={verdict_counts['TRAPPED']}")
 
                 # Bind per-article terrain class to walker state records for waterfall persistence.
                 if walker_state_records and phantom_verdicts and len(walker_state_records) == len(phantom_verdicts):
