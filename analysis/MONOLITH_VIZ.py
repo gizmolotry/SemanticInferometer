@@ -563,9 +563,15 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
             tautology_thresh = np.percentile(efficiency, 10)  # bottom 10% → TAUTOLOGY
             w_values = np.array([v.get('w_actual', 0.0) for v in phantom_verdicts], dtype=float)
             w_median = float(np.median(w_values))
-            reclassified = []
             for v, eff, w in zip(phantom_verdicts, efficiency, w_values):
                 nv = dict(v)
+                old_verdict = str(nv.get('verdict', '')).upper()
+                
+                # PRESERVE failure states if already set
+                if old_verdict in {'BROKEN', 'TRAPPED'}:
+                    reclassified.append(nv)
+                    continue
+
                 if eff >= honest_thresh:
                     nv['verdict'] = 'HONEST'
                 elif eff <= tautology_thresh:
@@ -2007,6 +2013,42 @@ def render_phantom_paths_3d(
                         hoverinfo='skip',
                     ))
 
+        elif verdict == "BROKEN":
+            # BROKEN: Dotted red line indicating kinetic energy exhaustion
+            end_pos = pos + direction * 0.25
+            traces.append(go.Scatter3d(
+                x=[pos[0], end_pos[0]],
+                y=[pos[1], end_pos[1]],
+                z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03),
+                mode='lines',
+                line=dict(color='#FF5555', width=2, dash='dot'),
+                opacity=0.8,
+                name='Broken (Kinetic Death)',
+                hovertemplate=hover_text + '<extra></extra>',
+                showlegend=len([t for t in traces if 'Broken' in (getattr(t, 'name', '') or '')]) == 0,
+            ))
+
+        elif verdict == "TRAPPED":
+            # TRAPPED: Jittery dim phantom path (topological stall)
+            n_jitter = 5
+            jitter_x, jitter_y, jitter_z = [], [], []
+            for _ in range(n_jitter):
+                jp = pos + np.random.randn(3) * 0.015
+                jitter_x.append(jp[0])
+                jitter_y.append(jp[1])
+                # Ensure z is a flat array for interpolate_z
+                jz = interpolate_z_from_terrain(np.array([jp[0]]), np.array([jp[1]]), offset=0.02)
+                jitter_z.append(jz[0] if hasattr(jz, "__len__") else jz)
+
+            traces.append(go.Scatter3d(
+                x=jitter_x, y=jitter_y, z=jitter_z,
+                mode='markers',
+                marker=dict(size=3, color='#888888', opacity=0.4),
+                name='Trapped (Stall)',
+                hovertemplate=hover_text + '<extra></extra>',
+                showlegend=len([t for t in traces if 'Trapped' in (getattr(t, 'name', '') or '')]) == 0,
+            ))
+
     return traces
 
 
@@ -3308,6 +3350,7 @@ def create_monolith_cockpit(
     exp: ExperimentData,
     output_path: Path,
     physics_mode: str = "synthesis",
+    observer_idx: Optional[int] = None,
     show_terrain: bool = True,
     show_fog: bool = True,
     show_walkers: bool = True,
@@ -3340,6 +3383,9 @@ def create_monolith_cockpit(
         features = exp.features
 
     n_articles = len(features)
+    focus_idx: Optional[int] = None
+    if observer_idx is not None and 0 <= int(observer_idx) < n_articles:
+        focus_idx = int(observer_idx)
 
     # Spectral data
     spectral_evr = exp.spectral_evr if exp.spectral_evr is not None else np.ones(n_articles) * 0.5
@@ -3626,8 +3672,10 @@ def create_monolith_cockpit(
         d_str = f"{d_val:.2f}" if np.isfinite(d_val) else "inf"
         w_str = f"{w_val:.2f}" if np.isfinite(w_val) else "inf"
 
+        focus_line = "<span style='color:#FFD700'>(FOCUS)</span><br>" if (focus_idx is not None and i == focus_idx) else ""
         hover_texts.append(
             f'<b style="font-size:14px">Article #{i}</b><br>'
+            f"{focus_line}"
             f'<span style="color:#00F0FF">{title}</span><br>'
             f'<span style="color:#888">UID: {bt_uid}</span><br>'
             f'{pub_line}'
@@ -3785,6 +3833,8 @@ def create_monolith_cockpit(
     print(f"[MONOLITH] Rendering {n_articles} data points...")
     # Match marker size to density: consensus points (Bridge - high density) are solid, sparse points (Void - low density) are small/dimmed.
     sizes = np.ones(n_articles) * 10 * (0.5 + 0.5 * terrain_density) # Scale size by density (5 to 10)
+    if focus_idx is not None:
+        sizes[focus_idx] = max(sizes[focus_idx] * 1.8, 14.0)
     point_traces = render_data_points_3d(
         positions_3d, spectral_evr, sizes, hover_texts,
         phantom_verdicts=phantom_verdicts, is_fog=is_fog,
@@ -4518,6 +4568,7 @@ def main():
     parser.add_argument("experiment_dir", type=Path, help="Path to experiment seed directory")
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output HTML path")
     parser.add_argument("--mode", choices=["synthesis", "analysis"], default="synthesis")
+    parser.add_argument("--observer-idx", type=int, default=None, help="Optional article index to emphasize in the render.")
     parser.add_argument("--strict", action="store_true",
                         help="Fail generation if canonical zone/NMI validation checks fail.")
     args = parser.parse_args()
@@ -4534,6 +4585,7 @@ def main():
         exp,
         output,
         physics_mode=args.mode,
+        observer_idx=args.observer_idx,
         strict_validation=args.strict,
     )
 

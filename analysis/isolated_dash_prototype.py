@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, callback_context, dcc, html
+import plotly.graph_objects as go
 
 
 PALETTE = {
@@ -80,6 +82,20 @@ TRACK_MARKERS = {
     "T5": ["track 5", "phantom", "tautology", "honest"],
     "T6": ["track 6", "hott", "proof"],
 }
+VERIFICATION_STATUSES = {"VERIFIED", "NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"}
+REQUIRED_PROVENANCE_KEYS = {
+    "schema_version",
+    "cache_version",
+    "dataset_hash",
+    "code_hash_or_commit",
+    "weights_hash",
+    "kernel_params",
+    "rks_dim",
+    "crn_seed",
+    "alpha",
+    "timestamp_utc",
+    "verification_status",
+}
 
 
 def _safe_read_text(path: Path) -> str:
@@ -91,6 +107,244 @@ def _safe_json(path: Path, default):
         return json.loads(_safe_read_text(path))
     except Exception:
         return default
+
+
+def _is_number(val) -> bool:
+    try:
+        float(val)
+        return True
+    except Exception:
+        return False
+
+
+def _run_contract_paths(run_dir: Optional[Path]) -> Dict[str, Optional[Path]]:
+    if not run_dir or not run_dir.exists():
+        return {
+            "baseline_meta": None,
+            "baseline_state": None,
+            "verification_report": None,
+            "verification_summary": None,
+            "hidden_groups": None,
+            "group_summaries": None,
+            "group_matrix": None,
+        }
+
+    labels_dir = run_dir / "labels"
+    derived_dir = labels_dir / "derived"
+    candidates = {
+        "baseline_meta": [run_dir / "baseline_meta.json"],
+        "baseline_state": [run_dir / "baseline_state.json"],
+        "verification_report": [
+            run_dir / "verification_report.json",
+            run_dir.parent / "verification_report.json",
+            run_dir.parent.parent / "verification_report.json" if run_dir.parent and run_dir.parent.parent else None,
+        ],
+        "verification_summary": [
+            run_dir / "verification_summary.csv",
+            run_dir.parent / "verification_summary.csv",
+            run_dir.parent.parent / "verification_summary.csv" if run_dir.parent and run_dir.parent.parent else None,
+        ],
+        "hidden_groups": [labels_dir / "hidden_groups.csv", run_dir / "hidden_groups.csv"],
+        "group_summaries": [derived_dir / "group_summaries.json", run_dir / "group_summaries.json"],
+        "group_matrix": [derived_dir / "group_matrix.json", run_dir / "group_matrix.json"],
+    }
+
+    out: Dict[str, Optional[Path]] = {}
+    for key, paths in candidates.items():
+        found = None
+        for p in paths:
+            if p and p.exists():
+                found = p
+                break
+        out[key] = found
+    return out
+
+
+def _validate_provenance(meta: dict) -> List[str]:
+    if not isinstance(meta, dict):
+        return ["baseline_meta is not a JSON object"]
+    missing = [k for k in sorted(REQUIRED_PROVENANCE_KEYS) if k not in meta]
+    errors: List[str] = []
+    if missing:
+        errors.append(f"baseline_meta missing keys: {', '.join(missing)}")
+    status = str(meta.get("verification_status", "")).upper()
+    if status and status not in VERIFICATION_STATUSES:
+        errors.append(f"baseline_meta.verification_status invalid: {status}")
+    return errors
+
+
+def _validate_baseline_state(blob: dict) -> List[str]:
+    if not isinstance(blob, dict):
+        return ["baseline_state is not a JSON object"]
+    errors: List[str] = []
+    for field in ("articles", "paths", "axes", "metrics"):
+        if field not in blob:
+            errors.append(f"baseline_state missing '{field}'")
+    if "articles" in blob and not isinstance(blob.get("articles"), list):
+        errors.append("baseline_state.articles must be a list")
+    if "paths" in blob and not isinstance(blob.get("paths"), list):
+        errors.append("baseline_state.paths must be a list")
+    return errors
+
+
+def _validate_observer_state(blob: dict, observer_id: int) -> List[str]:
+    if not isinstance(blob, dict):
+        return ["observer state is not a JSON object"]
+    errors: List[str] = []
+    for field in ("observer_id", "articles", "paths", "axes", "metrics", "provenance"):
+        if field not in blob:
+            errors.append(f"state missing '{field}'")
+    if "observer_id" in blob:
+        try:
+            obs = int(blob.get("observer_id"))
+            if obs != observer_id:
+                errors.append(f"state observer_id mismatch: expected {observer_id}, got {obs}")
+        except Exception:
+            errors.append("state observer_id is not an integer")
+    return errors
+
+
+def _validate_observer_delta(blob: dict, observer_id: int) -> List[str]:
+    if not isinstance(blob, dict):
+        return ["observer delta is not a JSON object"]
+    errors: List[str] = []
+    for field in (
+        "observer_id",
+        "null_observer_equivalence",
+        "path_flip_delta",
+        "metrics_delta",
+        "axis_delta",
+    ):
+        if field not in blob:
+            errors.append(f"delta missing '{field}'")
+    if "observer_id" in blob:
+        try:
+            obs = int(blob.get("observer_id"))
+            if obs != observer_id:
+                errors.append(f"delta observer_id mismatch: expected {observer_id}, got {obs}")
+        except Exception:
+            errors.append("delta observer_id is not an integer")
+    return errors
+
+
+def _read_hidden_groups(path: Optional[Path]) -> Tuple[List[dict], List[str]]:
+    rows: List[dict] = []
+    errors: List[str] = []
+    if not path or not path.exists():
+        return rows, ["hidden_groups.csv missing"]
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            required = {"article_id", "group_topic"}
+            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+                errors.append("hidden_groups.csv missing required columns article_id, group_topic")
+                return rows, errors
+            for row in reader:
+                rows.append(dict(row))
+    except Exception as exc:
+        errors.append(f"failed to parse hidden_groups.csv: {exc}")
+    return rows, errors
+
+
+def _validate_group_summaries(path: Optional[Path]) -> Tuple[dict, List[str]]:
+    data = _safe_json(path, {}) if path and path.exists() else {}
+    errors: List[str] = []
+    if not data:
+        return {}, ["group_summaries.json missing"]
+    groups = data.get("groups")
+    if not isinstance(groups, list):
+        errors.append("group_summaries.json must contain list field 'groups'")
+        return data, errors
+    for g in groups:
+        if not isinstance(g, dict):
+            errors.append("group_summaries.groups entries must be objects")
+            continue
+        if "group_name" not in g:
+            errors.append("group_summaries entry missing group_name")
+        if "n_articles" not in g or not _is_number(g.get("n_articles")):
+            errors.append("group_summaries entry missing numeric n_articles")
+    return data, errors
+
+
+def _validate_group_matrix(path: Optional[Path]) -> Tuple[dict, List[str]]:
+    data = _safe_json(path, {}) if path and path.exists() else {}
+    errors: List[str] = []
+    if not data:
+        return {}, ["group_matrix.json missing"]
+    groups = data.get("groups")
+    matrix = data.get("cost_matrix")
+    if not isinstance(groups, list) or not groups:
+        errors.append("group_matrix.groups must be a non-empty list")
+        return data, errors
+    if not isinstance(matrix, list):
+        errors.append("group_matrix.cost_matrix must be a list")
+        return data, errors
+    n = len(groups)
+    if len(matrix) != n:
+        errors.append(f"group_matrix rows mismatch: expected {n}, got {len(matrix)}")
+        return data, errors
+    for i, row in enumerate(matrix):
+        if not isinstance(row, list) or len(row) != n:
+            errors.append(f"group_matrix row {i} has invalid width")
+            continue
+        for val in row:
+            if not _is_number(val):
+                errors.append(f"group_matrix row {i} contains non-numeric value")
+                break
+    return data, errors
+
+
+def _observer_id_from_value(observer_value: str) -> Optional[int]:
+    if not observer_value or not str(observer_value).startswith("article:"):
+        return None
+    try:
+        return int(str(observer_value).split(":", 1)[1])
+    except Exception:
+        return None
+
+
+def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
+    run_dir = _resolve_run_dir(run_key)
+    paths = _run_contract_paths(run_dir)
+    errors: List[str] = []
+
+    baseline_meta = _safe_json(paths["baseline_meta"], {}) if paths["baseline_meta"] else {}
+    baseline_state = _safe_json(paths["baseline_state"], {}) if paths["baseline_state"] else {}
+    errors.extend(_validate_provenance(baseline_meta))
+    errors.extend(_validate_baseline_state(baseline_state))
+
+    observer_id = _observer_id_from_value(observer_value)
+    state_blob = {}
+    delta_blob = {}
+    if observer_id is not None and run_dir and run_dir.exists():
+        rel_dir = run_dir / "relativity_cache"
+        state_path = rel_dir / f"state_{observer_id}.json"
+        delta_path = rel_dir / f"delta_{observer_id}.json"
+        state_blob = _safe_json(state_path, {}) if state_path.exists() else {}
+        delta_blob = _safe_json(delta_path, {}) if delta_path.exists() else {}
+        errors.extend(_validate_observer_state(state_blob, observer_id))
+        errors.extend(_validate_observer_delta(delta_blob, observer_id))
+
+    hidden_rows, hidden_errors = _read_hidden_groups(paths["hidden_groups"])
+    group_summaries, gs_errors = _validate_group_summaries(paths["group_summaries"])
+    group_matrix, gm_errors = _validate_group_matrix(paths["group_matrix"])
+    errors.extend(hidden_errors)
+    errors.extend(gs_errors)
+    errors.extend(gm_errors)
+
+    status = "OK" if not errors else "INVALID_SCHEMA"
+    return {
+        "status": status,
+        "errors": errors,
+        "paths": {k: (str(v) if v else "NOT FOUND") for k, v in paths.items()},
+        "baseline_meta": baseline_meta,
+        "baseline_state": baseline_state,
+        "observer_state": state_blob,
+        "observer_delta": delta_blob,
+        "hidden_groups": hidden_rows,
+        "group_summaries": group_summaries,
+        "group_matrix": group_matrix,
+    }
 
 
 def _find_latest_file(filename: str) -> Optional[Path]:
@@ -288,9 +542,17 @@ def _find_bool_key(blob: dict, keys: List[str]) -> Optional[bool]:
 
 def load_verification_state(run_key: Optional[str], verification_source: Optional[str] = "auto") -> dict:
     summary_csv, report_json = _resolve_verification_pair(run_key, verification_source)
+    run_dir = _resolve_run_dir(run_key)
+    contract_paths = _run_contract_paths(run_dir)
+    if not report_json and contract_paths.get("verification_report"):
+        report_json = contract_paths.get("verification_report")
+    if not summary_csv and contract_paths.get("verification_summary"):
+        summary_csv = contract_paths.get("verification_summary")
+
     global_pass: Optional[bool] = None
     seed_stability: Optional[bool] = None
     crn_locked: Optional[bool] = None
+    verification_status = "UNVERIFIED"
     broken = 0
     trapped = 0
     total = 0
@@ -300,6 +562,19 @@ def load_verification_state(run_key: Optional[str], verification_source: Optiona
         global_pass = _find_bool_key(payload, ["global_pass"])
         seed_stability = _find_bool_key(payload, ["seed_stability", "seed_stability_pass", "seed_stable"])
         crn_locked = _find_bool_key(payload, ["crn_locked", "crn_lock_pass", "crn_pass"])
+        if isinstance(payload, dict):
+            for key in ("verification_status", "status", "comparability_status"):
+                raw = payload.get(key)
+                if raw is not None:
+                    candidate = str(raw).upper().strip()
+                    if candidate in VERIFICATION_STATUSES:
+                        verification_status = candidate
+                        break
+
+    if not report_json:
+        verification_status = "UNVERIFIED"
+    elif verification_status == "UNVERIFIED" and global_pass is True:
+        verification_status = "VERIFIED"
 
     if summary_csv and summary_csv.exists():
         with summary_csv.open("r", encoding="utf-8", errors="replace") as f:
@@ -326,6 +601,7 @@ def load_verification_state(run_key: Optional[str], verification_source: Optiona
         friction = failures / float(total)
 
     return {
+        "verification_status": verification_status,
         "global_pass": global_pass,
         "seed_stability": seed_stability,
         "crn_locked": crn_locked,
@@ -564,6 +840,16 @@ def _artifact_track_state(path: Optional[Path]) -> Dict[str, str]:
 
 
 def _artifact_coverage(run_key: str, variant_name: str) -> Tuple[int, int]:
+    run = INDEX["runs"].get(run_key, {})
+    manifest = run.get("observer_manifest") or {}
+    manifest_variant = str(manifest.get("variant", "")).strip()
+    if manifest and (not manifest_variant or manifest_variant == str(variant_name or "").strip()):
+        cov = manifest.get("coverage", {})
+        try:
+            return int(cov.get("found", 0)), int(cov.get("total", 0))
+        except Exception:
+            pass
+
     observer_values = [
         opt.get("value")
         for opt in INDEX["observers_by_run"].get(run_key, [])
@@ -651,6 +937,22 @@ def _build_run_observers_and_rows(run: dict) -> Tuple[List[dict], Dict[int, dict
                 title = (row.get("title") or "").strip()
                 title_short = (title[:42] + "...") if len(title) > 45 else title
                 observers.append({"label": f"Article #{idx} | {title_short}", "value": f"article:{idx}"})
+
+    manifest = run.get("observer_manifest") or {}
+    manifest_observers = manifest.get("observers", [])
+    if isinstance(manifest_observers, list):
+        seen = {o.get("value") for o in observers if isinstance(o, dict)}
+        for item in manifest_observers:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("value", "")).strip()
+            if not value.startswith("article:") or value in seen:
+                continue
+            idx_text = value.split(":", 1)[1]
+            label = f"Article #{idx_text}"
+            observers.append({"label": label, "value": value})
+            seen.add(value)
+
     return observers, article_rows
 
 
@@ -689,7 +991,24 @@ def build_artifact_index() -> dict:
             "variants": variants,
             "article_meta_path": run_dir / "article_metadata.json",
             "monolith_data_path": run_dir / "MONOLITH_DATA.csv",
+            "observer_manifest_path": run_dir / "observer_manifest.json",
+            "observer_manifest": {},
+            "observer_artifacts": {},
         }
+        manifest_path = run["observer_manifest_path"]
+        if manifest_path.exists():
+            manifest = _safe_json(manifest_path, {})
+            if isinstance(manifest, dict):
+                run["observer_manifest"] = manifest
+                for obs in manifest.get("observers", []):
+                    if not isinstance(obs, dict):
+                        continue
+                    value = str(obs.get("value", "")).strip()
+                    rel = str(obs.get("relative_path", "")).strip()
+                    if not value or not rel:
+                        continue
+                    run["observer_artifacts"][value] = run_dir / rel.replace("/", "\\")
+
         runs[run_key] = run
         run_keys.append(run_key)
 
@@ -743,6 +1062,10 @@ def resolve_artifact(run_key: str, variant_name: str, observer_value: str) -> Op
     # Observer-specific naming support (future-compatible) should take priority
     # for article viewpoints, then fallback to chosen global variant.
     if observer_value.startswith("article:"):
+        manifest_hit = run.get("observer_artifacts", {}).get(observer_value)
+        if manifest_hit and manifest_hit.exists():
+            return manifest_hit
+
         idx = observer_value.split(":", 1)[1]
         stem = Path(selected_variant).stem
         observer_candidates = [
@@ -885,6 +1208,45 @@ app.layout = dbc.Container(
                         dcc.Dropdown(id="observer-dropdown", options=INDEX["observers"], value="global", clearable=False, style={"color": "#111", "marginBottom": "8px"}),
                         html.Label("Verification Source", style={"color": PALETTE["text"], "fontWeight": "600"}),
                         dcc.Dropdown(id="verification-source", options=discover_verification_sources(DEFAULT_RUN), value="auto", clearable=False, style={"color": "#111", "marginBottom": "8px"}),
+                        html.Div(id="provenance-line", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "marginBottom": "8px", "wordBreak": "break-all"}),
+                        html.Label("View Mode", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}),
+                        dcc.RadioItems(
+                            id="view-mode",
+                            options=[{"label": "Global", "value": "global"}, {"label": "Observer", "value": "observer"}],
+                            value="observer",
+                            labelStyle={"display": "inline-block", "marginRight": "10px", "color": PALETTE["text"], "fontSize": "0.8rem"},
+                            style={"marginBottom": "6px"},
+                        ),
+                        html.Label("Delta Mode", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}),
+                        dcc.RadioItems(
+                            id="delta-mode",
+                            options=[{"label": "Baseline", "value": "baseline"}, {"label": "Observer", "value": "observer"}, {"label": "Delta", "value": "delta"}],
+                            value="delta",
+                            labelStyle={"display": "inline-block", "marginRight": "10px", "color": PALETTE["text"], "fontSize": "0.8rem"},
+                            style={"marginBottom": "6px"},
+                        ),
+                        dcc.Checklist(
+                            id="translation-mode",
+                            options=[{"label": "Translation Only", "value": "translation_only"}],
+                            value=[],
+                            inputStyle={"marginRight": "6px"},
+                            labelStyle={"color": PALETTE["text"], "fontSize": "0.8rem"},
+                            style={"marginBottom": "6px"},
+                        ),
+                        dcc.Checklist(
+                            id="failure-overlays",
+                            options=[{"label": "Show Failure Overlays", "value": "on"}],
+                            value=[],
+                            inputStyle={"marginRight": "6px"},
+                            labelStyle={"color": PALETTE["text"], "fontSize": "0.8rem"},
+                            style={"marginBottom": "8px"},
+                        ),
+                        html.Label("Hidden Label Column", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}),
+                        dcc.Dropdown(id="label-column-dropdown", options=[], value=None, clearable=True, style={"color": "#111", "marginBottom": "6px"}),
+                        html.Label("Hidden Label Group", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}),
+                        dcc.Dropdown(id="label-value-dropdown", options=[], value=[], multi=True, clearable=True, style={"color": "#111", "marginBottom": "8px"}),
+                        html.Div(id="hidden-label-badge", style={"padding": "6px 8px", "borderRadius": "6px", "fontWeight": "700", "letterSpacing": "0.03em", "marginBottom": "8px", "textAlign": "center"}),
+                        html.Div(id="hidden-label-detail", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "marginBottom": "8px", "whiteSpace": "pre-wrap"}),
                         dcc.Checklist(
                             id="compare-enabled",
                             options=[{"label": "Enable A/B Compare", "value": "on"}],
@@ -937,7 +1299,30 @@ app.layout = dbc.Container(
                         html.Div(id="control-metrics", style={"color": PALETTE["cyan"], "fontSize": "0.8rem", "whiteSpace": "pre-wrap", "marginBottom": "6px"}),
                     ],
                 ),
-                dbc.Col(xs=12, md=8, lg=9, style={"minHeight": "100vh", "padding": "0"}, children=[dcc.Loading(id="artifact-loading", type="default", color=PALETTE["cyan"], children=[html.Div(id="artifact-container", style={"height": "100vh", "width": "100%"})])]),
+                dbc.Col(
+                    xs=12,
+                    md=8,
+                    lg=9,
+                    style={"minHeight": "100vh", "padding": "0", "backgroundColor": "#020208"},
+                    children=[
+                        html.Div(
+                            style={"position": "relative", "height": "62vh", "width": "100%"},
+                            children=[
+                                dcc.Loading(id="artifact-loading", type="default", color=PALETTE["cyan"], children=[html.Div(id="artifact-container", style={"height": "62vh", "width": "100%"})]),
+                                html.Div(id="watermark-overlay", style={"position": "absolute", "inset": "0", "display": "none", "alignItems": "center", "justifyContent": "center", "fontSize": "3.2rem", "fontWeight": "700", "letterSpacing": "0.08em", "color": "rgba(255,42,0,0.18)", "pointerEvents": "none", "textAlign": "center"}),
+                            ],
+                        ),
+                        dcc.Tabs(
+                            id="analysis-tabs",
+                            value="tab-relativity",
+                            children=[
+                                dcc.Tab(label="Relativity Deltas", value="tab-relativity", children=[html.Div(id="relativity-panel", style={"padding": "10px", "height": "34vh", "overflowY": "auto"})]),
+                                dcc.Tab(label="Group Path Patterns", value="tab-groups", children=[html.Div(id="group-panel", style={"padding": "10px", "height": "34vh", "overflowY": "auto"})]),
+                                dcc.Tab(label="Empathy Gap", value="tab-empathy", children=[dcc.Graph(id="empathy-heatmap", style={"height": "34vh"})]),
+                            ],
+                        ),
+                    ],
+                ),
             ],
         ),
     ],
@@ -1010,6 +1395,34 @@ def refresh_verification_sources(run_key: str, current_value: str):
     values = [o["value"] for o in options]
     value = current_value if current_value in values else "auto"
     return options, value
+
+
+@app.callback(
+    Output("label-column-dropdown", "options"),
+    Output("label-column-dropdown", "value"),
+    Output("label-value-dropdown", "options"),
+    Output("label-value-dropdown", "value"),
+    Input("run-dropdown", "value"),
+    State("label-column-dropdown", "value"),
+    State("label-value-dropdown", "value"),
+)
+def refresh_hidden_label_filters(run_key: str, current_col: Optional[str], current_values: Optional[List[str]]):
+    contract = load_contract_state(run_key, "global")
+    rows = contract.get("hidden_groups", []) or []
+    if not rows:
+        return [], None, [], []
+
+    columns = sorted({k for r in rows if isinstance(r, dict) for k in r.keys() if k.startswith("group_")})
+    col_opts = [{"label": c, "value": c} for c in columns]
+    chosen_col = current_col if current_col in columns else (columns[0] if columns else None)
+
+    value_opts = []
+    if chosen_col:
+        values = sorted({str(r.get(chosen_col, "")).strip() for r in rows if str(r.get(chosen_col, "")).strip()})
+        value_opts = [{"label": v, "value": v} for v in values]
+    current_values = current_values or []
+    valid_values = [v for v in current_values if any(opt["value"] == v for opt in value_opts)]
+    return col_opts, chosen_col, value_opts, valid_values
 
 
 app.clientside_callback(
@@ -1169,6 +1582,15 @@ def update_gallery_progress(observer_value: str, observer_options):
     Output("telemetry-detail", "children"),
     Output("ablation-metrics", "children"),
     Output("control-metrics", "children"),
+    Output("provenance-line", "children"),
+    Output("hidden-label-badge", "children"),
+    Output("hidden-label-badge", "style"),
+    Output("hidden-label-detail", "children"),
+    Output("relativity-panel", "children"),
+    Output("group-panel", "children"),
+    Output("empathy-heatmap", "figure"),
+    Output("watermark-overlay", "children"),
+    Output("watermark-overlay", "style"),
     Input("run-dropdown", "value"),
     Input("observer-dropdown", "value"),
     Input("variant-a-dropdown", "value"),
@@ -1178,6 +1600,12 @@ def update_gallery_progress(observer_value: str, observer_options):
     Input("transition-style", "value"),
     Input("verification-poll", "n_intervals"),
     Input("gallery-interval", "n_intervals"),
+    Input("view-mode", "value"),
+    Input("delta-mode", "value"),
+    Input("translation-mode", "value"),
+    Input("failure-overlays", "value"),
+    Input("label-column-dropdown", "value"),
+    Input("label-value-dropdown", "value"),
 )
 def render_dashboard(
     run_key: str,
@@ -1189,6 +1617,168 @@ def render_dashboard(
     transition_style: str,
     poll_tick: int,
     gallery_tick: int,
+    view_mode: str,
+    delta_mode: str,
+    translation_mode_values: List[str],
+    failure_overlay_values: List[str],
+    label_column: Optional[str],
+    label_values: List[str],
+):
+    return _render_dashboard_impl(
+        run_key=run_key,
+        observer_value=observer_value,
+        variant_a=variant_a,
+        variant_b=variant_b,
+        verification_source=verification_source,
+        compare_enabled_values=compare_enabled_values,
+        transition_style=transition_style,
+        poll_tick=poll_tick,
+        gallery_tick=gallery_tick,
+        view_mode=view_mode,
+        delta_mode=delta_mode,
+        translation_mode_values=translation_mode_values,
+        failure_overlay_values=failure_overlay_values,
+        label_column=label_column,
+        label_values=label_values,
+    )
+
+
+def _extract_survival_rate(html_text: str) -> Optional[float]:
+    """Extract T4 Survival % from the Epistemic Panel in the HTML."""
+    try:
+        match = re.search(r"T4 Survival:.*?(\d+)%", html_text, re.IGNORECASE)
+        if match:
+            return float(match.group(1)) / 100.0
+    except Exception:
+        pass
+    return None
+
+
+def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values: Optional[List[str]]):
+    matrix_blob = contract.get("group_matrix", {}) or {}
+    groups = matrix_blob.get("groups", []) if isinstance(matrix_blob, dict) else []
+    matrix = matrix_blob.get("cost_matrix", []) if isinstance(matrix_blob, dict) else []
+
+    fig = go.Figure()
+    if not groups or not matrix:
+        fig.update_layout(
+            template="plotly_dark",
+            margin={"l": 30, "r": 10, "t": 30, "b": 30},
+            title="Empathy Gap Matrix (unavailable)",
+            annotations=[{"text": "group_matrix not available", "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5, "showarrow": False}],
+        )
+        return fig
+
+    filtered_idx = list(range(len(groups)))
+    if label_values:
+        selected = set(label_values)
+        filtered_idx = [i for i, g in enumerate(groups) if g in selected]
+        if not filtered_idx:
+            filtered_idx = list(range(len(groups)))
+
+    fg = [groups[i] for i in filtered_idx]
+    fm = [[float(matrix[i][j]) for j in filtered_idx] for i in filtered_idx]
+    fig.add_trace(
+        go.Heatmap(
+            z=fm,
+            x=fg,
+            y=fg,
+            colorscale="Viridis",
+            colorbar={"title": "Cost"},
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        margin={"l": 40, "r": 10, "t": 30, "b": 40},
+        title="Empathy Gap Matrix (Directed Cost)",
+        xaxis_title=label_col or "Group",
+        yaxis_title="Observer Group",
+    )
+    return fig
+
+
+def _build_group_panel(contract: dict, label_col: Optional[str], label_values: Optional[List[str]]):
+    rows = contract.get("hidden_groups", []) or []
+    summaries = (contract.get("group_summaries", {}) or {}).get("groups", [])
+    if not rows:
+        return html.Div("Hidden labels unavailable for this run.", style={"color": PALETTE["amber"]})
+
+    if not label_col:
+        label_col = "group_topic"
+
+    counts: Dict[str, int] = {}
+    for row in rows:
+        key = str(row.get(label_col, "UNLABELED"))
+        if label_values and key not in set(label_values):
+            continue
+        counts[key] = counts.get(key, 0) + 1
+
+    lines = [f"{label_col} counts:"]
+    for k in sorted(counts):
+        lines.append(f"  - {k}: {counts[k]}")
+
+    summary_lines = []
+    if isinstance(summaries, list):
+        summary_lines.append("Group summaries:")
+        for g in summaries[:8]:
+            if not isinstance(g, dict):
+                continue
+            name = g.get("group_name", "unknown")
+            n = g.get("n_articles", "n/a")
+            summary_lines.append(f"  - {name}: n={n}")
+
+    return html.Pre("\n".join(lines + [""] + summary_lines), style={"margin": "0", "color": PALETTE["text"], "fontSize": "0.82rem"})
+
+
+def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str, translation_mode_values: List[str]):
+    if observer_value == "global":
+        return html.Div("Global baseline selected. Choose an article observer to view Type-2 deltas.", style={"color": PALETTE["dim"]})
+
+    delta = contract.get("observer_delta", {}) or {}
+    if not delta:
+        return html.Div("Observer delta artifact missing.", style={"color": PALETTE["amber"]})
+
+    null_eq = delta.get("null_observer_equivalence", {}) or {}
+    metrics_delta = delta.get("metrics_delta", {}) or {}
+    axis_delta = delta.get("axis_delta", {}) or {}
+    flips = delta.get("path_flip_delta", {}) or {}
+
+    translation_only = translation_mode_values is not None and "translation_only" in translation_mode_values
+    tcomp = delta.get("translation_only_comparison", {}) if translation_only else {}
+
+    lines = [
+        f"Observer: {observer_value} | mode={delta_mode}",
+        f"Null Eq -> max_coord_delta={null_eq.get('max_coord_delta', 'n/a')} | path_flip_count={null_eq.get('path_flip_count', 'n/a')} | axis_rotation_deg={null_eq.get('axis_rotation_deg', 'n/a')}",
+        f"Metrics Delta -> d_rupture_rate={metrics_delta.get('d_rupture_rate', 'n/a')} | d_mean_work={metrics_delta.get('d_mean_work', 'n/a')} | d_survival_pct={metrics_delta.get('d_survival_pct', 'n/a')}",
+        f"Axis Delta -> rotation_deg={axis_delta.get('rotation_deg', 'n/a')} | d_explained_variance_axis1={axis_delta.get('d_explained_variance_axis1', 'n/a')}",
+        "Path Flip Delta (top):",
+    ]
+    flip_items = sorted(flips.items(), key=lambda kv: -float(kv[1]) if _is_number(kv[1]) else 0.0)
+    for k, v in flip_items[:8]:
+        lines.append(f"  - {k}: {v}")
+    if translation_only and tcomp:
+        lines.append("Translation-only comparison:")
+        lines.append(f"  - d_path_flip_count={tcomp.get('d_path_flip_count', 'n/a')} | d_mean_work={tcomp.get('d_mean_work', 'n/a')}")
+
+    return html.Pre("\n".join(lines), style={"margin": "0", "color": PALETTE["text"], "fontSize": "0.82rem"})
+
+
+def _render_dashboard_impl(
+    run_key: str,
+    observer_value: str,
+    variant_a: str,
+    variant_b: str,
+    verification_source: str,
+    compare_enabled_values: List[str],
+    transition_style: str,
+    poll_tick: int,
+    gallery_tick: int,
+    view_mode: str,
+    delta_mode: str,
+    translation_mode_values: List[str],
+    failure_overlay_values: List[str],
+    label_column: Optional[str],
+    label_values: List[str],
 ):
     if not INDEX["run_keys"] or not run_key:
         empty = build_empty_index_fallback()
@@ -1204,6 +1794,8 @@ def render_dashboard(
             "backgroundColor": "rgba(255,179,71,0.12)",
         }
         detail = f"artifact_roots={INDEX.get('artifact_root_count', 0)} | primary={INDEX.get('artifact_root') or 'NOT FOUND'}"
+        empty_fig = go.Figure()
+        empty_fig.update_layout(template="plotly_dark", title="Empathy Gap Matrix (unavailable)")
         return (
             empty,
             "Artifact: NOT FOUND",
@@ -1220,24 +1812,47 @@ def render_dashboard(
             detail,
             "Ablation: n/a",
             "Control: n/a",
+            "provenance: n/a",
+            "[HIDDEN LABELS MISSING]",
+            {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["amber"], "border": f"1px solid {PALETTE['amber']}", "backgroundColor": "rgba(255,179,71,0.12)"},
+            "labels/hidden_groups.csv not found",
+            html.Div("Relativity data unavailable", style={"color": PALETTE["amber"]}),
+            html.Div("Group data unavailable", style={"color": PALETTE["amber"]}),
+            empty_fig,
+            "",
+            {"position": "absolute", "inset": "0", "display": "none", "alignItems": "center", "justifyContent": "center", "fontSize": "3.2rem", "fontWeight": "700", "letterSpacing": "0.08em", "color": "rgba(255,42,0,0.18)", "pointerEvents": "none", "textAlign": "center"},
         )
 
     run = INDEX["runs"].get(run_key, {})
     compare_enabled = compare_enabled_values is not None and "on" in compare_enabled_values
+    effective_observer = "global" if view_mode == "global" else observer_value
+    contract = load_contract_state(run_key, effective_observer)
+    contract_status = contract.get("status", "INVALID_SCHEMA")
+    contract_errors = contract.get("errors", [])
+    baseline_meta = contract.get("baseline_meta", {}) or {}
 
-    p_a = resolve_artifact(run_key, variant_a, observer_value) if run_key else None
-    p_b = resolve_artifact(run_key, variant_b, observer_value) if run_key else None
-
-    if p_a and p_a.exists():
-        c_a = _transition_wrapper(html.Iframe(srcDoc=_safe_read_text(p_a), style={"width": "100%", "height": "100%", "border": "0"}), transition_style)
+    # VALIDATION TYPE 2: Perspective Sensitivity (Global vs Subjective)
+    # If in observer mode, Variant A shows Global perspective for comparison.
+    if view_mode == "observer" and observer_value.startswith("article:"):
+        p_a = resolve_artifact(run_key, variant_a, "global") if run_key else None
+        p_b = resolve_artifact(run_key, variant_b, observer_value) if run_key else None
     else:
-        c_a = build_terminal_fallback(observer_value, run_key, variant_a, gallery_tick)
+        p_a = resolve_artifact(run_key, variant_a, effective_observer) if run_key else None
+        p_b = resolve_artifact(run_key, variant_b, effective_observer) if run_key else None
+
+    text_a = _safe_read_text(p_a) if (p_a and p_a.exists()) else ""
+    text_b = _safe_read_text(p_b) if (p_b and p_b.exists()) else ""
+
+    if text_a:
+        c_a = _transition_wrapper(html.Iframe(srcDoc=text_a, style={"width": "100%", "height": "100%", "border": "0"}), transition_style)
+    else:
+        c_a = build_terminal_fallback(effective_observer, run_key, variant_a, gallery_tick)
 
     if compare_enabled:
-        if p_b and p_b.exists():
-            c_b = _transition_wrapper(html.Iframe(srcDoc=_safe_read_text(p_b), style={"width": "100%", "height": "100%", "border": "0"}), transition_style)
+        if text_b:
+            c_b = _transition_wrapper(html.Iframe(srcDoc=text_b, style={"width": "100%", "height": "100%", "border": "0"}), transition_style)
         else:
-            c_b = build_terminal_fallback(observer_value, run_key, variant_b, gallery_tick)
+            c_b = build_terminal_fallback(effective_observer, run_key, variant_b, gallery_tick)
         container = dbc.Row(
             className="g-0",
             style={"height": "100vh"},
@@ -1254,9 +1869,9 @@ def render_dashboard(
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
 
     article_metric_text = "Article Metrics: n/a"
-    if observer_value.startswith("article:"):
+    if effective_observer.startswith("article:"):
         try:
-            idx = int(observer_value.split(":", 1)[1])
+            idx = int(effective_observer.split(":", 1)[1])
             row = INDEX["article_rows_by_run"].get(run_key, {}).get(idx, {})
             if row:
                 article_metric_text = (
@@ -1275,19 +1890,51 @@ def render_dashboard(
     coverage_text = f"Observer Artifact Coverage (Variant A): {found}/{total}" if total > 0 else "Observer Artifact Coverage: n/a"
 
     state = load_verification_state(run_key, verification_source)
+    verification_status = str(state.get("verification_status", "UNVERIFIED")).upper()
     global_pass = state.get("global_pass")
+    claims_enabled = (verification_status == "VERIFIED") and (global_pass is True) and (contract_status == "OK")
+
+    # VALIDATION TYPE 2: Perspective Sensitivity (Divergence Check)
+    type2_dissonance = False
+    if compare_enabled and text_a and text_b:
+        surv_a = _extract_survival_rate(text_a)
+        surv_b = _extract_survival_rate(text_b)
+        if surv_a is not None and surv_b is not None:
+            if abs(surv_a - surv_b) > 0.20:
+                type2_dissonance = True
+
     base_badge = {"padding": "8px 10px", "borderRadius": "6px", "fontWeight": "700", "letterSpacing": "0.05em", "marginBottom": "10px", "textAlign": "center"}
-    if global_pass is True:
+    if type2_dissonance:
+        badge_text = "[TYPE 2 DISSONANCE]"
+        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)", animation="glitchFlash 0.5s steps(2,end) infinite")
+    elif claims_enabled:
         badge_text = "[VERIFIED]"
         badge_style = dict(base_badge, color="#00FF41", border="1px solid #00FF41", backgroundColor="rgba(0,255,65,0.12)", boxShadow="0 0 14px rgba(0,255,65,0.45)", animation="neonPulse 1.4s ease-in-out infinite")
+    elif contract_status != "OK":
+        badge_text = "[INVALID SCHEMA]"
+        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)")
+    elif verification_status == "MISSING_ARTIFACTS":
+        badge_text = "[MISSING ARTIFACTS]"
+        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)")
+    elif verification_status == "NON_COMPARABLE":
+        badge_text = "[NON-COMPARABLE]"
+        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)")
     else:
-        badge_text = "[SIGNAL UNSTABLE]"
+        badge_text = "[UNVERIFIED]"
         badge_style = dict(base_badge, color="#FF2A00", border="1px solid #FF2A00", backgroundColor="rgba(255,42,0,0.12)", boxShadow="0 0 12px rgba(255,42,0,0.4)", animation="glitchFlash 0.9s steps(2,end) infinite")
 
-    t1 = f"System 1: Topologic Integrity | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))} [cite: 2026-02-04]"
-    t2 = f"System 2: Geometric Friction = {state.get('geometric_friction', 0.0):.3f} (broken={state.get('n_broken', 0)}, trapped={state.get('n_trapped', 0)}) [cite: 2026-02-04]"
-    t3 = f"System 2: Survival % = {state.get('survival_pct', 100.0):.2f}% [cite: 2026-02-04]"
+    if claims_enabled:
+        t1 = f"System 1: Topologic Integrity | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))} [cite: 2026-02-04]"
+        t2 = f"System 2: Geometric Friction = {state.get('geometric_friction', 0.0):.3f} (broken={state.get('n_broken', 0)}, trapped={state.get('n_trapped', 0)}) [cite: 2026-02-04]"
+        t3 = f"System 2: Survival % = {state.get('survival_pct', 100.0):.2f}% [cite: 2026-02-04]"
+    else:
+        t1 = "System 1: Claims disabled (verification/provenance gate not satisfied)"
+        t2 = "System 2: Claims disabled (exploratory mode)"
+        t3 = "System 2: Claims disabled (exploratory mode)"
+
     detail = f"source={state.get('verification_source')} | verification_summary.csv: {state.get('summary_path')} | verification_report.json: {state.get('report_path')}"
+    if contract_errors:
+        detail = detail + " | schema_errors=" + "; ".join(contract_errors[:3])
     ab = load_ablation_state(run_key)
     ctrl = load_control_state(run_key)
     ablation_text = (
@@ -1307,6 +1954,49 @@ def render_dashboard(
         f"source={ctrl.get('source', 'NOT FOUND')}"
     )
 
+    provenance_line = (
+        " | ".join(
+            [
+                f"weights={baseline_meta.get('weights_hash', 'n/a')}",
+                f"dataset={baseline_meta.get('dataset_hash', 'n/a')}",
+                f"kernel={baseline_meta.get('kernel_params', 'n/a')}",
+                f"rks_dim={baseline_meta.get('rks_dim', 'n/a')}",
+                f"seed={baseline_meta.get('crn_seed', 'n/a')}",
+                f"alpha={baseline_meta.get('alpha', 'n/a')}",
+            ]
+        )
+    )
+
+    hidden_rows = contract.get("hidden_groups", []) or []
+    if hidden_rows:
+        hidden_badge_text = "[HIDDEN LABELS READY]"
+        hidden_badge_style = {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["green"], "border": f"1px solid {PALETTE['green']}", "backgroundColor": "rgba(0,255,65,0.10)"}
+        hidden_detail = f"rows={len(hidden_rows)} | group_summaries={contract.get('paths', {}).get('group_summaries', 'NOT FOUND')} | group_matrix={contract.get('paths', {}).get('group_matrix', 'NOT FOUND')}"
+    else:
+        hidden_badge_text = "[HIDDEN LABELS MISSING]"
+        hidden_badge_style = {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["amber"], "border": f"1px solid {PALETTE['amber']}", "backgroundColor": "rgba(255,179,71,0.12)"}
+        hidden_detail = "Expected labels/hidden_groups.csv and labels/derived/group_*.json"
+
+    relativity_panel = _build_relativity_panel(contract, effective_observer, delta_mode, translation_mode_values or [])
+    group_panel = _build_group_panel(contract, label_column, label_values or [])
+    empathy_fig = _build_empathy_figure(contract, label_column, label_values or [])
+
+    watermark_visible = (not claims_enabled) or (failure_overlay_values is not None and "on" in failure_overlay_values)
+    watermark_text = "UNVERIFIED / EXPLORATORY" if not claims_enabled else "FAILURE OVERLAYS"
+    watermark_style = {
+        "position": "absolute",
+        "inset": "0",
+        "display": "flex" if watermark_visible else "none",
+        "alignItems": "center",
+        "justifyContent": "center",
+        "fontSize": "3.2rem",
+        "fontWeight": "700",
+        "letterSpacing": "0.08em",
+        "color": "rgba(255,42,0,0.18)",
+        "pointerEvents": "none",
+        "textAlign": "center",
+    }
+
     return (
         container,
         path_text,
@@ -1323,6 +2013,15 @@ def render_dashboard(
         detail,
         ablation_text,
         control_text,
+        provenance_line,
+        hidden_badge_text,
+        hidden_badge_style,
+        hidden_detail,
+        relativity_panel,
+        group_panel,
+        empathy_fig,
+        watermark_text,
+        watermark_style,
     )
 
 
