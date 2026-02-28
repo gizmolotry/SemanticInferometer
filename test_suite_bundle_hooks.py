@@ -1,0 +1,105 @@
+import os
+import shutil
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from run_full_experiment_suite import materialize_baseline_bundle
+
+
+@pytest.fixture
+def tmp_path(request):
+    """Workspace-local tmp_path override for restricted Windows temp directories."""
+    root = Path.cwd() / ".pytest_local_tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    case_dir = root / request.node.name
+    if case_dir.exists():
+        shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    return case_dir
+
+
+@pytest.fixture
+def mock_run_dir(tmp_path):
+    """Create a skeleton run directory."""
+    run_dir = tmp_path / "experiments_test_run"
+    run_dir.mkdir()
+    (run_dir / "MONOLITH_DATA.csv").write_text("dummy data", encoding="utf-8")
+    return run_dir
+
+
+def test_materialize_baseline_bundle_happy_path(mock_run_dir):
+    """Scenario 1: Happy path - both subprocess calls succeed."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
+
+        result = materialize_baseline_bundle(mock_run_dir, strict=True)
+
+        assert result["status"] == "success"
+        assert "run_dir" in result
+        assert "monolith" in result
+        assert "observer_manifest" in result
+        assert result["run_dir"] == str(mock_run_dir)
+        assert str(mock_run_dir) in result["monolith"]
+        assert str(mock_run_dir) in result["observer_manifest"]
+        assert mock_run.call_count == 2
+
+
+def test_materialize_baseline_bundle_viz_fail(mock_run_dir):
+    """Scenario 2: Monolith render fails - first subprocess non-zero."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1)
+
+        result = materialize_baseline_bundle(mock_run_dir, strict=True)
+
+        assert result["status"] == "failed"
+        assert result["stage"] == "monolith_render"
+        assert result["returncode"] == 1
+        assert result["run_dir"] == str(mock_run_dir)
+        assert mock_run.call_count == 1
+
+
+def test_materialize_baseline_bundle_precompute_fail(mock_run_dir):
+    """Scenario 3: Observer manifest fails - first success, second non-zero."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = [
+            MagicMock(returncode=0),
+            MagicMock(returncode=2),
+        ]
+
+        result = materialize_baseline_bundle(mock_run_dir, strict=True)
+
+        assert result["status"] == "failed"
+        assert result["stage"] == "observer_manifest"
+        assert result["returncode"] == 2
+        assert result["run_dir"] == str(mock_run_dir)
+        assert mock_run.call_count == 2
+
+
+def test_materialize_baseline_bundle_exception(mock_run_dir):
+    """Scenario 4: Subprocess exception - subprocess.run raises exception."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = RuntimeError("Subprocess crashed")
+
+        result = materialize_baseline_bundle(mock_run_dir, strict=True)
+
+        assert result["status"] == "failed"
+        assert result["stage"] == "exception"
+        assert "Subprocess crashed" in result["error"]
+        assert result["run_dir"] == str(mock_run_dir)
+
+        for key, val in result.items():
+            if key != "run_dir" and isinstance(val, str) and os.path.isabs(val):
+                assert val.startswith(str(mock_run_dir))
+
+
+def test_materialize_baseline_bundle_skipped(tmp_path):
+    """Bonus: Verify skip when CSV is missing."""
+    run_dir = tmp_path / "empty_run"
+    run_dir.mkdir()
+
+    result = materialize_baseline_bundle(run_dir)
+
+    assert result["status"] == "skipped"
+    assert "missing MONOLITH_DATA.csv" in result["reason"]

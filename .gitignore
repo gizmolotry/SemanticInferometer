@@ -15,6 +15,8 @@ analysis/reports/
 *.stdout
 *.tmp
 *.temp
+*.bak
+*.orig
 nul
 
 # Python caches / env
@@ -22,8 +24,16 @@ __pycache__/
 **/__pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
 .venv/
 venv/
+env/
+ENV/
 
 # Large binaries / arrays
 *.npy
@@ -41,8 +51,18 @@ venv/
 .claude/
 .omc/
 oh-my-claudecode/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
 
 # Thesis / release housekeeping
 thesis_release/*/scratch/
 thesis_release/*/tmp/
 thesis_release/*/validation_report.json
+
+# Build/package outputs
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/

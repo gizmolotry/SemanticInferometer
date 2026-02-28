@@ -20,6 +20,13 @@ from typing import Dict, List, Optional, Tuple
 import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, callback_context, dcc, html
 import plotly.graph_objects as go
+from analysis.verification.contract import (
+    LayerStatus,
+    REQUIRED_CONSUMER_ARTIFACTS,
+    OPTIONAL_CONSUMER_ARTIFACTS,
+    REQUIRED_PROVENANCE_KEYS,
+    evaluate_consumer_contract,
+)
 
 
 PALETTE = {
@@ -82,20 +89,7 @@ TRACK_MARKERS = {
     "T5": ["track 5", "phantom", "tautology", "honest"],
     "T6": ["track 6", "hott", "proof"],
 }
-VERIFICATION_STATUSES = {"VERIFIED", "NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"}
-REQUIRED_PROVENANCE_KEYS = {
-    "schema_version",
-    "cache_version",
-    "dataset_hash",
-    "code_hash_or_commit",
-    "weights_hash",
-    "kernel_params",
-    "rks_dim",
-    "crn_seed",
-    "alpha",
-    "timestamp_utc",
-    "verification_status",
-}
+VERIFICATION_STATUSES = {s.value for s in LayerStatus}
 
 
 def _safe_read_text(path: Path) -> str:
@@ -305,38 +299,72 @@ def _observer_id_from_value(observer_value: str) -> Optional[int]:
 
 def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     run_dir = _resolve_run_dir(run_key)
-    paths = _run_contract_paths(run_dir)
-    errors: List[str] = []
+    if not run_dir or not run_dir.exists():
+        return {
+            "status": "INVALID_SCHEMA",
+            "errors": [f"run_dir missing for run_key={run_key}"],
+            "missing_required_artifacts": list(REQUIRED_CONSUMER_ARTIFACTS),
+            "missing_optional_artifacts": list(OPTIONAL_CONSUMER_ARTIFACTS),
+            "schema_errors": [f"run_dir missing for run_key={run_key}"],
+            "paths": {},
+            "baseline_meta": {},
+            "baseline_state": {},
+            "observer_state": {},
+            "observer_delta": {},
+            "hidden_groups": [],
+            "group_summaries": {},
+            "group_matrix": {},
+        }
 
-    baseline_meta = _safe_json(paths["baseline_meta"], {}) if paths["baseline_meta"] else {}
-    baseline_state = _safe_json(paths["baseline_state"], {}) if paths["baseline_state"] else {}
-    errors.extend(_validate_provenance(baseline_meta))
-    errors.extend(_validate_baseline_state(baseline_state))
+    diag = evaluate_consumer_contract(run_dir)
+    paths = {k: (str(v) if v else "NOT FOUND") for k, v in diag.paths.items()}
+    errors: List[str] = list(diag.schema_errors)
+    missing_required = list(diag.missing_required_artifacts)
+    missing_optional = list(diag.missing_optional_artifacts)
+
+    baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
+    baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
 
     observer_id = _observer_id_from_value(observer_value)
     state_blob = {}
     delta_blob = {}
-    if observer_id is not None and run_dir and run_dir.exists():
+    if observer_id is not None:
         rel_dir = run_dir / "relativity_cache"
         state_path = rel_dir / f"state_{observer_id}.json"
         delta_path = rel_dir / f"delta_{observer_id}.json"
-        state_blob = _safe_json(state_path, {}) if state_path.exists() else {}
-        delta_blob = _safe_json(delta_path, {}) if delta_path.exists() else {}
-        errors.extend(_validate_observer_state(state_blob, observer_id))
-        errors.extend(_validate_observer_delta(delta_blob, observer_id))
+        if state_path.exists():
+            state_blob = _safe_json(state_path, {})
+        else:
+            missing_optional.append(f"relativity_cache/state_{observer_id}.json")
+        if delta_path.exists():
+            delta_blob = _safe_json(delta_path, {})
+        else:
+            missing_optional.append(f"relativity_cache/delta_{observer_id}.json")
 
-    hidden_rows, hidden_errors = _read_hidden_groups(paths["hidden_groups"])
-    group_summaries, gs_errors = _validate_group_summaries(paths["group_summaries"])
-    group_matrix, gm_errors = _validate_group_matrix(paths["group_matrix"])
-    errors.extend(hidden_errors)
-    errors.extend(gs_errors)
-    errors.extend(gm_errors)
+    hidden_path = diag.paths.get("labels/hidden_groups.csv")
+    hidden_rows, hidden_errors = _read_hidden_groups(hidden_path)
+    if hidden_path is None:
+        hidden_errors = []
 
-    status = "OK" if not errors else "INVALID_SCHEMA"
+    gs_path = diag.paths.get("labels/derived/group_summaries.json")
+    gm_path = diag.paths.get("labels/derived/group_matrix.json")
+    group_summaries, gs_errors = _validate_group_summaries(gs_path)
+    group_matrix, gm_errors = _validate_group_matrix(gm_path)
+    if gs_path is None:
+        gs_errors = []
+    if gm_path is None:
+        gm_errors = []
+
+    # Optional artifacts can degrade panels but should not hard-fail gating.
+    optional_schema_errors = hidden_errors + gs_errors + gm_errors
+    status = "OK" if (diag.contract_ok and len(missing_required) == 0) else "INVALID_SCHEMA"
     return {
         "status": status,
-        "errors": errors,
-        "paths": {k: (str(v) if v else "NOT FOUND") for k, v in paths.items()},
+        "errors": errors + optional_schema_errors,
+        "missing_required_artifacts": sorted(set(missing_required)),
+        "missing_optional_artifacts": sorted(set(missing_optional)),
+        "schema_errors": errors,
+        "paths": paths,
         "baseline_meta": baseline_meta,
         "baseline_state": baseline_state,
         "observer_state": state_blob,
@@ -543,16 +571,16 @@ def _find_bool_key(blob: dict, keys: List[str]) -> Optional[bool]:
 def load_verification_state(run_key: Optional[str], verification_source: Optional[str] = "auto") -> dict:
     summary_csv, report_json = _resolve_verification_pair(run_key, verification_source)
     run_dir = _resolve_run_dir(run_key)
-    contract_paths = _run_contract_paths(run_dir)
-    if not report_json and contract_paths.get("verification_report"):
-        report_json = contract_paths.get("verification_report")
-    if not summary_csv and contract_paths.get("verification_summary"):
-        summary_csv = contract_paths.get("verification_summary")
+    contract_diag = evaluate_consumer_contract(run_dir) if run_dir and run_dir.exists() else None
+    if not report_json and contract_diag and contract_diag.paths.get("verification_report.json"):
+        report_json = contract_diag.paths.get("verification_report.json")
+    if not summary_csv and contract_diag and contract_diag.paths.get("verification_summary.csv"):
+        summary_csv = contract_diag.paths.get("verification_summary.csv")
 
     global_pass: Optional[bool] = None
     seed_stability: Optional[bool] = None
     crn_locked: Optional[bool] = None
-    verification_status = "UNVERIFIED"
+    verification_status = contract_diag.verification_status if contract_diag else LayerStatus.UNVERIFIED.value
     broken = 0
     trapped = 0
     total = 0
@@ -571,10 +599,10 @@ def load_verification_state(run_key: Optional[str], verification_source: Optiona
                         verification_status = candidate
                         break
 
-    if not report_json:
-        verification_status = "UNVERIFIED"
-    elif verification_status == "UNVERIFIED" and global_pass is True:
-        verification_status = "VERIFIED"
+    if not report_json and contract_diag and contract_diag.missing_required_artifacts:
+        verification_status = LayerStatus.MISSING_ARTIFACTS.value
+    elif verification_status == LayerStatus.UNVERIFIED.value and global_pass is True:
+        verification_status = LayerStatus.VERIFIED.value
 
     if summary_csv and summary_csv.exists():
         with summary_csv.open("r", encoding="utf-8", errors="replace") as f:
@@ -1654,6 +1682,41 @@ def _extract_survival_rate(html_text: str) -> Optional[float]:
     return None
 
 
+def _claims_enabled(contract_status: str, verification_status: str, global_pass: Optional[bool]) -> bool:
+    return (
+        str(contract_status).upper() == "OK"
+        and str(verification_status).upper() == LayerStatus.VERIFIED.value
+        and (global_pass is True)
+    )
+
+
+def _compute_gate_presentation(
+    contract_status: str,
+    verification_status: str,
+    global_pass: Optional[bool],
+    type2_dissonance: bool,
+) -> Dict[str, Any]:
+    claims_enabled = _claims_enabled(contract_status, verification_status, global_pass)
+    if type2_dissonance:
+        badge_text = "[TYPE 2 DISSONANCE]"
+    elif claims_enabled:
+        badge_text = "[VERIFIED]"
+    elif str(contract_status).upper() != "OK":
+        badge_text = "[INVALID SCHEMA]"
+    elif str(verification_status).upper() == LayerStatus.MISSING_ARTIFACTS.value:
+        badge_text = "[MISSING ARTIFACTS]"
+    elif str(verification_status).upper() == LayerStatus.NON_COMPARABLE.value:
+        badge_text = "[NON-COMPARABLE]"
+    else:
+        badge_text = "[UNVERIFIED]"
+    watermark_visible = not claims_enabled
+    return {
+        "claims_enabled": claims_enabled,
+        "badge_text": badge_text,
+        "watermark_visible": watermark_visible,
+    }
+
+
 def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values: Optional[List[str]]):
     matrix_blob = contract.get("group_matrix", {}) or {}
     groups = matrix_blob.get("groups", []) if isinstance(matrix_blob, dict) else []
@@ -1829,6 +1892,9 @@ def _render_dashboard_impl(
     contract = load_contract_state(run_key, effective_observer)
     contract_status = contract.get("status", "INVALID_SCHEMA")
     contract_errors = contract.get("errors", [])
+    schema_errors = contract.get("schema_errors", [])
+    missing_required = contract.get("missing_required_artifacts", [])
+    missing_optional = contract.get("missing_optional_artifacts", [])
     baseline_meta = contract.get("baseline_meta", {}) or {}
 
     # VALIDATION TYPE 2: Perspective Sensitivity (Global vs Subjective)
@@ -1892,7 +1958,6 @@ def _render_dashboard_impl(
     state = load_verification_state(run_key, verification_source)
     verification_status = str(state.get("verification_status", "UNVERIFIED")).upper()
     global_pass = state.get("global_pass")
-    claims_enabled = (verification_status == "VERIFIED") and (global_pass is True) and (contract_status == "OK")
 
     # VALIDATION TYPE 2: Perspective Sensitivity (Divergence Check)
     type2_dissonance = False
@@ -1903,24 +1968,15 @@ def _render_dashboard_impl(
             if abs(surv_a - surv_b) > 0.20:
                 type2_dissonance = True
 
+    gate = _compute_gate_presentation(contract_status, verification_status, global_pass, type2_dissonance)
+    claims_enabled = gate["claims_enabled"]
+    badge_text = gate["badge_text"]
     base_badge = {"padding": "8px 10px", "borderRadius": "6px", "fontWeight": "700", "letterSpacing": "0.05em", "marginBottom": "10px", "textAlign": "center"}
-    if type2_dissonance:
-        badge_text = "[TYPE 2 DISSONANCE]"
-        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)", animation="glitchFlash 0.5s steps(2,end) infinite")
-    elif claims_enabled:
-        badge_text = "[VERIFIED]"
+    if badge_text == "[VERIFIED]":
         badge_style = dict(base_badge, color="#00FF41", border="1px solid #00FF41", backgroundColor="rgba(0,255,65,0.12)", boxShadow="0 0 14px rgba(0,255,65,0.45)", animation="neonPulse 1.4s ease-in-out infinite")
-    elif contract_status != "OK":
-        badge_text = "[INVALID SCHEMA]"
-        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)")
-    elif verification_status == "MISSING_ARTIFACTS":
-        badge_text = "[MISSING ARTIFACTS]"
-        badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)")
-    elif verification_status == "NON_COMPARABLE":
-        badge_text = "[NON-COMPARABLE]"
+    elif badge_text in {"[TYPE 2 DISSONANCE]", "[INVALID SCHEMA]", "[MISSING ARTIFACTS]", "[NON-COMPARABLE]"}:
         badge_style = dict(base_badge, color=PALETTE["amber"], border=f"1px solid {PALETTE['amber']}", backgroundColor="rgba(255,179,71,0.12)")
     else:
-        badge_text = "[UNVERIFIED]"
         badge_style = dict(base_badge, color="#FF2A00", border="1px solid #FF2A00", backgroundColor="rgba(255,42,0,0.12)", boxShadow="0 0 12px rgba(255,42,0,0.4)", animation="glitchFlash 0.9s steps(2,end) infinite")
 
     if claims_enabled:
@@ -1933,8 +1989,14 @@ def _render_dashboard_impl(
         t3 = "System 2: Claims disabled (exploratory mode)"
 
     detail = f"source={state.get('verification_source')} | verification_summary.csv: {state.get('summary_path')} | verification_report.json: {state.get('report_path')}"
-    if contract_errors:
-        detail = detail + " | schema_errors=" + "; ".join(contract_errors[:3])
+    if missing_required:
+        detail += " | missing_required_artifacts=" + ",".join(missing_required)
+    if missing_optional:
+        detail += " | missing_optional_artifacts=" + ",".join(missing_optional[:5])
+    if schema_errors:
+        detail += " | schema_errors=" + "; ".join(schema_errors[:3])
+    elif contract_errors:
+        detail += " | diagnostics=" + "; ".join(contract_errors[:3])
     ab = load_ablation_state(run_key)
     ctrl = load_control_state(run_key)
     ablation_text = (
@@ -1976,12 +2038,14 @@ def _render_dashboard_impl(
         hidden_badge_text = "[HIDDEN LABELS MISSING]"
         hidden_badge_style = {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["amber"], "border": f"1px solid {PALETTE['amber']}", "backgroundColor": "rgba(255,179,71,0.12)"}
         hidden_detail = "Expected labels/hidden_groups.csv and labels/derived/group_*.json"
+        if missing_optional:
+            hidden_detail += f" | missing_optional_artifacts={','.join(missing_optional)}"
 
     relativity_panel = _build_relativity_panel(contract, effective_observer, delta_mode, translation_mode_values or [])
     group_panel = _build_group_panel(contract, label_column, label_values or [])
     empathy_fig = _build_empathy_figure(contract, label_column, label_values or [])
 
-    watermark_visible = (not claims_enabled) or (failure_overlay_values is not None and "on" in failure_overlay_values)
+    watermark_visible = gate["watermark_visible"] or (failure_overlay_values is not None and "on" in failure_overlay_values)
     watermark_text = "UNVERIFIED / EXPLORATORY" if not claims_enabled else "FAILURE OVERLAYS"
     watermark_style = {
         "position": "absolute",
