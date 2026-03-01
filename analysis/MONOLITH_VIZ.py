@@ -554,6 +554,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         # the dataset. Efficiency = delta (Displacement / Path_Length; 1.0 = perfect
         # straight line, values near 0 = spinning tautology trap).
         if phantom_verdicts and len(phantom_verdicts) > 1:
+            reclassified = []
             deltas = np.array([v.get('delta', 1e-8) for v in phantom_verdicts], dtype=float)
             # Clamp to avoid division by zero / log issues
             deltas = np.maximum(deltas, 1e-8)
@@ -1794,6 +1795,7 @@ def render_phantom_paths_3d(
     """3+2+1 EPISTEMIC OVERHAUL: Families A (Paths) and B (Breaks)."""
     if not HAS_PLOTLY: return []
     traces = []
+    legend_shown = set()
     fast_render = os.environ.get("MONOLITH_FAST_RENDER", "0").strip() == "1"
     n_articles = min(len(phantom_verdicts), len(positions_3d))
     centroid = positions_3d.mean(axis=0)
@@ -1829,19 +1831,45 @@ def render_phantom_paths_3d(
             curve_x = pos[0] + direction[0] * t * path_length + curve_radius * np.sin(t * np.pi)
             curve_y = pos[1] + direction[1] * t * path_length + curve_radius * np.cos(t * np.pi)
             curve_z = interpolate_z_from_terrain(curve_x, curve_y, offset=0.03)
-            traces.append(go.Scatter3d(x=curve_x, y=curve_y, z=curve_z, mode='lines', line=dict(color=path_color, width=3), opacity=0.8, name=f'{verdict.capitalize()} Path'))
+            legend_group = f'path-{verdict.lower()}'
+            legend_name = f'{verdict.capitalize()} Path'
+            traces.append(go.Scatter3d(
+                x=curve_x, y=curve_y, z=curve_z, mode='lines',
+                line=dict(color=path_color, width=3), opacity=0.8,
+                name=legend_name,
+                legendgroup=legend_group,
+                showlegend=legend_group not in legend_shown,
+            ))
+            legend_shown.add(legend_group)
 
         # FAMILY B: THE TOPOLOGICAL BREAKS (B/F)
         elif verdict == "RUPTURE":
             if walker_state == "broken":
                 end_pos = pos + direction * 0.3
-                traces.append(go.Scatter3d(x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]], z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03), mode='lines', line=dict(color="#FF2222", width=4), name='Walker Break (Laser)'))
+                legend_group = 'path-rupture-broken'
+                traces.append(go.Scatter3d(
+                    x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]],
+                    z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03),
+                    mode='lines', line=dict(color="#FF2222", width=4),
+                    name='Walker Broken',
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in legend_shown,
+                ))
+                legend_shown.add(legend_group)
             else:
                 n_jag = 6
                 jx = np.linspace(pos[0], pos[0] + direction[0] * 0.2, n_jag) + np.random.uniform(-0.04, 0.04, n_jag)
                 jy = np.linspace(pos[1], pos[1] + direction[1] * 0.2, n_jag) + np.random.uniform(-0.04, 0.04, n_jag)
                 jz = interpolate_z_from_terrain(jx, jy, offset=0.04)
-                traces.append(go.Scatter3d(x=jx, y=jy, z=jz, mode='lines', line=dict(color='#FF00FF', width=2), name='Fault Line (Lightning)'))
+                legend_group = 'path-rupture-trapped'
+                traces.append(go.Scatter3d(
+                    x=jx, y=jy, z=jz, mode='lines',
+                    line=dict(color='#FF00FF', width=2),
+                    name='Walker Trapped',
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in legend_shown,
+                ))
+                legend_shown.add(legend_group)
     return traces
 
 
@@ -2487,12 +2515,19 @@ def render_spectral_axis_3d(
 
     # Axis colors and labels
     axis_colors = [PALETTE.cyan, PALETTE.rupture_core, PALETTE.yellow]
-    axis_labels = ['Vector: Primary Conflict', 'Vector: Secondary Conflict', 'Vector: Nuance']
+    axis_labels = ['Primary Conflict', 'Secondary Conflict', 'Nuance']
     axis_names = ['X-Axis (Primary War)', 'Y-Axis (Secondary War)', 'Z-Axis (Nuance)']
 
     for i in range(min(3, len(pca.components_))):
         component = pca.components_[i]
         explained_var = pca.explained_variance_ratio_[i]
+        dominant_probe_idx = get_dominant_probe(component)
+        dominant_probe_label = (
+            PROBE_LABELS[dominant_probe_idx]
+            if 0 <= dominant_probe_idx < len(PROBE_LABELS)
+            else f"Probe {dominant_probe_idx}"
+        )
+        semantic_label = f"{axis_labels[i]}: {dominant_probe_label}"
 
         # Use a fixed length for vectors for consistency, relative to overall scene size
         scene_range = positions_3d.max(axis=0) - positions_3d.min(axis=0)
@@ -2541,8 +2576,8 @@ def render_spectral_axis_3d(
             mode='lines',
             line=dict(color=axis_colors[i], width=5 - i*1.5), # Wider for PC1, narrower for PC3
             opacity=0.9,
-            name=f'{axis_labels[i]} (EVR={explained_var*100:.1f}%)',
-            hovertemplate=f'<b>{axis_labels[i]}</b><br>Explained Var: {explained_var*100:.1f}%<extra></extra>',
+            name=f'Vector: {semantic_label} (EVR={explained_var*100:.1f}%)',
+            hovertemplate=f'<b>Vector: {semantic_label}</b><br>Explained Var: {explained_var*100:.1f}%<extra></extra>',
             showlegend=True,
         ))
 
@@ -2554,7 +2589,7 @@ def render_spectral_axis_3d(
 # =============================================================================
 def render_data_points_3d(
     positions: np.ndarray,
-    colors: np.ndarray,
+    spectral_evr: np.ndarray,
     sizes: np.ndarray,
     hover_texts: List[str],
     name: str = "Articles",
@@ -2616,7 +2651,7 @@ def render_data_points_3d(
         glow_size_factor_val = 1.0 # Default glow size factor for points
 
                 # FAMILY C: NODE FAILURES (Internal Singularity)
-        if evr < 0.5:
+        if spectral_evr is not None and i < len(spectral_evr) and spectral_evr[i] < 0.5:
             glow_opacity_val = 0.8
             glow_size_factor_val = 2.5
             r, g, b = (255, 0, 0) # Pulsing Red
@@ -2688,6 +2723,7 @@ def render_data_points_3d(
             symbol='circle',  # Explicit circle shape
         ),
         text=hover_texts,
+        customdata=list(range(n)),
         hoverinfo='text',
         hovertemplate='%{text}<extra></extra>',
         hoverlabel=dict(
@@ -2970,6 +3006,8 @@ def generate_hud_html(
     kernel_name: str = "rbf",
     n_cracks: int = 0,
     n_bonds: int = 0,
+    n_broken: int = 0,
+    n_trapped: int = 0,
     mean_action: float = 0.0,
     survival_rate: float = 1.0,
     synthesis_nmi: Optional[float] = None,
@@ -2982,7 +3020,11 @@ def generate_hud_html(
     walker_class = "good" if survival_rate >= 0.95 else "warn" if survival_rate >= 0.8 else "alert"
 
     # Build T5 section with optional NMI
-    t5_section = f'<span class="hud-item {phantom_class}">T5 SPECTRAL: {n_honest}H/{n_phantoms}P/{n_tautology}T'
+    t5_section = (
+        f'<span class="hud-item {phantom_class}">'
+        f'T5: {n_honest}H / {n_phantoms}P / {n_tautology}T | '
+        f'RUPTURES: {n_broken} Broken / {n_trapped} Trapped'
+    )
     if synthesis_nmi is not None:
         nmi_class = "good" if synthesis_nmi > 0.7 else "warn" if synthesis_nmi > 0.5 else "alert"
         t5_section += f' | NMI: <span class="{nmi_class}">{synthesis_nmi:.3f}</span>'
@@ -2998,7 +3040,7 @@ def generate_hud_html(
         <span class="hud-sep">//</span>
         <span class="hud-item {rupture_class}">T1.5: {n_ruptures}R</span>
         <span class="hud-sep">//</span>
-        <span class="hud-item {crack_class}">T3: {n_bonds}B/{n_cracks}C</span>
+        <span class="hud-item {crack_class}">T3: HYST COOL {n_bonds}:{n_cracks}</span>
         <span class="hud-sep">//</span>
         <span class="hud-item {walker_class}">T4: Act {mean_action:.2f} | Surv {survival_rate:.0%}</span>
         <span class="hud-sep">//</span>
@@ -3358,14 +3400,12 @@ def create_monolith_cockpit(
     positions_3d = project_points_onto_terrain(positions_2d, energy_values_for_points)
 
     # If MONOLITH_DATA.csv was successfully loaded, update it with x_proj and y_proj
-    # And overwrite the existing MONOLITH_DATA.csv for downstream analysis scripts (e.g., ablation.py)
+    # and overwrite existing values as needed so invalid cache values do not persist.
     if 'monolith_df' in locals(): # Check if monolith_df was successfully loaded
         x_proj = positions_2d[:, 0]
         y_proj = positions_2d[:, 1]
-        if 'x_proj' not in monolith_df.columns:
-            monolith_df['x_proj'] = x_proj
-        if 'y_proj' not in monolith_df.columns:
-            monolith_df['y_proj'] = y_proj
+        monolith_df['x_proj'] = x_proj
+        monolith_df['y_proj'] = y_proj
         
         # Save the updated MONOLITH_DATA.csv (with x_proj, y_proj)
         monolith_data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3844,6 +3884,8 @@ def create_monolith_cockpit(
         kernel_name=exp.kernel,
         n_cracks=n_cracks,
         n_bonds=n_bonds,
+        n_broken=n_broken,
+        n_trapped=n_trapped,
         mean_action=mean_action,
         survival_rate=survival_rate,
         synthesis_nmi=exp.synthesis_nmi,
@@ -3923,36 +3965,24 @@ def create_monolith_cockpit(
     <div class="legend-panel" id="legend-synthesis">
         <div class="legend-title">SYNTHESIS MODE</div>
         <div class="legend-item">
-            <div class="legend-dot" style="background: {PALETTE.green};"></div>
-            <span>High Signal (EVR > 0.7)</span>
+            <div class="legend-line" style="background: #00F0FF;"></div>
+            <span>Cyan: Honest Path (Logically valid, geometrically cheap)</span>
         </div>
         <div class="legend-item">
-            <div class="legend-dot" style="background: {PALETTE.yellow};"></div>
-            <span>Medium Signal</span>
+            <div class="legend-line" style="background: #FF00FF;"></div>
+            <span>Magenta: Phantom Path (Logically forced, geometrically warped)</span>
         </div>
         <div class="legend-item">
-            <div class="legend-dot" style="background: {PALETTE.red};"></div>
-            <span>Low Signal (Rupture Zone)</span>
+            <div class="legend-dot" style="background: #888888;"></div>
+            <span>Grey: Tautology (Topological collapse / Echo chamber)</span>
         </div>
         <div class="legend-item">
-            <div class="legend-line" style="background: {PALETTE.honest_cyan};"></div>
-            <span>Honest Path</span>
+            <div class="legend-dot" style="background: #FF2222;"></div>
+            <span>Red 'X': Walker Broken (System 2 Kinetic failure)</span>
         </div>
         <div class="legend-item">
-            <div class="legend-line" style="background: {PALETTE.phantom_white}; border-style: dashed;"></div>
-            <span>Phantom Path</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-line" style="background: {PALETTE.rupture_red};"></div>
-            <span>Rupture (Lightning)</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-dot" style="background: {PALETTE.walker_trapped};"></div>
-            <span>Walker Trapped</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-dot" style="background: {PALETTE.walker_broken};"></div>
-            <span>Walker Broken</span>
+            <div class="legend-dot" style="background: #FFB347;"></div>
+            <span>Orange 'O': Walker Trapped (System 1 Topological trap)</span>
         </div>
     </div>
     '''
@@ -4147,6 +4177,26 @@ def create_monolith_cockpit(
     </div>
     '''
 
+    dash_run_key = str(exp.experiment_dir)
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        dash_run_key = str(exp.experiment_dir.resolve().relative_to(repo_root)).replace("\\", "/")
+    except Exception:
+        dash_run_key = str(exp.experiment_dir).replace("\\", "/")
+
+    dash_embed_panel = '''
+    <div id="dash-embed-panel" style="position: fixed; left: 18px; bottom: 18px; width: 46vw; height: 42vh; min-width: 420px; min-height: 280px; background: rgba(3,5,10,0.95); border: 1px solid #1e5062; border-radius: 8px; z-index: 1100; display: none; box-shadow: 0 8px 30px rgba(0,0,0,0.45); overflow: hidden;">
+        <div style="height: 34px; display:flex; align-items:center; justify-content:space-between; padding: 0 10px; background: rgba(0,240,255,0.08); border-bottom: 1px solid #1e5062; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #b9f7ff;">
+            <span id="dash-embed-title">DASH OBSERVER VIEW</span>
+            <button onclick="closeDashEmbed()" style="background: transparent; color: #9adce8; border: 1px solid #2f7688; border-radius: 4px; font-size: 10px; cursor: pointer; padding: 2px 8px;">CLOSE</button>
+        </div>
+        <iframe id="dash-embed-frame" style="width: 100%; height: calc(100% - 34px); border: 0; background: #070912;"></iframe>
+    </div>
+    <div id="dash-embed-hint" style="position: fixed; left: 18px; bottom: 18px; z-index: 1050; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #7ca3af; background: rgba(5,8,12,0.7); border: 1px solid #1f2e35; border-radius: 6px; padding: 5px 8px;">
+        Click an article point to open embedded Dash observer lab
+    </div>
+    '''
+
 
     html_template = f'''<!DOCTYPE html>
 <html>
@@ -4174,6 +4224,7 @@ def create_monolith_cockpit(
     {legend_synthesis}
     {legend_analysis}
     {legend_diagnostics}
+    {dash_embed_panel}
     <div class="cockpit-container" id="cockpit"></div>
 
     <script>
@@ -4185,6 +4236,8 @@ def create_monolith_cockpit(
         var ANALYSIS_START = {analysis_trace_start};
         var ANALYSIS_END = {analysis_trace_end};
         var currentMode = 'synthesis';
+        var DASH_BASE_URL = 'http://127.0.0.1:8050/';
+        var DASH_RUN_KEY = {json.dumps(dash_run_key)};
 
         // Initialize plot
         var figData = {{PLOT_DATA}};
@@ -4193,6 +4246,53 @@ def create_monolith_cockpit(
             displayModeBar: true,
             modeBarButtonsToRemove: ['lasso2d', 'select2d'],
         }});
+
+        function closeDashEmbed() {{
+            var panel = document.getElementById('dash-embed-panel');
+            var frame = document.getElementById('dash-embed-frame');
+            if (panel) panel.style.display = 'none';
+            if (frame) frame.src = 'about:blank';
+        }}
+
+        function openDashForArticle(articleIdx) {{
+            var panel = document.getElementById('dash-embed-panel');
+            var frame = document.getElementById('dash-embed-frame');
+            var title = document.getElementById('dash-embed-title');
+            if (!panel || !frame) return;
+            var qs = new URLSearchParams();
+            qs.set('run_key', DASH_RUN_KEY);
+            qs.set('observer', 'article:' + String(articleIdx));
+            qs.set('view_mode', 'observer');
+            qs.set('compare', '0');
+            qs.set('embedded', '1');
+            frame.src = DASH_BASE_URL + '?' + qs.toString();
+            if (title) {{
+                title.textContent = 'DASH OBSERVER VIEW | article:' + String(articleIdx);
+            }}
+            panel.style.display = 'block';
+        }}
+
+        var cockpitEl = document.getElementById('cockpit');
+        if (cockpitEl) {{
+            cockpitEl.on('plotly_click', function(evt) {{
+                try {{
+                    var point = (evt && evt.points && evt.points.length) ? evt.points[0] : null;
+                    if (!point) return;
+                    var traceName = ((point.data && point.data.name) || '').toString();
+                    if (traceName !== 'Articles') return;
+                    var idx = null;
+                    if (typeof point.customdata === 'number' && isFinite(point.customdata)) {{
+                        idx = Math.floor(point.customdata);
+                    }} else if (typeof point.pointNumber === 'number' && isFinite(point.pointNumber)) {{
+                        idx = Math.floor(point.pointNumber);
+                    }}
+                    if (idx === null || idx < 0) return;
+                    openDashForArticle(idx);
+                }} catch (err) {{
+                    console.warn('dash embed click handler failed', err);
+                }}
+            }});
+        }}
 
 
 
