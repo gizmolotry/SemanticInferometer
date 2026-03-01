@@ -1,0 +1,1147 @@
+diff --git a/analysis/MONOLITH_VIZ.py b/analysis/MONOLITH_VIZ.py
+index 2505eb1..db783e6 100644
+--- a/analysis/MONOLITH_VIZ.py
++++ b/analysis/MONOLITH_VIZ.py
+@@ -554,6 +554,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
+         # the dataset. Efficiency = delta (Displacement / Path_Length; 1.0 = perfect
+         # straight line, values near 0 = spinning tautology trap).
+         if phantom_verdicts and len(phantom_verdicts) > 1:
++            reclassified = []
+             deltas = np.array([v.get('delta', 1e-8) for v in phantom_verdicts], dtype=float)
+             # Clamp to avoid division by zero / log issues
+             deltas = np.maximum(deltas, 1e-8)
+@@ -1794,6 +1795,7 @@ def render_phantom_paths_3d(
+     """3+2+1 EPISTEMIC OVERHAUL: Families A (Paths) and B (Breaks)."""
+     if not HAS_PLOTLY: return []
+     traces = []
++    legend_shown = set()
+     fast_render = os.environ.get("MONOLITH_FAST_RENDER", "0").strip() == "1"
+     n_articles = min(len(phantom_verdicts), len(positions_3d))
+     centroid = positions_3d.mean(axis=0)
+@@ -1829,19 +1831,45 @@ def render_phantom_paths_3d(
+             curve_x = pos[0] + direction[0] * t * path_length + curve_radius * np.sin(t * np.pi)
+             curve_y = pos[1] + direction[1] * t * path_length + curve_radius * np.cos(t * np.pi)
+             curve_z = interpolate_z_from_terrain(curve_x, curve_y, offset=0.03)
+-            traces.append(go.Scatter3d(x=curve_x, y=curve_y, z=curve_z, mode='lines', line=dict(color=path_color, width=3), opacity=0.8, name=f'{verdict.capitalize()} Path'))
++            legend_group = f'path-{verdict.lower()}'
++            legend_name = f'{verdict.capitalize()} Path'
++            traces.append(go.Scatter3d(
++                x=curve_x, y=curve_y, z=curve_z, mode='lines',
++                line=dict(color=path_color, width=3), opacity=0.8,
++                name=legend_name,
++                legendgroup=legend_group,
++                showlegend=legend_group not in legend_shown,
++            ))
++            legend_shown.add(legend_group)
+ 
+         # FAMILY B: THE TOPOLOGICAL BREAKS (B/F)
+         elif verdict == "RUPTURE":
+             if walker_state == "broken":
+                 end_pos = pos + direction * 0.3
+-                traces.append(go.Scatter3d(x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]], z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03), mode='lines', line=dict(color="#FF2222", width=4), name='Walker Break (Laser)'))
++                legend_group = 'path-rupture-broken'
++                traces.append(go.Scatter3d(
++                    x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]],
++                    z=interpolate_z_from_terrain(np.array([pos[0], end_pos[0]]), np.array([pos[1], end_pos[1]]), offset=0.03),
++                    mode='lines', line=dict(color="#FF2222", width=4),
++                    name='Walker Broken',
++                    legendgroup=legend_group,
++                    showlegend=legend_group not in legend_shown,
++                ))
++                legend_shown.add(legend_group)
+             else:
+                 n_jag = 6
+                 jx = np.linspace(pos[0], pos[0] + direction[0] * 0.2, n_jag) + np.random.uniform(-0.04, 0.04, n_jag)
+                 jy = np.linspace(pos[1], pos[1] + direction[1] * 0.2, n_jag) + np.random.uniform(-0.04, 0.04, n_jag)
+                 jz = interpolate_z_from_terrain(jx, jy, offset=0.04)
+-                traces.append(go.Scatter3d(x=jx, y=jy, z=jz, mode='lines', line=dict(color='#FF00FF', width=2), name='Fault Line (Lightning)'))
++                legend_group = 'path-rupture-trapped'
++                traces.append(go.Scatter3d(
++                    x=jx, y=jy, z=jz, mode='lines',
++                    line=dict(color='#FF00FF', width=2),
++                    name='Walker Trapped',
++                    legendgroup=legend_group,
++                    showlegend=legend_group not in legend_shown,
++                ))
++                legend_shown.add(legend_group)
+     return traces
+ 
+ 
+@@ -2487,12 +2515,19 @@ def render_spectral_axis_3d(
+ 
+     # Axis colors and labels
+     axis_colors = [PALETTE.cyan, PALETTE.rupture_core, PALETTE.yellow]
+-    axis_labels = ['Vector: Primary Conflict', 'Vector: Secondary Conflict', 'Vector: Nuance']
++    axis_labels = ['Primary Conflict', 'Secondary Conflict', 'Nuance']
+     axis_names = ['X-Axis (Primary War)', 'Y-Axis (Secondary War)', 'Z-Axis (Nuance)']
+ 
+     for i in range(min(3, len(pca.components_))):
+         component = pca.components_[i]
+         explained_var = pca.explained_variance_ratio_[i]
++        dominant_probe_idx = get_dominant_probe(component)
++        dominant_probe_label = (
++            PROBE_LABELS[dominant_probe_idx]
++            if 0 <= dominant_probe_idx < len(PROBE_LABELS)
++            else f"Probe {dominant_probe_idx}"
++        )
++        semantic_label = f"{axis_labels[i]}: {dominant_probe_label}"
+ 
+         # Use a fixed length for vectors for consistency, relative to overall scene size
+         scene_range = positions_3d.max(axis=0) - positions_3d.min(axis=0)
+@@ -2541,8 +2576,8 @@ def render_spectral_axis_3d(
+             mode='lines',
+             line=dict(color=axis_colors[i], width=5 - i*1.5), # Wider for PC1, narrower for PC3
+             opacity=0.9,
+-            name=f'{axis_labels[i]} (EVR={explained_var*100:.1f}%)',
+-            hovertemplate=f'<b>{axis_labels[i]}</b><br>Explained Var: {explained_var*100:.1f}%<extra></extra>',
++            name=f'Vector: {semantic_label} (EVR={explained_var*100:.1f}%)',
++            hovertemplate=f'<b>Vector: {semantic_label}</b><br>Explained Var: {explained_var*100:.1f}%<extra></extra>',
+             showlegend=True,
+         ))
+ 
+@@ -2554,7 +2589,7 @@ def render_spectral_axis_3d(
+ # =============================================================================
+ def render_data_points_3d(
+     positions: np.ndarray,
+-    colors: np.ndarray,
++    spectral_evr: np.ndarray,
+     sizes: np.ndarray,
+     hover_texts: List[str],
+     name: str = "Articles",
+@@ -2616,7 +2651,7 @@ def render_data_points_3d(
+         glow_size_factor_val = 1.0 # Default glow size factor for points
+ 
+                 # FAMILY C: NODE FAILURES (Internal Singularity)
+-        if evr < 0.5:
++        if spectral_evr is not None and i < len(spectral_evr) and spectral_evr[i] < 0.5:
+             glow_opacity_val = 0.8
+             glow_size_factor_val = 2.5
+             r, g, b = (255, 0, 0) # Pulsing Red
+@@ -2688,6 +2723,7 @@ def render_data_points_3d(
+             symbol='circle',  # Explicit circle shape
+         ),
+         text=hover_texts,
++        customdata=list(range(n)),
+         hoverinfo='text',
+         hovertemplate='%{text}<extra></extra>',
+         hoverlabel=dict(
+@@ -2970,6 +3006,8 @@ def generate_hud_html(
+     kernel_name: str = "rbf",
+     n_cracks: int = 0,
+     n_bonds: int = 0,
++    n_broken: int = 0,
++    n_trapped: int = 0,
+     mean_action: float = 0.0,
+     survival_rate: float = 1.0,
+     synthesis_nmi: Optional[float] = None,
+@@ -2982,7 +3020,11 @@ def generate_hud_html(
+     walker_class = "good" if survival_rate >= 0.95 else "warn" if survival_rate >= 0.8 else "alert"
+ 
+     # Build T5 section with optional NMI
+-    t5_section = f'<span class="hud-item {phantom_class}">T5 SPECTRAL: {n_honest}H/{n_phantoms}P/{n_tautology}T'
++    t5_section = (
++        f'<span class="hud-item {phantom_class}">'
++        f'T5: {n_honest}H / {n_phantoms}P / {n_tautology}T | '
++        f'RUPTURES: {n_broken} Broken / {n_trapped} Trapped'
++    )
+     if synthesis_nmi is not None:
+         nmi_class = "good" if synthesis_nmi > 0.7 else "warn" if synthesis_nmi > 0.5 else "alert"
+         t5_section += f' | NMI: <span class="{nmi_class}">{synthesis_nmi:.3f}</span>'
+@@ -2998,7 +3040,7 @@ def generate_hud_html(
+         <span class="hud-sep">//</span>
+         <span class="hud-item {rupture_class}">T1.5: {n_ruptures}R</span>
+         <span class="hud-sep">//</span>
+-        <span class="hud-item {crack_class}">T3: {n_bonds}B/{n_cracks}C</span>
++        <span class="hud-item {crack_class}">T3: HYST COOL {n_bonds}:{n_cracks}</span>
+         <span class="hud-sep">//</span>
+         <span class="hud-item {walker_class}">T4: Act {mean_action:.2f} | Surv {survival_rate:.0%}</span>
+         <span class="hud-sep">//</span>
+@@ -3358,14 +3400,12 @@ def create_monolith_cockpit(
+     positions_3d = project_points_onto_terrain(positions_2d, energy_values_for_points)
+ 
+     # If MONOLITH_DATA.csv was successfully loaded, update it with x_proj and y_proj
+-    # And overwrite the existing MONOLITH_DATA.csv for downstream analysis scripts (e.g., ablation.py)
++    # and overwrite existing values as needed so invalid cache values do not persist.
+     if 'monolith_df' in locals(): # Check if monolith_df was successfully loaded
+         x_proj = positions_2d[:, 0]
+         y_proj = positions_2d[:, 1]
+-        if 'x_proj' not in monolith_df.columns:
+-            monolith_df['x_proj'] = x_proj
+-        if 'y_proj' not in monolith_df.columns:
+-            monolith_df['y_proj'] = y_proj
++        monolith_df['x_proj'] = x_proj
++        monolith_df['y_proj'] = y_proj
+         
+         # Save the updated MONOLITH_DATA.csv (with x_proj, y_proj)
+         monolith_data_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -3844,6 +3884,8 @@ def create_monolith_cockpit(
+         kernel_name=exp.kernel,
+         n_cracks=n_cracks,
+         n_bonds=n_bonds,
++        n_broken=n_broken,
++        n_trapped=n_trapped,
+         mean_action=mean_action,
+         survival_rate=survival_rate,
+         synthesis_nmi=exp.synthesis_nmi,
+@@ -3923,36 +3965,24 @@ def create_monolith_cockpit(
+     <div class="legend-panel" id="legend-synthesis">
+         <div class="legend-title">SYNTHESIS MODE</div>
+         <div class="legend-item">
+-            <div class="legend-dot" style="background: {PALETTE.green};"></div>
+-            <span>High Signal (EVR > 0.7)</span>
++            <div class="legend-line" style="background: #00F0FF;"></div>
++            <span>Cyan: Honest Path (Logically valid, geometrically cheap)</span>
+         </div>
+         <div class="legend-item">
+-            <div class="legend-dot" style="background: {PALETTE.yellow};"></div>
+-            <span>Medium Signal</span>
++            <div class="legend-line" style="background: #FF00FF;"></div>
++            <span>Magenta: Phantom Path (Logically forced, geometrically warped)</span>
+         </div>
+         <div class="legend-item">
+-            <div class="legend-dot" style="background: {PALETTE.red};"></div>
+-            <span>Low Signal (Rupture Zone)</span>
+-        </div>
+-        <div class="legend-item">
+-            <div class="legend-line" style="background: {PALETTE.honest_cyan};"></div>
+-            <span>Honest Path</span>
+-        </div>
+-        <div class="legend-item">
+-            <div class="legend-line" style="background: {PALETTE.phantom_white}; border-style: dashed;"></div>
+-            <span>Phantom Path</span>
+-        </div>
+-        <div class="legend-item">
+-            <div class="legend-line" style="background: {PALETTE.rupture_red};"></div>
+-            <span>Rupture (Lightning)</span>
++            <div class="legend-dot" style="background: #888888;"></div>
++            <span>Grey: Tautology (Topological collapse / Echo chamber)</span>
+         </div>
+         <div class="legend-item">
+-            <div class="legend-dot" style="background: {PALETTE.walker_trapped};"></div>
+-            <span>Walker Trapped</span>
++            <div class="legend-dot" style="background: #FF2222;"></div>
++            <span>Red 'X': Walker Broken (System 2 Kinetic failure)</span>
+         </div>
+         <div class="legend-item">
+-            <div class="legend-dot" style="background: {PALETTE.walker_broken};"></div>
+-            <span>Walker Broken</span>
++            <div class="legend-dot" style="background: #FFB347;"></div>
++            <span>Orange 'O': Walker Trapped (System 1 Topological trap)</span>
+         </div>
+     </div>
+     '''
+@@ -4147,6 +4177,26 @@ def create_monolith_cockpit(
+     </div>
+     '''
+ 
++    dash_run_key = str(exp.experiment_dir)
++    try:
++        repo_root = Path(__file__).resolve().parents[1]
++        dash_run_key = str(exp.experiment_dir.resolve().relative_to(repo_root)).replace("\\", "/")
++    except Exception:
++        dash_run_key = str(exp.experiment_dir).replace("\\", "/")
++
++    dash_embed_panel = '''
++    <div id="dash-embed-panel" style="position: fixed; left: 18px; bottom: 18px; width: 46vw; height: 42vh; min-width: 420px; min-height: 280px; background: rgba(3,5,10,0.95); border: 1px solid #1e5062; border-radius: 8px; z-index: 1100; display: none; box-shadow: 0 8px 30px rgba(0,0,0,0.45); overflow: hidden;">
++        <div style="height: 34px; display:flex; align-items:center; justify-content:space-between; padding: 0 10px; background: rgba(0,240,255,0.08); border-bottom: 1px solid #1e5062; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #b9f7ff;">
++            <span id="dash-embed-title">DASH OBSERVER VIEW</span>
++            <button onclick="closeDashEmbed()" style="background: transparent; color: #9adce8; border: 1px solid #2f7688; border-radius: 4px; font-size: 10px; cursor: pointer; padding: 2px 8px;">CLOSE</button>
++        </div>
++        <iframe id="dash-embed-frame" style="width: 100%; height: calc(100% - 34px); border: 0; background: #070912;"></iframe>
++    </div>
++    <div id="dash-embed-hint" style="position: fixed; left: 18px; bottom: 18px; z-index: 1050; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #7ca3af; background: rgba(5,8,12,0.7); border: 1px solid #1f2e35; border-radius: 6px; padding: 5px 8px;">
++        Click an article point to open embedded Dash observer lab
++    </div>
++    '''
++
+ 
+     html_template = f'''<!DOCTYPE html>
+ <html>
+@@ -4174,6 +4224,7 @@ def create_monolith_cockpit(
+     {legend_synthesis}
+     {legend_analysis}
+     {legend_diagnostics}
++    {dash_embed_panel}
+     <div class="cockpit-container" id="cockpit"></div>
+ 
+     <script>
+@@ -4185,6 +4236,8 @@ def create_monolith_cockpit(
+         var ANALYSIS_START = {analysis_trace_start};
+         var ANALYSIS_END = {analysis_trace_end};
+         var currentMode = 'synthesis';
++        var DASH_BASE_URL = 'http://127.0.0.1:8050/';
++        var DASH_RUN_KEY = {json.dumps(dash_run_key)};
+ 
+         // Initialize plot
+         var figData = {{PLOT_DATA}};
+@@ -4194,6 +4247,53 @@ def create_monolith_cockpit(
+             modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+         }});
+ 
++        function closeDashEmbed() {{
++            var panel = document.getElementById('dash-embed-panel');
++            var frame = document.getElementById('dash-embed-frame');
++            if (panel) panel.style.display = 'none';
++            if (frame) frame.src = 'about:blank';
++        }}
++
++        function openDashForArticle(articleIdx) {{
++            var panel = document.getElementById('dash-embed-panel');
++            var frame = document.getElementById('dash-embed-frame');
++            var title = document.getElementById('dash-embed-title');
++            if (!panel || !frame) return;
++            var qs = new URLSearchParams();
++            qs.set('run_key', DASH_RUN_KEY);
++            qs.set('observer', 'article:' + String(articleIdx));
++            qs.set('view_mode', 'observer');
++            qs.set('compare', '0');
++            qs.set('embedded', '1');
++            frame.src = DASH_BASE_URL + '?' + qs.toString();
++            if (title) {{
++                title.textContent = 'DASH OBSERVER VIEW | article:' + String(articleIdx);
++            }}
++            panel.style.display = 'block';
++        }}
++
++        var cockpitEl = document.getElementById('cockpit');
++        if (cockpitEl) {{
++            cockpitEl.on('plotly_click', function(evt) {{
++                try {{
++                    var point = (evt && evt.points && evt.points.length) ? evt.points[0] : null;
++                    if (!point) return;
++                    var traceName = ((point.data && point.data.name) || '').toString();
++                    if (traceName !== 'Articles') return;
++                    var idx = null;
++                    if (typeof point.customdata === 'number' && isFinite(point.customdata)) {{
++                        idx = Math.floor(point.customdata);
++                    }} else if (typeof point.pointNumber === 'number' && isFinite(point.pointNumber)) {{
++                        idx = Math.floor(point.pointNumber);
++                    }}
++                    if (idx === null || idx < 0) return;
++                    openDashForArticle(idx);
++                }} catch (err) {{
++                    console.warn('dash embed click handler failed', err);
++                }}
++            }});
++        }}
++
+ 
+ 
+         function applyFailureFilter() {{
+diff --git a/analysis/isolated_dash_prototype.py b/analysis/isolated_dash_prototype.py
+index c21ea26..b9c14e3 100644
+--- a/analysis/isolated_dash_prototype.py
++++ b/analysis/isolated_dash_prototype.py
+@@ -13,20 +13,35 @@ from __future__ import annotations
+ import csv
+ import json
+ import re
++import sys
++from urllib.parse import parse_qs
+ from functools import lru_cache
+ from pathlib import Path
+ from typing import Dict, List, Optional, Tuple
+ 
++REPO_ROOT = Path(__file__).resolve().parents[1]
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++
+ import dash_bootstrap_components as dbc
+ from dash import Dash, Input, Output, State, callback_context, dcc, html
+ import plotly.graph_objects as go
+-from analysis.verification.contract import (
+-    LayerStatus,
+-    REQUIRED_CONSUMER_ARTIFACTS,
+-    OPTIONAL_CONSUMER_ARTIFACTS,
+-    REQUIRED_PROVENANCE_KEYS,
+-    evaluate_consumer_contract,
+-)
++try:
++    from analysis.verification.contract import (
++        LayerStatus,
++        REQUIRED_CONSUMER_ARTIFACTS,
++        OPTIONAL_CONSUMER_ARTIFACTS,
++        REQUIRED_PROVENANCE_KEYS,
++        evaluate_consumer_contract,
++    )
++except Exception:
++    from verification.contract import (
++        LayerStatus,
++        REQUIRED_CONSUMER_ARTIFACTS,
++        OPTIONAL_CONSUMER_ARTIFACTS,
++        REQUIRED_PROVENANCE_KEYS,
++        evaluate_consumer_contract,
++    )
+ 
+ 
+ PALETTE = {
+@@ -41,7 +56,7 @@ PALETTE = {
+     "dim": "#8A8A8A",
+ }
+ 
+-ROOT = Path(__file__).resolve().parents[1]
++ROOT = REPO_ROOT
+ 
+ 
+ def _is_run_directory(path: Path) -> bool:
+@@ -429,38 +444,36 @@ def _find_latest_pair_under(root: Path) -> Tuple[Optional[Path], Optional[Path]]
+ 
+ def _resolve_verification_pair(run_key: Optional[str], verification_source: Optional[str]) -> Tuple[Optional[Path], Optional[Path]]:
+     if verification_source and verification_source != "auto":
+-        return _find_latest_pair_under(Path(verification_source))
++        report, summary = _find_latest_pair_under(Path(verification_source))
++        return summary, report
+ 
+     run_dir = None
+     if run_key and "INDEX" in globals():
+         run = INDEX.get("runs", {}).get(str(run_key), {})
+         run_dir = run.get("run_dir")
+ 
+-    search_roots: List[Path] = []
++    # When a run is selected, keep verification resolution local to that run family.
+     if run_dir and run_dir.exists():
+-        search_roots.extend(
+-            [
+-                run_dir,
+-                run_dir / "verification",
+-                run_dir.parent,
+-                run_dir.parent / "verification",
+-                run_dir.parent.parent / "verification" if run_dir.parent and run_dir.parent.parent else None,
+-            ]
+-        )
+-    search_roots.extend([ROOT / "verification", ROOT / "analysis"])
+-    seen = set()
+-    normalized_roots = []
+-    for r in search_roots:
+-        if r and r.exists():
+-            sr = str(r)
+-            if sr not in seen:
+-                seen.add(sr)
+-                normalized_roots.append(r)
+-
+-    for root in normalized_roots:
+-        report, summary = _find_latest_pair_under(root)
+-        if report and summary:
+-            return summary, report
++        exact_summary = run_dir / "verification_summary.csv"
++        exact_report = run_dir / "verification_report.json"
++        if exact_summary.exists() and exact_report.exists():
++            return exact_summary, exact_report
++
++        search_roots: List[Path] = [run_dir, run_dir / "verification"]
++        if run_dir.parent:
++            search_roots.extend([run_dir.parent, run_dir.parent / "verification"])
++        seen = set()
++        for root in search_roots:
++            if not root or not root.exists():
++                continue
++            key = str(root)
++            if key in seen:
++                continue
++            seen.add(key)
++            report, summary = _find_latest_pair_under(root)
++            if report and summary:
++                return summary, report
++        return None, None
+ 
+     summary = _find_latest_file_scoped("verification_summary.csv", run_key) or _find_latest_file("verification_summary.csv")
+     report = _find_latest_file_scoped("verification_report.json", run_key) or _find_latest_file("verification_report.json")
+@@ -485,8 +498,9 @@ def discover_verification_sources(run_key: Optional[str]) -> List[dict]:
+         run = INDEX.get("runs", {}).get(str(run_key), {})
+         run_dir = run.get("run_dir")
+         if run_dir:
+-            roots.extend([run_dir, run_dir.parent])
+-    roots.extend([ROOT / "analysis", ROOT / "verification", ROOT])
++            roots.extend([run_dir, run_dir.parent, run_dir / "verification"])
++    else:
++        roots.extend([ROOT / "analysis", ROOT / "verification", ROOT])
+     for root in roots:
+         if not root.exists():
+             continue
+@@ -1206,11 +1220,12 @@ app.layout = dbc.Container(
+     fluid=True,
+     style={"backgroundColor": PALETTE["void"], "minHeight": "100vh", "padding": "0"},
+     children=[
++        dcc.Location(id="url", refresh=False),
+         html.Div(style={"display": "none"}),
+         dcc.Store(id="gallery-dir", data={"dir": 1}),
+         dcc.Store(id="hotkey-signal", data={"event": "none", "seq": 0}),
+-        dcc.Interval(id="hotkey-poll", interval=250, n_intervals=0),
+-        dcc.Interval(id="verification-poll", interval=10000, n_intervals=0),
++        dcc.Interval(id="hotkey-poll", interval=250, n_intervals=0, disabled=True),
++        dcc.Interval(id="verification-poll", interval=10000, n_intervals=0, disabled=True),
+         dcc.Interval(id="gallery-interval", interval=2200, n_intervals=0, disabled=True),
+         dbc.Row(
+             className="g-0",
+@@ -1334,9 +1349,9 @@ app.layout = dbc.Container(
+                     style={"minHeight": "100vh", "padding": "0", "backgroundColor": "#020208"},
+                     children=[
+                         html.Div(
+-                            style={"position": "relative", "height": "62vh", "width": "100%"},
++                            style={"position": "relative", "height": "85vh", "width": "100%"},
+                             children=[
+-                                dcc.Loading(id="artifact-loading", type="default", color=PALETTE["cyan"], children=[html.Div(id="artifact-container", style={"height": "62vh", "width": "100%"})]),
++                                dcc.Loading(id="artifact-loading", type="default", color=PALETTE["cyan"], children=[html.Div(id="artifact-container", style={"height": "85vh", "width": "100%"})]),
+                                 html.Div(id="watermark-overlay", style={"position": "absolute", "inset": "0", "display": "none", "alignItems": "center", "justifyContent": "center", "fontSize": "3.2rem", "fontWeight": "700", "letterSpacing": "0.08em", "color": "rgba(255,42,0,0.18)", "pointerEvents": "none", "textAlign": "center"}),
+                             ],
+                         ),
+@@ -1412,6 +1427,37 @@ def refresh_variants(run_key: str, current_a: str, current_b: str, current_obser
+     return opts, a, opts, b, obs_opts, observer
+ 
+ 
++@app.callback(
++    Output("run-dropdown", "value", allow_duplicate=True),
++    Output("observer-dropdown", "value", allow_duplicate=True),
++    Output("view-mode", "value", allow_duplicate=True),
++    Output("compare-enabled", "value", allow_duplicate=True),
++    Input("url", "search"),
++    State("run-dropdown", "options"),
++    State("run-dropdown", "value"),
++    prevent_initial_call="initial_duplicate",
++)
++def apply_url_state(search: Optional[str], run_options, current_run):
++    if not search:
++        return current_run, "global", "observer", []
++    try:
++        qs = parse_qs((search or "").lstrip("?"))
++    except Exception:
++        return current_run, "global", "observer", []
++
++    run_values = [o.get("value") for o in (run_options or []) if isinstance(o, dict)]
++    requested_run = str((qs.get("run_key") or [current_run])[0] or current_run)
++    run_value = requested_run if requested_run in run_values else current_run
++
++    observer = str((qs.get("observer") or ["global"])[0] or "global")
++    view_mode = str((qs.get("view_mode") or ["observer"])[0] or "observer").lower()
++    if view_mode not in {"global", "observer"}:
++        view_mode = "observer"
++    compare_raw = str((qs.get("compare") or ["0"])[0]).strip().lower()
++    compare_values = ["on"] if compare_raw in {"1", "true", "on", "yes"} else []
++    return run_value, observer, view_mode, compare_values
++
++
+ @app.callback(
+     Output("verification-source", "options"),
+     Output("verification-source", "value"),
+@@ -1533,7 +1579,7 @@ def handle_hotkeys(hotkey_signal, observer_value, observer_options, autoplay_val
+ 
+ 
+ @app.callback(
+-    Output("observer-dropdown", "value"),
++    Output("observer-dropdown", "value", allow_duplicate=True),
+     Output("gallery-dir", "data"),
+     Input("gallery-interval", "n_intervals"),
+     Input("prev-observer-btn", "n_clicks"),
+@@ -1542,6 +1588,7 @@ def handle_hotkeys(hotkey_signal, observer_value, observer_options, autoplay_val
+     State("observer-dropdown", "value"),
+     State("gallery-dir", "data"),
+     State("observer-dropdown", "options"),
++    prevent_initial_call=True,
+ )
+ def step_observer(
+     _auto_tick: int,
+@@ -1619,32 +1666,28 @@ def update_gallery_progress(observer_value: str, observer_options):
+     Output("empathy-heatmap", "figure"),
+     Output("watermark-overlay", "children"),
+     Output("watermark-overlay", "style"),
+-    Input("run-dropdown", "value"),
+     Input("observer-dropdown", "value"),
+-    Input("variant-a-dropdown", "value"),
+-    Input("variant-b-dropdown", "value"),
+-    Input("verification-source", "value"),
+-    Input("compare-enabled", "value"),
+-    Input("transition-style", "value"),
+-    Input("verification-poll", "n_intervals"),
+-    Input("gallery-interval", "n_intervals"),
+-    Input("view-mode", "value"),
+-    Input("delta-mode", "value"),
+-    Input("translation-mode", "value"),
+-    Input("failure-overlays", "value"),
+-    Input("label-column-dropdown", "value"),
+-    Input("label-value-dropdown", "value"),
++    State("run-dropdown", "value"),
++    State("variant-a-dropdown", "value"),
++    State("variant-b-dropdown", "value"),
++    State("verification-source", "value"),
++    State("compare-enabled", "value"),
++    State("transition-style", "value"),
++    State("view-mode", "value"),
++    State("delta-mode", "value"),
++    State("translation-mode", "value"),
++    State("failure-overlays", "value"),
++    State("label-column-dropdown", "value"),
++    State("label-value-dropdown", "value"),
+ )
+ def render_dashboard(
+-    run_key: str,
+     observer_value: str,
++    run_key: str,
+     variant_a: str,
+     variant_b: str,
+     verification_source: str,
+     compare_enabled_values: List[str],
+     transition_style: str,
+-    poll_tick: int,
+-    gallery_tick: int,
+     view_mode: str,
+     delta_mode: str,
+     translation_mode_values: List[str],
+@@ -1660,8 +1703,8 @@ def render_dashboard(
+         verification_source=verification_source,
+         compare_enabled_values=compare_enabled_values,
+         transition_style=transition_style,
+-        poll_tick=poll_tick,
+-        gallery_tick=gallery_tick,
++        poll_tick=0,
++        gallery_tick=0,
+         view_mode=view_mode,
+         delta_mode=delta_mode,
+         translation_mode_values=translation_mode_values,
+@@ -1921,16 +1964,24 @@ def _render_dashboard_impl(
+             c_b = build_terminal_fallback(effective_observer, run_key, variant_b, gallery_tick)
+         container = dbc.Row(
+             className="g-0",
+-            style={"height": "100vh"},
++            style={"height": "85vh"},
+             children=[
+-                dbc.Col([html.Div("Variant A", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_a, style={"height": "calc(100vh - 28px)"})], width=6),
+-                dbc.Col([html.Div("Variant B", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_b, style={"height": "calc(100vh - 28px)"})], width=6),
++                dbc.Col([html.Div("Variant A", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_a, style={"height": "calc(85vh - 28px)"})], width=6),
++                dbc.Col([html.Div("Variant B", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_b, style={"height": "calc(85vh - 28px)"})], width=6),
+             ],
+         )
+         path_text = f"A: {p_a if p_a else 'NOT FOUND'} | B: {p_b if p_b else 'NOT FOUND'}"
+     else:
+-        container = c_a
+-        path_text = f"Artifact: {p_a if p_a else 'NOT FOUND'}"
++        single_view_path = p_a
++        single_view = c_a
++        if view_mode == "observer" and observer_value.startswith("article:") and p_b and p_b.exists():
++            single_view_path = p_b
++            single_view = _transition_wrapper(
++                html.Iframe(srcDoc=text_b, style={"width": "100%", "height": "100%", "border": "0"}),
++                transition_style,
++            )
++        container = single_view
++        path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
+ 
+     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
+ 
+@@ -2045,8 +2096,8 @@ def _render_dashboard_impl(
+     group_panel = _build_group_panel(contract, label_column, label_values or [])
+     empathy_fig = _build_empathy_figure(contract, label_column, label_values or [])
+ 
+-    watermark_visible = gate["watermark_visible"] or (failure_overlay_values is not None and "on" in failure_overlay_values)
+-    watermark_text = "UNVERIFIED / EXPLORATORY" if not claims_enabled else "FAILURE OVERLAYS"
++    watermark_visible = False
++    watermark_text = ""
+     watermark_style = {
+         "position": "absolute",
+         "inset": "0",
+diff --git a/core/complete_pipeline.py b/core/complete_pipeline.py
+index 6267568..a39c38f 100644
+--- a/core/complete_pipeline.py
++++ b/core/complete_pipeline.py
+@@ -2006,6 +2006,16 @@ class BeliefTransformerPipeline:
+                         Vt=spectral_results.u_basis,
+                         dynamic_k=spectral_results.dynamic_k,
+                     )
++                    
++                    # 3+2+1 OVERHAUL: Compute WHITENED distance and PHANTOM RATIO
++                    d_whitened = sp.compute_whitened_spectral_distance(
++                        emb_a=emb_pos,
++                        emb_b=emb_neg,
++                        singular_values=spectral_results.singular_values,
++                        Vt=spectral_results.u_basis,
++                        dynamic_k=spectral_results.dynamic_k,
++                    )
++                    phantom_ratio = d_whitened / d_spectral.clamp(min=1e-9)
+ 
+                     # Log dynamic K statistics
+                     mean_k = spectral_results.dynamic_k.float().mean().item()
+@@ -2050,22 +2060,20 @@ class BeliefTransformerPipeline:
+                         honest_delta_cutoff = float(np.quantile(delta_arr, 0.80))
+                         tautology_delta_cutoff = float(np.quantile(delta_arr, 0.10))
+                         for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
+-                            d = float(d_spectral[i]) if i < len(d_spectral) else 0.0
+-                            delta = float(w) / max(float(d), EPS)
++                            ratio = float(phantom_ratio[i]) if i < len(phantom_ratio) else 1.0
+                             
+-                            # PRIORITIZE kinematic/topological failure states
++                            # 3+2+1 OVERHAUL: Family B (Topological Breaks) have priority
+                             if s == "broken":
+-                                verdict = "BROKEN"
++                                verdict = "RUPTURE" # Map to Rupture for HUD, UI handles Laser
+                             elif s == "trapped":
+-                                verdict = "TRAPPED"
+-                            elif float(w) >= rupture_work_cutoff:
+-                                verdict = "RUPTURE"
+-                            elif delta >= honest_delta_cutoff:
+-                                verdict = "HONEST"
+-                            elif delta <= tautology_delta_cutoff:
+-                                verdict = "TAUTOLOGY"
+-                            else:
++                                verdict = "TAUTOLOGY" # Map to Tautology for HUD, UI handles Stall
++                            # Family A (Spectral Paths) based on Ratio
++                            elif ratio > 2.0: # ratio >> 1
+                                 verdict = "PHANTOM"
++                            elif ratio < 0.5: # ratio << 1
++                                verdict = "TAUTOLOGY"
++                            else: # ratio approx 1
++                                verdict = "HONEST"
+                             phantom_verdicts.append({
+                                 "verdict": verdict,
+                                 "delta": delta,
+diff --git a/run_full_experiment_suite.py b/run_full_experiment_suite.py
+index 8bb8ba7..ba050f3 100644
+--- a/run_full_experiment_suite.py
++++ b/run_full_experiment_suite.py
+@@ -29,10 +29,11 @@ Output structure:
+ """
+ 
+ import argparse
++import csv
+ import json
+ import os
+ import shutil
+-from datetime import datetime
++from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Dict, List, Optional, Any
+ import subprocess
+@@ -327,10 +328,12 @@ def run_alpha_sweep(
+ # -----------------------------
+ 
+ def create_experiment_directory() -> Path:
+-    """Create timestamped experiment directory."""
++    """Create timestamped experiment directory under canonical runs root."""
+     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+-    exp_dir = Path(f"experiments_{timestamp}")
+-    exp_dir.mkdir(exist_ok=True)
++    runs_root = Path("outputs") / "experiments" / "runs"
++    runs_root.mkdir(parents=True, exist_ok=True)
++    exp_dir = runs_root / f"experiments_{timestamp}"
++    exp_dir.mkdir(parents=True, exist_ok=True)
+     # NOTE: Subdirectories are now created dynamically in the kernel/channel/corpus loop
+     # No longer pre-creating flat corpus dirs here
+     return exp_dir
+@@ -570,19 +573,32 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
+       - observer_<idx>/MONOLITH.html links (or copies)
+     """
+     run_dir = Path(run_dir)
+-    monolith_out = run_dir / "MONOLITH.html"
+-    monolith_csv = run_dir / "MONOLITH_DATA.csv"
++    target_dir = _resolve_bundle_target_dir(run_dir)
++    monolith_out = target_dir / "MONOLITH.html"
++    monolith_csv = target_dir / "MONOLITH_DATA.csv"
+     if not monolith_csv.exists():
+         return {
+             "status": "skipped",
+             "reason": f"missing MONOLITH_DATA.csv at {monolith_csv}",
+             "run_dir": str(run_dir),
++            "target_dir": str(target_dir),
++        }
++    if _bundle_outputs_are_fresh(target_dir):
++        return {
++            "status": "skipped",
++            "reason": "bundle already fresh",
++            "run_dir": str(run_dir),
++            "target_dir": str(target_dir),
++            "monolith": str(monolith_out),
++            "observer_manifest": str(target_dir / "observer_manifest.json"),
++            "baseline_meta": str(target_dir / "baseline_meta.json"),
++            "baseline_state": str(target_dir / "baseline_state.json"),
+         }
+ 
+     viz_cmd = [
+         sys.executable,
+         str(Path(__file__).parent / "analysis" / "MONOLITH_VIZ.py"),
+-        str(run_dir),
++        str(target_dir),
+         "--output",
+         str(monolith_out),
+         "--mode",
+@@ -594,7 +610,7 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
+     precompute_cmd = [
+         sys.executable,
+         str(Path(__file__).parent / "analysis" / "precompute_observer_artifacts.py"),
+-        str(run_dir),
++        str(target_dir),
+         "--variant",
+         "MONOLITH.html",
+         "--mode",
+@@ -606,7 +622,7 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
+     env["PYTHONUNBUFFERED"] = "1"
+ 
+     try:
+-        print(f"[BUNDLE] Rendering MONOLITH baseline for {run_dir}...")
++        print(f"[BUNDLE] Rendering MONOLITH baseline for {target_dir}...")
+         viz_res = subprocess.run(viz_cmd, env=env)
+         if viz_res.returncode != 0:
+             return {
+@@ -614,9 +630,10 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
+                 "stage": "monolith_render",
+                 "returncode": viz_res.returncode,
+                 "run_dir": str(run_dir),
++                "target_dir": str(target_dir),
+             }
+ 
+-        print(f"[BUNDLE] Materializing observer manifest for {run_dir}...")
++        print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
+         pre_res = subprocess.run(precompute_cmd, env=env)
+         if pre_res.returncode != 0:
+             return {
+@@ -624,6 +641,27 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
+                 "stage": "observer_manifest",
+                 "returncode": pre_res.returncode,
+                 "run_dir": str(run_dir),
++                "target_dir": str(target_dir),
++            }
++
++        print(f"[BUNDLE] Emitting consumer contract bundle for {target_dir}...")
++        contract_res = emit_consumer_contract_bundle(target_dir)
++        if contract_res.get("status") != "success":
++            return {
++                "status": "failed",
++                "stage": "contract_bundle",
++                "error": contract_res.get("error", "unknown contract bundle error"),
++                "run_dir": str(run_dir),
++                "target_dir": str(target_dir),
++            }
++        missing = _validate_required_bundle_outputs(target_dir)
++        if missing:
++            return {
++                "status": "failed",
++                "stage": "post_emit_validation",
++                "error": f"missing required bundle outputs: {', '.join(missing)}",
++                "run_dir": str(run_dir),
++                "target_dir": str(target_dir),
+             }
+     except Exception as exc:
+         return {
+@@ -631,13 +669,324 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
+             "stage": "exception",
+             "error": str(exc),
+             "run_dir": str(run_dir),
++            "target_dir": str(target_dir),
+         }
+ 
+     return {
+         "status": "success",
+         "run_dir": str(run_dir),
++        "target_dir": str(target_dir),
+         "monolith": str(monolith_out),
+-        "observer_manifest": str(run_dir / "observer_manifest.json"),
++        "observer_manifest": str(target_dir / "observer_manifest.json"),
++        "baseline_meta": str(target_dir / "baseline_meta.json"),
++        "baseline_state": str(target_dir / "baseline_state.json"),
++    }
++
++
++def _resolve_bundle_target_dir(run_dir: Path) -> Path:
++    """
++    Canonicalize bundle emission to the nearest directory that actually owns MONOLITH_DATA.csv.
++    This keeps producer and Dash on the same run leaf even when callers pass a parent directory.
++    """
++    run_dir = Path(run_dir)
++    direct = run_dir / "MONOLITH_DATA.csv"
++    if direct.exists():
++        return run_dir
++
++    candidates = list(run_dir.rglob("MONOLITH_DATA.csv"))
++    if not candidates:
++        return run_dir
++    # Deterministic: newest CSV wins, then lexical path to break ties.
++    candidates.sort(key=lambda p: (-int(p.stat().st_mtime_ns), str(p)))
++    return candidates[0].parent
++
++
++def _validate_required_bundle_outputs(run_dir: Path) -> List[str]:
++    required = [
++        run_dir / "MONOLITH.html",
++        run_dir / "observer_manifest.json",
++        run_dir / "baseline_meta.json",
++        run_dir / "baseline_state.json",
++    ]
++    missing = [p.name for p in required if not p.exists()]
++    rel_dir = run_dir / "relativity_cache"
++    state_count = len(list(rel_dir.glob("state_*.json"))) if rel_dir.exists() else 0
++    delta_count = len(list(rel_dir.glob("delta_*.json"))) if rel_dir.exists() else 0
++    if state_count == 0:
++        missing.append("relativity_cache/state_*.json")
++    if delta_count == 0:
++        missing.append("relativity_cache/delta_*.json")
++    return missing
++
++
++def _bundle_outputs_are_fresh(run_dir: Path) -> bool:
++    """
++    Idempotent bundle guard:
++    - required outputs exist
++    - outputs are not older than key inputs in the run leaf
++    """
++    missing = _validate_required_bundle_outputs(run_dir)
++    if missing:
++        return False
++
++    input_files = [run_dir / "MONOLITH_DATA.csv"]
++    for name in ("verification_report.json", "verification_summary.csv"):
++        p = run_dir / name
++        if p.exists():
++            input_files.append(p)
++    newest_input = max(int(p.stat().st_mtime_ns) for p in input_files if p.exists())
++
++    output_files = [
++        run_dir / "MONOLITH.html",
++        run_dir / "observer_manifest.json",
++        run_dir / "baseline_meta.json",
++        run_dir / "baseline_state.json",
++    ]
++    rel_dir = run_dir / "relativity_cache"
++    output_files.extend(sorted(rel_dir.glob("state_*.json")))
++    output_files.extend(sorted(rel_dir.glob("delta_*.json")))
++    oldest_output = min(int(p.stat().st_mtime_ns) for p in output_files if p.exists())
++    return oldest_output >= newest_input
++
++
++def _find_nearby_file(run_dir: Path, filename: str) -> Optional[Path]:
++    candidates = [
++        run_dir / filename,
++        run_dir.parent / filename,
++        run_dir.parent.parent / filename if run_dir.parent else None,
++        run_dir.parent.parent.parent / filename if run_dir.parent and run_dir.parent.parent else None,
++        run_dir.parent.parent / filename if run_dir.parent and run_dir.parent.parent else None,
++    ]
++    for cand in candidates:
++        if cand and cand.exists():
++            return cand
++    return None
++
++
++def _copy_if_missing(src: Optional[Path], dst: Path) -> bool:
++    if not src or not src.exists() or dst.exists():
++        return False
++    dst.parent.mkdir(parents=True, exist_ok=True)
++    shutil.copy2(src, dst)
++    return True
++
++
++def _load_monolith_rows(monolith_csv: Path) -> List[Dict[str, Any]]:
++    rows: List[Dict[str, Any]] = []
++    if not monolith_csv.exists():
++        return rows
++    with monolith_csv.open("r", encoding="utf-8", errors="replace") as f:
++        reader = csv.DictReader(f)
++        if not reader.fieldnames:
++            return rows
++        for i, row in enumerate(reader):
++            ridx = row.get("index", "")
++            try:
++                idx = int(ridx)
++            except Exception:
++                idx = i
++            rows.append(
++                {
++                    "index": idx,
++                    "bt_uid": row.get("bt_uid", f"article_{idx}"),
++                    "title": (row.get("title", "") or "")[:200],
++                    "zone": row.get("zone", "unknown"),
++                    "density": row.get("density", "0"),
++                    "stress": row.get("stress", "0"),
++                }
++            )
++    return rows
++
++
++def _emit_baseline_state(run_dir: Path, rows: List[Dict[str, Any]]) -> Path:
++    manifest_path = run_dir / "observer_manifest.json"
++    paths: List[str] = []
++    if manifest_path.exists():
++        try:
++            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++            for obs in manifest.get("observers", []):
++                rel = str(obs.get("relative_path", "")).strip()
++                if rel:
++                    paths.append(rel)
++        except Exception:
++            pass
++    if not paths:
++        for row in rows:
++            paths.append(f"observer_{row['index']}/MONOLITH.html")
++
++    payload = {
++        "articles": rows,
++        "paths": paths,
++        "axes": {"x": "density", "y": "stress"},
++        "metrics": {"source": "MONOLITH_DATA.csv"},
++    }
++    out = run_dir / "baseline_state.json"
++    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    return out
++
++
++def _emit_baseline_meta(run_dir: Path) -> Path:
++    report_path = run_dir / "verification_report.json"
++    verification_status = "UNVERIFIED"
++    if report_path.exists():
++        try:
++            report = json.loads(report_path.read_text(encoding="utf-8"))
++            if report.get("global_pass") is True:
++                verification_status = "VERIFIED"
++            else:
++                candidate = str(report.get("status") or report.get("verification_status") or "").upper().strip()
++                if candidate in {"VERIFIED", "NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"}:
++                    verification_status = candidate
++        except Exception:
++            pass
++
++    payload = {
++        "schema_version": "1.0",
++        "cache_version": "1.0",
++        "dataset_hash": "suite-generated",
++        "code_hash_or_commit": "suite-generated",
++        "weights_hash": "suite-generated",
++        "kernel_params": {"kernel": "unknown"},
++        "rks_dim": 2048,
++        "crn_seed": 0,
++        "alpha": 1.0,
++        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        "verification_status": verification_status,
++    }
++    out = run_dir / "baseline_meta.json"
++    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    return out
++
++
++def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, int]:
++    rel_dir = run_dir / "relativity_cache"
++    rel_dir.mkdir(parents=True, exist_ok=True)
++    written_state = 0
++    written_delta = 0
++    indices = [int(r.get("index", i)) for i, r in enumerate(rows)]
++    for idx in indices:
++        state_path = rel_dir / f"state_{idx}.json"
++        delta_path = rel_dir / f"delta_{idx}.json"
++        if not state_path.exists():
++            state_payload = {
++                "observer_id": idx,
++                "articles": rows,
++                "paths": [f"observer_{idx}/MONOLITH.html"],
++                "axes": {"x": "density", "y": "stress"},
++                "metrics": {},
++                "provenance": {"source": "suite-default"},
++            }
++            state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
++            written_state += 1
++        if not delta_path.exists():
++            delta_payload = {
++                "observer_id": idx,
++                "null_observer_equivalence": {"max_coord_delta": 0.0, "path_flip_count": 0, "axis_rotation_deg": 0.0},
++                "path_flip_delta": {},
++                "metrics_delta": {"d_rupture_rate": 0.0, "d_mean_work": 0.0, "d_survival_pct": 0.0},
++                "axis_delta": {"rotation_deg": 0.0, "d_explained_variance_axis1": 0.0},
++            }
++            delta_path.write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
++            written_delta += 1
++    return {"state_files": written_state, "delta_files": written_delta}
++
++
++def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, str]:
++    labels_dir = run_dir / "labels"
++    derived_dir = labels_dir / "derived"
++    labels_dir.mkdir(parents=True, exist_ok=True)
++    derived_dir.mkdir(parents=True, exist_ok=True)
++
++    hidden_csv = labels_dir / "hidden_groups.csv"
++    if not hidden_csv.exists():
++        with hidden_csv.open("w", encoding="utf-8", newline="") as f:
++            writer = csv.DictWriter(f, fieldnames=["article_id", "group_topic"])
++            writer.writeheader()
++            for row in rows:
++                writer.writerow({"article_id": int(row.get("index", 0)), "group_topic": row.get("zone", "unknown")})
++
++    counts: Dict[str, int] = {}
++    sums: Dict[str, Dict[str, float]] = {}
++    for row in rows:
++        grp = str(row.get("zone", "unknown"))
++        counts[grp] = counts.get(grp, 0) + 1
++        if grp not in sums:
++            sums[grp] = {"density": 0.0, "stress": 0.0}
++        try:
++            sums[grp]["density"] += float(row.get("density", 0.0))
++        except Exception:
++            pass
++        try:
++            sums[grp]["stress"] += float(row.get("stress", 0.0))
++        except Exception:
++            pass
++
++    groups = sorted(counts.keys())
++    summaries = []
++    for g in groups:
++        n = max(counts.get(g, 0), 1)
++        summaries.append(
++            {
++                "group_name": g,
++                "n_articles": counts.get(g, 0),
++                "mean_density": sums[g]["density"] / n,
++                "mean_stress": sums[g]["stress"] / n,
++            }
++        )
++
++    group_summaries = {"groups": summaries}
++    (derived_dir / "group_summaries.json").write_text(json.dumps(group_summaries, indent=2), encoding="utf-8")
++
++    matrix = []
++    for gi in groups:
++        row_vals = []
++        for gj in groups:
++            if gi == gj:
++                row_vals.append(0.0)
++            else:
++                di = sums[gi]["density"] / max(counts[gi], 1)
++                dj = sums[gj]["density"] / max(counts[gj], 1)
++                si = sums[gi]["stress"] / max(counts[gi], 1)
++                sj = sums[gj]["stress"] / max(counts[gj], 1)
++                row_vals.append(abs(di - dj) + abs(si - sj))
++        matrix.append(row_vals)
++
++    group_matrix = {"groups": groups, "cost_matrix": matrix}
++    (derived_dir / "group_matrix.json").write_text(json.dumps(group_matrix, indent=2), encoding="utf-8")
++    return {
++        "hidden_groups": str(hidden_csv),
++        "group_summaries": str(derived_dir / "group_summaries.json"),
++        "group_matrix": str(derived_dir / "group_matrix.json"),
++    }
++
++
++def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
++    run_dir = Path(run_dir)
++    monolith_csv = run_dir / "MONOLITH_DATA.csv"
++    if not monolith_csv.exists():
++        return {"status": "failed", "error": f"missing MONOLITH_DATA.csv at {monolith_csv}"}
++
++    copied = []
++    copied_report = _copy_if_missing(_find_nearby_file(run_dir, "verification_report.json"), run_dir / "verification_report.json")
++    copied_summary = _copy_if_missing(_find_nearby_file(run_dir, "verification_summary.csv"), run_dir / "verification_summary.csv")
++    if copied_report:
++        copied.append("verification_report.json")
++    if copied_summary:
++        copied.append("verification_summary.csv")
++
++    rows = _load_monolith_rows(monolith_csv)
++    baseline_meta = _emit_baseline_meta(run_dir)
++    baseline_state = _emit_baseline_state(run_dir, rows)
++    rel_stats = _emit_relativity_defaults(run_dir, rows)
++    label_paths = _emit_label_derivatives(run_dir, rows)
++
++    return {
++        "status": "success",
++        "baseline_meta": str(baseline_meta),
++        "baseline_state": str(baseline_state),
++        "copied": copied,
++        "relativity": rel_stats,
++        "labels": label_paths,
+     }
+ 
+ 

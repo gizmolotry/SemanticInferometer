@@ -13,20 +13,35 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sys
+from urllib.parse import parse_qs
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, callback_context, dcc, html
 import plotly.graph_objects as go
-from analysis.verification.contract import (
-    LayerStatus,
-    REQUIRED_CONSUMER_ARTIFACTS,
-    OPTIONAL_CONSUMER_ARTIFACTS,
-    REQUIRED_PROVENANCE_KEYS,
-    evaluate_consumer_contract,
-)
+try:
+    from analysis.verification.contract import (
+        LayerStatus,
+        REQUIRED_CONSUMER_ARTIFACTS,
+        OPTIONAL_CONSUMER_ARTIFACTS,
+        REQUIRED_PROVENANCE_KEYS,
+        evaluate_consumer_contract,
+    )
+except Exception:
+    from verification.contract import (
+        LayerStatus,
+        REQUIRED_CONSUMER_ARTIFACTS,
+        OPTIONAL_CONSUMER_ARTIFACTS,
+        REQUIRED_PROVENANCE_KEYS,
+        evaluate_consumer_contract,
+    )
 
 
 PALETTE = {
@@ -41,7 +56,7 @@ PALETTE = {
     "dim": "#8A8A8A",
 }
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = REPO_ROOT
 
 
 def _is_run_directory(path: Path) -> bool:
@@ -429,38 +444,36 @@ def _find_latest_pair_under(root: Path) -> Tuple[Optional[Path], Optional[Path]]
 
 def _resolve_verification_pair(run_key: Optional[str], verification_source: Optional[str]) -> Tuple[Optional[Path], Optional[Path]]:
     if verification_source and verification_source != "auto":
-        return _find_latest_pair_under(Path(verification_source))
+        report, summary = _find_latest_pair_under(Path(verification_source))
+        return summary, report
 
     run_dir = None
     if run_key and "INDEX" in globals():
         run = INDEX.get("runs", {}).get(str(run_key), {})
         run_dir = run.get("run_dir")
 
-    search_roots: List[Path] = []
+    # When a run is selected, keep verification resolution local to that run family.
     if run_dir and run_dir.exists():
-        search_roots.extend(
-            [
-                run_dir,
-                run_dir / "verification",
-                run_dir.parent,
-                run_dir.parent / "verification",
-                run_dir.parent.parent / "verification" if run_dir.parent and run_dir.parent.parent else None,
-            ]
-        )
-    search_roots.extend([ROOT / "verification", ROOT / "analysis"])
-    seen = set()
-    normalized_roots = []
-    for r in search_roots:
-        if r and r.exists():
-            sr = str(r)
-            if sr not in seen:
-                seen.add(sr)
-                normalized_roots.append(r)
+        exact_summary = run_dir / "verification_summary.csv"
+        exact_report = run_dir / "verification_report.json"
+        if exact_summary.exists() and exact_report.exists():
+            return exact_summary, exact_report
 
-    for root in normalized_roots:
-        report, summary = _find_latest_pair_under(root)
-        if report and summary:
-            return summary, report
+        search_roots: List[Path] = [run_dir, run_dir / "verification"]
+        if run_dir.parent:
+            search_roots.extend([run_dir.parent, run_dir.parent / "verification"])
+        seen = set()
+        for root in search_roots:
+            if not root or not root.exists():
+                continue
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            report, summary = _find_latest_pair_under(root)
+            if report and summary:
+                return summary, report
+        return None, None
 
     summary = _find_latest_file_scoped("verification_summary.csv", run_key) or _find_latest_file("verification_summary.csv")
     report = _find_latest_file_scoped("verification_report.json", run_key) or _find_latest_file("verification_report.json")
@@ -485,8 +498,9 @@ def discover_verification_sources(run_key: Optional[str]) -> List[dict]:
         run = INDEX.get("runs", {}).get(str(run_key), {})
         run_dir = run.get("run_dir")
         if run_dir:
-            roots.extend([run_dir, run_dir.parent])
-    roots.extend([ROOT / "analysis", ROOT / "verification", ROOT])
+            roots.extend([run_dir, run_dir.parent, run_dir / "verification"])
+    else:
+        roots.extend([ROOT / "analysis", ROOT / "verification", ROOT])
     for root in roots:
         if not root.exists():
             continue
@@ -1206,11 +1220,12 @@ app.layout = dbc.Container(
     fluid=True,
     style={"backgroundColor": PALETTE["void"], "minHeight": "100vh", "padding": "0"},
     children=[
+        dcc.Location(id="url", refresh=False),
         html.Div(style={"display": "none"}),
         dcc.Store(id="gallery-dir", data={"dir": 1}),
         dcc.Store(id="hotkey-signal", data={"event": "none", "seq": 0}),
-        dcc.Interval(id="hotkey-poll", interval=250, n_intervals=0),
-        dcc.Interval(id="verification-poll", interval=10000, n_intervals=0),
+        dcc.Interval(id="hotkey-poll", interval=250, n_intervals=0, disabled=True),
+        dcc.Interval(id="verification-poll", interval=10000, n_intervals=0, disabled=True),
         dcc.Interval(id="gallery-interval", interval=2200, n_intervals=0, disabled=True),
         dbc.Row(
             className="g-0",
@@ -1218,9 +1233,15 @@ app.layout = dbc.Container(
             children=[
                 dbc.Col(
                     xs=12,
-                    md=4,
+                    md=3,
                     lg=3,
-                    style={"background": "linear-gradient(180deg, #050505 0%, #0b0b14 100%)", "borderRight": f"1px solid {PALETTE['grid']}", "padding": "16px"},
+                    style={
+                        "background": "linear-gradient(180deg, #050505 0%, #0b0b14 100%)",
+                        "borderRight": f"1px solid {PALETTE['grid']}",
+                        "padding": "16px",
+                        "maxHeight": "100vh",
+                        "overflowY": "auto",
+                    },
                     children=[
                         html.H4("MONOLITH COMMAND CENTER", style={"color": PALETTE["cyan"], "letterSpacing": "0.05em", "marginBottom": "12px"}),
                         html.Div(
@@ -1325,28 +1346,31 @@ app.layout = dbc.Container(
                         html.Div(id="ablation-metrics", style={"color": PALETTE["amber"], "fontSize": "0.8rem", "whiteSpace": "pre-wrap", "marginBottom": "8px"}),
                         html.Div("Control Metrics", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="control-metrics", style={"color": PALETTE["cyan"], "fontSize": "0.8rem", "whiteSpace": "pre-wrap", "marginBottom": "6px"}),
+                        html.Hr(style={"borderColor": PALETTE["grid"], "margin": "10px 0"}),
+                        html.Div("Relativity Deltas", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
+                        html.Div(id="relativity-panel", style={"padding": "8px", "maxHeight": "24vh", "overflowY": "auto", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "6px", "marginBottom": "8px"}),
+                        html.Div("Group Path Patterns", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
+                        html.Div(id="group-panel", style={"padding": "8px", "maxHeight": "22vh", "overflowY": "auto", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "6px", "marginBottom": "8px"}),
+                        html.Div("Empathy Gap", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
+                        dcc.Graph(id="empathy-heatmap", style={"height": "28vh", "marginBottom": "8px"}),
                     ],
                 ),
                 dbc.Col(
                     xs=12,
-                    md=8,
+                    md=9,
                     lg=9,
                     style={"minHeight": "100vh", "padding": "0", "backgroundColor": "#020208"},
                     children=[
                         html.Div(
-                            style={"position": "relative", "height": "62vh", "width": "100%"},
+                            style={"height": "90vh", "width": "100%"},
                             children=[
-                                dcc.Loading(id="artifact-loading", type="default", color=PALETTE["cyan"], children=[html.Div(id="artifact-container", style={"height": "62vh", "width": "100%"})]),
-                                html.Div(id="watermark-overlay", style={"position": "absolute", "inset": "0", "display": "none", "alignItems": "center", "justifyContent": "center", "fontSize": "3.2rem", "fontWeight": "700", "letterSpacing": "0.08em", "color": "rgba(255,42,0,0.18)", "pointerEvents": "none", "textAlign": "center"}),
-                            ],
-                        ),
-                        dcc.Tabs(
-                            id="analysis-tabs",
-                            value="tab-relativity",
-                            children=[
-                                dcc.Tab(label="Relativity Deltas", value="tab-relativity", children=[html.Div(id="relativity-panel", style={"padding": "10px", "height": "34vh", "overflowY": "auto"})]),
-                                dcc.Tab(label="Group Path Patterns", value="tab-groups", children=[html.Div(id="group-panel", style={"padding": "10px", "height": "34vh", "overflowY": "auto"})]),
-                                dcc.Tab(label="Empathy Gap", value="tab-empathy", children=[dcc.Graph(id="empathy-heatmap", style={"height": "34vh"})]),
+                                dcc.Loading(
+                                    id="artifact-loading",
+                                    type="default",
+                                    color=PALETTE["cyan"],
+                                    children=[html.Div(id="artifact-container", style={"height": "90vh", "width": "100%"})],
+                                ),
+                                html.Div(id="watermark-overlay", style={"display": "none"}),
                             ],
                         ),
                     ],
@@ -1410,6 +1434,37 @@ def refresh_variants(run_key: str, current_a: str, current_b: str, current_obser
     obs_values = [o["value"] for o in obs_opts]
     observer = current_observer if current_observer in obs_values else "global"
     return opts, a, opts, b, obs_opts, observer
+
+
+@app.callback(
+    Output("run-dropdown", "value", allow_duplicate=True),
+    Output("observer-dropdown", "value", allow_duplicate=True),
+    Output("view-mode", "value", allow_duplicate=True),
+    Output("compare-enabled", "value", allow_duplicate=True),
+    Input("url", "search"),
+    State("run-dropdown", "options"),
+    State("run-dropdown", "value"),
+    prevent_initial_call="initial_duplicate",
+)
+def apply_url_state(search: Optional[str], run_options, current_run):
+    if not search:
+        return current_run, "global", "observer", []
+    try:
+        qs = parse_qs((search or "").lstrip("?"))
+    except Exception:
+        return current_run, "global", "observer", []
+
+    run_values = [o.get("value") for o in (run_options or []) if isinstance(o, dict)]
+    requested_run = str((qs.get("run_key") or [current_run])[0] or current_run)
+    run_value = requested_run if requested_run in run_values else current_run
+
+    observer = str((qs.get("observer") or ["global"])[0] or "global")
+    view_mode = str((qs.get("view_mode") or ["observer"])[0] or "observer").lower()
+    if view_mode not in {"global", "observer"}:
+        view_mode = "observer"
+    compare_raw = str((qs.get("compare") or ["0"])[0]).strip().lower()
+    compare_values = ["on"] if compare_raw in {"1", "true", "on", "yes"} else []
+    return run_value, observer, view_mode, compare_values
 
 
 @app.callback(
@@ -1533,7 +1588,7 @@ def handle_hotkeys(hotkey_signal, observer_value, observer_options, autoplay_val
 
 
 @app.callback(
-    Output("observer-dropdown", "value"),
+    Output("observer-dropdown", "value", allow_duplicate=True),
     Output("gallery-dir", "data"),
     Input("gallery-interval", "n_intervals"),
     Input("prev-observer-btn", "n_clicks"),
@@ -1542,6 +1597,7 @@ def handle_hotkeys(hotkey_signal, observer_value, observer_options, autoplay_val
     State("observer-dropdown", "value"),
     State("gallery-dir", "data"),
     State("observer-dropdown", "options"),
+    prevent_initial_call=True,
 )
 def step_observer(
     _auto_tick: int,
@@ -1619,32 +1675,28 @@ def update_gallery_progress(observer_value: str, observer_options):
     Output("empathy-heatmap", "figure"),
     Output("watermark-overlay", "children"),
     Output("watermark-overlay", "style"),
-    Input("run-dropdown", "value"),
     Input("observer-dropdown", "value"),
-    Input("variant-a-dropdown", "value"),
-    Input("variant-b-dropdown", "value"),
-    Input("verification-source", "value"),
-    Input("compare-enabled", "value"),
-    Input("transition-style", "value"),
-    Input("verification-poll", "n_intervals"),
-    Input("gallery-interval", "n_intervals"),
-    Input("view-mode", "value"),
-    Input("delta-mode", "value"),
-    Input("translation-mode", "value"),
-    Input("failure-overlays", "value"),
-    Input("label-column-dropdown", "value"),
-    Input("label-value-dropdown", "value"),
+    State("run-dropdown", "value"),
+    State("variant-a-dropdown", "value"),
+    State("variant-b-dropdown", "value"),
+    State("verification-source", "value"),
+    State("compare-enabled", "value"),
+    State("transition-style", "value"),
+    State("view-mode", "value"),
+    State("delta-mode", "value"),
+    State("translation-mode", "value"),
+    State("failure-overlays", "value"),
+    State("label-column-dropdown", "value"),
+    State("label-value-dropdown", "value"),
 )
 def render_dashboard(
-    run_key: str,
     observer_value: str,
+    run_key: str,
     variant_a: str,
     variant_b: str,
     verification_source: str,
     compare_enabled_values: List[str],
     transition_style: str,
-    poll_tick: int,
-    gallery_tick: int,
     view_mode: str,
     delta_mode: str,
     translation_mode_values: List[str],
@@ -1660,8 +1712,8 @@ def render_dashboard(
         verification_source=verification_source,
         compare_enabled_values=compare_enabled_values,
         transition_style=transition_style,
-        poll_tick=poll_tick,
-        gallery_tick=gallery_tick,
+        poll_tick=0,
+        gallery_tick=0,
         view_mode=view_mode,
         delta_mode=delta_mode,
         translation_mode_values=translation_mode_values,
@@ -1883,7 +1935,7 @@ def _render_dashboard_impl(
             html.Div("Group data unavailable", style={"color": PALETTE["amber"]}),
             empty_fig,
             "",
-            {"position": "absolute", "inset": "0", "display": "none", "alignItems": "center", "justifyContent": "center", "fontSize": "3.2rem", "fontWeight": "700", "letterSpacing": "0.08em", "color": "rgba(255,42,0,0.18)", "pointerEvents": "none", "textAlign": "center"},
+            {"display": "none"},
         )
 
     run = INDEX["runs"].get(run_key, {})
@@ -1921,16 +1973,24 @@ def _render_dashboard_impl(
             c_b = build_terminal_fallback(effective_observer, run_key, variant_b, gallery_tick)
         container = dbc.Row(
             className="g-0",
-            style={"height": "100vh"},
+            style={"height": "90vh"},
             children=[
-                dbc.Col([html.Div("Variant A", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_a, style={"height": "calc(100vh - 28px)"})], width=6),
-                dbc.Col([html.Div("Variant B", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_b, style={"height": "calc(100vh - 28px)"})], width=6),
+                dbc.Col([html.Div("Variant A", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_a, style={"height": "calc(90vh - 28px)"})], width=6),
+                dbc.Col([html.Div("Variant B", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_b, style={"height": "calc(90vh - 28px)"})], width=6),
             ],
         )
         path_text = f"A: {p_a if p_a else 'NOT FOUND'} | B: {p_b if p_b else 'NOT FOUND'}"
     else:
-        container = c_a
-        path_text = f"Artifact: {p_a if p_a else 'NOT FOUND'}"
+        single_view_path = p_a
+        single_view = c_a
+        if view_mode == "observer" and observer_value.startswith("article:") and p_b and p_b.exists():
+            single_view_path = p_b
+            single_view = _transition_wrapper(
+                html.Iframe(srcDoc=text_b, style={"width": "100%", "height": "100%", "border": "0"}),
+                transition_style,
+            )
+        container = single_view
+        path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
 
@@ -2045,21 +2105,9 @@ def _render_dashboard_impl(
     group_panel = _build_group_panel(contract, label_column, label_values or [])
     empathy_fig = _build_empathy_figure(contract, label_column, label_values or [])
 
-    watermark_visible = gate["watermark_visible"] or (failure_overlay_values is not None and "on" in failure_overlay_values)
-    watermark_text = "UNVERIFIED / EXPLORATORY" if not claims_enabled else "FAILURE OVERLAYS"
-    watermark_style = {
-        "position": "absolute",
-        "inset": "0",
-        "display": "flex" if watermark_visible else "none",
-        "alignItems": "center",
-        "justifyContent": "center",
-        "fontSize": "3.2rem",
-        "fontWeight": "700",
-        "letterSpacing": "0.08em",
-        "color": "rgba(255,42,0,0.18)",
-        "pointerEvents": "none",
-        "textAlign": "center",
-    }
+    watermark_visible = False
+    watermark_text = ""
+    watermark_style = {"display": "none"}
 
     return (
         container,

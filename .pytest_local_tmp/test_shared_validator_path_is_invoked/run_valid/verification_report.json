@@ -1,0 +1,19 @@
+{
+  "run_id": "run_valid",
+  "timestamp": "2026-02-28T00:00:00Z",
+  "layers": [
+    {
+      "layer_id": "rbf/cls",
+      "layer_name": "cls",
+      "status": "VERIFIED",
+      "checks": [
+        {
+          "name": "crn_locked",
+          "pass": true
+        }
+      ],
+      "fail_reasons": []
+    }
+  ],
+  "global_pass": true
+}

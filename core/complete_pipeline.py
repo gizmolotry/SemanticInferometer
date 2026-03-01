@@ -2006,6 +2006,16 @@ class BeliefTransformerPipeline:
                         Vt=spectral_results.u_basis,
                         dynamic_k=spectral_results.dynamic_k,
                     )
+                    
+                    # 3+2+1 OVERHAUL: Compute WHITENED distance and PHANTOM RATIO
+                    d_whitened = sp.compute_whitened_spectral_distance(
+                        emb_a=emb_pos,
+                        emb_b=emb_neg,
+                        singular_values=spectral_results.singular_values,
+                        Vt=spectral_results.u_basis,
+                        dynamic_k=spectral_results.dynamic_k,
+                    )
+                    phantom_ratio = d_whitened / d_spectral.clamp(min=1e-9)
 
                     # Log dynamic K statistics
                     mean_k = spectral_results.dynamic_k.float().mean().item()
@@ -2050,22 +2060,20 @@ class BeliefTransformerPipeline:
                         honest_delta_cutoff = float(np.quantile(delta_arr, 0.80))
                         tautology_delta_cutoff = float(np.quantile(delta_arr, 0.10))
                         for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
-                            d = float(d_spectral[i]) if i < len(d_spectral) else 0.0
-                            delta = float(w) / max(float(d), EPS)
+                            ratio = float(phantom_ratio[i]) if i < len(phantom_ratio) else 1.0
                             
-                            # PRIORITIZE kinematic/topological failure states
+                            # 3+2+1 OVERHAUL: Family B (Topological Breaks) have priority
                             if s == "broken":
-                                verdict = "BROKEN"
+                                verdict = "RUPTURE" # Map to Rupture for HUD, UI handles Laser
                             elif s == "trapped":
-                                verdict = "TRAPPED"
-                            elif float(w) >= rupture_work_cutoff:
-                                verdict = "RUPTURE"
-                            elif delta >= honest_delta_cutoff:
-                                verdict = "HONEST"
-                            elif delta <= tautology_delta_cutoff:
-                                verdict = "TAUTOLOGY"
-                            else:
+                                verdict = "TAUTOLOGY" # Map to Tautology for HUD, UI handles Stall
+                            # Family A (Spectral Paths) based on Ratio
+                            elif ratio > 2.0: # ratio >> 1
                                 verdict = "PHANTOM"
+                            elif ratio < 0.5: # ratio << 1
+                                verdict = "TAUTOLOGY"
+                            else: # ratio approx 1
+                                verdict = "HONEST"
                             phantom_verdicts.append({
                                 "verdict": verdict,
                                 "delta": delta,

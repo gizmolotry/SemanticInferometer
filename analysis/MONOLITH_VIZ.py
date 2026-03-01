@@ -390,6 +390,7 @@ def _short_hash(value: Any) -> str:
 
 def load_epistemic_contract_data(experiment_dir: Path) -> Dict[str, Any]:
     """Load verification/provenance contract data with conservative fallbacks."""
+    # Canonical artifact path: verification_report.json / verification_summary.csv.
     status = "UNVERIFIED"
     global_pass = None
     seed_stability = None
@@ -1028,6 +1029,7 @@ def render_terrain_surface(
     use_manifold_colormap: bool = True,
     global_density_median: float = 0.5, # For consistent zone mapping
     global_stress_median: float = 0.5,  # For consistent zone mapping
+    opacity: float = 0.9,               # New opacity parameter
 ) -> Tuple[Optional[Any], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     ASTER v3.2 BI-AXIAL TERRAIN SURFACE
@@ -1220,7 +1222,7 @@ def render_terrain_surface(
         surfacecolor=surfacecolor,
         colorscale=colorscale,
         cmin=cmin, cmax=cmax,
-        opacity=0.9,
+        opacity=opacity,
         showscale=True,
         colorbar=colorbar_config,
         lighting=dict(
@@ -3542,6 +3544,15 @@ def create_monolith_cockpit(
     # =========================================
     synthesis_trace_start = len(fig.data)
 
+    # Determine surface opacity based on verification status (Type 1 Ghosting)
+    surface_opacity = 0.9
+    verification_title_stamp = ""
+    if exp.verification_global_pass is False:
+        surface_opacity = 0.3
+        verification_title_stamp = " [UNSTABLE SIGNAL]"
+    elif exp.verification_global_pass is True:
+        verification_title_stamp = " [VERIFIED SEMANTICS]"
+
     # Layer 1: Terrain Surface (colored by density×stress manifold)
     if show_terrain:
         print("[MONOLITH] Rendering terrain surface with density×stress gradient...")
@@ -3552,6 +3563,7 @@ def create_monolith_cockpit(
             use_manifold_colormap=True,
             global_density_median=global_density_median,
             global_stress_median=global_stress_median,
+            opacity=surface_opacity,
         )
         if terrain:
             terrain.visible = True
@@ -3859,7 +3871,7 @@ def create_monolith_cockpit(
             y=0.99,
         ),
         title=dict(
-            text=f"<b>ASTER v3.2 MONOLITH [{exp.kernel.upper()}]</b>",
+            text=f"<b>ASTER v3.2 MONOLITH [{exp.kernel.upper()}]{verification_title_stamp}</b>",
             font=dict(family='Inter, sans-serif', size=16, color=PALETTE.cyan),
             x=0.5,
             y=0.98,

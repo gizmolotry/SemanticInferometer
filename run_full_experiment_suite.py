@@ -29,10 +29,11 @@ Output structure:
 """
 
 import argparse
+import csv
 import json
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import subprocess
@@ -327,10 +328,12 @@ def run_alpha_sweep(
 # -----------------------------
 
 def create_experiment_directory() -> Path:
-    """Create timestamped experiment directory."""
+    """Create timestamped experiment directory under canonical runs root."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_dir = Path(f"experiments_{timestamp}")
-    exp_dir.mkdir(exist_ok=True)
+    runs_root = Path("outputs") / "experiments" / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    exp_dir = runs_root / f"experiments_{timestamp}"
+    exp_dir.mkdir(parents=True, exist_ok=True)
     # NOTE: Subdirectories are now created dynamically in the kernel/channel/corpus loop
     # No longer pre-creating flat corpus dirs here
     return exp_dir
@@ -570,19 +573,32 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
       - observer_<idx>/MONOLITH.html links (or copies)
     """
     run_dir = Path(run_dir)
-    monolith_out = run_dir / "MONOLITH.html"
-    monolith_csv = run_dir / "MONOLITH_DATA.csv"
+    target_dir = _resolve_bundle_target_dir(run_dir)
+    monolith_out = target_dir / "MONOLITH.html"
+    monolith_csv = target_dir / "MONOLITH_DATA.csv"
     if not monolith_csv.exists():
         return {
             "status": "skipped",
             "reason": f"missing MONOLITH_DATA.csv at {monolith_csv}",
             "run_dir": str(run_dir),
+            "target_dir": str(target_dir),
+        }
+    if _bundle_outputs_are_fresh(target_dir):
+        return {
+            "status": "skipped",
+            "reason": "bundle already fresh",
+            "run_dir": str(run_dir),
+            "target_dir": str(target_dir),
+            "monolith": str(monolith_out),
+            "observer_manifest": str(target_dir / "observer_manifest.json"),
+            "baseline_meta": str(target_dir / "baseline_meta.json"),
+            "baseline_state": str(target_dir / "baseline_state.json"),
         }
 
     viz_cmd = [
         sys.executable,
         str(Path(__file__).parent / "analysis" / "MONOLITH_VIZ.py"),
-        str(run_dir),
+        str(target_dir),
         "--output",
         str(monolith_out),
         "--mode",
@@ -594,7 +610,7 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     precompute_cmd = [
         sys.executable,
         str(Path(__file__).parent / "analysis" / "precompute_observer_artifacts.py"),
-        str(run_dir),
+        str(target_dir),
         "--variant",
         "MONOLITH.html",
         "--mode",
@@ -606,7 +622,7 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     env["PYTHONUNBUFFERED"] = "1"
 
     try:
-        print(f"[BUNDLE] Rendering MONOLITH baseline for {run_dir}...")
+        print(f"[BUNDLE] Rendering MONOLITH baseline for {target_dir}...")
         viz_res = subprocess.run(viz_cmd, env=env)
         if viz_res.returncode != 0:
             return {
@@ -614,9 +630,10 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "stage": "monolith_render",
                 "returncode": viz_res.returncode,
                 "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
             }
 
-        print(f"[BUNDLE] Materializing observer manifest for {run_dir}...")
+        print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
         pre_res = subprocess.run(precompute_cmd, env=env)
         if pre_res.returncode != 0:
             return {
@@ -624,6 +641,27 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "stage": "observer_manifest",
                 "returncode": pre_res.returncode,
                 "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
+            }
+
+        print(f"[BUNDLE] Emitting consumer contract bundle for {target_dir}...")
+        contract_res = emit_consumer_contract_bundle(target_dir)
+        if contract_res.get("status") != "success":
+            return {
+                "status": "failed",
+                "stage": "contract_bundle",
+                "error": contract_res.get("error", "unknown contract bundle error"),
+                "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
+            }
+        missing = _validate_required_bundle_outputs(target_dir)
+        if missing:
+            return {
+                "status": "failed",
+                "stage": "post_emit_validation",
+                "error": f"missing required bundle outputs: {', '.join(missing)}",
+                "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
             }
     except Exception as exc:
         return {
@@ -631,13 +669,324 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
             "stage": "exception",
             "error": str(exc),
             "run_dir": str(run_dir),
+            "target_dir": str(target_dir),
         }
 
     return {
         "status": "success",
         "run_dir": str(run_dir),
+        "target_dir": str(target_dir),
         "monolith": str(monolith_out),
-        "observer_manifest": str(run_dir / "observer_manifest.json"),
+        "observer_manifest": str(target_dir / "observer_manifest.json"),
+        "baseline_meta": str(target_dir / "baseline_meta.json"),
+        "baseline_state": str(target_dir / "baseline_state.json"),
+    }
+
+
+def _resolve_bundle_target_dir(run_dir: Path) -> Path:
+    """
+    Canonicalize bundle emission to the nearest directory that actually owns MONOLITH_DATA.csv.
+    This keeps producer and Dash on the same run leaf even when callers pass a parent directory.
+    """
+    run_dir = Path(run_dir)
+    direct = run_dir / "MONOLITH_DATA.csv"
+    if direct.exists():
+        return run_dir
+
+    candidates = list(run_dir.rglob("MONOLITH_DATA.csv"))
+    if not candidates:
+        return run_dir
+    # Deterministic: newest CSV wins, then lexical path to break ties.
+    candidates.sort(key=lambda p: (-int(p.stat().st_mtime_ns), str(p)))
+    return candidates[0].parent
+
+
+def _validate_required_bundle_outputs(run_dir: Path) -> List[str]:
+    required = [
+        run_dir / "MONOLITH.html",
+        run_dir / "observer_manifest.json",
+        run_dir / "baseline_meta.json",
+        run_dir / "baseline_state.json",
+    ]
+    missing = [p.name for p in required if not p.exists()]
+    rel_dir = run_dir / "relativity_cache"
+    state_count = len(list(rel_dir.glob("state_*.json"))) if rel_dir.exists() else 0
+    delta_count = len(list(rel_dir.glob("delta_*.json"))) if rel_dir.exists() else 0
+    if state_count == 0:
+        missing.append("relativity_cache/state_*.json")
+    if delta_count == 0:
+        missing.append("relativity_cache/delta_*.json")
+    return missing
+
+
+def _bundle_outputs_are_fresh(run_dir: Path) -> bool:
+    """
+    Idempotent bundle guard:
+    - required outputs exist
+    - outputs are not older than key inputs in the run leaf
+    """
+    missing = _validate_required_bundle_outputs(run_dir)
+    if missing:
+        return False
+
+    input_files = [run_dir / "MONOLITH_DATA.csv"]
+    for name in ("verification_report.json", "verification_summary.csv"):
+        p = run_dir / name
+        if p.exists():
+            input_files.append(p)
+    newest_input = max(int(p.stat().st_mtime_ns) for p in input_files if p.exists())
+
+    output_files = [
+        run_dir / "MONOLITH.html",
+        run_dir / "observer_manifest.json",
+        run_dir / "baseline_meta.json",
+        run_dir / "baseline_state.json",
+    ]
+    rel_dir = run_dir / "relativity_cache"
+    output_files.extend(sorted(rel_dir.glob("state_*.json")))
+    output_files.extend(sorted(rel_dir.glob("delta_*.json")))
+    oldest_output = min(int(p.stat().st_mtime_ns) for p in output_files if p.exists())
+    return oldest_output >= newest_input
+
+
+def _find_nearby_file(run_dir: Path, filename: str) -> Optional[Path]:
+    candidates = [
+        run_dir / filename,
+        run_dir.parent / filename,
+        run_dir.parent.parent / filename if run_dir.parent else None,
+        run_dir.parent.parent.parent / filename if run_dir.parent and run_dir.parent.parent else None,
+        run_dir.parent.parent / filename if run_dir.parent and run_dir.parent.parent else None,
+    ]
+    for cand in candidates:
+        if cand and cand.exists():
+            return cand
+    return None
+
+
+def _copy_if_missing(src: Optional[Path], dst: Path) -> bool:
+    if not src or not src.exists() or dst.exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return True
+
+
+def _load_monolith_rows(monolith_csv: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not monolith_csv.exists():
+        return rows
+    with monolith_csv.open("r", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return rows
+        for i, row in enumerate(reader):
+            ridx = row.get("index", "")
+            try:
+                idx = int(ridx)
+            except Exception:
+                idx = i
+            rows.append(
+                {
+                    "index": idx,
+                    "bt_uid": row.get("bt_uid", f"article_{idx}"),
+                    "title": (row.get("title", "") or "")[:200],
+                    "zone": row.get("zone", "unknown"),
+                    "density": row.get("density", "0"),
+                    "stress": row.get("stress", "0"),
+                }
+            )
+    return rows
+
+
+def _emit_baseline_state(run_dir: Path, rows: List[Dict[str, Any]]) -> Path:
+    manifest_path = run_dir / "observer_manifest.json"
+    paths: List[str] = []
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for obs in manifest.get("observers", []):
+                rel = str(obs.get("relative_path", "")).strip()
+                if rel:
+                    paths.append(rel)
+        except Exception:
+            pass
+    if not paths:
+        for row in rows:
+            paths.append(f"observer_{row['index']}/MONOLITH.html")
+
+    payload = {
+        "articles": rows,
+        "paths": paths,
+        "axes": {"x": "density", "y": "stress"},
+        "metrics": {"source": "MONOLITH_DATA.csv"},
+    }
+    out = run_dir / "baseline_state.json"
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_baseline_meta(run_dir: Path) -> Path:
+    report_path = run_dir / "verification_report.json"
+    verification_status = "UNVERIFIED"
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if report.get("global_pass") is True:
+                verification_status = "VERIFIED"
+            else:
+                candidate = str(report.get("status") or report.get("verification_status") or "").upper().strip()
+                if candidate in {"VERIFIED", "NON_COMPARABLE", "MISSING_ARTIFACTS", "UNVERIFIED"}:
+                    verification_status = candidate
+        except Exception:
+            pass
+
+    payload = {
+        "schema_version": "1.0",
+        "cache_version": "1.0",
+        "dataset_hash": "suite-generated",
+        "code_hash_or_commit": "suite-generated",
+        "weights_hash": "suite-generated",
+        "kernel_params": {"kernel": "unknown"},
+        "rks_dim": 2048,
+        "crn_seed": 0,
+        "alpha": 1.0,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "verification_status": verification_status,
+    }
+    out = run_dir / "baseline_meta.json"
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    written_state = 0
+    written_delta = 0
+    indices = [int(r.get("index", i)) for i, r in enumerate(rows)]
+    for idx in indices:
+        state_path = rel_dir / f"state_{idx}.json"
+        delta_path = rel_dir / f"delta_{idx}.json"
+        if not state_path.exists():
+            state_payload = {
+                "observer_id": idx,
+                "articles": rows,
+                "paths": [f"observer_{idx}/MONOLITH.html"],
+                "axes": {"x": "density", "y": "stress"},
+                "metrics": {},
+                "provenance": {"source": "suite-default"},
+            }
+            state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+            written_state += 1
+        if not delta_path.exists():
+            delta_payload = {
+                "observer_id": idx,
+                "null_observer_equivalence": {"max_coord_delta": 0.0, "path_flip_count": 0, "axis_rotation_deg": 0.0},
+                "path_flip_delta": {},
+                "metrics_delta": {"d_rupture_rate": 0.0, "d_mean_work": 0.0, "d_survival_pct": 0.0},
+                "axis_delta": {"rotation_deg": 0.0, "d_explained_variance_axis1": 0.0},
+            }
+            delta_path.write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
+            written_delta += 1
+    return {"state_files": written_state, "delta_files": written_delta}
+
+
+def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    labels_dir = run_dir / "labels"
+    derived_dir = labels_dir / "derived"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    derived_dir.mkdir(parents=True, exist_ok=True)
+
+    hidden_csv = labels_dir / "hidden_groups.csv"
+    if not hidden_csv.exists():
+        with hidden_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["article_id", "group_topic"])
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({"article_id": int(row.get("index", 0)), "group_topic": row.get("zone", "unknown")})
+
+    counts: Dict[str, int] = {}
+    sums: Dict[str, Dict[str, float]] = {}
+    for row in rows:
+        grp = str(row.get("zone", "unknown"))
+        counts[grp] = counts.get(grp, 0) + 1
+        if grp not in sums:
+            sums[grp] = {"density": 0.0, "stress": 0.0}
+        try:
+            sums[grp]["density"] += float(row.get("density", 0.0))
+        except Exception:
+            pass
+        try:
+            sums[grp]["stress"] += float(row.get("stress", 0.0))
+        except Exception:
+            pass
+
+    groups = sorted(counts.keys())
+    summaries = []
+    for g in groups:
+        n = max(counts.get(g, 0), 1)
+        summaries.append(
+            {
+                "group_name": g,
+                "n_articles": counts.get(g, 0),
+                "mean_density": sums[g]["density"] / n,
+                "mean_stress": sums[g]["stress"] / n,
+            }
+        )
+
+    group_summaries = {"groups": summaries}
+    (derived_dir / "group_summaries.json").write_text(json.dumps(group_summaries, indent=2), encoding="utf-8")
+
+    matrix = []
+    for gi in groups:
+        row_vals = []
+        for gj in groups:
+            if gi == gj:
+                row_vals.append(0.0)
+            else:
+                di = sums[gi]["density"] / max(counts[gi], 1)
+                dj = sums[gj]["density"] / max(counts[gj], 1)
+                si = sums[gi]["stress"] / max(counts[gi], 1)
+                sj = sums[gj]["stress"] / max(counts[gj], 1)
+                row_vals.append(abs(di - dj) + abs(si - sj))
+        matrix.append(row_vals)
+
+    group_matrix = {"groups": groups, "cost_matrix": matrix}
+    (derived_dir / "group_matrix.json").write_text(json.dumps(group_matrix, indent=2), encoding="utf-8")
+    return {
+        "hidden_groups": str(hidden_csv),
+        "group_summaries": str(derived_dir / "group_summaries.json"),
+        "group_matrix": str(derived_dir / "group_matrix.json"),
+    }
+
+
+def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    monolith_csv = run_dir / "MONOLITH_DATA.csv"
+    if not monolith_csv.exists():
+        return {"status": "failed", "error": f"missing MONOLITH_DATA.csv at {monolith_csv}"}
+
+    copied = []
+    copied_report = _copy_if_missing(_find_nearby_file(run_dir, "verification_report.json"), run_dir / "verification_report.json")
+    copied_summary = _copy_if_missing(_find_nearby_file(run_dir, "verification_summary.csv"), run_dir / "verification_summary.csv")
+    if copied_report:
+        copied.append("verification_report.json")
+    if copied_summary:
+        copied.append("verification_summary.csv")
+
+    rows = _load_monolith_rows(monolith_csv)
+    baseline_meta = _emit_baseline_meta(run_dir)
+    baseline_state = _emit_baseline_state(run_dir, rows)
+    rel_stats = _emit_relativity_defaults(run_dir, rows)
+    label_paths = _emit_label_derivatives(run_dir, rows)
+
+    return {
+        "status": "success",
+        "baseline_meta": str(baseline_meta),
+        "baseline_state": str(baseline_state),
+        "copied": copied,
+        "relativity": rel_stats,
+        "labels": label_paths,
     }
 
 

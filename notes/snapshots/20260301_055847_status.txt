@@ -1,0 +1,12 @@
+## master
+ M analysis/MONOLITH_VIZ.py
+ M analysis/isolated_dash_prototype.py
+ M core/complete_pipeline.py
+ M run_full_experiment_suite.py
+?? .pytest_local_tmp/
+?? analysis/patch_321_fixes.py
+?? analysis/patch_pipeline_321.py
+?? notes/snapshots/
+?? test_dash_contract_gating_diagnostics.py
+?? test_run_full_experiment_suite_paths.py
+?? test_suite_contract_emission.py

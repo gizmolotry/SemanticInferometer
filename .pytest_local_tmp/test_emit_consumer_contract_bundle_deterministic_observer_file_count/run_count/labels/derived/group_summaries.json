@@ -1,0 +1,16 @@
+{
+  "groups": [
+    {
+      "group_name": "Bridge",
+      "n_articles": 1,
+      "mean_density": 0.1,
+      "mean_stress": 0.2
+    },
+    {
+      "group_name": "Swamp",
+      "n_articles": 1,
+      "mean_density": 0.7,
+      "mean_stress": 0.9
+    }
+  ]
+}

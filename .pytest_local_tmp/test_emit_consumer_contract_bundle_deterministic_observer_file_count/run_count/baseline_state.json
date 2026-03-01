@@ -1,0 +1,31 @@
+{
+  "articles": [
+    {
+      "index": 0,
+      "bt_uid": "a0",
+      "title": "t0",
+      "zone": "Bridge",
+      "density": "0.1",
+      "stress": "0.2"
+    },
+    {
+      "index": 1,
+      "bt_uid": "a1",
+      "title": "t1",
+      "zone": "Swamp",
+      "density": "0.7",
+      "stress": "0.9"
+    }
+  ],
+  "paths": [
+    "observer_0/MONOLITH.html",
+    "observer_1/MONOLITH.html"
+  ],
+  "axes": {
+    "x": "density",
+    "y": "stress"
+  },
+  "metrics": {
+    "source": "MONOLITH_DATA.csv"
+  }
+}
