@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import json
@@ -368,3 +368,34 @@ def summarize(report: Dict[str, Any]) -> Dict[str, Any]:
         "global_pass": report.get("global_pass"),
         "layers": layer_rows,
     }
+
+def resolve_run_directory(root_dir: Path, kernel: str, channel: str, corpus: str) -> Path:
+    """
+    Canonical path resolver for experiment runs.
+    Ensures that Producers and Consumers always look at the same directory.
+    """
+    # Priority 1: Nested Structure (Standard)
+    # kernel/channel/corpus
+    nested = Path(root_dir) / kernel / channel / corpus
+    if nested.exists():
+        return nested
+        
+    # Priority 2: Flat Structure (Legacy/Root)
+    # corpus/
+    flat = Path(root_dir) / corpus
+    if flat.exists():
+        return flat
+        
+    # Default to Nested for newly created directories
+    return nested
+
+class ArtifactRegistry:
+    """Service for locating and registering artifacts within a run."""
+    def __init__(self, run_dir: Path):
+        self.run_dir = Path(run_dir)
+        
+    def get_path(self, artifact_name: str) -> Path:
+        return self.run_dir / artifact_name
+        
+    def exists(self, artifact_name: str) -> bool:
+        return self.get_path(artifact_name).exists()

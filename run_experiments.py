@@ -36,10 +36,12 @@ if sys.platform == 'win32':
 
 from pathlib import Path
 import json
-import argparse
+import argparse, os
 from datetime import datetime
 import torch
 import hashlib
+
+from core.data_utils import extract_article_text
 
 # Parsed CLI args (set in main)
 args = None
@@ -195,6 +197,10 @@ EXPERIMENT_MODES = {
         'shared_pca': False,
         'kernel_type': 'rbf',
         'use_cls_tokens': True,
+        'use_attention': True,
+        'use_dirichlet_fusion': True,
+        'dirichlet_alpha': 1.0,
+        'dirichlet_n_observers': 50,
         'projection_dim': 256,
         'apply_pca_to_cls': True,
         'normalize_before_projection': True,
@@ -318,110 +324,35 @@ def load_articles(filepath):
 
 def load_corpus(corpus_type, limit=None):
     """
-    Load corpus based on type - UPDATED with control corpus support!
-    
-    Supported corpus types:
-    - real: Scraped news articles
-    - temporal: Combined temporal corpus
-    - control: Legacy control corpus
-    - control_constant: Identical text control (NEW!)
-    - control_shuffled: Shuffled tokens control (NEW!)
-    - control_random: Random text control (NEW!)
+    Load corpus based on type - UPDATED with path support!
     """
-    # Control corpora (NEW!)
+    # Support for custom corpus paths (Direct Injection)
+    if os.path.exists(corpus_type):
+        articles = load_articles(Path(corpus_type))
+        if limit:
+            articles = articles[:limit]
+        return articles
+
     if corpus_type == 'control_constant':
         corpus_file = DATA_DIR / 'control_constant.jsonl'
-        if not corpus_file.exists():
-            raise FileNotFoundError(
-                f"Control constant corpus not found: {corpus_file}\n"
-                f"Generate it: python controls/make_control_corpus.py"
-            )
         articles = load_articles(corpus_file)
-        print(f"[OK] Loaded CONSTANT control: {len(articles)} identical articles")
-    
     elif corpus_type == 'control_shuffled':
         corpus_file = DATA_DIR / 'control_shuffled.jsonl'
-        if not corpus_file.exists():
-            raise FileNotFoundError(
-                f"Control shuffled corpus not found: {corpus_file}\n"
-                f"Generate it: python controls/make_control_corpus.py"
-            )
         articles = load_articles(corpus_file)
-        print(f"[OK] Loaded SHUFFLED control: {len(articles)} articles (same tokens, random order)")
-    
     elif corpus_type == 'control_random':
         corpus_file = DATA_DIR / 'control_random.jsonl'
-        if not corpus_file.exists():
-            raise FileNotFoundError(
-                f"Control random corpus not found: {corpus_file}\n"
-                f"Generate it: python controls/make_control_corpus.py"
-            )
         articles = load_articles(corpus_file)
-        print(f"[OK] Loaded RANDOM control: {len(articles)} articles (random text)")
-    
-    # Legacy control (backward compatible)
-    elif corpus_type == 'control':
-        print("[WARN] Using legacy 'control' corpus name")
-        print("  Recommend: Use --corpus control_constant, control_shuffled, or control_random")
-        corpus_file = DATA_DIR / 'control_corpus.jsonl'
-        if not corpus_file.exists():
-            # Try the combined control file
-            corpus_file = DATA_DIR / 'control_combined.jsonl'
-        if not corpus_file.exists():
-            raise FileNotFoundError(
-                f"Control corpus not found.\n"
-                f"Generate it: python controls/make_control_corpus.py"
-            )
-        articles = load_articles(corpus_file)
-        print(f"[OK] Loaded control corpus: {len(articles)} articles")
-    
-    # Real corpus
     elif corpus_type == 'real':
-        # Try multiple possible filenames
-        possible_files = [
-            DATA_DIR / 'scraped_articles.jsonl',
-            DATA_DIR / 'real_corpus.jsonl',
-            DATA_DIR / 'articles.jsonl',
-            DATA_DIR / 'corpus.jsonl'
-        ]
-        
-        corpus_file = None
-        for f in possible_files:
-            if f.exists():
-                corpus_file = f
-                break
-        
-        if corpus_file is None:
-            raise FileNotFoundError(
-                f"Real corpus not found. Tried:\n" +
-                "\n".join([f"  - {f}" for f in possible_files])
-            )
-        
+        corpus_file = DATA_DIR / 'real_corpus.jsonl'
         articles = load_articles(corpus_file)
-        print(f"[OK] Loaded REAL corpus: {len(articles)} articles from {corpus_file.name}")
-    
-    # Temporal combined (for non-batch mode)
     elif corpus_type == 'temporal':
-        corpus_file = DATA_DIR / 'temporal_combined.jsonl'
-        if not corpus_file.exists():
-            raise FileNotFoundError(
-                f"Temporal combined corpus not found: {corpus_file}\n"
-                f"For batch processing, use --batch-temporal flag"
-            )
-        articles = load_articles(corpus_file)
-        print(f"[OK] Loaded TEMPORAL corpus: {len(articles)} articles")
-    
+        # Temporal is handled separately in main loop usually
+        raise ValueError("Temporal corpus should be handled via --batch-temporal")
     else:
-        raise ValueError(
-            f"Unknown corpus type: {corpus_type}\n"
-            f"Valid types: real, temporal, control, control_constant, control_shuffled, control_random"
-        )
-    
-    # Apply limit if specified
-    if limit is not None:
+        raise ValueError(f"Unknown corpus type: {corpus_type}")
+
+    if limit:
         articles = articles[:limit]
-        print(f"  [WARN] LIMITED to {len(articles)} articles for testing")
-    
     return articles
 
 
@@ -615,6 +546,8 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         use_contrastive=pipeline_config['use_contrastive'],
         use_pca_removal=pipeline_config['use_pca_removal'],
         use_cls_tokens=pipeline_config['use_cls_tokens'],
+        use_attention=mode_config.get('use_attention', True),
+        use_dirichlet_fusion=mode_config.get('use_dirichlet_fusion', False),
         shared_pca=mode_config.get('shared_pca', False),
         kernel_type=pipeline_config.get('kernel_type', 'rbf'),
         kernel_types=pipeline_config.get('kernel_types'),
@@ -626,6 +559,7 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
         corpus_name=corpus_name,
         nli_cache_path=getattr(args, 'nli_cache_path', None),
+        enable_checkpoints=True, # Always capture data lineage
     )
     
     # Save results - BUT only if output_root is NOT provided
@@ -831,10 +765,10 @@ def run_dirichlet_fusion_experiment(articles, mode_config, seeds, corpus_name='r
     print(f"[NLI] Hidden size: {nli_extractor.hidden_size}")
     cls_per_bot_list = []
     
-    batch_size = 32
+    batch_size = 512
     for i in range(0, len(articles), batch_size):
         batch = articles[i:i+batch_size]
-        texts = [a.get('body', a.get('text', ''))[:2000] for a in batch]
+        texts = [a.get('body', a.get('text', a.get('content', '')))[:2000] for a in batch]
         
         with torch.no_grad():
             result = nli_extractor.extract_batch(texts)
@@ -906,6 +840,22 @@ def run_dirichlet_fusion_experiment(articles, mode_config, seeds, corpus_name='r
                 'provenance': result.get('provenance', {}),
             },
         }
+        
+        # --- NEW: Preserve full physics payload for bridge extraction ---
+        physics_keys = [
+            'walker_states', 'walker_work_integrals', 
+            'spectral_evr', 'spectral_u_axis', 
+            'article_metadata', 'phantom_verdicts'
+        ]
+        for k in physics_keys:
+            if k in result:
+                val = result[k]
+                # Convert tensors to CPU if needed
+                if torch.is_tensor(val):
+                    output_artifact[k] = val.cpu()
+                else:
+                    output_artifact[k] = val
+        
         output_artifact, _ = _ensure_verification_provenance(output_artifact, mode_config, seed)
         
         output_file = output_dir / f"observer_{seed}.pt"
@@ -980,7 +930,6 @@ def main():
         '--corpus',
         type=str,
         default='real',
-        choices=['real', 'control', 'temporal', 'control_constant', 'control_shuffled', 'control_random'],
         help='Which corpus to use (NEW: separate control types!)'
     )
     
@@ -1156,6 +1105,10 @@ def main():
     
     global args
     args = parser.parse_args()
+    
+    # Resolve corpus name for custom paths
+    corpus_name = Path(args.corpus).stem if os.path.exists(args.corpus) else args.corpus
+
 
     # ------------------------------------------------------------------
     # Load manifest (if provided)
@@ -1328,6 +1281,9 @@ def main():
         mode_config["kernel_type"] = args.kernel_type
         mode_config.pop("kernel_types", None)
         mode_config.pop("kernel_types_per_framing", None)
+        if 'pipeline_config' in locals():
+            pipeline_config['kernel_type'] = args.kernel_type
+        print(f"Kernel override: {args.kernel_type}")
 
     # NEW: Handle unified pipeline mode (single inference for all outputs)
     if mode_config.get('use_unified_pipeline', False):
@@ -1335,16 +1291,16 @@ def main():
             articles,
             mode_config,
             args.seeds,
-            corpus_name=args.corpus,
+            corpus_name=corpus_name,
             output_root=args.output_root,
         )
-    # Handle Dirichlet fusion mode
-    elif mode_config.get('use_dirichlet_fusion', False):
+    # Handle Dirichlet fusion standalone mode (only if strictly specified as the mode)
+    elif args.mode == 'dirichlet':
         run_dirichlet_fusion_experiment(
             articles,
             mode_config,
             args.seeds,
-            corpus_name=args.corpus,
+            corpus_name=corpus_name,
             output_root=args.output_root,
         )
     elif 'kernel_types' in mode_config:
@@ -1359,7 +1315,7 @@ def main():
             articles,
             mode_config,
             args.seeds,
-            corpus_name=args.corpus,
+            corpus_name=corpus_name,
             output_root=args.output_root,
             gru_mode=getattr(args, "gru_mode", "intra")
         )

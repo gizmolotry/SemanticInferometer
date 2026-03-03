@@ -23,7 +23,7 @@ This is a useful baseline but not yet a full canonical matrix (single run key on
 
 ## Canonical Run Registry
 
-_Auto-generated from manifests on 2026-02-26T07:31:12._
+_Auto-generated from manifests on 2026-03-01T19:08:38._
 
 | Run ID | Date | Purpose | Command Class | Status | Canonical | Notes |
 |---|---|---|---|---|---|---|
@@ -60,6 +60,11 @@ _Auto-generated from manifests on 2026-02-26T07:31:12._
 | experiments_20260225_034558 | 2026-02-25 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7124; mean_ari=0.4178 |
 | experiments_20260225_225508 | 2026-02-25 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7124; mean_ari=0.4178 |
 | experiments_20260225_230337 | 2026-02-26 | Corpus matrix | Suite | Unknown/Empty | No | no experiments[] entries; config_keys=kernels,channels,corpora,seeds |
+| experiments_20260226_164201 | 2026-02-26 | Corpus matrix | Suite | Success | Yes | experiments=4; kernels=rbf; channels=cls; corpora=real,control_constant,control_shuffled,control_random |
+| experiments_20260226_172453 | 2026-02-26 | Corpus matrix | Suite | Success | Yes | experiments=4; kernels=rbf; channels=cls; corpora=real,control_constant,control_shuffled,control_random |
+| experiments_20260301_131321 | 2026-03-01 | Corpus matrix | Suite | Failed/Partial | No | experiments=1; failures=1; kernels=rbf; channels=cls; corpora=real,control_constant,control_shuffled,control_random |
+| experiments_20260301_190150 | 2026-03-01 | Synthetic | Synthetic | Success | Yes | successful_runs=4/4; mean_nmi=0.4706; mean_ari=0.2313 |
+| experiments_20260301_190621 | 2026-03-01 | Corpus matrix | Suite | Failed/Partial | No | experiments=2; failures=2; kernels=matern; channels=cls,logits; corpora=sythgen/high_quality_articles.jsonl |
 
 ## Thesis Tables To Populate
 

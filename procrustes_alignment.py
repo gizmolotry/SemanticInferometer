@@ -30,6 +30,8 @@ from core.procrustes import (
     interpret_residuals
 )
 
+from core.metric_fusion import calculate_unified_metric
+
 
 def load_and_align_observers(
     observer_files: List[Path],
@@ -62,7 +64,7 @@ def load_and_align_observers(
     for i, filepath in enumerate(observer_files):
         print(f"\nLoading observer {i+1}/{len(observer_files)}: {filepath.name}")
         
-        data = torch.load(filepath, map_location='cpu')
+        data = torch.load(filepath, map_location='cpu', weights_only=False)
         
         # Get embeddings - try multiple field names
         embeddings = None
@@ -163,6 +165,13 @@ def save_alignment_results(results: Dict, output_dir: Path):
         'consensus': results['consensus'],
         'variance_decomposition': results['variance_decomposition']
     }, output_dir / 'consensus.pt')
+    
+    # Add .npy export for viz engine
+    if torch.is_tensor(results['consensus']):
+        consensus_np = results['consensus'].detach().cpu().numpy()
+    else:
+        consensus_np = np.array(results['consensus'])
+    np.save(output_dir / 'features.npy', consensus_np)
     
     # Save aligned embeddings
     for i, aligned in enumerate(results['aligned_embeddings']):
@@ -343,7 +352,179 @@ if __name__ == "__main__":
     
     # Save results
     save_alignment_results(results, args.output_dir)
-    
+
+    # --- EXECUTION BRIDGE (PHASE 2) ---
     print("\n" + "="*70)
-    print("✅ ALIGNMENT COMPLETE (CORRECTED VARIANCE)")
+    print("BRIDGE: EXTRACTING PHYSICS ARTIFACTS")
+    print("="*70)
+
+    output_dir = Path(args.output_dir)
+    reference_file = observer_files[args.reference_idx]
+    ref_data = torch.load(reference_file, map_location='cpu', weights_only=False)
+
+    # 1. Extract and save downstream artifacts from reference observer
+    artifact_count = 0
+
+    # NEW: Reconstruct article metadata if missing (crucial for synthetic runs)
+    if not ref_data.get('article_metadata'):
+        print("  [INFO] article_metadata missing or empty in observer. Attempting reconstruction from corpus...")
+        try:
+            # Look for corpus name in meta
+            corpus_name = ref_data.get('meta', {}).get('corpus', 'high_quality_articles')
+            if not corpus_name.endswith('.jsonl'):
+                corpus_name += '.jsonl'
+
+            corpus_path = Path("sythgen") / corpus_name
+            if not corpus_path.exists():
+                corpus_path = Path("data") / corpus_name
+
+            if corpus_path.exists():
+                metadata = []
+                with open(corpus_path, 'r', encoding='utf-8') as f:
+                    for i, line in enumerate(f):
+                        if i >= ref_data['n_articles']: break
+                        item = json.loads(line)
+                        # Extract basic metadata
+                        metadata.append({
+                            'article_id': item.get('event_id', f'art_{i}'),
+                            'title': item.get('title', 'Untitled'),
+                            'source': item.get('publication', 'Synthetic'),
+                            'perspective_tag': item.get('perspective_tag', 'unknown'),
+                            'perspective_type': item.get('perspective_type', 'unknown')
+                        })
+
+                import pandas as pd
+                pd.DataFrame(metadata).to_csv(output_dir / "article_metadata.csv", index=False)
+                print(f"  [OK] Reconstructed article_metadata.csv from {corpus_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Metadata reconstruction failed: {e}")
+    else:
+        # Check if we need to convert metadata list to CSV for metric_fusion
+        metadata = ref_data['article_metadata']
+        import pandas as pd
+        pd.DataFrame(metadata).to_csv(output_dir / "article_metadata.csv", index=False)
+        print("  [OK] Extracted article_metadata.csv")
+    # Extract spectral_evr
+    if 'spectral_evr' in ref_data:
+        np.save(output_dir / "spectral_evr.npy", ref_data['spectral_evr'])
+        artifact_count += 1
+        print("  [OK] Extracted spectral_evr.npy")
+    elif 'fused_std' in ref_data:
+        # High fused_std = low confidence/EVR
+        std_norm = torch.norm(ref_data['fused_std'], dim=1).numpy()
+        # Scale to [0.1, 0.9] range as proxy for EVR
+        evr_proxy = 1.0 - (std_norm / (std_norm.max() + 1e-9)) * 0.8
+        np.save(output_dir / "spectral_evr.npy", evr_proxy)
+        artifact_count += 1
+        print("  [OK] Derived spectral_evr.npy from Dirichlet variance")
+
+    # Extract spectral_u_axis
+    if 'spectral_u_axis' in ref_data:
+        np.save(output_dir / "spectral_u_axis.npy", ref_data['spectral_u_axis'])
+        artifact_count += 1
+        print("  [OK] Extracted spectral_u_axis.npy")
+    elif 'features' in ref_data:
+        from sklearn.decomposition import PCA
+        feats = ref_data['features'].numpy() if torch.is_tensor(ref_data['features']) else ref_data['features']
+        # Project 8 bots to 2D for the "wind" field
+        pca = PCA(n_components=2)
+        u_axis = pca.fit_transform(feats)
+        np.save(output_dir / "spectral_u_axis.npy", u_axis)
+        artifact_count += 1
+        print("  [OK] Derived spectral_u_axis.npy from features PCA")
+
+    # Extract walker data
+    if 'walker_states' in ref_data:
+        with open(output_dir / "walker_states.json", 'w') as f:
+            json.dump(ref_data['walker_states'], f, indent=2)
+        artifact_count += 1
+        print("  [OK] Extracted walker_states.json")
+
+    if 'walker_work_integrals' in ref_data:
+        np.save(output_dir / "walker_work_integrals.npy", ref_data['walker_work_integrals'])
+        artifact_count += 1
+        print("  [OK] Extracted walker_work_integrals.npy")
+
+    # NEW: Extract phantom_verdicts, variance_tracking, and meta
+    if 'phantom_verdicts' in ref_data:
+        with open(output_dir / "phantom_verdicts.json", 'w') as f:
+            json.dump(ref_data['phantom_verdicts'], f, indent=2)
+        artifact_count += 1
+        print("  [OK] Extracted phantom_verdicts.json")
+
+    if 'variance_tracking' in ref_data:
+        with open(output_dir / "variance_tracking.json", 'w') as f:
+            json.dump(ref_data['variance_tracking'], f, indent=2)
+        artifact_count += 1
+        print("  [OK] Extracted variance_tracking.json")
+
+    if 'meta' in ref_data:
+        with open(output_dir / "run_meta.json", 'w') as f:
+            json.dump(ref_data['meta'], f, indent=2)
+        artifact_count += 1
+        print("  [OK] Extracted run_meta.json")
+        
+    # --- CHECKPOINT UNPACKING (PHASE 3) ---
+    ckpt_out_dir = output_dir / "checkpoints"
+    ckpt_out_dir.mkdir(parents=True, exist_ok=True)
+    
+    if 'T0_substrate' in ref_data:
+        np.save(ckpt_out_dir / "T0_substrate.npy", ref_data['T0_substrate'])
+        print("  [OK] Unpacked T0_substrate.npy")
+        
+    if 'T1_embeddings' in ref_data:
+        np.save(ckpt_out_dir / "T1_embeddings.npy", ref_data['T1_embeddings'])
+        print("  [OK] Unpacked T1_embeddings.npy")
+        
+    if 'T1.5_spectral' in ref_data:
+        spec = ref_data['T1.5_spectral']
+        if isinstance(spec, dict):
+            np.savez(ckpt_out_dir / "T1.5_spectral_state.npz", **spec)
+        else:
+            np.save(ckpt_out_dir / "T1.5_spectral_state.npz", spec)
+        print("  [OK] Unpacked T1.5_spectral_state.npz")
+        
+    if 'T2_kernels' in ref_data:
+        np.savez(ckpt_out_dir / "T2_kernel_projections.npz", z_rbf=ref_data['T2_kernels'])
+        print("  [OK] Unpacked T2_kernel_projections.npz")
+        
+    if 'T3_topology' in ref_data:
+        topo = ref_data['T3_topology']
+        if isinstance(topo, dict):
+            np.savez(ckpt_out_dir / "T3_topology.npz", **topo)
+        else:
+            np.save(ckpt_out_dir / "T3_topology.npz", topo)
+        print("  [OK] Unpacked T3_topology.npz")
+
+    print(f"✅ Bridge: Saved {artifact_count} physics artifacts.")
+
+    # 2. Trigger Metric Fusion if possible
+    embeddings_path = output_dir / "features.npy"
+    gradients_path = output_dir / "spectral_u_axis.npy"
+    metadata_path = output_dir / "article_metadata.csv"
+    fusion_output = output_dir / "MONOLITH_DATA.csv"
+
+    if embeddings_path.exists() and gradients_path.exists() and metadata_path.exists():
+        print("\n" + "="*70)
+        print("BRIDGE: TRIGGERING UNIFIED METRIC FUSION")
+        print("="*70)
+        try:
+            calculate_unified_metric(
+                embeddings_path=embeddings_path,
+                gradients_path=gradients_path,
+                metadata_path=metadata_path,
+                output_path=fusion_output
+            )
+            print("✅ Bridge: Generated MONOLITH_DATA.csv")
+        except Exception as e:
+            print(f"❌ Bridge: Metric fusion failed: {e}")
+    else:
+        missing = []
+        if not embeddings_path.exists(): missing.append("features.npy")
+        if not gradients_path.exists(): missing.append("spectral_u_axis.npy")
+        if not metadata_path.exists(): missing.append("article_metadata.csv")
+        print(f"⚠️  Bridge: Skipping metric fusion, missing: {', '.join(missing)}")
+
+    print("\n" + "="*70)
+    print("✅ ALIGNMENT & PHYSICS COMPLETE")
     print("="*70)

@@ -428,7 +428,14 @@ class SemanticWalker:
         for t in range(n_steps):
             # A. Propose a step (perturb weights)
             noise = torch.randn_like(current_weights) * self.thermo_config.noise_sigma
-            proposal = torch.abs(current_weights + noise)
+            
+            # RESTORE WIND FORCE: Push walkers across the manifold using the u_axis field.
+            # We guide walkers towards their opposing pole target if defined by the field.
+            wind_drift = 0
+            if self.u_axis is not None and target_weights is not None:
+                wind_drift = (target_weights - current_weights) * 0.1
+
+            proposal = torch.abs(current_weights + noise + wind_drift)
             proposal = proposal / proposal.sum(dim=-1, keepdim=True)
 
             # B. Check the wall (calculate energy)
@@ -863,13 +870,15 @@ def compute_walker_resistance(
     )
 
     # 4-state system: TAUTOLOGY / HONEST / PHANTOM / RUPTURE
-    state_names = ["tautology", "honest", "phantom", "rupture", "broken", "trapped"]
+    state_names = ["tautology", "honest", "phantom", "rupture", "Type 1 Rupture", "Type 2 Rupture"]
     state_code = result.state.item()
     state_name = state_names[min(state_code, len(state_names) - 1)]  # Safety clamp
-    if state_name == "broken":
-        walker_status = "BROKEN"
-    elif state_name == "trapped":
-        walker_status = "TRAPPED"
+    if state_name == "Type 1 Rupture":
+        walker_status = "FAILED"
+    elif state_name == "Type 2 Rupture":
+        walker_status = "FAILED"
+    elif state_name == "rupture":
+        walker_status = "FAILED"
     else:
         walker_status = "SUCCESS"
 

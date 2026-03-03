@@ -1,4 +1,4 @@
-﻿"""
+"""
 complete_pipeline.py  end-to-end orchestration for the Belief Transformer / bias-geometry experiments.
 
 This file is intentionally "pipeline glue": it wires together the NLI extractor, optional temporal modeling,
@@ -853,7 +853,7 @@ def initialize_full_pipeline(
         rks_map = RKSFeatureMap(
             input_dim=output_dim if gru_model is not None else embedding_dim,
             output_dim=final_dim,
-            kernel_type="rbf",
+            kernel_type=kernel_type,
             gamma=1.0,
             random_seed=random_seed,
             device=device,
@@ -869,7 +869,7 @@ def initialize_full_pipeline(
             cls_hidden_dim = dirichlet_hidden_dim  # 1536 for DeBERTa-large
             if kernel_type.lower() == 'rbf':
                 built_kernel_ctx = KernelContext(
-                    kernel_type='rbf',
+                    kernel_type=kernel_type.lower(),
                     input_dim=cls_hidden_dim,  # Use actual hidden dim, not 768
                     rks_dim=dirichlet_rks_dim,
                     seed=dirichlet_basis_seed,
@@ -1703,11 +1703,28 @@ class BeliefTransformerPipeline:
 
             diagnostics["timing"]["dirichlet_fusion"] = time.time() - t_fusion
 
-        # Choose the canonical "features" output for backward compatibility.
+        # choose the canonical "features" output for backward compatibility.
         if self.compare_logits_vs_cli:
             final_features = out_by_channel["logits"]
         else:
             final_features = out_by_channel["main"]
+
+        # NEW: Ensure intermediate states are in the output for iterative runners
+        pipeline_checkpoints = {}
+        if logits_t1 is not None:
+            pipeline_checkpoints['T0_substrate'] = logits_t1.view(-1, 8, 3)
+        if final_features is not None:
+            pipeline_checkpoints['T1_embeddings'] = final_features
+        if spectral_results is not None:
+            pipeline_checkpoints['T1.5_spectral'] = {
+                'u_axis': spectral_results.u_axis,
+                'evr': spectral_results.evr,
+                'probe_magnitudes': spectral_results.probe_magnitudes
+            }
+        if dirichlet_results is not None and "fused" in dirichlet_results:
+            pipeline_checkpoints['T2_kernels'] = dirichlet_results["fused"]
+        
+        # T3 is social_texture (populated below if enabled)
 
         diagnostics["variance"]["final_variance"] = float(final_features.var().item())
         diagnostics["timing"]["total"] = time.time() - start_total
@@ -2233,6 +2250,8 @@ class BeliefTransformerPipeline:
             "channel_extras": extras_by_channel,
             # NEW: Primary rep_kind for downstream contract checks
             "rep_kind": self.primary_rep_kind.value,
+            # NEW: Pipeline intermediate states for checkpointing
+            "checkpoints": pipeline_checkpoints,
         }
 
         if features_cli is not None:
@@ -2318,6 +2337,15 @@ class BeliefTransformerPipeline:
 
                 nmi_score = 0.0
                 ari_score = 0.0
+
+                # NEW: Capture T3 state for pipeline return
+                pipeline_checkpoints['T3_topology'] = {
+                    'bond_matrix': bond_matrix,
+                    'crack_matrix': crack_matrix,
+                    'rupture_pairs': rupture_pairs,
+                    'nmi_score': nmi_score,
+                    'ari_score': ari_score
+                }
 
                 waterfall_ckpt.save_t3_topology(
                     bond_matrix=bond_matrix,
@@ -2565,6 +2593,8 @@ def run_multi_observer_experiment_simple(
             adult_sigma=kwargs.get("adult_sigma", None),
             adult_center=bool(kwargs.get("adult_center", True)),
             adult_nystrom_m=int(kwargs.get("adult_nystrom_m", 256)),
+            use_attention=kwargs.get("use_attention", True),
+            use_dirichlet_fusion=kwargs.get("use_dirichlet_fusion", False),
             embedding_dim=24 if not use_cls_tokens else 8192,
         )
         
@@ -2577,7 +2607,14 @@ def run_multi_observer_experiment_simple(
         if shared_nli_cache is not None:
             pipeline._nli_cache = shared_nli_cache
         
-        result = pipeline.process_month(articles, month_name="batch")
+        # NEW: Enable checkpoint system if requested via kwargs
+        pipeline_config = {
+            "enable_checkpoints": bool(kwargs.get("enable_checkpoints", False)),
+            "output_dir": str(output_dir) if output_dir else "outputs",
+            "checkpoint_dir": str(output_dir) if output_dir else "outputs",
+        }
+        
+        result = pipeline.process_month(articles, month_name="batch", config=pipeline_config)
         
         # Save NLI cache after first extraction (for reuse across kernels)
         if shared_nli_cache is None and nli_cache_path and pipeline._nli_cache is not None:
@@ -2658,6 +2695,25 @@ def run_multi_observer_experiment_simple(
             },
         }
         
+        # --- PHASE 3 PAYLOAD FIX ---
+        physics_keys = [
+            'walker_states', 'walker_work_integrals', 
+            'spectral_evr', 'spectral_u_axis', 'spectral_probe_magnitudes',
+            'article_metadata', 'phantom_verdicts',
+            'T0_substrate', 'T1_embeddings', 'T1.5_spectral', 'T2_kernels', 'T3_topology'
+        ]
+        
+        # Unpack from result or its internal 'checkpoints' dict
+        pipeline_checkpoints = result.get('checkpoints', {})
+        
+        for k in physics_keys:
+            if k in result:
+                val = result[k]
+                output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
+            elif k in pipeline_checkpoints:
+                val = pipeline_checkpoints[k]
+                output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
+                
         # Save directly to output_dir (caller already creates structured path)
         # NOTE: Do NOT use build_structured_output_path here - that causes double-nesting
         # when run_full_experiment_suite already passes kernel/channel/corpus path

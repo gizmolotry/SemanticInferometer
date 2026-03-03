@@ -20,6 +20,7 @@ from typing import Tuple, List
 import json
 import argparse
 from .thermo_config import ThermodynamicConfig
+from .artifact_ledger import ArtifactContract
 
 def calculate_unified_metric(
     embeddings_path: Path,
@@ -32,19 +33,10 @@ def calculate_unified_metric(
 ) -> pd.DataFrame:
     """
     Fuses Track 1.5 (Gradients) and Track 2 (Density) to calculate unified metrics.
-
-    Args:
-        embeddings_path: Path to the .npy file containing embeddings (e.g., CLS features).
-        gradients_path: Path to the .npy file containing gradient vectors (Track 1.5).
-        metadata_path: Path to the .csv file containing article metadata.
-        output_path: Path to save the resulting MONOLITH_DATA.csv.
-        knn_k: Number of neighbors for KNN density calculation.
-        z_stress_factor: Multiplier for stress in Z_HEIGHT calculation.
-        z_density_factor: Multiplier for (1-density) in Z_HEIGHT calculation.
-
-    Returns:
-        A pandas DataFrame with the original metadata and appended unified metric columns.
     """
+    # 0. ENFORCE CONTRACT
+    ArtifactContract(embeddings_path.parent).verify()
+
     print(f"Loading data: {embeddings_path}, {gradients_path}, {metadata_path}")
     thermo_config = ThermodynamicConfig()
 
@@ -101,36 +93,95 @@ def calculate_unified_metric(
     z_scaler = MinMaxScaler(feature_range=(0.0, max_z))
     z_height = z_scaler.fit_transform(z_potential.reshape(-1, 1)).reshape(-1)
 
-    # 5. Calculate ZONES (Bridge/Swamp/Tightrope/Void) using DYNAMIC MEDIAN THRESHOLDS
+    # 5. Calculate ZONES (Bridge/Swamp/Tightrope/Void) using ABSOLUTE THRESHOLDS
     print("Classifying zones (Bridge/Swamp/Tightrope/Void)...")
-    # Dynamic median thresholds to force even distribution
-    density_median = np.percentile(density, 50)
-    stress_median = np.percentile(stress, 50)
+    # ASTER v3.2 Strict Physical Thresholds (No percentiles)
+    density_thresh = 0.5
+    stress_thresh = 0.5
 
     zones = []
-    color_codes = [] # Also generate color codes based on zone for convenience
+    color_codes = [] 
     for i in range(len(metadata_df)):
-        if density[i] >= density_median and stress[i] < stress_median:
+        if density[i] >= density_thresh and stress[i] < stress_thresh:
             zones.append("Bridge")
-            color_codes.append("#00F0FF") # Cyan
-        elif density[i] >= density_median and stress[i] >= stress_median:
+            color_codes.append("#00F0FF")
+        elif density[i] >= density_thresh and stress[i] >= stress_thresh:
             zones.append("Swamp")
-            color_codes.append("#9932CC") # Purple
-        elif density[i] < density_median and stress[i] < stress_median:
+            color_codes.append("#9932CC")
+        elif density[i] < density_thresh and stress[i] < stress_thresh:
             zones.append("Tightrope")
-            color_codes.append("#FFFFCC") # Yellow
-        else: # density[i] < density_median and stress[i] >= stress_median
+            color_codes.append("#FFFFCC")
+        else: 
             zones.append("Void")
-            color_codes.append("#FF0000") # Red (or #1A0000 for dark void)
+            color_codes.append("#FF0000")
+
+    # 5.5. Calculate VERDICTS (ASTER v3.2 Strict Physical Handoff)
+    print("Classifying verdicts (Honest/Phantom/Rupture/Tautology)...")
+    
+    # Try to load walker work integrals and states for actual physics
+    walker_work_path = embeddings_path.parent / "walker_work_integrals.npy"
+    walker_states_path = embeddings_path.parent / "walker_states.json"
+    
+    if not walker_work_path.exists():
+        raise FileNotFoundError(f"CRITICAL ERROR: Physics payload missing (work). {walker_work_path.name}")
+    
+    w_actual = np.load(walker_work_path)
+    
+    walker_states = None
+    if walker_states_path.exists():
+        with open(walker_states_path, 'r') as f:
+            walker_states = json.load(f)
+        print(f"  [OK] Using actual walker states from {walker_states_path.name}")
+    else:
+        print(f"  [WARN] walker_states.json missing. Falling back to work-only classification.")
+
+    # Divergence Ratio Logic (Panic Function)
+    centroid_2d = np.mean(embeddings[:, :2], axis=0)
+    d_spectral = np.linalg.norm(embeddings[:, :2] - centroid_2d, axis=1)
+    d_spectral = np.clip(d_spectral, 0.1, None)
+
+    verdicts = []
+    for i in range(len(metadata_df)):
+        # Delta = W / d
+        delta = w_actual[i] / d_spectral[i]
+        state = walker_states[i] if walker_states is not None else "unknown"
+        
+        # 1. TAUTOLOGY: Spinning in place (efficiency ~ 0)
+        if delta < 0.2:
+            verdicts.append("TAUTOLOGY")
+            continue
+
+        # 2. SUCCESS: Honors the walker physics engine
+        if state in ["SUCCESS", "honest", "success"]:
+            if delta < 1.5:
+                verdicts.append("HONEST")
+            else:
+                verdicts.append("PHANTOM")
+            continue
+
+        # 3. RUPTURE: Categorization by failure mode
+        if state in ["broken", "BROKEN"]:
+            verdicts.append("TYPE_1_RUPTURE") # Kinetic crash
+        elif state in ["trapped", "TRAPPED"]:
+            verdicts.append("TYPE_2_RUPTURE") # Topological trap
+        else:
+            # Fallback for unknown states using absolute thresholds
+            if delta > 10.0:
+                verdicts.append("TYPE_1_RUPTURE")
+            elif delta > 5.0:
+                verdicts.append("PHANTOM")
+            else:
+                verdicts.append("HONEST")
 
     # 6. Save the result as 'MONOLITH_DATA.csv' with new columns:
-    #    'density', 'stress', 'z_height', 'zone', 'color_code'.
+    #    'density', 'stress', 'z_height', 'zone', 'color_code', 'verdict'.
     print(f"Appending new columns and saving to {output_path}...")
     metadata_df['density'] = density
     metadata_df['stress'] = stress
     metadata_df['z_height'] = z_height
     metadata_df['zone'] = zones
     metadata_df['color_code'] = color_codes
+    metadata_df['verdict'] = verdicts
 
     metadata_df.to_csv(output_path, index=False)
     print("Unified metric calculation complete and saved.")
@@ -150,10 +201,15 @@ if __name__ == "__main__":
     
     # Prioritize 'articles_with_sources.csv' if it exists for richer metadata
     articles_with_sources_path = exp_dir / "articles_with_sources.csv"
+    article_metadata_csv = exp_dir / "article_metadata.csv"
+    
     if articles_with_sources_path.exists():
         metadata_path = articles_with_sources_path
         print(f"Using rich metadata from: {metadata_path}")
-    else: # Fallback to original metadata logic if articles_with_sources.csv does not exist
+    elif article_metadata_csv.exists():
+        metadata_path = article_metadata_csv
+        print(f"Using metadata from: {metadata_path}")
+    else: # Fallback to original metadata logic
         metadata_path = exp_dir / "article_metadata.json" # Fallback to original metadata file
         if metadata_path.exists() and metadata_path.suffix == '.json':
             print(f"Converting {metadata_path} to temporary CSV for processing...")

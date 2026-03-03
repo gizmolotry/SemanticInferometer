@@ -44,6 +44,8 @@ import numpy as np
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import yaml
 
+from .data_utils import extract_article_text
+
 
 # =============================================================================
 # REPRESENTATION KIND (Constitutional Gate)
@@ -520,10 +522,7 @@ class UnifiedNLIExtractor(nn.Module):
                 print(f"  Extracting: {i+1}/{n}")
 
             # Get text
-            if isinstance(article, dict):
-                text = article.get('text', article.get('content', ''))
-            else:
-                text = str(article)
+            text = extract_article_text(article)
 
             if not text or len(text.strip()) < 5:
                 # Empty article - use zeros
@@ -928,9 +927,7 @@ class NLIExtractor:
         self.output_dim = self.extractor.cls_dim if use_cls_tokens else self.extractor.logits_dim
     
     def _get_text(self, article: Union[str, Dict[str, str]]) -> str:
-        if isinstance(article, dict):
-            return (article.get("content") or article.get("text") or "").strip()
-        return str(article).strip()
+        return extract_article_text(article)
     
     def extract_nli_pairs(self, articles: List[Union[str, Dict[str, str]]]) -> List[Dict[str, Any]]:
         """

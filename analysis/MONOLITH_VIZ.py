@@ -48,9 +48,11 @@ import random
 import datetime
 from collections import Counter
 from pathlib import Path
+from verification.contract import resolve_run_directory
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Union
 
+from core.artifact_ledger import ArtifactContract
 import numpy as np
 import pandas as pd # Added for MONOLITH_DATA.csv loading
 
@@ -390,7 +392,32 @@ def _short_hash(value: Any) -> str:
 
 def load_epistemic_contract_data(experiment_dir: Path) -> Dict[str, Any]:
     """Load verification/provenance contract data with conservative fallbacks."""
-    # Canonical artifact path: verification_report.json / verification_summary.csv.
+    # Priority 1: Consolidated Epistemic Contract
+    contract_path = experiment_dir / "EPISTEMIC_CONTRACT.json"
+    if contract_path.exists():
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            prov = contract.get("provenance", {})
+            verif = contract.get("verification", {})
+            
+            status = "VERIFIED" if verif.get("global_pass") else "NON_COMPARABLE"
+            return {
+                "status": status,
+                "global_pass": verif.get("global_pass"),
+                "seed_stability": verif.get("seed_stability"),
+                "crn_locked": verif.get("crn_locked"),
+                "provenance": {
+                    "weights_hash": prov.get("weights_hash", "missing"),
+                    "basis_hash": prov.get("basis_hash", "missing"),
+                    "alpha": prov.get("alpha", "missing"),
+                    "crn_seed": prov.get("crn_seed", "missing"),
+                },
+                "type2_robustness": contract.get("consensus", {}).get("type2_robustness", 1.0)
+            }
+        except Exception:
+            pass
+
+    # Priority 2: Fragmented Legacy Logic
     status = "UNVERIFIED"
     global_pass = None
     seed_stability = None
@@ -469,6 +496,9 @@ def load_epistemic_contract_data(experiment_dir: Path) -> Dict[str, Any]:
 def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     """Load all experiment data from a seed directory."""
     experiment_dir = Path(experiment_dir)
+
+    # ENFORCE CONTRACT
+    ArtifactContract(experiment_dir).verify()
 
     # Required
     features = np.load(experiment_dir / "features.npy")
@@ -550,43 +580,6 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     if (experiment_dir / "phantom_verdicts.json").exists():
         with open(experiment_dir / "phantom_verdicts.json") as f:
             phantom_verdicts = json.load(f)
-        # ADAPTIVE RECLASSIFICATION: Use percentile thresholds per-swarm to avoid
-        # the "All Tautology" bug caused by fixed thresholds that don't scale with
-        # the dataset. Efficiency = delta (Displacement / Path_Length; 1.0 = perfect
-        # straight line, values near 0 = spinning tautology trap).
-        if phantom_verdicts and len(phantom_verdicts) > 1:
-            reclassified = []
-            deltas = np.array([v.get('delta', 1e-8) for v in phantom_verdicts], dtype=float)
-            # Clamp to avoid division by zero / log issues
-            deltas = np.maximum(deltas, 1e-8)
-            # efficiency = delta (higher delta = straighter path = more HONEST)
-            efficiency = deltas
-            honest_thresh  = np.percentile(efficiency, 80)   # top 20% → HONEST
-            tautology_thresh = np.percentile(efficiency, 10)  # bottom 10% → TAUTOLOGY
-            w_values = np.array([v.get('w_actual', 0.0) for v in phantom_verdicts], dtype=float)
-            w_median = float(np.median(w_values))
-            for v, eff, w in zip(phantom_verdicts, efficiency, w_values):
-                nv = dict(v)
-                old_verdict = str(nv.get('verdict', '')).upper()
-                
-                # PRESERVE failure states if already set
-                if old_verdict in {'BROKEN', 'TRAPPED'}:
-                    reclassified.append(nv)
-                    continue
-
-                if eff >= honest_thresh:
-                    nv['verdict'] = 'HONEST'
-                elif eff <= tautology_thresh:
-                    nv['verdict'] = 'TAUTOLOGY'
-                else:
-                    # Middle band: distinguish PHANTOM (tortuous but alive) from
-                    # RUPTURE (crashed into void) by work integral
-                    nv['verdict'] = 'RUPTURE' if w > w_median * 2.0 else 'PHANTOM'
-                reclassified.append(nv)
-            phantom_verdicts = reclassified
-            counts = Counter(v['verdict'] for v in phantom_verdicts)
-            print(f"[MONOLITH] Adaptive verdict reclassification (n={len(phantom_verdicts)}): "
-                  f"honest_thresh={honest_thresh:.4f}, tautology_thresh={tautology_thresh:.4f} -> {dict(counts)}")
 
     # Track 6: HoTT
     hott_proofs = None
@@ -623,13 +616,13 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     cp_t3_blinker = None
     ground_truth_labels = None
 
-    # Look for checkpoints directory
-    checkpoint_dir = experiment_dir / "checkpoints" / experiment_dir.name
-    if not checkpoint_dir.exists():
-        # Try alternative paths
-        checkpoint_dir = experiment_dir / "checkpoints"
+    # Smart Discovery for checkpoints
+    checkpoint_dir = None
+    candidates = list(experiment_dir.rglob("T0_substrate.npy"))
+    if candidates:
+        checkpoint_dir = candidates[0].parent
 
-    if checkpoint_dir.exists():
+    if checkpoint_dir and checkpoint_dir.exists():
         # T0: Raw logits [N, 8, 3]
         t0_path = checkpoint_dir / "T0_substrate.npy"
         if t0_path.exists():
@@ -1476,7 +1469,7 @@ def render_wind_streamlines(
         z=positions_3d[:, 2],
         u=antag_3d[:, 0] * scale,
         v=antag_3d[:, 1] * scale,
-        w=antag_3d[:, 2] * scale,
+        w=antag_3d[:, 2] * scale if antag_3d.shape[1] > 2 else np.zeros_like(antag_3d[:, 0]),
         colorscale=[[0, 'rgba(0,240,255,0.3)'], [1, 'rgba(255,100,100,0.6)']],
         sizemode='absolute',
         sizeref=scale * 0.3,
@@ -1493,12 +1486,16 @@ def render_wind_streamlines(
 
     for idx in sample_idx:
         start = positions_3d[idx]
-        direction = antag_3d[idx] * scale * 3
+        
+        # Handle 2D vs 3D vectors
+        u = antag_3d[idx, 0] * scale * 3
+        v = antag_3d[idx, 1] * scale * 3
+        w = antag_3d[idx, 2] * scale * 3 if antag_3d.shape[1] > 2 else 0.0
 
         # Create streamline path
-        x_line = [start[0], start[0] + direction[0]]
-        y_line = [start[1], start[1] + direction[1]]
-        z_line = [start[2], start[2] + direction[2]]
+        x_line = [start[0], start[0] + u]
+        y_line = [start[1], start[1] + v]
+        z_line = [start[2], start[2] + w]
 
         traces.append(go.Scatter3d(
             x=x_line, y=y_line, z=z_line,
@@ -3233,6 +3230,11 @@ def create_monolith_cockpit(
     spectral_evr = exp.spectral_evr if exp.spectral_evr is not None else np.ones(n_articles) * 0.5
     spectral_mags = exp.spectral_probe_magnitudes if exp.spectral_probe_magnitudes is not None else np.zeros((n_articles, 8))
 
+    # Task 1 Fix: Inject tiny noise if all zeros to prevent PCA divide-by-zero
+    if np.all(spectral_mags == 0) or np.any(np.isnan(spectral_mags)):
+        print("[MONOLITH] WARNING: spectral_mags are zero or NaN. Injecting tiny noise for PCA stability.")
+        spectral_mags = np.random.normal(0, 1e-5, spectral_mags.shape)
+
     # Track 1: Logit confidence (for halos) - fallback to spectral_evr if not available
     logit_confidence = exp.logit_confidence if exp.logit_confidence is not None else spectral_evr
 
@@ -3278,6 +3280,18 @@ def create_monolith_cockpit(
 
         print(f"[MONOLITH] Loading unified metrics from {monolith_data_path}...")
         monolith_df = pd.read_csv(monolith_data_path)
+
+        # Task 2 Fix: Wire verdicts from CSV into the visualization
+        if 'verdict' in monolith_df.columns and not phantom_verdicts:
+            print(f"[MONOLITH] Wiring {len(monolith_df)} verdicts from MONOLITH_DATA.csv")
+            phantom_verdicts = []
+            for i, row in monolith_df.iterrows():
+                phantom_verdicts.append({
+                    'article_id': row.get('article_id', f'art_{i}'),
+                    'verdict': row['verdict'],
+                    'w_actual': row.get('stress', 0.5) * 5.0, # Approximate work for HUD
+                    'delta': 1.0 # Default delta
+                })
 
         # Ensure loaded data matches n_articles
         if len(monolith_df) != n_articles:
@@ -3958,6 +3972,9 @@ def create_monolith_cockpit(
         <div class="ep-row"><span class="k">CRN Locked:</span> <span class="v">{verification_crn_locked if verification_crn_locked is not None else 'unknown'}</span></div>
         <div class="ep-row"><span class="k">T4 Survival:</span> <span class="v">{survival_rate:.0%}</span></div>
         <div class="ep-row"><span class="k">Broken/Trapped:</span> <span class="v">{n_broken}/{n_trapped if n_total > 0 else 'unknown'}</span></div>
+        <div class="ep-divider" style="border-top: 1px solid #333; margin: 8px 0;"></div>
+        <div class="ep-row"><b>System 1 (Topological NMI):</b> <span class="v">{exp.synthesis_nmi if exp.synthesis_nmi is not None else 'N/A'}</span></div>
+        <div class="ep-row"><b>System 2 (Thermodynamic Cost):</b> <span class="v">{survival_rate:.1%}</span></div>
         <div class="provenance-line">
             <div><span class="k">Provenance:</span>
             <span class="v">weights_hash={weights_hash_short} | basis_hash={basis_hash_short} | alpha={alpha_display} | crn_seed={crn_seed_display}</span></div>
@@ -4484,8 +4501,12 @@ def main():
     args = parser.parse_args()
 
     exp_dir = Path(args.experiment_dir)
+    # Smart Discovery: Try to resolve deep nesting (rbf/cls/real) if path doesn't exist
     if not exp_dir.exists():
-        print(f"Error: Directory not found: {exp_dir}")
+        exp_dir = resolve_run_directory(exp_dir.parent, "rbf", "cls", exp_dir.name)
+        
+    if not exp_dir.exists():
+        print(f"Error: Directory not found: {args.experiment_dir}")
         sys.exit(1)
 
     output = args.output or exp_dir / "MONOLITH.html"

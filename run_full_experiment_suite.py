@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 run_full_experiment_suite.py
 
@@ -1876,8 +1876,8 @@ def main():
         "--kernels",
         type=str,
         nargs="+",
-        default=["rbf", "laplacian", "rq", "imq"],
-        help="Kernel types to run (default: all four). Options: rbf, laplacian, rq, imq"
+        default=["rbf", "laplacian", "rq", "imq", "matern"],
+        help="Kernel types to run (default: all five). Options: rbf, laplacian, rq, imq, matern"
     )
     
     parser.add_argument(
@@ -1893,7 +1893,7 @@ def main():
         type=str,
         nargs="+",
         default=["real", "control_constant", "control_shuffled", "control_random"],
-        help="Corpora to process (default: all four)"
+        help="Corpora to process (default: all five)"
     )
     
     parser.add_argument(

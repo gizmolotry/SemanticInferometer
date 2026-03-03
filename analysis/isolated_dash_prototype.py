@@ -41,6 +41,7 @@ except Exception:
         OPTIONAL_CONSUMER_ARTIFACTS,
         REQUIRED_PROVENANCE_KEYS,
         evaluate_consumer_contract,
+        resolve_run_directory,
     )
 
 
@@ -314,6 +315,12 @@ def _observer_id_from_value(observer_value: str) -> Optional[int]:
 
 def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     run_dir = _resolve_run_dir(run_key)
+    # Smart Discovery: Try to resolve deep nesting (rbf/cls/real) if path doesn't exist
+    if run_dir and not run_dir.exists():
+        # Heuristic: try to infer kernel/channel from run_key if it looks like experiments_*/real
+        # For Dash, we'll try a common default if it's missing.
+        run_dir = resolve_run_directory(run_dir.parent, "rbf", "cls", run_dir.name)
+
     if not run_dir or not run_dir.exists():
         return {
             "status": "INVALID_SCHEMA",
@@ -337,8 +344,15 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     missing_required = list(diag.missing_required_artifacts)
     missing_optional = list(diag.missing_optional_artifacts)
 
-    baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
-    baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
+    # Priority 1: Consolidated Epistemic Contract
+    contract_path = run_dir / "EPISTEMIC_CONTRACT.json"
+    if contract_path.exists():
+        contract = _safe_json(contract_path, {})
+        baseline_meta = contract.get("provenance", {})
+        baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
+    else:
+        baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
+        baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
 
     observer_id = _observer_id_from_value(observer_value)
     state_blob = {}
