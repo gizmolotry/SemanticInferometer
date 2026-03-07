@@ -1193,6 +1193,26 @@ def render_terrain_surface(
         grid_density = gaussian_filter(grid_density, sigma=1.0)
         grid_stress_color = gaussian_filter(grid_stress_color, sigma=1.0)
 
+        # Color channel expects normalized manifold axes in [0, 1].
+        # Keep geometry untouched; normalize only color-mapping inputs.
+        def _normalize_unit(arr: np.ndarray) -> np.ndarray:
+            arr = np.asarray(arr, dtype=float)
+            arr = np.nan_to_num(arr, nan=0.5)
+            amin = float(np.nanmin(arr))
+            amax = float(np.nanmax(arr))
+            if not np.isfinite(amin) or not np.isfinite(amax):
+                return np.full_like(arr, 0.5, dtype=float)
+            if amax - amin <= 1e-9:
+                return np.full_like(arr, 0.5, dtype=float)
+            return (arr - amin) / (amax - amin)
+
+        density_color = grid_density if (
+            float(np.nanmin(grid_density)) >= -1e-6 and float(np.nanmax(grid_density)) <= 1.0 + 1e-6
+        ) else _normalize_unit(grid_density)
+        stress_color = grid_stress_color if (
+            float(np.nanmin(grid_stress_color)) >= -1e-6 and float(np.nanmax(grid_stress_color)) <= 1.0 + 1e-6
+        ) else _normalize_unit(grid_stress_color)
+
         # Compute continuous terrain_scalar using the manifold formula:
         # terrain_scalar = stress * 0.5 + (1.0 - density) * 0.5
         # This maps 2D (density, stress) to 1D [0,1] for colormap:
@@ -1200,7 +1220,7 @@ def render_terrain_surface(
         #   TIGHTROPE (density=0, stress=0) → 0.5 * (1-0) = 0.25 (adjusted below)
         #   SWAMP (density=1, stress=1) → 0.5 + 0 = 0.5 (adjusted to 0.75)
         #   VOID (density=0, stress=1) → 0.5 + 0.5 = 1.0
-        terrain_scalar_grid = grid_stress_color * 0.5 + (1.0 - grid_density) * 0.5
+        terrain_scalar_grid = stress_color * 0.5 + (1.0 - density_color) * 0.5
 
         # Clamp to [0, 1] for safety
         terrain_scalar_grid = np.clip(terrain_scalar_grid, 0.0, 1.0)
