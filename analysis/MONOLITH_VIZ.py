@@ -44,7 +44,6 @@ import sys
 import json
 import html
 import re
-import base64
 import random
 import datetime
 from collections import Counter
@@ -1081,17 +1080,16 @@ def render_terrain_surface(
     # =========================================
     # Z represents STRESS (gradient magnitude / walker resistance)
     # High Z = High Conflict (Mountains), Low Z = Consensus (Valleys)
-    legacy_geometry = os.environ.get("MONOLITH_LEGACY_GEOMETRY", "0").strip() == "1"
-    if terrain_stress_geometry is not None and not legacy_geometry:
+    if terrain_stress_geometry is not None:
         stress_values = terrain_stress_geometry
     else:
-        # Legacy mode or fallback: use provided terrain energy / point z values.
+        # Deterministic fallback: use provided terrain energy / point z values.
         stress_values = energy_values if energy_values is not None else positions_3d[:, 2]
     try:
         print(
             f"[MONOLITH][TERRAIN] geometry_input range="
             f"[{float(np.nanmin(stress_values)):.3f}, {float(np.nanmax(stress_values)):.3f}] "
-            f"(legacy={legacy_geometry}, stress_override={'yes' if terrain_stress_geometry is not None else 'no'})"
+            f"(stress_override={'yes' if terrain_stress_geometry is not None else 'no'})"
         )
     except Exception:
         pass
@@ -1129,46 +1127,6 @@ def render_terrain_surface(
         )
     except Exception:
         pass
-    # Optional canonical z-lock for visual parity with the restored cockpit.
-    if os.environ.get("MONOLITH_CANONICAL_Z_LOCK", "0").strip() == "1":
-        try:
-            target_min = float(os.environ.get("MONOLITH_CANONICAL_Z_MIN", "-8.677044603093792"))
-            target_max = float(os.environ.get("MONOLITH_CANONICAL_Z_MAX", "77.76793372869173"))
-            cur_min = float(np.nanmin(z_geometry))
-            cur_max = float(np.nanmax(z_geometry))
-            if np.isfinite(cur_min) and np.isfinite(cur_max) and cur_max > cur_min:
-                z_geometry = (z_geometry - cur_min) / (cur_max - cur_min)
-                z_geometry = z_geometry * (target_max - target_min) + target_min
-        except Exception:
-            pass
-    # Optional canonical z-template injection: use the exact surface z-grid from
-    # a known-good HTML file (e.g., monolith_cockpit_restored_exact.html).
-    canonical_tpl = os.environ.get("MONOLITH_CANONICAL_Z_TEMPLATE", "").strip()
-    if canonical_tpl:
-        try:
-            p = Path(canonical_tpl)
-            if p.exists():
-                html = p.read_text(encoding="utf-8", errors="ignore")
-                m = re.search(r"var figData = (\{.*?\});\s*Plotly\.newPlot", html, re.S)
-                if m:
-                    fig_obj = json.loads(m.group(1))
-                    z_obj = fig_obj["data"][0].get("z")
-                    if isinstance(z_obj, dict) and "bdata" in z_obj:
-                        z_tpl = np.frombuffer(base64.b64decode(z_obj["bdata"]), dtype=np.float64)
-                        shp = z_obj.get("shape")
-                        if isinstance(shp, (list, tuple)):
-                            z_tpl = z_tpl.reshape(tuple(int(v) for v in shp))
-                        elif isinstance(shp, str):
-                            dims = [int(v) for v in re.findall(r"\d+", shp)]
-                            if dims:
-                                z_tpl = z_tpl.reshape(tuple(dims))
-                        elif z_tpl.size == z_geometry.size:
-                            z_tpl = z_tpl.reshape(z_geometry.shape)
-                        if z_tpl.shape == z_geometry.shape:
-                            z_geometry = z_tpl
-        except Exception:
-            pass
-
     # =========================================
     # 2. THE SKIN (COLOR) = CONTINUOUS MANIFOLD GRADIENT
     # =========================================
@@ -3444,13 +3402,8 @@ def create_monolith_cockpit(
         terrain_density = unified_density
         terrain_stress = unified_stress
         energy_values_for_points = unified_z_height # Z-height for points is the calculated unified Z
-        # Terrain geometry mode:
-        # default to physics z_height for visible manifold relief; allow stress override.
-        terrain_mode = os.environ.get("MONOLITH_TERRAIN_MODE", "z_height").strip().lower()
-        if terrain_mode == "stress":
-            energy_values_for_terrain = unified_stress
-        else:
-            energy_values_for_terrain = unified_z_height
+        # Deterministic terrain geometry contract: use unified z_height.
+        energy_values_for_terrain = unified_z_height
 
         # Re-derive atmospheric states for fog/bond based on unified_density (Track 2 - Density)
         # Using unified_density as proxy for inverse blinker_magnitude.
@@ -3485,12 +3438,9 @@ def create_monolith_cockpit(
         global_density_median = np.percentile(terrain_density, 50)
         global_stress_median = np.percentile(terrain_stress, 50)
 
-        # PHYSICS FIX: Use terrain_scalar for Z height
-        energy_values_for_points = terrain_scalar # Z proportional to terrain state for points
-        if os.environ.get("MONOLITH_LEGACY_GEOMETRY", "0").strip() == "1":
-            energy_values_for_terrain = terrain_scalar
-        else:
-            energy_values_for_terrain = terrain_stress # Z-geometry for terrain is stress
+        # Deterministic fallback geometry contract: one Z source for points+terrain.
+        energy_values_for_points = terrain_scalar
+        energy_values_for_terrain = energy_values_for_points.copy()
 
         # Fallback zone and color calculation
         # 4 canonical zones from 2 orthogonal axes: Density (x) vs Stress (y)
@@ -3596,38 +3546,20 @@ def create_monolith_cockpit(
     xy_center = np.mean(positions_3d[:, 0:2], axis=0, keepdims=True)
     xy_scale = target_xy_span / xy_ptp
     positions_3d[:, 0:2] = (positions_3d[:, 0:2] - xy_center) * xy_scale
-    # Only normalize path XY when path span is compatible with article span.
-    # Some persisted walker paths are already in an absolute render frame; scaling
-    # those with article-scale factors can explode extents and hide the surface.
-    article_span_ref = float(np.max(xy_ptp))
-    path_spans = []
-    for _path in walker_paths_pure.values():
-        if _path.ndim == 2 and _path.shape[1] >= 2 and len(_path) > 1:
-            path_spans.append(float(np.max(np.ptp(_path[:, 0:2], axis=0))))
-    median_path_span = float(np.median(path_spans)) if path_spans else 0.0
-    normalize_paths = (
-        bool(path_spans)
-        and np.isfinite(median_path_span)
-        and median_path_span <= (article_span_ref * 10.0)
-    )
-    if normalize_paths:
-        for _idx, _path in walker_paths_pure.items():
-            if _path.ndim == 2 and _path.shape[1] >= 2:
-                _path[:, 0:2] = (_path[:, 0:2] - xy_center) * xy_scale
-                walker_paths_pure[_idx] = _path
-    else:
-        print(
-            "[MONOLITH] Skipping walker path XY normalization due to frame mismatch: "
-            f"article_span={article_span_ref:.6f}, median_path_span={median_path_span:.6f}"
-        )
+    # Deterministic frame contract: normalize all path XY in the same article frame.
+    for _idx, _path in walker_paths_pure.items():
+        if _path.ndim == 2 and _path.shape[1] >= 2:
+            _path[:, 0:2] = (_path[:, 0:2] - xy_center) * xy_scale
+            walker_paths_pure[_idx] = _path
     print(
         "[MONOLITH] Applied deterministic per-axis XY normalization: "
         f"scale_x={xy_scale[0]:.1f}, scale_y={xy_scale[1]:.1f}, "
         f"ptp=({xy_ptp[0]:.6f},{xy_ptp[1]:.6f})->(6.0,6.0)"
     )
 
-    # Preserve selected terrain semantics (e.g., MONOLITH_TERRAIN_MODE=stress)
-    # unless upstream terrain values are missing/invalid.
+    # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
+    energy_values_for_terrain = pure_z.copy()
+    # Contract guardrail: preserve explicit invalid-array fallback path.
     terrain_values_valid = False
     try:
         terrain_arr = np.asarray(energy_values_for_terrain, dtype=float)
@@ -3897,7 +3829,7 @@ def create_monolith_cockpit(
     # Layer 1: Terrain Surface (colored by density×stress manifold)
     if show_terrain:
         print("[MONOLITH] Rendering terrain surface with density×stress gradient...")
-        terrain_stress_for_geometry = terrain_stress if (locals().get("terrain_mode", "z_height") == "stress") else None
+        terrain_stress_for_geometry = None
         terrain, terrain_grid_x, terrain_grid_y, terrain_grid_z, grid_density, grid_stress = render_terrain_surface(
             positions_3d, energy_values_for_terrain,
             terrain_density=terrain_density,
@@ -4698,24 +4630,7 @@ def create_monolith_cockpit(
             // Update plot
             Plotly.restyle('cockpit', {{'visible': visibility}});
 
-            // Update camera dynamically based on mode
-            if (mode === 'analysis') {{
-                Plotly.relayout('cockpit', {{
-                    'scene.camera': {{
-                        up: {{x: 0, y: 0, z: 1}},
-                        center: {{x: 0, y: 0, z: 0}},
-                        eye: {{x: 1.8, y: 1.2, z: 1.3}}
-                    }}
-                }});
-            }} else {{
-                Plotly.relayout('cockpit', {{
-                    'scene.camera': {{
-                        up: {{x: 0, y: 0, z: 1}},
-                        center: {{x: 0, y: 0, z: 0}},
-                        eye: {{x: 1.5, y: 1.5, z: 1.2}}
-                    }}
-                }});
-            }}
+            // Camera remains fixed to avoid mode-dependent geometry perception drift.
 
             // Update HUD mode indicator
             var hudMode = document.querySelector('.hud-item');
