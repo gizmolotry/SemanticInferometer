@@ -1181,7 +1181,7 @@ def run_synthetic_experiment_suite(
     # Import pipeline components (functions load_and_mask_corpus and validate_against_ground_truth are defined above)
     try:
         from core.complete_pipeline import initialize_full_pipeline, BeliefTransformerPipeline
-        from core.pipeline_config import PipelineRuntimeConfig
+        from core.pipeline_config import PipelineRuntimeConfig, DEFAULT_PIPELINE_RUNTIME_CONFIG
     except ImportError as e:
         print(f"[ERROR] Could not import required modules: {e}")
         return {"status": "failed", "error": str(e)}
@@ -1197,8 +1197,6 @@ def run_synthetic_experiment_suite(
     # Load and mask corpus
     print(f"\n  Loading corpus from: {corpus_path}")
     articles, ground_truth = load_and_mask_corpus(corpus_path)
-    print(f"DEBUG: Loaded {len(ground_truth)} ground truth labels.")
-    print(f"DEBUG: Sample Label: {list(ground_truth.items())[:3]}")
     max_articles = n_articles_per_cluster * n_clusters
     if max_articles < len(articles):
         articles = articles[:max_articles]
@@ -1242,7 +1240,7 @@ def run_synthetic_experiment_suite(
                     dirichlet_hidden_dim=actual_hidden_dim,
                     mix_in_rkhs=True,
                     geometry_mode="rks",
-                    normalize_features=True,
+                    normalize_features=DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features,
                 )
                 components = initialize_full_pipeline(
                     random_seed=seed,

@@ -1758,12 +1758,6 @@ class BeliefTransformerPipeline:
             pipeline_checkpoints['T0_substrate'] = logits_t1.view(-1, 8, 3)
         if final_features is not None:
             pipeline_checkpoints['T1_embeddings'] = final_features
-        if spectral_results is not None:
-            pipeline_checkpoints['T1.5_spectral'] = {
-                'u_axis': spectral_results.u_axis,
-                'evr': spectral_results.evr,
-                'probe_magnitudes': spectral_results.probe_magnitudes
-            }
         if dirichlet_results is not None and "fused" in dirichlet_results:
             pipeline_checkpoints['T2_kernels'] = dirichlet_results["fused"]
         
@@ -1937,9 +1931,9 @@ class BeliefTransformerPipeline:
                             # T1.5: Save spectral state checkpoint
                             if waterfall_ckpt is not None:
                                 waterfall_ckpt.save_t15_spectral(
-                                    u_axis=spectral_results.u_axis[0].detach().cpu().numpy(),  # Use first article's u_axis as representative
+                                    u_axis=spectral_results.u_axis.detach().cpu().numpy(),
                                     evr=float(spectral_results.evr.mean().item()),
-                                    singular_values=spectral_results.singular_values[0].detach().cpu().numpy() if hasattr(spectral_results, 'singular_values') else np.zeros(8),
+                                    singular_values=spectral_results.singular_values.detach().cpu().numpy() if hasattr(spectral_results, 'singular_values') else np.zeros((1, 8)),
                                     probe_magnitudes=spectral_results.probe_magnitudes.detach().cpu().numpy(),
                                     dipole_valid=spectral_results.dipole_valid.detach().cpu().numpy(),
                                     n_persistent_scales=int(spectral_results.n_persistent_scales.float().mean().item()),
@@ -2359,6 +2353,12 @@ class BeliefTransformerPipeline:
             # Expose scaled force separately to avoid semantic ambiguity.
             out["spectral_u_axis"] = spectral_results.u_axis.detach().cpu().numpy()
             out["spectral_antagonism"] = spectral_results.antagonism.detach().cpu().numpy()
+            pipeline_checkpoints["T1.5_spectral"] = {
+                "u_axis": spectral_results.u_axis,
+                "evr": spectral_results.evr,
+                "probe_magnitudes": spectral_results.probe_magnitudes,
+                "antagonism": spectral_results.antagonism,
+            }
 
         # NEW: Include Walker (Track 4) work integrals and states
         if walker_work_integrals:

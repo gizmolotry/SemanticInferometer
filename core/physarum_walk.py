@@ -440,6 +440,19 @@ class SemanticWalker:
             proposal = torch.abs(current_weights + noise + wind_drift)
             proposal = proposal / proposal.sum(dim=-1, keepdim=True)
 
+            # Optional kinetic dampening on proposed move.
+            # Must occur before energy/acceptance/memory so transition math
+            # and reinforced path are consistent with executed dynamics.
+            max_step_cfg = getattr(self.thermo_config, "max_kinematic_velocity", None)
+            max_step = float(max_step_cfg) if max_step_cfg is not None else 0.0
+            if max_step > 0.0:
+                proposal_step = proposal - current_weights
+                proposal_step_norm = torch.norm(proposal_step, p=2, dim=-1, keepdim=True)
+                proposal_scale = torch.clamp(max_step / (proposal_step_norm + 1e-12), max=1.0)
+                proposal = current_weights + proposal_step * proposal_scale
+                proposal = torch.clamp(proposal, min=0.0)
+                proposal = proposal / proposal.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
             # B. Check the wall (calculate energy)
             proposal_energy = self._compute_energy(proposal)
 
@@ -470,23 +483,6 @@ class SemanticWalker:
             mask_expanded = mask_accept.unsqueeze(-1).expand_as(current_weights)
             next_weights = torch.where(mask_expanded, proposal, current_weights)
             next_energy = torch.where(mask_accept, proposal_energy, current_energy)
-
-            # Kinetic dampening: clip accepted weight-step magnitude to prevent
-            # runaway trajectories in high-curvature regimes.
-            # Apply only when explicitly configured; preserves historical behavior
-            # for configs without max_kinematic_velocity.
-            max_step_cfg = getattr(self.thermo_config, "max_kinematic_velocity", None)
-            max_step = float(max_step_cfg) if max_step_cfg is not None else 0.0
-            if max_step > 0.0:
-                step_vec = next_weights - current_weights
-                step_norm = torch.norm(step_vec, p=2, dim=-1, keepdim=True)
-                step_scale = torch.clamp(max_step / (step_norm + 1e-12), max=1.0)
-                damped_weights = current_weights + step_vec * step_scale
-                damped_weights = torch.clamp(damped_weights, min=0.0)
-                damped_weights = damped_weights / damped_weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-                next_weights = torch.where(mask_expanded, damped_weights, current_weights)
-                damped_energy = self._compute_energy(next_weights)
-                next_energy = torch.where(mask_accept, damped_energy, current_energy)
 
             # Kinetic energy tank: deduct terrain-friction work for accepted moves.
             current_pos = torch.matmul(current_weights, self.embeddings)

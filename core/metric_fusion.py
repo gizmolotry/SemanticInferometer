@@ -158,41 +158,18 @@ def calculate_unified_metric(
     # 2) Fit 1D K-Means to find natural energetic states.
     delta_array = np.array(delta_values).reshape(-1, 1)
     sorted_centers = np.array([1.0, 5.0, 10.0], dtype=float)
+    min_stable_samples = 10
     threshold_mode = "kmeans_3cluster"
-    if len(delta_array) >= 3:
+    if len(delta_array) >= min_stable_samples:
         kmeans = KMeans(n_clusters=3, random_state=42, n_init=10).fit(delta_array)
         sorted_centers = np.sort(kmeans.cluster_centers_.flatten())
         threshold_tautology = sorted_centers[0] + (sorted_centers[1] - sorted_centers[0]) / 2.0
         threshold_honest = sorted_centers[1] + (sorted_centers[2] - sorted_centers[1]) / 2.0
     else:
-        # Sparse-state fallback: derive thresholds from observed deltas instead
-        # of fixed constants to reduce arbitrary label swings on small runs.
-        fallback_deltas = []
-        for i in range(len(metadata_df)):
-            raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
-            if isinstance(raw_state, dict):
-                state = str(raw_state.get("status", "UNKNOWN")).upper()
-            else:
-                state = str(raw_state).upper()
-            if state in rupture_states:
-                continue
-            d = d_spectral[i] + 1e-8
-            val = float(w_actual[i] / d)
-            if np.isfinite(val):
-                fallback_deltas.append(val)
-        if fallback_deltas:
-            arr = np.asarray(fallback_deltas, dtype=float)
-            threshold_tautology = float(np.quantile(arr, 0.33))
-            threshold_honest = float(np.quantile(arr, 0.66))
-            if threshold_honest < threshold_tautology:
-                threshold_tautology, threshold_honest = threshold_honest, threshold_tautology
-            sorted_centers = np.array(
-                [float(arr.min()), float(np.median(arr)), float(arr.max())], dtype=float
-            )
-            threshold_mode = "quantile_fallback"
-        else:
-            threshold_tautology, threshold_honest = 1.0, 10.0
-            threshold_mode = "fixed_fallback"
+        # Sparse-state fallback: use stable calibrated thresholds to avoid
+        # run-local quantile drift on tiny/failed runs.
+        threshold_tautology, threshold_honest = 1.0, 10.0
+        threshold_mode = "sparse_fixed_calibrated"
 
     verdicts = []
     for i in range(len(metadata_df)):
