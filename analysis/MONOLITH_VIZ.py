@@ -885,11 +885,12 @@ def compute_terrain_field(
     else:
         stress = np.ones(N) * 0.5
 
-    # Map 2D (density, stress) to 1D scalar for colormap:
+    # Map 2D (density, stress) to 1D scalar for colormap with unique 4-corner anchors:
     # BRIDGE (1,0) -> 0.0, TIGHTROPE (0,0) -> 0.25
     # SWAMP (1,1) -> 0.75, VOID (0,1) -> 1.0
-    # Formula: scalar = stress * 0.5 + (1 - density) * 0.5
-    terrain_scalar = stress * 0.5 + (1.0 - density) * 0.5
+    # Formula chosen to satisfy all four constraints:
+    #   scalar = 0.25 - 0.25*density + 0.75*stress
+    terrain_scalar = 0.25 - 0.25 * density + 0.75 * stress
 
     return density, stress, terrain_scalar
 
@@ -919,7 +920,7 @@ def get_continuous_manifold_colorscale() -> list:
 
     Unlike the discrete 4-zone colormap, this provides smooth interpolation
     across the entire 2D manifold space. The terrain_scalar formula
-    (stress * 0.5 + (1.0 - density) * 0.5) maps the 2D space to [0,1]:
+    (0.25 - 0.25*density + 0.75*stress) maps the 2D space to [0,1]:
 
     terrain_scalar=0.0: High density (1.0), Low stress (0.0) → BRIDGE (Cyan)
     terrain_scalar=0.25: Low density (0.0), Low stress (0.0) → TIGHTROPE (Yellow)
@@ -1214,13 +1215,13 @@ def render_terrain_surface(
         ) else _normalize_unit(grid_stress_color)
 
         # Compute continuous terrain_scalar using the manifold formula:
-        # terrain_scalar = stress * 0.5 + (1.0 - density) * 0.5
+        # terrain_scalar = 0.25 - 0.25*density + 0.75*stress
         # This maps 2D (density, stress) to 1D [0,1] for colormap:
         #   BRIDGE (density=1, stress=0) → 0.0
-        #   TIGHTROPE (density=0, stress=0) → 0.5 * (1-0) = 0.25 (adjusted below)
-        #   SWAMP (density=1, stress=1) → 0.5 + 0 = 0.5 (adjusted to 0.75)
-        #   VOID (density=0, stress=1) → 0.5 + 0.5 = 1.0
-        terrain_scalar_grid = stress_color * 0.5 + (1.0 - density_color) * 0.5
+        #   TIGHTROPE (density=0, stress=0) → 0.25
+        #   SWAMP (density=1, stress=1) → 0.75
+        #   VOID (density=0, stress=1) → 1.0
+        terrain_scalar_grid = 0.25 - 0.25 * density_color + 0.75 * stress_color
 
         # Clamp to [0, 1] for safety
         terrain_scalar_grid = np.clip(terrain_scalar_grid, 0.0, 1.0)
@@ -3669,29 +3670,31 @@ def create_monolith_cockpit(
 
 
 
-    # Contract Bridge gravity: reserve cyan for the lowest 10% of vertical energy.
-    z_for_contract = np.asarray(energy_values_for_points, dtype=float)
-    q10 = float(np.nanpercentile(z_for_contract, 10)) if z_for_contract.size else 0.0
-    q22 = float(np.nanpercentile(z_for_contract, 22)) if z_for_contract.size else 0.0
-    q55 = float(np.nanpercentile(z_for_contract, 55)) if z_for_contract.size else 0.0
-    contracted_colors = []
-    for zc in z_for_contract:
-        if zc <= q10:
-            contracted_colors.append(ZONE_COLOR_MAP["Bridge"])
-        elif zc <= q22:
-            contracted_colors.append(ZONE_COLOR_MAP["Tightrope"])
-        elif zc <= q55:
-            contracted_colors.append("#7B2CBF")  # Swamp compresses rapidly into purple
-        else:
-            contracted_colors.append("#4A0404")  # Void dark red
-    unified_color_codes = np.array(contracted_colors, dtype=object)
-    print(
-        "[MONOLITH] Bridge contraction by Z-bands: "
-        f"bridge={int((z_for_contract<=q10).sum())}, "
-        f"tightrope={int(((z_for_contract>q10)&(z_for_contract<=q22)).sum())}, "
-        f"swamp={int(((z_for_contract>q22)&(z_for_contract<=q55)).sum())}, "
-        f"void={int((z_for_contract>q55).sum())}"
-    )
+    # Optional legacy display recolor (off by default): quantile-based Z banding.
+    # Canonical behavior is to preserve zone-derived colors from MONOLITH_DATA.csv.
+    if os.environ.get("MONOLITH_ENABLE_BRIDGE_CONTRACTION", "0").strip() == "1":
+        z_for_contract = np.asarray(energy_values_for_points, dtype=float)
+        q10 = float(np.nanpercentile(z_for_contract, 10)) if z_for_contract.size else 0.0
+        q22 = float(np.nanpercentile(z_for_contract, 22)) if z_for_contract.size else 0.0
+        q55 = float(np.nanpercentile(z_for_contract, 55)) if z_for_contract.size else 0.0
+        contracted_colors = []
+        for zc in z_for_contract:
+            if zc <= q10:
+                contracted_colors.append(ZONE_COLOR_MAP["Bridge"])
+            elif zc <= q22:
+                contracted_colors.append(ZONE_COLOR_MAP["Tightrope"])
+            elif zc <= q55:
+                contracted_colors.append("#7B2CBF")
+            else:
+                contracted_colors.append("#4A0404")
+        unified_color_codes = np.array(contracted_colors, dtype=object)
+        print(
+            "[MONOLITH] Bridge contraction by Z-bands: "
+            f"bridge={int((z_for_contract<=q10).sum())}, "
+            f"tightrope={int(((z_for_contract>q10)&(z_for_contract<=q22)).sum())}, "
+            f"swamp={int(((z_for_contract>q22)&(z_for_contract<=q55)).sum())}, "
+            f"void={int((z_for_contract>q55).sum())}"
+        )
 
     # (terrain_scalar already computed above for Z positioning)
 
