@@ -1,0 +1,62 @@
+"""
+Airflow DAG to freeze and verify a known-good MONOLITH run tuple.
+
+Goal: prevent recursion where code restore succeeds but run artifacts drift.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from airflow.decorators import dag, task  # type: ignore
+except Exception:  # pragma: no cover
+    dag = None
+    task = None
+
+from analysis.freeze_viz_tuple import FreezeConfig, freeze_run_snapshot, verify_snapshot
+
+
+if dag is not None and task is not None:  # pragma: no cover
+    @dag(
+        dag_id="monolith_known_good_snapshot_guard_v1",
+        schedule=None,
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        tags=["monolith", "viz", "snapshot", "guard"],
+    )
+    def monolith_known_good_snapshot_guard_v1():
+        @task
+        def freeze_task(
+            snapshot_name: str = "2026-03-07_b0af754_honest_matern_probe",
+            source_html: str = "outputs/honest_matern/MONOLITH_PROBE_b0af754.html",
+            source_log: str = "outputs/honest_matern/MONOLITH_PROBE_b0af754.log",
+            source_viz_code: str = "analysis/_probe_b0af754.py",
+            source_viz_code_git: str = "analysis/_probe_b0af754.py",
+            input_dir: str = "outputs/honest_matern",
+            viz_code_commit: str = "b0af754",
+            command: str = "python -m analysis._probe_b0af754 outputs/honest_matern -o outputs/honest_matern/MONOLITH_PROBE_b0af754.html",
+        ) -> str:
+            snap_dir = freeze_run_snapshot(
+                FreezeConfig(
+                    snapshot_name=snapshot_name,
+                    snapshot_root=Path("analysis/locked_runs"),
+                    source_html=Path(source_html),
+                    source_log=Path(source_log),
+                    source_viz_code=Path(source_viz_code),
+                    source_viz_code_git=Path(source_viz_code_git),
+                    input_dir=Path(input_dir),
+                    viz_code_commit=viz_code_commit,
+                    command=command,
+                )
+            )
+            return str(snap_dir / "RUN_MANIFEST.json")
+
+        @task
+        def verify_task(manifest_path: str) -> None:
+            verify_snapshot(Path(manifest_path))
+
+        verify_task(freeze_task())
+
+    monolith_known_good_snapshot_guard_v1_dag = monolith_known_good_snapshot_guard_v1()
