@@ -3607,8 +3607,21 @@ def create_monolith_cockpit(
         f"ptp=({xy_ptp[0]:.6f},{xy_ptp[1]:.6f})->(6.0,6.0)"
     )
 
-    # RAW TERRAIN Z: keep terrain in the same coordinate space as points.
-    energy_values_for_terrain = pure_z.copy()
+    # Preserve selected terrain semantics (e.g., MONOLITH_TERRAIN_MODE=stress)
+    # unless upstream terrain values are missing/invalid.
+    terrain_values_valid = False
+    try:
+        terrain_arr = np.asarray(energy_values_for_terrain, dtype=float)
+        terrain_values_valid = (
+            terrain_arr.ndim == 1
+            and terrain_arr.shape[0] == n_articles
+            and np.isfinite(terrain_arr).all()
+        )
+    except Exception:
+        terrain_values_valid = False
+    if not terrain_values_valid:
+        print("[MONOLITH] Falling back terrain Z to pure_z due to invalid terrain field.")
+        energy_values_for_terrain = pure_z.copy()
 
     # Raw variance probe (requested).
     print(f"RAW TERRAIN VARIANCE: Min={np.min(unified_stress)}, Max={np.max(unified_stress)}")
@@ -3910,7 +3923,7 @@ def create_monolith_cockpit(
     # positions_2d contains the (x, y) coordinates of the articles
     article_xy = positions_2d[:, :2] # Only X and Y
     
-    # Enforce coordinate contract: article points render at pure_x/pure_y/pure_z.
+    # Enforce coordinate contract: article points default to pure_x/pure_y/pure_z.
     # Terrain interpolator remains available for overlays that intentionally drape to surface.
     energy_values_for_points = positions_3d[:, 2]
 
@@ -3935,6 +3948,21 @@ def create_monolith_cockpit(
             # Use average Z of the points, or 0.0
             return np.full_like(np.atleast_1d(x_coords), positions_3d[:, 2].mean() if len(positions_3d) > 0 else 0.0) + offset
 
+    # Article markers should sit on the rendered terrain manifold when available.
+    # Fallback remains the current point Z contract when interpolation is unavailable/fails.
+    article_marker_z = np.asarray(energy_values_for_points, dtype=float)
+    try:
+        if interp_terrain_z is not None:
+            article_marker_z = np.asarray(
+                get_surface_z(article_xy[:, 0], article_xy[:, 1], offset=0.01),
+                dtype=float,
+            )
+            if article_marker_z.shape[0] != n_articles:
+                article_marker_z = np.asarray(energy_values_for_points, dtype=float)
+    except Exception as marker_z_err:
+        print(f"[MONOLITH] Marker Z fallback to point Z due to interpolation error: {marker_z_err}")
+        article_marker_z = np.asarray(energy_values_for_points, dtype=float)
+
 
     # Layer 2: Phantom Paths (Track 5)
     if show_phantom_paths and phantom_verdicts:
@@ -3942,7 +3970,7 @@ def create_monolith_cockpit(
         path_traces = render_phantom_paths_3d(
             phantom_verdicts, positions_3d,
             walker_paths=walker_paths_pure,
-            article_z_height=energy_values_for_points,
+            article_z_height=article_marker_z,
             terrain_z_values=energy_values_for_terrain,
             surface_z_func=get_surface_z,
             article_metadata=metadata,
@@ -3992,7 +4020,7 @@ def create_monolith_cockpit(
     point_traces = render_data_points_3d(
         positions_3d, spectral_evr, sizes, hover_texts,
         phantom_verdicts=phantom_verdicts, is_fog=is_fog,
-        article_z_height=energy_values_for_points, # Pass unified_z_height for exact Z positioning
+        article_z_height=article_marker_z, # Prefer terrain-manifold Z for marker anchoring
         article_color_codes=unified_color_codes, # Pass unified_color_codes for coloring
     )
     for t in point_traces:
@@ -4723,7 +4751,7 @@ def create_monolith_cockpit(
             if str(getattr(_t, "mode", "")) != "lines":
                 continue
             trace_name = str(getattr(_t, "name", ""))
-            if "Path" not in trace_name:
+            if ("Path" not in trace_name) and (trace_name not in {"Walker Broken", "Walker Trapped"}):
                 continue
             tx = np.asarray(_t.x, dtype=float).ravel()
             ty = np.asarray(_t.y, dtype=float).ravel()
