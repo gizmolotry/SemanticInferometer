@@ -1194,25 +1194,24 @@ def render_terrain_surface(
         grid_density = gaussian_filter(grid_density, sigma=1.0)
         grid_stress_color = gaussian_filter(grid_stress_color, sigma=1.0)
 
-        # Color channel expects normalized manifold axes in [0, 1].
-        # Keep geometry untouched; normalize only color-mapping inputs.
-        def _normalize_unit(arr: np.ndarray) -> np.ndarray:
+        # Color channel expects manifold axes in [0, 1].
+        # Normalize against source ranges (not smoothed grid ranges) to avoid
+        # narrow-band color collapse after interpolation/smoothing.
+        def _normalize_with_bounds(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
             arr = np.asarray(arr, dtype=float)
             arr = np.nan_to_num(arr, nan=0.5)
-            amin = float(np.nanmin(arr))
-            amax = float(np.nanmax(arr))
-            if not np.isfinite(amin) or not np.isfinite(amax):
+            if not np.isfinite(lo) or not np.isfinite(hi):
                 return np.full_like(arr, 0.5, dtype=float)
-            if amax - amin <= 1e-9:
+            if hi - lo <= 1e-9:
                 return np.full_like(arr, 0.5, dtype=float)
-            return (arr - amin) / (amax - amin)
+            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
 
-        density_color = grid_density if (
-            float(np.nanmin(grid_density)) >= -1e-6 and float(np.nanmax(grid_density)) <= 1.0 + 1e-6
-        ) else _normalize_unit(grid_density)
-        stress_color = grid_stress_color if (
-            float(np.nanmin(grid_stress_color)) >= -1e-6 and float(np.nanmax(grid_stress_color)) <= 1.0 + 1e-6
-        ) else _normalize_unit(grid_stress_color)
+        density_src = np.nan_to_num(np.asarray(terrain_density, dtype=float), nan=0.5)
+        stress_src = np.nan_to_num(np.asarray(terrain_stress, dtype=float), nan=0.5)
+        d_lo, d_hi = float(np.nanmin(density_src)), float(np.nanmax(density_src))
+        s_lo, s_hi = float(np.nanmin(stress_src)), float(np.nanmax(stress_src))
+        density_color = _normalize_with_bounds(grid_density, d_lo, d_hi)
+        stress_color = _normalize_with_bounds(grid_stress_color, s_lo, s_hi)
 
         # Compute continuous terrain_scalar using the manifold formula:
         # terrain_scalar = 0.25 - 0.25*density + 0.75*stress
@@ -2751,7 +2750,6 @@ def render_data_points_3d(
         if spectral_evr is not None and i < len(spectral_evr) and spectral_evr[i] < 0.5:
             glow_opacity_val = 0.8
             glow_size_factor_val = 2.5
-            r, g, b = (255, 0, 0) # Pulsing Red
         if is_fog is not None and i < len(is_fog) and is_fog[i]:
             # Decoherent (Fog): glow is minimal
             glow_opacity_val = 0.05

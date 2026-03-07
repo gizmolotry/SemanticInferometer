@@ -33,6 +33,7 @@ try:
         OPTIONAL_CONSUMER_ARTIFACTS,
         REQUIRED_PROVENANCE_KEYS,
         evaluate_consumer_contract,
+        resolve_run_directory,
     )
 except Exception:
     from verification.contract import (
@@ -146,13 +147,11 @@ def _run_contract_paths(run_dir: Optional[Path]) -> Dict[str, Optional[Path]]:
         "baseline_state": [run_dir / "baseline_state.json"],
         "verification_report": [
             run_dir / "verification_report.json",
-            run_dir.parent / "verification_report.json",
-            run_dir.parent.parent / "verification_report.json" if run_dir.parent and run_dir.parent.parent else None,
+            run_dir / "verification" / "verification_report.json",
         ],
         "verification_summary": [
             run_dir / "verification_summary.csv",
-            run_dir.parent / "verification_summary.csv",
-            run_dir.parent.parent / "verification_summary.csv" if run_dir.parent and run_dir.parent.parent else None,
+            run_dir / "verification" / "verification_summary.csv",
         ],
         "hidden_groups": [labels_dir / "hidden_groups.csv", run_dir / "hidden_groups.csv"],
         "group_summaries": [derived_dir / "group_summaries.json", run_dir / "group_summaries.json"],
@@ -344,15 +343,8 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     missing_required = list(diag.missing_required_artifacts)
     missing_optional = list(diag.missing_optional_artifacts)
 
-    # Priority 1: Consolidated Epistemic Contract
-    contract_path = run_dir / "EPISTEMIC_CONTRACT.json"
-    if contract_path.exists():
-        contract = _safe_json(contract_path, {})
-        baseline_meta = contract.get("provenance", {})
-        baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
-    else:
-        baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
-        baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
+    baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
+    baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
 
     observer_id = _observer_id_from_value(observer_value)
     state_blob = {}
@@ -418,8 +410,7 @@ def _find_latest_file_scoped(filename: str, run_key: Optional[str]) -> Optional[
         if "INDEX" in globals():
             run = INDEX.get("runs", {}).get(str(run_key), {})
             run_dir = run.get("run_dir")
-        run_parent = run_dir.parent if run_dir else None
-        candidate_roots = [run_dir, run_parent, ROOT / "analysis", ROOT / "verification", ROOT]
+        candidate_roots = [run_dir, run_dir / "verification"] if run_dir else []
     else:
         candidate_roots = [ROOT / "analysis", ROOT / "verification", ROOT]
     hits: List[Path] = []
@@ -474,8 +465,6 @@ def _resolve_verification_pair(run_key: Optional[str], verification_source: Opti
             return exact_summary, exact_report
 
         search_roots: List[Path] = [run_dir, run_dir / "verification"]
-        if run_dir.parent:
-            search_roots.extend([run_dir.parent, run_dir.parent / "verification"])
         seen = set()
         for root in search_roots:
             if not root or not root.exists():
@@ -512,7 +501,7 @@ def discover_verification_sources(run_key: Optional[str]) -> List[dict]:
         run = INDEX.get("runs", {}).get(str(run_key), {})
         run_dir = run.get("run_dir")
         if run_dir:
-            roots.extend([run_dir, run_dir.parent, run_dir / "verification"])
+            roots.extend([run_dir, run_dir / "verification"])
     else:
         roots.extend([ROOT / "analysis", ROOT / "verification", ROOT])
     for root in roots:

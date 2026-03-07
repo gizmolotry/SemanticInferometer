@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
 import itertools
 
@@ -381,16 +381,21 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
         for p in layer_dir.rglob("synthetic_validation_summary.json"):
             try:
                 with open(p) as f:
-                    mi_score = json.load(f).get("nmi", json.load(f).get("mean_nmi"))
+                    summary = json.load(f)
+                    mi_score = summary.get("nmi", summary.get("mean_nmi"))
                     if mi_score is not None: break
             except: pass
 
+    crn_pass = to_native(crn["pass"])
+    seed_pass = to_native(stability["pass"])
     report = {
         "layer_id": layer_id, "layer_name": layer_name, "corpora": corpora, "status": status.value,
+        "crn_locked": crn_pass,
+        "seed_stability": seed_pass,
         "checks": [
-            {"name": "crn_locked", "pass": to_native(crn["pass"]), "details": to_native(crn["details"])},
+            {"name": "crn_locked", "pass": crn_pass, "details": to_native(crn["details"])},
             {"name": "control_ordering", "pass": to_native(ordering["pass"]), "values": to_native(ordering["values"]), "valid": to_native(ordering["valid"])},
-            {"name": "seed_stability", "pass": to_native(stability["pass"]), "value": to_native(stability["value"]), "valid": to_native(stability["valid"])},
+            {"name": "seed_stability", "pass": seed_pass, "value": to_native(stability["value"]), "valid": to_native(stability["valid"])},
             {"name": "alpha_sweep_sanity", "pass": to_native(alpha_sweep["pass"]), "value": to_native(alpha_sweep["value"]), "path": to_native(alpha_sweep["path"])},
             {"name": "mi_score", "pass": None, "value": to_native(mi_score)}
         ],
@@ -399,11 +404,17 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
     
     return report
 
-def write_report(reports: List[Dict[str, Any]], out_dir: Path):
-    """Write machine-readable JSON and human-readable CSV summary."""
+def write_report(reports: List[Dict[str, Any]], out_dir: Path, global_pass_override: Optional[bool] = None):
+    """Write machine-readable JSON and human-readable CSV summary to one directory."""
     timestamp = pd.Timestamp.now().isoformat()
     run_id = out_dir.name if out_dir.name.startswith("experiments_") else f"run_{timestamp}"
-    final_report = {"run_id": run_id, "timestamp": timestamp, "layers": reports, "global_pass": all(r["status"] == LayerStatus.VERIFIED.value for r in reports)}
+    computed_global_pass = all(r["status"] == LayerStatus.VERIFIED.value for r in reports)
+    final_report = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "layers": reports,
+        "global_pass": computed_global_pass if global_pass_override is None else bool(global_pass_override),
+    }
     with open(out_dir / "verification_report.json", "w") as f: json.dump(final_report, f, indent=2)
     summary_rows = []
     for r in reports:
@@ -420,6 +431,53 @@ def write_report(reports: List[Dict[str, Any]], out_dir: Path):
         df.reindex(columns=cols).to_csv(out_dir / "verification_summary.csv", index=False)
     print(f"Verification artifacts written to {out_dir}")
 
+
+def _leaf_output_dirs(exp_dir: Path, all_layers: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
+    """
+    Resolve leaf run directories where verification artifacts should live.
+    Leaf = directory containing MONOLITH_DATA.csv for a specific corpus/run slice.
+    """
+    leaves: List[Tuple[Path, str]] = []
+    seen = set()
+    for layer in all_layers:
+        layer_dir = Path(layer.get("layer_dir", exp_dir))
+        artifacts = layer.get("artifacts", {}) or {}
+        corpora = list(artifacts.keys()) if isinstance(artifacts, dict) else []
+        if not corpora:
+            corpora = ["real"]
+
+        for corpus in corpora:
+            candidate = layer_dir / str(corpus)
+            if (candidate / "MONOLITH_DATA.csv").exists():
+                key = str(candidate.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    leaves.append((candidate, str(layer.get("layer_id", ""))))
+                continue
+            if (layer_dir / "MONOLITH_DATA.csv").exists():
+                key = str(layer_dir.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    leaves.append((layer_dir, str(layer.get("layer_id", ""))))
+    return leaves
+
+
+def write_reports_to_leaves(reports: List[Dict[str, Any]], exp_dir: Path, all_layers: List[Dict[str, Any]]) -> List[Path]:
+    """Write verification artifacts strictly to leaf run directories."""
+    leaves = _leaf_output_dirs(exp_dir, all_layers)
+    by_layer_id: Dict[str, Dict[str, Any]] = {
+        str(r.get("layer_id", "")): r for r in reports if str(r.get("layer_id", ""))
+    }
+    global_pass_all = all(r.get("status") == LayerStatus.VERIFIED.value for r in reports)
+    out_dirs: List[Path] = []
+    for out_dir, layer_id in leaves:
+        layer_report = by_layer_id.get(layer_id)
+        if not layer_report:
+            continue
+        write_report([layer_report], out_dir, global_pass_override=global_pass_all)
+        out_dirs.append(out_dir)
+    return out_dirs
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -435,5 +493,9 @@ if __name__ == "__main__":
         print(f"Verifying Layer: {layer['layer_id']}")
         reports.append(verify_layer_data(layer['layer_id'], layer['layer_name'], layer['artifacts'], layer['layer_dir'], args.exp_dir))
             
-    if reports: write_report(reports, args.exp_dir)
-    else: print("No layers discovered.")
+    if reports:
+        out_dirs = write_reports_to_leaves(reports, args.exp_dir, all_layers)
+        if not out_dirs:
+            print("No leaf MONOLITH_DATA.csv directories discovered; no verification artifacts written.")
+    else:
+        print("No layers discovered.")
