@@ -38,10 +38,12 @@ from pathlib import Path
 import json
 import argparse, os
 from datetime import datetime
+import subprocess
 import torch
 import hashlib
 
 from core.data_utils import extract_article_text
+from core.canonical_ids import assign_canonical_uids
 
 # Parsed CLI args (set in main)
 args = None
@@ -55,6 +57,7 @@ DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "outputs"
 
 from core.complete_pipeline import run_multi_observer_experiment
+from core.pipeline_config import PipelineRuntimeConfig
 
 
 # =========================================================================
@@ -318,7 +321,9 @@ def load_articles(filepath):
             if not line:
                 continue
             articles.append(json.loads(line))
-    
+
+    # Front-load canonical IDs so every downstream path starts with strict bt_uid keys.
+    articles, _uid_stats = assign_canonical_uids(articles)
     return articles
 
 
@@ -511,20 +516,23 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
     """
     print_experiment_header(mode_config['name'], mode_config)
     
+    runtime_config = PipelineRuntimeConfig.from_mode_config(mode_config)
+
     # Prepare config for pipeline
     pipeline_config = {
-        'use_contrastive': mode_config.get('use_contrastive', False),
-        'use_pca_removal': mode_config.get('use_pca_removal', False),
-        'use_cls_tokens': mode_config.get('use_cls_tokens', False),
-        'projection_dim': mode_config.get('projection_dim', 256),
-        'apply_pca_to_cls': mode_config.get('apply_pca_to_cls', True),
-        'normalize_before_projection': mode_config.get('normalize_before_projection', True),
+        'use_contrastive': runtime_config.use_contrastive,
+        'use_pca_removal': runtime_config.use_pca_removal,
+        'use_cls_tokens': runtime_config.use_cls_tokens,
+        'projection_dim': runtime_config.projection_dim,
+        'apply_pca_to_cls': runtime_config.apply_pca_to_cls,
+        'normalize_before_projection': runtime_config.normalize_before_projection,
+        'normalize_features': runtime_config.normalize_features,
         'paragraph_aware': mode_config.get('paragraph_aware', False),
         'paragraph_weights': mode_config.get('paragraph_weights', [0.5, 0.3, 0.2]),
-        'kernel_type': mode_config.get('kernel_type', 'rbf'),
+        'kernel_type': runtime_config.kernel_type,
         'kernel_params': {},
-        'use_multi_framing_rks': mode_config.get('use_multi_framing_rks', True),
-        'use_gru': mode_config.get('use_gru', True)
+        'use_multi_framing_rks': runtime_config.use_multi_framing_rks,
+        'use_gru': runtime_config.use_gru,
     }
     
     # Add kernel types per framing if specified
@@ -552,6 +560,7 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         kernel_type=pipeline_config.get('kernel_type', 'rbf'),
         kernel_types=pipeline_config.get('kernel_types'),
         kernel_params=pipeline_config.get('kernel_params', {}),
+        normalize_features=pipeline_config.get('normalize_features', True),
         use_gru=pipeline_config['use_gru'],
         use_multi_framing_rks=pipeline_config['use_multi_framing_rks'],
         device='cuda' if torch.cuda.is_available() else 'cpu',
@@ -664,7 +673,7 @@ def run_sigma_sweep_experiment(articles, mode_config, corpus_name='real'):
             'use_pca_removal': mode_config.get('use_pca_removal', True),
             'kernel_type': mode_config.get('kernel_type', 'rbf'),
             'kernel_params': {},
-            'rks_sigma': sigma
+            'rks_sigma': sigma,
         }
         
         results = run_multi_observer_experiment(
@@ -674,7 +683,7 @@ def run_sigma_sweep_experiment(articles, mode_config, corpus_name='real'):
             use_pca_removal=pipeline_config['use_pca_removal'],
             shared_pca=mode_config.get('shared_pca', True),
             kernel_type=pipeline_config['kernel_type'],
-            rks_sigma=sigma,
+            rks_sigma=pipeline_config['rks_sigma'],
             device='cuda' if torch.cuda.is_available() else 'cpu',
             track_variance=args.track_variance,
             output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
@@ -704,7 +713,7 @@ def run_rq_sweep_experiment(articles, mode_config, corpus_name='real'):
             'use_pca_removal': mode_config.get('use_pca_removal', True),
             'kernel_type': 'rq',
             'kernel_params': {'alpha': alpha},
-            'rks_sigma': sigma
+            'rks_sigma': sigma,
         }
         
         results = run_multi_observer_experiment(
@@ -715,7 +724,7 @@ def run_rq_sweep_experiment(articles, mode_config, corpus_name='real'):
             shared_pca=mode_config.get('shared_pca', True),
             kernel_type='rq',
             kernel_params={'alpha': alpha},
-            rks_sigma=sigma,
+            rks_sigma=pipeline_config['rks_sigma'],
             device='cuda' if torch.cuda.is_available() else 'cpu',
             track_variance=args.track_variance,
             output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
@@ -917,6 +926,83 @@ def run_unified_pipeline_experiment(articles, mode_config, seeds, corpus_name='r
     return results
 
 
+def _git_head_short() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return proc.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _maybe_freeze_known_good_tuple(
+    *,
+    output_root: str | None,
+    corpus_name: str,
+    mode_name: str,
+    argv: list[str],
+    require_success: bool,
+) -> None:
+    """Freeze/verify a run tuple when MONOLITH HTML output is present."""
+    if output_root:
+        run_dir = Path(output_root)
+    else:
+        corpus_dir = OUTPUT_DIR / corpus_name
+        run_dir = corpus_dir if corpus_dir.exists() else OUTPUT_DIR
+
+    if not run_dir.exists():
+        if require_success:
+            raise RuntimeError(f"[FREEZE] Output directory not found: {run_dir}")
+        print(f"[FREEZE] Skip: output directory not found: {run_dir}")
+        return
+
+    html_candidates = sorted(run_dir.glob("MONOLITH*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not html_candidates:
+        if require_success:
+            raise RuntimeError(f"[FREEZE] No MONOLITH HTML found in: {run_dir}")
+        print(f"[FREEZE] Skip: no MONOLITH HTML found in {run_dir}")
+        return
+
+    source_html = html_candidates[0]
+    source_log = source_html.with_suffix(".log")
+    if not source_log.exists():
+        source_log.write_text("[FREEZE] auto-generated placeholder log\n", encoding="utf-8")
+
+    try:
+        from analysis.freeze_viz_tuple import FreezeConfig, freeze_run_snapshot, verify_snapshot
+    except Exception as e:
+        if require_success:
+            raise RuntimeError(f"[FREEZE] Failed to import freeze tooling: {e}") from e
+        print(f"[FREEZE] Skip: freeze tooling unavailable ({e})")
+        return
+
+    viz_commit = _git_head_short()
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    snapshot_name = f"{timestamp}_{viz_commit}_{corpus_name}_{mode_name}".replace("/", "_").replace(" ", "_")
+    command = "python " + " ".join(argv)
+
+    snap_dir = freeze_run_snapshot(
+        FreezeConfig(
+            snapshot_name=snapshot_name,
+            snapshot_root=Path("analysis/locked_runs"),
+            source_html=source_html,
+            source_log=source_log,
+            source_viz_code=Path("analysis/MONOLITH_VIZ.py"),
+            source_viz_code_git=Path("analysis/MONOLITH_VIZ.py"),
+            input_dir=run_dir,
+            viz_code_commit=viz_commit,
+            command=command,
+        )
+    )
+    manifest_path = snap_dir / "RUN_MANIFEST.json"
+    verify_snapshot(manifest_path)
+    print(f"[FREEZE] Snapshot written+verified: {manifest_path}")
+
+
 # =========================================================================
 # MAIN
 # =========================================================================
@@ -1058,6 +1144,23 @@ def main():
         type=str,
         default=None,
         help='Path to NLI embedding cache file (for reuse across kernel runs)'
+    )
+    parser.add_argument(
+        '--freeze-good-run',
+        action='store_true',
+        default=True,
+        help='Auto-freeze and verify MONOLITH run tuple after successful run (default: on).'
+    )
+    parser.add_argument(
+        '--no-freeze-good-run',
+        action='store_false',
+        dest='freeze_good_run',
+        help='Disable post-run tuple freeze.'
+    )
+    parser.add_argument(
+        '--freeze-require-success',
+        action='store_true',
+        help='Fail run if post-run tuple freeze cannot be completed.'
     )
     
     # Dirichlet fusion flags
@@ -1321,6 +1424,15 @@ def main():
         )
 
     print(f"\nResults saved to: {OUTPUT_DIR}")
+
+    if args.freeze_good_run:
+        _maybe_freeze_known_good_tuple(
+            output_root=args.output_root,
+            corpus_name=corpus_name,
+            mode_name=args.mode,
+            argv=sys.argv,
+            require_success=bool(args.freeze_require_success),
+        )
     
     # Control-specific next steps
     if args.corpus.startswith('control_'):
