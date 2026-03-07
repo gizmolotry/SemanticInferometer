@@ -74,7 +74,8 @@ from .rks_feature_map import RKSFeatureMap, SharedBasis
 from .cross_article_attention import CrossArticleAttention
 from .pca_removal import remove_top_pca_component, fit_whitening_matrix, apply_whitening_fixed
 from .attention_recorder import AttentionRecorder
-from .provenance_tracker import ProvenanceTracker, ProvenanceEntry
+from .provenance_tracker import ProvenanceTracker, PipelineProvenanceEntry
+from .pipeline_config import DEFAULT_PIPELINE_RUNTIME_CONFIG, PipelineRuntimeConfig
 
 # Try to import Dirichlet fusion (optional, for new pipeline)
 try:
@@ -667,16 +668,16 @@ def initialize_full_pipeline(
     embedding_dim: int = 24,
     hidden_dim: int = 256,
     output_dim: int = 2048,
-    use_gru: bool = True,
+    use_gru: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_gru,
     use_rks: bool = True,
-    use_attention: bool = True,
-    use_contrastive: bool = False,
-    use_cls_tokens: bool = False,
-    normalize_features: bool = True,
+    use_attention: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_attention,
+    use_contrastive: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_contrastive,
+    use_cls_tokens: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_cls_tokens,
+    normalize_features: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features,
     pca_remove: bool = True,
     global_pca_component: bool = True,
     # New (no CLI sprawl): geometry + comparison modes
-    geometry_mode: str = "rks",  # "rks" | "kernel_pca" | "nystrom" | "none"
+    geometry_mode: str = DEFAULT_PIPELINE_RUNTIME_CONFIG.geometry_mode,  # "rks" | "kernel_pca" | "nystrom" | "none"
     adult_kernel: str = "rbf",
     adult_gamma: float = 1.0,
     adult_sigma: Optional[float] = None,
@@ -698,9 +699,9 @@ def initialize_full_pipeline(
     rks_output_dim: Optional[int] = None,
     # NEW: KernelContext integration (Phase 1)
     kernel_ctx: Optional[Any] = None,  # KernelContext instance
-    kernel_type: str = "rbf",          # Fallback if no kernel_ctx
+    kernel_type: str = DEFAULT_PIPELINE_RUNTIME_CONFIG.kernel_type,          # Fallback if no kernel_ctx
     kernel_bandwidth: Optional[float] = None,  # Fallback sigma
-    mix_in_rkhs: bool = False,         # Mode B for Dirichlet fusion
+    mix_in_rkhs: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs,         # Mode B for Dirichlet fusion
 ):
     """
     Initialize the full belief transformer pipeline components.
@@ -1015,7 +1016,9 @@ class BeliefTransformerPipeline:
         self.attention_model = components["attention_model"]
         self.recorder = components["recorder"]
 
-        self.normalize_features = components.get("normalize_features", True)
+        self.normalize_features = components.get(
+            "normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features
+        )
         self.pca_remove = components.get("pca_remove", True)
         self.global_pca_component = components.get("global_pca_component", True)
         self.use_cls_tokens = components.get("use_cls_tokens", False)
@@ -1143,6 +1146,7 @@ class BeliefTransformerPipeline:
         # ------------------------------------------------------------------
         # Initialize optional track outputs (prevent UnboundLocalError)
         # ------------------------------------------------------------------
+        logits_t1 = None
         logit_confidence_t1 = None
         spectral_results = None
         walker_results = None
@@ -1208,7 +1212,26 @@ class BeliefTransformerPipeline:
                     i: {
                         "bt_uid": bt_uids[i],
                         "id": art.get("id", art.get("url", f"article_{i}")),
-                        "source": art.get("source", "unknown"),
+                        "source": (
+                            art.get("source")
+                            or art.get("publisher")
+                            or art.get("publication")
+                            or art.get("outlet")
+                            or "unknown"
+                        ),
+                        "affiliation": (
+                            art.get("affiliation")
+                            or art.get("outlet_affiliation")
+                            or art.get("publisher_affiliation")
+                            or "unknown"
+                        ),
+                        "bias": (
+                            art.get("bias")
+                            or art.get("political_bias")
+                            or art.get("ideology")
+                            or art.get("lean")
+                            or "unknown"
+                        ),
                         "url": art.get("url", ""),
                         "timestamp_field": ts_source_keys[i],
                         "timestamp_raw": ts_raw_values[i],
@@ -1265,10 +1288,23 @@ class BeliefTransformerPipeline:
         else:
             base_by_channel["main"] = torch.stack([pair["embedding"] for pair in nli_pairs], dim=0)
 
-        # Normalize each channel independently (prevents one modality from dominating by scale)
+        def _maybe_l2_normalize_rows(t: torch.Tensor) -> torch.Tensor:
+            if not self.normalize_features:
+                return t
+            if t is None:
+                return t
+            if not torch.is_tensor(t):
+                return t
+            if t.dim() == 1:
+                return F.normalize(t.unsqueeze(0), p=2, dim=-1, eps=1e-12).squeeze(0)
+            return F.normalize(t, p=2, dim=-1, eps=1e-12)
+
+        # Normalize each channel independently when requested by runtime config.
+        # This preserves the behavior contract of `normalize_features`.
+        for k in list(base_by_channel.keys()):
+            base_by_channel[k] = _maybe_l2_normalize_rows(base_by_channel[k])
         if self.normalize_features:
-            for k in list(base_by_channel.keys()):
-                base_by_channel[k] = F.normalize(base_by_channel[k], dim=1)
+            diagnostics["steps"].append("normalize_features:input_channels")
 
         diagnostics.setdefault("channels", {})
         for k, Xk in base_by_channel.items():
@@ -1417,7 +1453,8 @@ class BeliefTransformerPipeline:
                 ch_diag["contract_note"] = "geometry_mode=none, no kernel mapping applied"
 
             if self.normalize_features:
-                Z = F.normalize(Z, dim=1)
+                Z = _maybe_l2_normalize_rows(Z)
+                diagnostics["steps"].append(f"normalize_features:geometry:{channel_name}")
 
             ch_diag["timing_geometry"] = time.time() - t_geom
             ch_diag["geometry_variance"] = float(Z.var().item())
@@ -1488,7 +1525,8 @@ class BeliefTransformerPipeline:
 
                 A = attn_out
                 if self.normalize_features:
-                    A = F.normalize(A, dim=1)
+                    A = _maybe_l2_normalize_rows(A)
+                    diagnostics["steps"].append(f"normalize_features:attention:{channel_name}")
 
                 ch_diag["timing_attention"] = time.time() - t_attn
                 ch_diag["attention_variance"] = float(A.var().item())
@@ -1513,7 +1551,8 @@ class BeliefTransformerPipeline:
                     global_component=self.global_pca_component,
                 )
                 if self.normalize_features:
-                    F_out = F.normalize(F_out, dim=1)
+                    F_out = _maybe_l2_normalize_rows(F_out)
+                    diagnostics["steps"].append(f"normalize_features:pca:{channel_name}")
                 ch_diag["timing_pca_removal"] = time.time() - t_pca
                 ch_diag["final_variance"] = float(F_out.var().item())
                 diagnostics["steps"].append(f"pca_removal:{channel_name}")
@@ -1596,6 +1635,8 @@ class BeliefTransformerPipeline:
                     else:
                         cp_whitened = cp
 
+                    # Preserve geometric magnitude for downstream manifold projection.
+
                     # Project each paragraph through Dirichlet fusion, then weighted-sum
                     para_fused = []
                     for p_idx in range(n_paras):
@@ -1618,9 +1659,8 @@ class BeliefTransformerPipeline:
                     cls_per_bot_list = [pair.get("cls_per_bot") for pair in nli_pairs if pair.get("cls_per_bot") is not None]
                     if cls_per_bot_list:
                         cls_per_bot = torch.stack(cls_per_bot_list, dim=0)
-                        # L2-normalize before Dirichlet/RKS (kernel expects unit vectors)
-                        if self.normalize_features:
-                            cls_per_bot = F.normalize(cls_per_bot, dim=-1)
+                        # Preserve geometric magnitude for downstream manifold projection.
+                        cls_per_bot_list = list(cls_per_bot)
                         curv_out = self.dirichlet_fusion(cls_per_bot, compute_curvature=True)
                         curvature_stats = curv_out["curvature"]
                     else:
@@ -1655,12 +1695,8 @@ class BeliefTransformerPipeline:
                 cls_per_bot_list = [pair.get("cls_per_bot") for pair in nli_pairs if pair.get("cls_per_bot") is not None]
                 if cls_per_bot_list:
                     cls_per_bot = torch.stack(cls_per_bot_list, dim=0)  # [N, 8, hidden]
-
-                    # CRITICAL FIX: L2-normalize cls_per_bot before Dirichlet/RKS
-                    # Raw DeBERTa embeddings have magnitude ~20-30, but RKS kernel expects unit vectors
-                    # Without this, sigma=0.79 causes exp(-400/1.28)  0 (kernel collapse)
-                    if self.normalize_features:
-                        cls_per_bot = F.normalize(cls_per_bot, dim=-1)  # Normalize each [hidden] vector
+                    # Preserve geometric magnitude for downstream manifold projection.
+                    cls_per_bot_list = list(cls_per_bot)
 
                     # ASTER v3.2: Use Sequential Annealing if enabled
                     if hasattr(self.dirichlet_fusion, 'config') and getattr(self.dirichlet_fusion.config, 'use_annealing', False):
@@ -1709,7 +1745,14 @@ class BeliefTransformerPipeline:
         else:
             final_features = out_by_channel["main"]
 
+        diagnostics["variance"]["final_variance"] = float(final_features.var().item())
+        diagnostics["timing"]["total"] = time.time() - start_total
+
+        # Expose comparison outputs (if present)
+        features_cli = out_by_channel.get("cli", None)
+
         # NEW: Ensure intermediate states are in the output for iterative runners
+        # (Populated after all tracks are computed)
         pipeline_checkpoints = {}
         if logits_t1 is not None:
             pipeline_checkpoints['T0_substrate'] = logits_t1.view(-1, 8, 3)
@@ -1725,12 +1768,6 @@ class BeliefTransformerPipeline:
             pipeline_checkpoints['T2_kernels'] = dirichlet_results["fused"]
         
         # T3 is social_texture (populated below if enabled)
-
-        diagnostics["variance"]["final_variance"] = float(final_features.var().item())
-        diagnostics["timing"]["total"] = time.time() - start_total
-
-        # Expose comparison outputs (if present)
-        features_cli = out_by_channel.get("cli", None)
 
         # ====================================================================
         # WATERFALL CHECKPOINT SYSTEM (Data Lineage)
@@ -1799,6 +1836,8 @@ class BeliefTransformerPipeline:
         walker_work_integrals = []  # Track 4 work integrals
         walker_states = []  # Track 4 state classifications
         walker_state_records = []  # Track 4 persisted physics metadata
+        walker_path_records = []  # Track 4 persisted trajectories (article_idx/bt_uid -> path_xyz)
+        walker_n_steps = int((config or {}).get("walker_n_steps", 150))
         if HAS_PHASE_SPACE and dirichlet_results is not None:
             t_phase = time.time()
             try:
@@ -1944,11 +1983,20 @@ class BeliefTransformerPipeline:
                                 u_axis=u_axis_i,
                                 temperature=0.5,
                                 n_walkers=20,
-                                n_steps=10,
+                                n_steps=walker_n_steps,
                             )
                             walker_outputs.append(result_t4["walker_output"])  # [D]
                             walker_work_integrals.append(result_t4["work_integral"])
                             walker_states.append(result_t4["state"]) # State name (string)
+                            if result_t4.get("path_xyz") is not None:
+                                path_xyz = result_t4["path_xyz"]
+                                if torch.is_tensor(path_xyz):
+                                    path_xyz = path_xyz.detach().cpu().numpy()
+                                walker_path_records.append({
+                                    "article_idx": i,
+                                    "bt_uid": bt_uids[i] if i < len(bt_uids) else f"article_{i}",
+                                    "path_xyz": path_xyz,
+                                })
                             walker_energy_budget = 50.0
                             if hasattr(self, "thermo_config") and getattr(self, "thermo_config", None) is not None:
                                 walker_energy_budget = float(getattr(self.thermo_config, "walker_energy_budget", 50.0))
@@ -1956,7 +2004,7 @@ class BeliefTransformerPipeline:
                                 "label": result_t4.get("state", "unknown"),
                                 "status": result_t4.get("status", "SUCCESS"),
                                 "energy_rem": float(walker_energy_budget - float(result_t4["work_integral"])),
-                                "steps": 10,
+                                "steps": walker_n_steps,
                                 "terrain_state": None,
                             })
 
@@ -1969,21 +2017,21 @@ class BeliefTransformerPipeline:
                                 "honest": 0,
                                 "phantom": 0,
                                 "rupture": 0,
-                                "broken": 0,
-                                "trapped": 0,
+                                "Type 1 Rupture": 0,
+                                "Type 2 Rupture": 0,
+                                "FAILED": 0,
                             }
                             # walker_states is a list of strings like "tautology"
                             for s in walker_states:
                                 if s in state_counts: # Defensive check
                                     state_counts[s] += 1
                                 else:
-                                    print(f"WARNING: Unknown walker state '{s}' encountered.")
+                                    # Fallback for generic or unknown
+                                    state_counts["FAILED"] += 1
                             
                             mean_work = np.mean(walker_work_integrals) # Calculate mean from the list
                             print(f"[Track 4] Walker: W={mean_work:.3f}, "
-                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B:{state_counts['broken']}, Tr:{state_counts['trapped']}}}")
-                            print(f"[Track 4] Walker: W={mean_work:.3f}, "
-                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B:{state_counts['broken']}, Tr:{state_counts['trapped']}}}")
+                                  f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B1:{state_counts['Type 1 Rupture']}, B2:{state_counts['Type 2 Rupture']}}}")
                     except Exception as e:
                         import traceback
                         print(f"[Track 4] Walker computation failed: {e}")
@@ -2080,7 +2128,7 @@ class BeliefTransformerPipeline:
                             ratio = float(phantom_ratio[i]) if i < len(phantom_ratio) else 1.0
                             
                             # 3+2+1 OVERHAUL: Family B (Topological Breaks) have priority
-                            if s == "broken":
+                            if s == "Type 1 Rupture" or s == "Type 2 Rupture" or s == "rupture":
                                 verdict = "RUPTURE" # Map to Rupture for HUD, UI handles Laser
                             elif s == "trapped":
                                 verdict = "TAUTOLOGY" # Map to Tautology for HUD, UI handles Stall
@@ -2091,10 +2139,11 @@ class BeliefTransformerPipeline:
                                 verdict = "TAUTOLOGY"
                             else: # ratio approx 1
                                 verdict = "HONEST"
+                            
                             phantom_verdicts.append({
                                 "verdict": verdict,
-                                "delta": delta,
-                                "d_spectral": d,
+                                "delta": float(delta_arr[i]),
+                                "d_spectral": float(d_arr[i]),
                                 "w_actual": float(w),
                                 "confidence": 1.0,
                                 "walker_state": s,
@@ -2208,18 +2257,26 @@ class BeliefTransformerPipeline:
         if self.enable_provenance and self.provenance_tracker is not None:
             # Record the "canonical" channel as the primary artifact.
             try:
-                prov_entry = ProvenanceEntry(
+                prov_entry = PipelineProvenanceEntry(
                     month=month_name,
                     seed=self.random_seed,
                     mode=self.geometry_mode, # [FIX] Use geometry_mode, not mode
                     embedding_type=("logits" if self.compare_logits_vs_cli else "main"),
                     n_articles=int(final_features.shape[0]),
                     dim=int(final_features.shape[1]),
+                    pipeline_steps=list(diagnostics.get("steps", [])),
+                    timings=dict(diagnostics.get("timing", {})),
+                    variance=dict(diagnostics.get("variance", {})),
                     metadata=provenance_metadata,
                     timestamp=time.time(),
                 )
                 self.provenance_tracker.add_entry(prov_entry)
                 provenance_entries = [prov_entry.to_dict()]
+                if self.provenance_dir:
+                    self.provenance_tracker.save(
+                        self.provenance_dir,
+                        filename=f"{month_name}_seed{self.random_seed}_provenance.json",
+                    )
             except Exception as e:
                 # Don't crash runs due to provenance bookkeeping
                 diagnostics.setdefault("warnings", []).append(f"provenance_error: {e}")
@@ -2227,11 +2284,22 @@ class BeliefTransformerPipeline:
         # Article metadata (index-stable)
         metadata = []
         for i, art in enumerate(articles):
+            source_val = art.get("source", None) if isinstance(art, dict) else None
+            if isinstance(art, dict):
+                source_val = source_val or art.get("publisher") or art.get("publication") or art.get("outlet")
+            affiliation_val = art.get("affiliation", None) if isinstance(art, dict) else None
+            if isinstance(art, dict):
+                affiliation_val = affiliation_val or art.get("outlet_affiliation") or art.get("publisher_affiliation")
+            bias_val = art.get("bias", None) if isinstance(art, dict) else None
+            if isinstance(art, dict):
+                bias_val = bias_val or art.get("political_bias") or art.get("ideology") or art.get("lean")
             meta = {
                 "index": i,
                 "bt_uid": bt_uids[i] if bt_uids is not None else None,
                 "published_at": art.get("published_at", None) if isinstance(art, dict) else None,
-                "source": art.get("source", None) if isinstance(art, dict) else None,
+                "source": source_val,
+                "affiliation": affiliation_val,
+                "bias": bias_val,
                 "title": art.get("title", None) if isinstance(art, dict) else None,
             }
             metadata.append(meta)
@@ -2287,13 +2355,57 @@ class BeliefTransformerPipeline:
             out["spectral_n_persistent_scales"] = spectral_results.n_persistent_scales.detach().cpu().numpy()
             out["spectral_evr_per_scale"] = spectral_results.evr_per_scale.detach().cpu().numpy()
             out["spectral_dipole_state"] = spectral_results.dipole_state
+            # Contract: spectral_u_axis must remain the directional axis.
+            # Expose scaled force separately to avoid semantic ambiguity.
             out["spectral_u_axis"] = spectral_results.u_axis.detach().cpu().numpy()
+            out["spectral_antagonism"] = spectral_results.antagonism.detach().cpu().numpy()
 
         # NEW: Include Walker (Track 4) work integrals and states
         if walker_work_integrals:
             out["walker_work_integrals"] = np.array(walker_work_integrals)
             # Flight-data-recorder schema: keep both semantic label and physics status.
             out["walker_states"] = walker_state_records if walker_state_records else walker_states
+        if walker_path_records:
+            out["walker_paths"] = walker_path_records
+
+        # Persist run-level artifacts needed by downstream visualizers/loaders.
+        run_output_dir = None
+        if config is not None:
+            run_output_dir = Path(config.get("output_dir", config.get("checkpoint_dir", "")))
+        if run_output_dir:
+            try:
+                run_output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                run_output_dir = None
+
+        if run_output_dir is not None and spectral_results is not None:
+            try:
+                np.save(
+                    run_output_dir / "spectral_probe_magnitudes.npy",
+                    spectral_results.probe_magnitudes.detach().cpu().numpy(),
+                )
+            except Exception as e:
+                print(f"[Track 1.5] Warning: failed to persist spectral_probe_magnitudes.npy: {e}")
+
+        if run_output_dir is not None and walker_path_records:
+            try:
+                path_arrays = [np.asarray(r["path_xyz"], dtype=np.float32) for r in walker_path_records]
+                if not path_arrays:
+                    raise RuntimeError("walker_path_records was non-empty but path arrays resolved empty.")
+                same_shape = len({tuple(p.shape) for p in path_arrays}) == 1
+                if same_shape:
+                    path_xyz_payload = np.stack(path_arrays, axis=0)
+                else:
+                    # Support variable-length trajectories without dropping the artifact.
+                    path_xyz_payload = np.array(path_arrays, dtype=object)
+                np.savez_compressed(
+                    run_output_dir / "walker_paths.npz",
+                    article_idx=np.array([int(r["article_idx"]) for r in walker_path_records], dtype=np.int32),
+                    bt_uid=np.array([str(r["bt_uid"]) for r in walker_path_records]),
+                    path_xyz=path_xyz_payload,
+                )
+            except Exception as e:
+                raise RuntimeError(f"[Track 4] Failed to persist walker_paths.npz: {e}") from e
 
         # NEW: Include Phantom Differential verdicts (ASTER v3.2)
         if phantom_verdicts:
@@ -2573,28 +2685,42 @@ def run_multi_observer_experiment_simple(
         print(f"\n{'='*70}")
         print(f"Observer {seed} | kernel={kernel_type} | channel={channel}")
         print(f"{'='*70}")
-        
+        runtime_cfg = PipelineRuntimeConfig(
+            use_contrastive=use_contrastive,
+            use_pca_removal=use_pca_removal,
+            use_cls_tokens=use_cls_tokens,
+            use_gru=use_gru,
+            use_multi_framing_rks=use_multi_framing_rks,
+            use_attention=bool(kwargs.get("use_attention", DEFAULT_PIPELINE_RUNTIME_CONFIG.use_attention)),
+            use_dirichlet_fusion=bool(
+                kwargs.get("use_dirichlet_fusion", DEFAULT_PIPELINE_RUNTIME_CONFIG.use_dirichlet_fusion)
+            ),
+            normalize_features=bool(
+                kwargs.get("normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features)
+            ),
+            geometry_mode=str(kwargs.get("geometry_mode", DEFAULT_PIPELINE_RUNTIME_CONFIG.geometry_mode)),
+            kernel_type=kernel_type,
+            mix_in_rkhs=bool(kwargs.get("mix_in_rkhs", DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs)),
+            dirichlet_rks_dim=int(kwargs.get("dirichlet_rks_dim", 2048)),
+            dirichlet_n_observers=int(kwargs.get("dirichlet_n_observers", 50)),
+            dirichlet_alpha=float(kwargs.get("dirichlet_alpha", 1.0)),
+            dirichlet_hidden_dim=int(kwargs.get("dirichlet_hidden_dim", 1536)),
+        )
+
         components = initialize_full_pipeline(
             random_seed=seed,
             device=device,
-            use_contrastive=use_contrastive,
-            use_cls_tokens=use_cls_tokens,
-            pca_remove=use_pca_removal,
+            **runtime_cfg.to_initialize_kwargs(),
             global_pca_component=shared_pca,
-            use_gru=use_gru,
-            use_rks=use_multi_framing_rks,
             # Increase dimensionality by default (can be overridden via kwargs)
             output_dim=int(kwargs.get("output_dim", 2048)),
             rks_output_dim=kwargs.get("rks_output_dim", None),
-            geometry_mode=kwargs.get("geometry_mode", "rks"),
             compare_logits_vs_cli=bool(kwargs.get("compare_logits_vs_cli", False)),
             adult_kernel=kwargs.get("adult_kernel", "rbf"),
             adult_gamma=float(kwargs.get("adult_gamma", 1.0)),
-            adult_sigma=kwargs.get("adult_sigma", None),
+            adult_sigma=kwargs.get("adult_sigma", rks_sigma),
             adult_center=bool(kwargs.get("adult_center", True)),
             adult_nystrom_m=int(kwargs.get("adult_nystrom_m", 256)),
-            use_attention=kwargs.get("use_attention", True),
-            use_dirichlet_fusion=kwargs.get("use_dirichlet_fusion", False),
             embedding_dim=24 if not use_cls_tokens else 8192,
         )
         
@@ -2675,6 +2801,7 @@ def run_multi_observer_experiment_simple(
                 'use_pca_removal': use_pca_removal,
                 'use_gru': use_gru,
                 'shared_pca': shared_pca,
+                'rks_sigma': rks_sigma,
                 'kernel_params': kernel_params or {},
                 # NEW: Reproducibility info
                 'git_hash': git_hash,
@@ -2698,8 +2825,8 @@ def run_multi_observer_experiment_simple(
         # --- PHASE 3 PAYLOAD FIX ---
         physics_keys = [
             'walker_states', 'walker_work_integrals', 
-            'spectral_evr', 'spectral_u_axis', 'spectral_probe_magnitudes',
-            'article_metadata', 'phantom_verdicts',
+            'spectral_evr', 'spectral_u_axis', 'spectral_antagonism', 'spectral_probe_magnitudes',
+            'article_metadata', 'phantom_verdicts', 'walker_paths',
             'T0_substrate', 'T1_embeddings', 'T1.5_spectral', 'T2_kernels', 'T3_topology'
         ]
         

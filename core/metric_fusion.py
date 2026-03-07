@@ -14,8 +14,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from typing import Tuple, List
 import json
 import argparse
@@ -28,8 +28,8 @@ def calculate_unified_metric(
     metadata_path: Path,
     output_path: Path,
     knn_k: int = 20,
-    z_stress_factor: float = 1.2, # Updated factor
-    z_density_factor: float = 0.8, # Updated factor
+    z_stress_factor: float = 1.2, # Retained for signature compatibility
+    z_density_factor: float = 0.8, # Retained for signature compatibility
 ) -> pd.DataFrame:
     """
     Fuses Track 1.5 (Gradients) and Track 2 (Density) to calculate unified metrics.
@@ -70,28 +70,18 @@ def calculate_unified_metric(
         print(f"Warning: Not enough samples ({len(embeddings)}) for KNN k={knn_k}. Assigning uniform density.")
         density = np.ones(len(embeddings)) * 0.5 # Default to mid-density
 
-    # 3. Calculate STRESS (grad_norm) as the L2 norm of the gradient vectors.
-    # Use robust scaling + power-law stretch so high-friction extremes are visible.
+    # 3. Calculate STRESS (grad_norm) as the raw L2 norm of gradient vectors.
+    # NOTE: Do not normalize/compress this value in fusion; keep raw thermodynamic scale.
     print("Calculating stress (L2 norm of gradients)...")
     raw_stress = np.linalg.norm(gradients, axis=1).astype(float)
-    stress_scaler = RobustScaler()
-    stress_robust = stress_scaler.fit_transform(raw_stress.reshape(-1, 1)).reshape(-1)
-    # Shift to non-negative before power transform.
-    stress_shifted = stress_robust - stress_robust.min()
-    stress_power = np.power(stress_shifted + thermo_config.density_clamp_min, 0.75)
-    stress = (
-        (stress_power - stress_power.min()) /
-        (stress_power.max() - stress_power.min() + thermo_config.density_clamp_min)
-    )
+    stress = raw_stress
 
     # 4. Calculate Z_HEIGHT from clamped log-density potential:
-    #    Z = -log(rho + epsilon), then min-max scale to [0, max_z].
+    #    Z = -log(rho + epsilon), preserving raw potential scale.
     print("Calculating Z_HEIGHT...")
     epsilon = thermo_config.density_clamp_min
     z_potential = -np.log(np.clip(density, epsilon, None))
-    max_z = float(z_stress_factor + z_density_factor)
-    z_scaler = MinMaxScaler(feature_range=(0.0, max_z))
-    z_height = z_scaler.fit_transform(z_potential.reshape(-1, 1)).reshape(-1)
+    z_height = z_potential
 
     # 5. Calculate ZONES (Bridge/Swamp/Tightrope/Void) using ABSOLUTE THRESHOLDS
     print("Classifying zones (Bridge/Swamp/Tightrope/Void)...")
@@ -140,38 +130,92 @@ def calculate_unified_metric(
     d_spectral = np.linalg.norm(embeddings[:, :2] - centroid_2d, axis=1)
     d_spectral = np.clip(d_spectral, 0.1, None)
 
+    rupture_states = {
+        "BROKEN",
+        "TRAPPED",
+        "RUPTURE",
+        "TYPE_1_RUPTURE",
+        "TYPE_2_RUPTURE",
+        "FAILED",
+    }
+
+    # 1) Calculate absolute curvature penalty for surviving walkers.
+    valid_indices = []
+    for i in range(len(metadata_df)):
+        raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
+        if isinstance(raw_state, dict):
+            state = str(raw_state.get("status", "UNKNOWN")).upper()
+        else:
+            state = str(raw_state).upper()
+        if state not in rupture_states and state != "UNKNOWN":
+            valid_indices.append(i)
+
+    delta_values = []
+    for i in valid_indices:
+        d = d_spectral[i] + 1e-8
+        delta_values.append(w_actual[i] / d)
+
+    # 2) Fit 1D K-Means to find natural energetic states.
+    delta_array = np.array(delta_values).reshape(-1, 1)
+    sorted_centers = np.array([1.0, 5.0, 10.0], dtype=float)
+    threshold_mode = "kmeans_3cluster"
+    if len(delta_array) >= 3:
+        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10).fit(delta_array)
+        sorted_centers = np.sort(kmeans.cluster_centers_.flatten())
+        threshold_tautology = sorted_centers[0] + (sorted_centers[1] - sorted_centers[0]) / 2.0
+        threshold_honest = sorted_centers[1] + (sorted_centers[2] - sorted_centers[1]) / 2.0
+    else:
+        # Sparse-state fallback: derive thresholds from observed deltas instead
+        # of fixed constants to reduce arbitrary label swings on small runs.
+        fallback_deltas = []
+        for i in range(len(metadata_df)):
+            raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
+            if isinstance(raw_state, dict):
+                state = str(raw_state.get("status", "UNKNOWN")).upper()
+            else:
+                state = str(raw_state).upper()
+            if state in rupture_states:
+                continue
+            d = d_spectral[i] + 1e-8
+            val = float(w_actual[i] / d)
+            if np.isfinite(val):
+                fallback_deltas.append(val)
+        if fallback_deltas:
+            arr = np.asarray(fallback_deltas, dtype=float)
+            threshold_tautology = float(np.quantile(arr, 0.33))
+            threshold_honest = float(np.quantile(arr, 0.66))
+            if threshold_honest < threshold_tautology:
+                threshold_tautology, threshold_honest = threshold_honest, threshold_tautology
+            sorted_centers = np.array(
+                [float(arr.min()), float(np.median(arr)), float(arr.max())], dtype=float
+            )
+            threshold_mode = "quantile_fallback"
+        else:
+            threshold_tautology, threshold_honest = 1.0, 10.0
+            threshold_mode = "fixed_fallback"
+
     verdicts = []
     for i in range(len(metadata_df)):
-        # Delta = W / d
-        delta = w_actual[i] / d_spectral[i]
-        state = walker_states[i] if walker_states is not None else "unknown"
-        
-        # 1. TAUTOLOGY: Spinning in place (efficiency ~ 0)
-        if delta < 0.2:
-            verdicts.append("TAUTOLOGY")
-            continue
-
-        # 2. SUCCESS: Honors the walker physics engine
-        if state in ["SUCCESS", "honest", "success"]:
-            if delta < 1.5:
-                verdicts.append("HONEST")
-            else:
-                verdicts.append("PHANTOM")
-            continue
-
-        # 3. RUPTURE: Categorization by failure mode
-        if state in ["broken", "BROKEN"]:
-            verdicts.append("TYPE_1_RUPTURE") # Kinetic crash
-        elif state in ["trapped", "TRAPPED"]:
-            verdicts.append("TYPE_2_RUPTURE") # Topological trap
+        raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
+        if isinstance(raw_state, dict):
+            state = str(raw_state.get("status", "UNKNOWN")).upper()
         else:
-            # Fallback for unknown states using absolute thresholds
-            if delta > 10.0:
-                verdicts.append("TYPE_1_RUPTURE")
-            elif delta > 5.0:
-                verdicts.append("PHANTOM")
-            else:
-                verdicts.append("HONEST")
+            state = str(raw_state).upper()
+
+        if state in {"BROKEN", "TYPE_1_RUPTURE"}:
+            verdicts.append("TYPE_1_RUPTURE") # Kinetic crash
+            continue
+        if state in {"TRAPPED", "TYPE_2_RUPTURE", "RUPTURE", "FAILED"}:
+            verdicts.append("TYPE_2_RUPTURE") # Topological/behavioral failure
+            continue
+
+        delta = w_actual[i] / (d_spectral[i] + 1e-8)
+        if delta < threshold_tautology:
+            verdicts.append("TAUTOLOGY")
+        elif delta <= threshold_honest:
+            verdicts.append("HONEST")
+        else:
+            verdicts.append("PHANTOM")
 
     # 6. Save the result as 'MONOLITH_DATA.csv' with new columns:
     #    'density', 'stress', 'z_height', 'zone', 'color_code', 'verdict'.
@@ -185,6 +229,12 @@ def calculate_unified_metric(
 
     metadata_df.to_csv(output_path, index=False)
     print("Unified metric calculation complete and saved.")
+    print(f"LEARNED CENTROIDS: {sorted_centers}")
+    print(
+        f"THRESHOLDS: Tautology < {threshold_tautology:.2f} | "
+        f"Honest <= {threshold_honest:.2f} | Phantom > {threshold_honest:.2f} "
+        f"(mode={threshold_mode})"
+    )
 
     return metadata_df
 
@@ -234,3 +284,4 @@ if __name__ == "__main__":
     )
     print(f"Generated MONOLITH_DATA.csv with {len(result_df.columns)} columns.")
     print(result_df.head())
+    print(result_df["verdict"].value_counts())

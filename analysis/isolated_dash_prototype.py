@@ -343,8 +343,14 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     missing_required = list(diag.missing_required_artifacts)
     missing_optional = list(diag.missing_optional_artifacts)
 
-    baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
-    baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
+    contract_path = run_dir / "EPISTEMIC_CONTRACT.json"
+    if contract_path.exists():
+        contract_blob = _safe_json(contract_path, {})
+        baseline_meta = contract_blob.get("provenance", {}) if isinstance(contract_blob, dict) else {}
+        baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
+    else:
+        baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
+        baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
 
     observer_id = _observer_id_from_value(observer_value)
     state_blob = {}

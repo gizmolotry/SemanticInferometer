@@ -100,6 +100,8 @@ class WalkerResult:
     # Thresholds used for classification (now Δ-based)
     honest_threshold: float   # Δ < this = honest
     rupture_threshold: float  # Δ > this = rupture
+    # [steps+1, D] — mean projected path across walkers (for persistence/visual routing)
+    trajectory_path: Optional[torch.Tensor] = None
     # HYSTERESIS (Path Memory) statistics
     hysteresis_stats: Optional[Dict[str, Any]] = None
     memory_matrix: Optional[torch.Tensor] = None  # [n_bots, n_bots] rut depths
@@ -469,6 +471,23 @@ class SemanticWalker:
             next_weights = torch.where(mask_expanded, proposal, current_weights)
             next_energy = torch.where(mask_accept, proposal_energy, current_energy)
 
+            # Kinetic dampening: clip accepted weight-step magnitude to prevent
+            # runaway trajectories in high-curvature regimes.
+            # Apply only when explicitly configured; preserves historical behavior
+            # for configs without max_kinematic_velocity.
+            max_step_cfg = getattr(self.thermo_config, "max_kinematic_velocity", None)
+            max_step = float(max_step_cfg) if max_step_cfg is not None else 0.0
+            if max_step > 0.0:
+                step_vec = next_weights - current_weights
+                step_norm = torch.norm(step_vec, p=2, dim=-1, keepdim=True)
+                step_scale = torch.clamp(max_step / (step_norm + 1e-12), max=1.0)
+                damped_weights = current_weights + step_vec * step_scale
+                damped_weights = torch.clamp(damped_weights, min=0.0)
+                damped_weights = damped_weights / damped_weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                next_weights = torch.where(mask_expanded, damped_weights, current_weights)
+                damped_energy = self._compute_energy(next_weights)
+                next_energy = torch.where(mask_accept, damped_energy, current_energy)
+
             # Kinetic energy tank: deduct terrain-friction work for accepted moves.
             current_pos = torch.matmul(current_weights, self.embeddings)
             next_pos = torch.matmul(next_weights, self.embeddings)
@@ -778,6 +797,7 @@ class SemanticWalker:
             state=majority_state,
             final_position=final_position,
             trajectory_endpoint=endpoint,
+            trajectory_path=projected.mean(dim=1),
             honest_threshold=self.honest_threshold,
             rupture_threshold=self.rupture_threshold,
             # HYSTERESIS: Include path memory state
@@ -890,6 +910,7 @@ def compute_walker_resistance(
         "state": state_name,
         "state_code": state_code,
         "walker_output": result.trajectory_endpoint,
+        "path_xyz": result.trajectory_path,
         "final_position": result.final_position,
         # Thresholds for reference
         "tautology_threshold": explorer.tautology_threshold,

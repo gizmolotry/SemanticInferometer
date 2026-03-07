@@ -1297,8 +1297,11 @@ def run_synthetic_experiment_suite(
                 if 'spectral_dipole_valid' in result:
                     np.save(run_dir / "spectral_dipole_valid.npy", result['spectral_dipole_valid'])
                 if 'spectral_u_axis' in result:
-                    # This is the antagonism vector field for wind streamlines
+                    # Directional spectral axis (Track 1.5 canonical contract)
                     np.save(run_dir / "spectral_u_axis.npy", result['spectral_u_axis'])
+                if 'spectral_antagonism' in result:
+                    # Scaled force variant, used by wind-field consumers when present.
+                    np.save(run_dir / "antagonism.npy", result['spectral_antagonism'])
                 if 'logit_confidence' in result:
                     np.save(run_dir / "logit_confidence.npy", result['logit_confidence'])
                 if 'dirichlet_fused_std' in result:
