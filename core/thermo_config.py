@@ -12,6 +12,7 @@ class ThermodynamicConfig:
     # Fusion & Terrain
     hadamard_floor: float = 0.15  # Softens the AND gate to rescue NMI + ridge connectivity
     density_clamp_min: float = 1e-4  # Prevents -Infinity black holes
+    epsilon_z: float = 1e-4  # Soft floor for z-height transform: z = -log(density + epsilon_z)
     stress_threshold: float = 0.75  # Tightened to expose more cracks
 
     # Walker Energy Budget (Track 4 Thermodynamics)

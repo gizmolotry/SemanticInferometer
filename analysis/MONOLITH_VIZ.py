@@ -76,8 +76,9 @@ except ImportError:
     go = None
 
 try:
-    from scipy.interpolate import griddata
+    from scipy.interpolate import griddata, Rbf
     from scipy.ndimage import gaussian_filter
+    from scipy.spatial import Delaunay
     from scipy.spatial.distance import cdist, pdist, squareform
     from scipy.stats import gaussian_kde
     from sklearn.neighbors import NearestNeighbors
@@ -972,16 +973,109 @@ def compute_smooth_terrain(
     yi = np.linspace(y_min, y_max, grid_resolution)
     Xi, Yi = np.meshgrid(xi, yi)
 
-    try:
-        Zi = griddata((x, y), energy_values, (Xi, Yi), method='cubic')
-        Zi_nearest = griddata((x, y), energy_values, (Xi, Yi), method='nearest')
-        Zi = np.where(np.isnan(Zi), Zi_nearest, Zi)
-    except Exception:
-        Zi = griddata((x, y), energy_values, (Xi, Yi), method='linear',
-                      fill_value=float(energy_values.mean()))
+    Zi = _interpolate_field_boundary_safe(
+        x=x,
+        y=y,
+        values=energy_values,
+        Xi=Xi,
+        Yi=Yi,
+        fill_value=float(np.nanmean(np.asarray(energy_values, dtype=float))),
+        clip_to_source=True,
+    )
 
     Zi = gaussian_filter(Zi, sigma=smoothing_sigma)
     return Xi, Yi, Zi
+
+
+def _interpolate_field_boundary_safe(
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    Xi: np.ndarray,
+    Yi: np.ndarray,
+    fill_value: float,
+    clip_to_source: bool = True,
+) -> np.ndarray:
+    """
+    Continuous, boundary-safe interpolation helper.
+
+    Uses cubic interpolation for interior structure and applies RBF only to
+    boundary NaN regions to avoid nearest-neighbor plateaus without reshaping
+    the entire manifold.
+    """
+    if not HAS_SCIPY:
+        return np.full_like(Xi, fill_value, dtype=float)
+
+    xv = np.asarray(x, dtype=float).ravel()
+    yv = np.asarray(y, dtype=float).ravel()
+    vv = np.asarray(values, dtype=float).ravel()
+    m = np.isfinite(xv) & np.isfinite(yv) & np.isfinite(vv)
+    if int(np.count_nonzero(m)) < 3:
+        return np.full_like(Xi, fill_value, dtype=float)
+
+    xv = xv[m]
+    yv = yv[m]
+    vv = vv[m]
+    coords = np.column_stack([xv, yv])
+    try:
+        _, uniq_idx = np.unique(np.round(coords, decimals=12), axis=0, return_index=True)
+        uniq_idx = np.sort(uniq_idx)
+        xv = xv[uniq_idx]
+        yv = yv[uniq_idx]
+        vv = vv[uniq_idx]
+    except Exception:
+        pass
+
+    if xv.size < 3:
+        return np.full_like(Xi, float(np.nanmean(vv)) if vv.size else fill_value, dtype=float)
+
+    src_min = float(np.nanmin(vv))
+    src_max = float(np.nanmax(vv))
+    src_fill = float(np.nanmean(vv)) if vv.size else fill_value
+
+    try:
+        Zi = griddata((xv, yv), vv, (Xi, Yi), method='cubic')
+    except Exception:
+        Zi = None
+
+    if Zi is None:
+        try:
+            Zi = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=src_fill)
+        except Exception:
+            Zi = np.full_like(Xi, src_fill, dtype=float)
+    else:
+        nan_mask = np.isnan(Zi)
+        if np.any(nan_mask):
+            try:
+                eps = None
+                if xv.size >= 4:
+                    d = pdist(np.column_stack([xv, yv]))
+                    d = d[np.isfinite(d) & (d > 1e-12)]
+                    if d.size > 0:
+                        eps = float(np.nanmedian(d))
+                smooth = max(float(np.nanstd(vv)) * 0.02, 1e-8)
+                rbf = Rbf(
+                    xv,
+                    yv,
+                    vv,
+                    function="multiquadric",
+                    epsilon=eps if eps is not None else 1.0,
+                    smooth=smooth,
+                )
+                Zi[nan_mask] = np.asarray(rbf(Xi[nan_mask], Yi[nan_mask]), dtype=float)
+            except Exception:
+                pass
+            if np.isnan(Zi).any():
+                try:
+                    Zi_linear = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=src_fill)
+                    Zi = np.where(np.isnan(Zi), Zi_linear, Zi)
+                except Exception:
+                    Zi = np.where(np.isnan(Zi), src_fill, Zi)
+
+    Zi = np.nan_to_num(Zi, nan=src_fill, posinf=src_fill, neginf=src_fill)
+    if clip_to_source and np.isfinite(src_min) and np.isfinite(src_max):
+        Zi = np.clip(Zi, src_min, src_max)
+    return Zi
 
 
 def project_points_onto_terrain(
@@ -1074,6 +1168,16 @@ def render_terrain_surface(
     xi = np.linspace(x_min, x_max, grid_resolution)
     yi = np.linspace(y_min, y_max, grid_resolution)
     Xi, Yi = np.meshgrid(xi, yi)
+    support_mask = None
+    try:
+        xy_points = np.column_stack([x, y])
+        if xy_points.shape[0] >= 3:
+            tri = Delaunay(xy_points)
+            grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
+            simplex = tri.find_simplex(grid_points)
+            support_mask = (simplex >= 0).reshape(Xi.shape)
+    except Exception:
+        support_mask = None
 
     # =========================================
     # 1. THE GEOMETRY (Z-AXIS) = STRESS
@@ -1094,13 +1198,15 @@ def render_terrain_surface(
     except Exception:
         pass
 
-    try:
-        grid_stress = griddata((x, y), stress_values, (Xi, Yi), method='cubic')
-        grid_stress_nearest = griddata((x, y), stress_values, (Xi, Yi), method='nearest')
-        grid_stress = np.where(np.isnan(grid_stress), grid_stress_nearest, grid_stress)
-    except Exception:
-        grid_stress = griddata((x, y), stress_values, (Xi, Yi), method='linear',
-                               fill_value=float(stress_values.mean()))
+    grid_stress = _interpolate_field_boundary_safe(
+        x=x,
+        y=y,
+        values=stress_values,
+        Xi=Xi,
+        Yi=Yi,
+        fill_value=float(np.nanmean(np.asarray(stress_values, dtype=float))),
+        clip_to_source=True,
+    )
 
     # Smooth geometry field.
     grid_stress = gaussian_filter(grid_stress, sigma=1.5)
@@ -1127,26 +1233,32 @@ def render_terrain_surface(
         )
     except Exception:
         pass
+    if support_mask is not None:
+        z_geometry = np.where(support_mask, z_geometry, np.nan)
     # =========================================
     # 2. THE SKIN (COLOR) = CONTINUOUS MANIFOLD GRADIENT
     # =========================================
     if use_manifold_colormap and terrain_density is not None and terrain_stress is not None:
-        # Interpolate density and stress to grid using cubic for smooth gradients
-        try:
-            grid_density = griddata((x, y), terrain_density, (Xi, Yi), method='cubic')
-            grid_density_nearest = griddata((x, y), terrain_density, (Xi, Yi), method='nearest')
-            grid_density = np.where(np.isnan(grid_density), grid_density_nearest, grid_density)
-        except Exception:
-            grid_density = griddata((x, y), terrain_density, (Xi, Yi),
-                                     method='linear', fill_value=0.5)
-
-        try:
-            grid_stress_color = griddata((x, y), terrain_stress, (Xi, Yi), method='cubic')
-            grid_stress_nearest = griddata((x, y), terrain_stress, (Xi, Yi), method='nearest')
-            grid_stress_color = np.where(np.isnan(grid_stress_color), grid_stress_nearest, grid_stress_color)
-        except Exception:
-            grid_stress_color = griddata((x, y), terrain_stress, (Xi, Yi),
-                                          method='linear', fill_value=0.5)
+        # Interpolate density and stress using continuous RBF helper to avoid
+        # cubic+nearest boundary seams.
+        grid_density = _interpolate_field_boundary_safe(
+            x=x,
+            y=y,
+            values=terrain_density,
+            Xi=Xi,
+            Yi=Yi,
+            fill_value=0.5,
+            clip_to_source=True,
+        )
+        grid_stress_color = _interpolate_field_boundary_safe(
+            x=x,
+            y=y,
+            values=terrain_stress,
+            Xi=Xi,
+            Yi=Yi,
+            fill_value=0.5,
+            clip_to_source=True,
+        )
 
         # Apply light smoothing for visual continuity
         grid_density = gaussian_filter(grid_density, sigma=1.0)
@@ -1182,6 +1294,8 @@ def render_terrain_surface(
 
         # Clamp to [0, 1] for safety
         terrain_scalar_grid = np.clip(terrain_scalar_grid, 0.0, 1.0)
+        if support_mask is not None:
+            terrain_scalar_grid = np.where(support_mask, terrain_scalar_grid, np.nan)
 
         # Use continuous manifold colorscale
         colorscale = get_continuous_manifold_colorscale()
@@ -1196,8 +1310,17 @@ def render_terrain_surface(
         )
     elif terrain_scalar is not None:
         # Legacy continuous colorscale
-        color_values = griddata((x, y), terrain_scalar, (Xi, Yi),
-                                 method='linear', fill_value=0.5)
+        color_values = _interpolate_field_boundary_safe(
+            x=x,
+            y=y,
+            values=terrain_scalar,
+            Xi=Xi,
+            Yi=Yi,
+            fill_value=0.5,
+            clip_to_source=True,
+        )
+        if support_mask is not None:
+            color_values = np.where(support_mask, color_values, np.nan)
         colorscale = get_terrain_colorscale()
         surfacecolor = color_values
         cmin, cmax = 0, 1
@@ -3508,10 +3631,11 @@ def create_monolith_cockpit(
                 continue
             if path_arr.shape[1] == features.shape[1]:
                 path_proj = pca_3d.transform(path_arr)
-            elif path_arr.shape[1] >= 3:
-                path_proj = path_arr[:, :3].copy()
+            elif path_arr.shape[1] == 3:
+                path_proj = path_arr.copy()
             else:
                 continue
+            path_proj = np.nan_to_num(path_proj, nan=0.0, posinf=0.0, neginf=0.0)
             walker_paths_projected[int(article_idx)] = path_proj[:, :3]
         except Exception:
             continue
@@ -3545,12 +3669,35 @@ def create_monolith_cockpit(
     target_xy_span = np.array([6.0, 6.0], dtype=float)
     xy_center = np.mean(positions_3d[:, 0:2], axis=0, keepdims=True)
     xy_scale = target_xy_span / xy_ptp
+    article_xy_ptp = np.ptp(positions_3d[:, :2], axis=0)
+    article_span_ref = (
+        float(np.max(article_xy_ptp))
+        if article_xy_ptp.size == 2 and np.isfinite(article_xy_ptp).all()
+        else 0.0
+    )
     positions_3d[:, 0:2] = (positions_3d[:, 0:2] - xy_center) * xy_scale
-    # Deterministic frame contract: normalize all path XY in the same article frame.
-    for _idx, _path in walker_paths_pure.items():
-        if _path.ndim == 2 and _path.shape[1] >= 2:
-            _path[:, 0:2] = (_path[:, 0:2] - xy_center) * xy_scale
-            walker_paths_pure[_idx] = _path
+    # Normalize path XY only when path frame appears compatible with article frame.
+    path_spans = []
+    for _path in walker_paths_pure.values():
+        if _path.ndim == 2 and _path.shape[1] >= 2 and len(_path) > 1:
+            path_spans.append(float(np.max(np.ptp(_path[:, 0:2], axis=0))))
+    median_path_span = float(np.median(path_spans)) if path_spans else 0.0
+    normalize_paths = (
+        bool(path_spans)
+        and np.isfinite(median_path_span)
+        and article_span_ref > 1e-12
+        and median_path_span <= (article_span_ref * 10.0)
+    )
+    if normalize_paths:
+        for _idx, _path in walker_paths_pure.items():
+            if _path.ndim == 2 and _path.shape[1] >= 2:
+                _path[:, 0:2] = (_path[:, 0:2] - xy_center) * xy_scale
+                walker_paths_pure[_idx] = _path
+    else:
+        print(
+            "[MONOLITH] Skipping walker path XY normalization due to frame mismatch: "
+            f"article_span={article_span_ref:.6f}, median_path_span={median_path_span:.6f}"
+        )
     print(
         "[MONOLITH] Applied deterministic per-axis XY normalization: "
         f"scale_x={xy_scale[0]:.1f}, scale_y={xy_scale[1]:.1f}, "
@@ -3880,6 +4027,16 @@ def create_monolith_cockpit(
     # Terrain interpolator remains available for overlays that intentionally drape to surface.
     energy_values_for_points = positions_3d[:, 2]
 
+    def _nearest_article_surface_z(x_coords, y_coords) -> np.ndarray:
+        xq = np.atleast_1d(x_coords).astype(float)
+        yq = np.atleast_1d(y_coords).astype(float)
+        if article_xy.shape[0] <= 0:
+            return np.full_like(xq, positions_3d[:, 2].mean() if len(positions_3d) > 0 else 0.0, dtype=float)
+        q = np.column_stack((xq, yq))
+        d = cdist(q, article_xy)
+        idx = np.argmin(d, axis=1)
+        return np.asarray(energy_values_for_points, dtype=float)[idx]
+
     # Helper function to get surface Z from interpolator
     def get_surface_z(x_coords, y_coords, offset=0.0):
         if interp_terrain_z is not None:
@@ -3890,7 +4047,13 @@ def create_monolith_cockpit(
             # Create points array for interpolator: (N, 2) where each row is (y, x)
             points_for_interp = np.column_stack((y_coord_np, x_coord_np))
             
-            interp_z = interp_terrain_z(points_for_interp)
+            interp_z = np.asarray(interp_terrain_z(points_for_interp), dtype=float)
+            invalid = ~np.isfinite(interp_z)
+            if np.any(invalid):
+                interp_z[invalid] = _nearest_article_surface_z(
+                    x_coord_np[invalid],
+                    y_coord_np[invalid],
+                )
             
             # If input was scalar, return scalar. If array, return array.
             if isinstance(x_coords, (int, float, np.floating)):
@@ -4785,5 +4948,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

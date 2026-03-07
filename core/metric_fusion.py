@@ -76,11 +76,11 @@ def calculate_unified_metric(
     raw_stress = np.linalg.norm(gradients, axis=1).astype(float)
     stress = raw_stress
 
-    # 4. Calculate Z_HEIGHT from clamped log-density potential:
-    #    Z = -log(rho + epsilon), preserving raw potential scale.
+    # 4. Calculate Z_HEIGHT from soft-floored log-density potential:
+    #    Z = -log(rho + epsilon_z), preserving raw potential scale.
     print("Calculating Z_HEIGHT...")
-    epsilon = thermo_config.density_clamp_min
-    z_potential = -np.log(np.clip(density, epsilon, None))
+    epsilon_z = thermo_config.epsilon_z
+    z_potential = -np.log(density + epsilon_z)
     z_height = z_potential
 
     # 5. Calculate ZONES (Bridge/Swamp/Tightrope/Void) using ABSOLUTE THRESHOLDS
