@@ -609,7 +609,7 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
 
     precompute_cmd = [
         sys.executable,
-        str(Path(__file__).parent / "analysis" / "precompute_observer_artifacts.py"),
+        str(Path(__file__).parent / "analysis" / "regression" / "precompute_observer_artifacts.py"),
         str(target_dir),
         "--variant",
         "MONOLITH.html",
@@ -966,13 +966,9 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     if not monolith_csv.exists():
         return {"status": "failed", "error": f"missing MONOLITH_DATA.csv at {monolith_csv}"}
 
-    copied = []
-    copied_report = _copy_if_missing(_find_nearby_file(run_dir, "verification_report.json"), run_dir / "verification_report.json")
-    copied_summary = _copy_if_missing(_find_nearby_file(run_dir, "verification_summary.csv"), run_dir / "verification_summary.csv")
-    if copied_report:
-        copied.append("verification_report.json")
-    if copied_summary:
-        copied.append("verification_summary.csv")
+    # Verification artifacts are leaf-local by contract. Do not copy from parent
+    # directories; inherited reports can misstate leaf verification status.
+    copied: List[str] = []
 
     rows = _load_monolith_rows(monolith_csv)
     baseline_meta = _emit_baseline_meta(run_dir)
@@ -1185,6 +1181,7 @@ def run_synthetic_experiment_suite(
     # Import pipeline components (functions load_and_mask_corpus and validate_against_ground_truth are defined above)
     try:
         from core.complete_pipeline import initialize_full_pipeline, BeliefTransformerPipeline
+        from core.pipeline_config import PipelineRuntimeConfig
     except ImportError as e:
         print(f"[ERROR] Could not import required modules: {e}")
         return {"status": "failed", "error": str(e)}
@@ -1235,19 +1232,22 @@ def run_synthetic_experiment_suite(
                 # Full ASTER v3.2 pipeline: CLS views -> Dirichlet Fusion -> RKS -> Spectral Polarity
                 # MUST match run_synthetic_experiment.py parameters exactly!
                 actual_hidden_dim = 1536  # DeBERTa-v3-large hidden size
-                components = initialize_full_pipeline(
-                    random_seed=seed,
-                    device="cuda" if TORCH_AVAILABLE else "cpu",
-                    kernel_type=kernel,            # NOT adult_kernel!
+                runtime_cfg = PipelineRuntimeConfig(
+                    kernel_type=kernel,
                     use_cls_tokens=True,
                     use_dirichlet_fusion=True,
                     dirichlet_rks_dim=512,
                     dirichlet_n_observers=10,
-                    dirichlet_alpha=1.0,           # Equality weighting (NMI 0.742 config)
+                    dirichlet_alpha=1.0,
                     dirichlet_hidden_dim=actual_hidden_dim,
-                    mix_in_rkhs=True,              # Mode B: map-then-mix (CRITICAL for NMI)
+                    mix_in_rkhs=True,
                     geometry_mode="rks",
                     normalize_features=True,
+                )
+                components = initialize_full_pipeline(
+                    random_seed=seed,
+                    device="cuda" if TORCH_AVAILABLE else "cpu",
+                    **runtime_cfg.to_initialize_kwargs(),
                 )
 
                 # Wrap in BeliefTransformerPipeline
@@ -3194,7 +3194,7 @@ def main():
             if str(analysis_path) not in sys.path:
                 sys.path.append(str(analysis_path))
             
-            from verification.verify_run import discover_all_layers, verify_layer_data, write_report
+            from verification.verify_run import discover_all_layers, verify_layer_data, write_reports_to_leaves
             
             reports = []
             # -----------------------------
@@ -3237,8 +3237,11 @@ def main():
                 reports.append(report)
             
             if reports:
-                write_report(reports, exp_dir)
-                print(f"[VERIFY] Verification report saved to: {exp_dir / 'verification_report.json'}")
+                leaf_dirs = write_reports_to_leaves(reports, exp_dir, all_layers)
+                if leaf_dirs:
+                    print(f"[VERIFY] Verification reports saved to {len(leaf_dirs)} leaf directories")
+                else:
+                    print("[VERIFY] No leaf directories with MONOLITH_DATA.csv found; no verification files written.")
         except Exception as e:
             print(f"[VERIFY] Error during verification: {e}")
             import traceback
