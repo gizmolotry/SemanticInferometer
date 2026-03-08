@@ -43,6 +43,26 @@ class SpectralPolarityConfig:
     use_adaptive_sigma: bool = True
     # Whether to enable multi-scale mode (False = single-scale legacy mode)
     multi_scale_enabled: bool = True
+    # Adaptive sigma sampling cap for median-heuristic pairwise distances.
+    adaptive_sigma_max_samples: int = 1000
+    # Lower bound clamp for adaptive sigma before any downstream scaling/division.
+    adaptive_sigma_min: float = 1e-6
+    # Floor for all sigma divisions in G / sigma conditioning paths.
+    sigma_scale_epsilon: float = 1e-6
+    # Shared numerical floor for variance/weight normalization.
+    normalization_epsilon: float = 1e-12
+    # Dynamic-K component threshold ratio (sigma_i > ratio * sigma_1).
+    dynamic_k_threshold_ratio: float = 0.1
+    # Explicit spectral weighting mode:
+    # - "sigma": legacy sigma * delta^2
+    # - "sigma_squared": sigma^2 * delta^2
+    weighted_sigma_mode: str = "sigma"
+    # Explicit whitened weighting mode:
+    # - "sigma": legacy (delta / sigma)^2
+    # - "sigma_squared": (delta / sigma^2)^2
+    whitened_sigma_mode: str = "sigma"
+    # Floor for whitened sigma term before inverse weighting.
+    whitened_sigma_epsilon: float = 1e-6
 
 
 @dataclass
@@ -90,6 +110,21 @@ class SpectralPolarity:
     def __init__(self, config: Optional[SpectralPolarityConfig] = None):
         self.config = config or SpectralPolarityConfig()
 
+    def _sanitize_sigma(self, sigma: float, min_sigma: float) -> float:
+        """Clamp sigma to a finite positive floor for stable scaling."""
+        sigma_value = float(sigma)
+        if not np.isfinite(sigma_value):
+            return float(min_sigma)
+        return float(max(sigma_value, min_sigma))
+
+    def _sigma_weight_term(self, sigma: torch.Tensor, mode: str) -> torch.Tensor:
+        """Convert singular values into explicit sigma weighting semantics."""
+        if mode == "sigma":
+            return sigma
+        if mode == "sigma_squared":
+            return sigma ** 2
+        raise ValueError(f"Unknown sigma weighting mode: {mode}")
+
     def _compute_adaptive_sigma(self, G: torch.Tensor) -> float:
         """
         Compute adaptive bandwidth using median heuristic.
@@ -101,7 +136,7 @@ class SpectralPolarity:
         # Flatten to [N*n_probes, H] for pairwise distance
         G_flat = G.reshape(-1, H)
         # Sample if too large (avoid O(n^2) explosion)
-        max_samples = 1000
+        max_samples = max(int(self.config.adaptive_sigma_max_samples), 1)
         if G_flat.shape[0] > max_samples:
             idx = torch.randperm(G_flat.shape[0])[:max_samples]
             G_sample = G_flat[idx]
@@ -115,7 +150,7 @@ class SpectralPolarity:
             median_dist = dists[mask].median().item()
         else:
             median_dist = 1.0
-        return median_dist
+        return self._sanitize_sigma(median_dist, self.config.adaptive_sigma_min)
 
     def _compute_single_scale(
         self,
@@ -134,9 +169,11 @@ class SpectralPolarity:
             evr: [N] explained variance ratio
             S: [N, 8] singular values
         """
-        # Scale the gradient matrix by bandwidth
-        # This is equivalent to computing gradients with a Gaussian kernel of width sigma
-        G_scaled = G / sigma
+        # Scale the gradient matrix by bandwidth.
+        safe_sigma = self._sanitize_sigma(sigma, self.config.sigma_scale_epsilon)
+        G_scaled = torch.nan_to_num(
+            G / safe_sigma, nan=0.0, posinf=0.0, neginf=0.0
+        )
 
         # SVD: G = U S Vt
         U, S, Vt = torch.linalg.svd(G_scaled, full_matrices=False)
@@ -146,7 +183,7 @@ class SpectralPolarity:
 
         # EVR = S[0]^2 / sum(S^2)
         S_sq = S ** 2
-        total_var = S_sq.sum(dim=1).clamp(min=1e-12)
+        total_var = S_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
         evr = S_sq[:, 0] / total_var
 
         return u_axis, evr, S
@@ -203,6 +240,10 @@ class SpectralPolarity:
             adaptive_sigma = self._compute_adaptive_sigma(G)
             if adaptive_sigma not in sigma_list:
                 sigma_list.append(adaptive_sigma)
+        sigma_list = [
+            self._sanitize_sigma(sigma, self.config.sigma_scale_epsilon)
+            for sigma in sigma_list
+        ]
 
         n_scales = len(sigma_list)
 
@@ -210,9 +251,21 @@ class SpectralPolarity:
         u_axes_per_scale = []  # List of [N, H]
         evr_per_scale = []     # List of [N]
         S_per_scale = []       # List of [N, 8]
+        master_u_axis = None
 
-        for sigma in sigma_list:
+        for i, sigma in enumerate(sigma_list):
             u_axis_s, evr_s, S_s = self._compute_single_scale(G, sigma)
+            # Align per-scale u-axis sign to avoid cancellation when aggregating.
+            if master_u_axis is None:
+                master_u_axis = u_axis_s.clone()
+            if i > 0:
+                sign_flip = (master_u_axis * u_axis_s).sum(dim=1) < 0
+                u_axis_s = torch.where(sign_flip.unsqueeze(1), -u_axis_s, u_axis_s)
+                # Maintain a running master direction so each scale aligns to the
+                # accumulated axis, not only the first scale.
+                master_u_axis = master_u_axis + u_axis_s
+                # Preserve magnitude; do not L2-normalize away thermodynamic scale.
+                master_u_axis = master_u_axis
             u_axes_per_scale.append(u_axis_s)
             evr_per_scale.append(evr_s)
             S_per_scale.append(S_s)
@@ -232,14 +285,17 @@ class SpectralPolarity:
         # --- Aggregate u_axis across valid scales ---
         # Mask invalid scales, compute weighted mean by EVR
         evr_masked = evr_stacked * scale_valid.float()  # Zero out invalid
-        evr_weights = evr_masked / evr_masked.sum(dim=1, keepdim=True).clamp(min=1e-12)  # [N, n_scales]
+        evr_weights = evr_masked / evr_masked.sum(dim=1, keepdim=True).clamp(
+            min=self.config.normalization_epsilon
+        )  # [N, n_scales]
 
         # Weighted sum of u_axes
         # [N, n_scales, H] * [N, n_scales, 1] -> sum over scales -> [N, H]
         u_axis_aggregated = (u_axes_stacked * evr_weights.unsqueeze(2)).sum(dim=1)
 
         # L2 normalize the aggregated direction
-        u_axis_aggregated = u_axis_aggregated / u_axis_aggregated.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        # Preserve magnitude; do not L2-normalize away thermodynamic scale.
+        u_axis_aggregated = u_axis_aggregated
 
         # For articles with no valid scales, fall back to scale with highest EVR
         no_valid_mask = n_persistent == 0
@@ -275,11 +331,20 @@ class SpectralPolarity:
 
         # --- Dynamic K: Significant Components ---
         # σ_i > 0.1 × σ_1 determines which components carry signal
-        dynamic_k = self.determine_dynamic_k(S_reference, threshold_ratio=0.1)
+        dynamic_k = self.determine_dynamic_k(
+            S_reference,
+            threshold_ratio=self.config.dynamic_k_threshold_ratio,
+        )
 
         # --- U_basis: Top-K Right Singular Vectors ---
         # Re-compute SVD at reference scale to get full Vt for weighted distance
-        _, _, Vt_ref = torch.linalg.svd(G / sigma_list[ref_scale_idx], full_matrices=False)
+        ref_sigma = self._sanitize_sigma(
+            sigma_list[ref_scale_idx], self.config.sigma_scale_epsilon
+        )
+        G_ref_scaled = torch.nan_to_num(
+            G / ref_sigma, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        _, _, Vt_ref = torch.linalg.svd(G_ref_scaled, full_matrices=False)
         # Gauge-fix each component consistently
         u_basis = Vt_ref  # [N, 8, H] — full basis, caller uses dynamic_k to slice
 
@@ -399,7 +464,8 @@ class SpectralPolarity:
         # Weight by singular values: σ_i × (Δx_i)^2
         # Use first K singular values
         sigma = singular_values[:, :K]  # [N, K]
-        weighted_sq = sigma * (delta ** 2)  # [N, K]
+        sigma_term = self._sigma_weight_term(sigma, self.config.weighted_sigma_mode)
+        weighted_sq = sigma_term * (delta ** 2)  # [N, K]
 
         # Apply dynamic K masking if provided
         if dynamic_k is not None:
@@ -409,7 +475,9 @@ class SpectralPolarity:
             weighted_sq = weighted_sq * mask.float()
 
         # Sum and sqrt
-        d_spectral = torch.sqrt(weighted_sq.sum(dim=1).clamp(min=1e-12))  # [N]
+        d_spectral = torch.sqrt(
+            weighted_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
+        )  # [N]
 
         return d_spectral
 
@@ -420,7 +488,7 @@ class SpectralPolarity:
         singular_values: torch.Tensor,  # [N, 8] or [N, K]
         Vt: torch.Tensor,  # [N, 8, H] or [N, K, H] — right singular vectors
         dynamic_k: Optional[torch.Tensor] = None,  # [N] — if None, use all components
-        epsilon: float = 1e-6,  # Floor to prevent division by zero on small σ
+        epsilon: Optional[float] = None,  # Optional override floor for singular values
     ) -> torch.Tensor:
         """
         Compute whitened (inverse-weighted) spectral distance between two embeddings.
@@ -468,8 +536,13 @@ class SpectralPolarity:
 
         # Inverse weight by singular values: (Δx_i / σ_i)^2
         # Floor σ to prevent explosion on near-zero components
-        sigma = singular_values[:, :K].clamp(min=epsilon)  # [N, K]
-        whitened_sq = (delta / sigma) ** 2  # [N, K]
+        sigma = singular_values[:, :K]  # [N, K]
+        sigma_term = self._sigma_weight_term(sigma, self.config.whitened_sigma_mode)
+        epsilon_floor = (
+            self.config.whitened_sigma_epsilon if epsilon is None else float(epsilon)
+        )
+        sigma_term = sigma_term.clamp(min=epsilon_floor)
+        whitened_sq = (delta / sigma_term) ** 2  # [N, K]
 
         # Apply dynamic K masking if provided
         if dynamic_k is not None:
@@ -478,7 +551,9 @@ class SpectralPolarity:
             whitened_sq = whitened_sq * mask.float()
 
         # Sum and sqrt
-        d_whitened = torch.sqrt(whitened_sq.sum(dim=1).clamp(min=1e-12))  # [N]
+        d_whitened = torch.sqrt(
+            whitened_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
+        )  # [N]
 
         return d_whitened
 
@@ -520,7 +595,7 @@ class SpectralPolarity:
         )
 
         # Avoid division by zero
-        ratio = d_whitened / d_weighted.clamp(min=1e-12)
+        ratio = d_whitened / d_weighted.clamp(min=self.config.normalization_epsilon)
 
         return ratio
 
@@ -579,7 +654,7 @@ class SpectralPolarity:
         u_axis = Vt[:, 0, :]
 
         S_sq = S ** 2
-        total_var = S_sq.sum(dim=1).clamp(min=1e-12)
+        total_var = S_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
         evr = S_sq[:, 0] / total_var
 
         dipole_valid = evr >= self.config.evr_threshold
@@ -594,7 +669,10 @@ class SpectralPolarity:
         antagonism = u_axis * S[:, 0:1]
 
         # Dynamic K
-        dynamic_k = self.determine_dynamic_k(S, threshold_ratio=0.1)
+        dynamic_k = self.determine_dynamic_k(
+            S,
+            threshold_ratio=self.config.dynamic_k_threshold_ratio,
+        )
 
         # Fake multi-scale outputs for compatibility
         n_persistent = dipole_valid.long()

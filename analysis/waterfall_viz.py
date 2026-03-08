@@ -23,6 +23,7 @@ Author: Belief Transformer Project (ASTER v3.2)
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import numpy as np
 from pathlib import Path
@@ -44,18 +45,24 @@ except ImportError:
 
 try:
     from sklearn.decomposition import PCA
-    from sklearn.manifold import TSNE
     from sklearn.cluster import KMeans
     from sklearn.metrics import normalized_mutual_info_score, silhouette_score
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
 
-try:
-    import umap
-    HAS_UMAP = True
-except ImportError:
-    HAS_UMAP = False
+if HAS_SKLEARN:
+    try:
+        from sklearn.manifold import TSNE
+        HAS_TSNE = True
+    except ImportError:
+        TSNE = None
+        HAS_TSNE = False
+else:
+    TSNE = None
+    HAS_TSNE = False
+
+HAS_UMAP = importlib.util.find_spec("umap") is not None
 
 
 # =============================================================================
@@ -363,6 +370,11 @@ def compute_projections(data: WaterfallData, method: str = "pca") -> WaterfallDa
         WaterfallData with cp1_2d, cp2_2d, cp3_2d, cp4_2d populated
     """
     if not HAS_SKLEARN:
+        if method == "tsne":
+            raise RuntimeError(
+                "[Waterfall] --method tsne requested but scikit-learn is unavailable. "
+                "Install scikit-learn or choose --method pca/umap."
+            )
         print("[Waterfall] sklearn not available, skipping projections")
         return data
 
@@ -441,6 +453,56 @@ def compute_projections(data: WaterfallData, method: str = "pca") -> WaterfallDa
     # =========================================================================
     # 2D PROJECTIONS FOR VISUALIZATION
     # =========================================================================
+    tsne_fallback_to_pca = False
+    umap_fallback_to_pca = False
+    if method == "tsne" and not HAS_TSNE:
+        print(
+            "[Waterfall] WARNING: --method tsne requested but TSNE dependency is unavailable; "
+            "falling back to PCA explicitly."
+        )
+        tsne_fallback_to_pca = True
+    if method == "umap" and not HAS_UMAP:
+        print(
+            "[Waterfall] WARNING: --method umap requested but umap dependency is unavailable; "
+            "falling back to PCA explicitly."
+        )
+        umap_fallback_to_pca = True
+
+    umap_mod = None
+
+    def _project_2d(raw: np.ndarray) -> np.ndarray:
+        nonlocal umap_mod, umap_fallback_to_pca
+        if raw.shape[1] <= 2:
+            return raw[:, :2]
+        if method == "umap" and not umap_fallback_to_pca:
+            try:
+                if umap_mod is None:
+                    import umap as _umap  # Lazy import to avoid heavy module import at test collection time.
+                    umap_mod = _umap
+                reducer = umap_mod.UMAP(
+                    n_components=2,
+                    random_state=42,
+                    n_neighbors=min(15, len(raw) - 1),
+                )
+                return reducer.fit_transform(raw)
+            except Exception as e:
+                print(f"[Waterfall] WARNING: UMAP projection unavailable ({e}); falling back to PCA.")
+                umap_fallback_to_pca = True
+        if method == "tsne" and not tsne_fallback_to_pca:
+            n_samples = raw.shape[0]
+            if n_samples < 2:
+                return np.zeros((n_samples, 2), dtype=float)
+            perplexity = max(1.0, min(30.0, float(n_samples - 1)))
+            reducer = TSNE(
+                n_components=2,
+                random_state=42,
+                perplexity=perplexity,
+                init="pca",
+                learning_rate="auto",
+            )
+            return reducer.fit_transform(raw)
+        pca = PCA(n_components=2, random_state=42)
+        return pca.fit_transform(raw)
 
     # CP-1: Logits → 2D
     if data.cp1_raw is not None:
@@ -453,32 +515,17 @@ def compute_projections(data: WaterfallData, method: str = "pca") -> WaterfallDa
 
     # CP-2: Track 2 only (base geometry δ_μν) → 2D
     if data.cp2_raw is not None:
-        if method == "umap" and HAS_UMAP:
-            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(data.cp2_raw)-1))
-            data.cp2_2d = reducer.fit_transform(data.cp2_raw)
-        else:
-            pca = PCA(n_components=2, random_state=42)
-            data.cp2_2d = pca.fit_transform(data.cp2_raw)
+        data.cp2_2d = _project_2d(data.cp2_raw)
         print(f"[Waterfall] CP2 projection (Track 2 only): {data.cp2_2d.shape}")
 
     # CP-3: Track 2 + Track 1.5 (+ observer shear ∇Φ∇Φ) → 2D
     if data.cp3_raw is not None:
-        if method == "umap" and HAS_UMAP:
-            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(data.cp3_raw)-1))
-            data.cp3_2d = reducer.fit_transform(data.cp3_raw)
-        else:
-            pca = PCA(n_components=2, random_state=42)
-            data.cp3_2d = pca.fit_transform(data.cp3_raw)
+        data.cp3_2d = _project_2d(data.cp3_raw)
         print(f"[Waterfall] CP3 projection (Track 2 + 1.5): {data.cp3_2d.shape}")
 
     # CP-4: Full metric (Track 2 + 1.5 + 3) → 2D
     if data.cp4_raw is not None:
-        if method == "umap" and HAS_UMAP:
-            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(data.cp4_raw)-1))
-            data.cp4_2d = reducer.fit_transform(data.cp4_raw)
-        else:
-            pca = PCA(n_components=2, random_state=42)
-            data.cp4_2d = pca.fit_transform(data.cp4_raw)
+        data.cp4_2d = _project_2d(data.cp4_raw)
         print(f"[Waterfall] CP4 projection (Full Metric): {data.cp4_2d.shape}")
     elif data.t4_viz is not None and "x_umap" in data.t4_viz:
         # Fallback to pre-computed viz coords

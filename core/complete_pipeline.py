@@ -176,6 +176,107 @@ def compute_variance_stats(tensor: torch.Tensor, name: str) -> Dict[str, float]:
         return stats
 
 
+SPECTRAL_CLS_NORMALIZATION_CONTRACT = "magnitude_preserving"
+
+
+def _canonicalize_cls_per_bot_for_spectral(
+    cls_per_bot_entries: List[torch.Tensor],
+    normalize_features_flag: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]], Dict[str, Any]]:
+    """
+    Build canonical cls_per_bot tensor/list views for spectral tracks.
+
+    Contract:
+      - Track 1.5 spectral inputs are always magnitude-preserving.
+      - `normalize_features` does not apply to cls_per_bot here.
+      - Tensor and list views are generated from the same stacked tensor.
+    """
+    if not cls_per_bot_entries:
+        return None, None, {
+            "contract": SPECTRAL_CLS_NORMALIZATION_CONTRACT,
+            "requested_normalize_features": bool(normalize_features_flag),
+            "applied_l2_normalization": False,
+            "n_articles": 0,
+        }
+
+    stacked = torch.stack(cls_per_bot_entries, dim=0)
+    return stacked, list(stacked.unbind(0)), {
+        "contract": SPECTRAL_CLS_NORMALIZATION_CONTRACT,
+        "requested_normalize_features": bool(normalize_features_flag),
+        "applied_l2_normalization": False,
+        "n_articles": int(stacked.shape[0]),
+    }
+
+
+def _construct_spectral_poles(
+    cls_per_bot_tensor: torch.Tensor,
+    probe_magnitudes: torch.Tensor,
+    min_bucket_mass: float = 1e-8,
+) -> Dict[str, Any]:
+    """
+    Construct positive/negative pole embeddings with explicit degeneracy fallbacks.
+
+    Degeneracy handling:
+      - If one sign bucket is near-empty, replace that pole with extreme-probe fallback.
+      - If both buckets are near-empty (all near-zero projections), use probe[0]/probe[1].
+      - Emit per-article fallback state instead of relying on silent clamp floors.
+    """
+    G = cls_per_bot_tensor
+    mags = probe_magnitudes
+    N, n_probes, _ = G.shape
+
+    pos_mass = torch.clamp(mags, min=0.0).sum(dim=1)
+    neg_mass = torch.clamp(-mags, min=0.0).sum(dim=1)
+    missing_pos = pos_mass <= float(min_bucket_mass)
+    missing_neg = neg_mass <= float(min_bucket_mass)
+    both_missing = missing_pos & missing_neg
+
+    pos_weights = torch.clamp(mags, min=0.0).unsqueeze(-1)
+    neg_weights = torch.clamp(-mags, min=0.0).unsqueeze(-1)
+    pos_sum = pos_weights.sum(dim=1)
+    neg_sum = neg_weights.sum(dim=1)
+
+    emb_pos = (G * pos_weights).sum(dim=1) / torch.where(pos_sum > 0, pos_sum, torch.ones_like(pos_sum))
+    emb_neg = (G * neg_weights).sum(dim=1) / torch.where(neg_sum > 0, neg_sum, torch.ones_like(neg_sum))
+
+    row_idx = torch.arange(N, device=G.device)
+    max_idx = mags.argmax(dim=1)
+    min_idx = mags.argmin(dim=1)
+    emb_max = G[row_idx, max_idx, :]
+    emb_min = G[row_idx, min_idx, :]
+
+    if missing_pos.any():
+        emb_pos[missing_pos] = emb_max[missing_pos]
+    if missing_neg.any():
+        emb_neg[missing_neg] = emb_min[missing_neg]
+
+    if both_missing.any():
+        emb_pos[both_missing] = G[both_missing, 0, :]
+        fallback_neg_idx = 1 if n_probes > 1 else 0
+        emb_neg[both_missing] = G[both_missing, fallback_neg_idx, :]
+
+    fallback_used = missing_pos | missing_neg
+    fallback_state = []
+    for i in range(N):
+        if bool(both_missing[i].item()):
+            fallback_state.append("fallback_both_sign_buckets_empty")
+        elif bool(missing_pos[i].item()):
+            fallback_state.append("fallback_positive_sign_bucket_empty")
+        elif bool(missing_neg[i].item()):
+            fallback_state.append("fallback_negative_sign_bucket_empty")
+        else:
+            fallback_state.append("weighted_sign_buckets")
+
+    return {
+        "emb_pos": emb_pos,
+        "emb_neg": emb_neg,
+        "pos_mass": pos_mass,
+        "neg_mass": neg_mass,
+        "fallback_used": fallback_used,
+        "fallback_state": fallback_state,
+    }
+
+
 class VarianceTracker:
     """Track variance at each pipeline stage for information preservation."""
     
@@ -1156,6 +1257,9 @@ class BeliefTransformerPipeline:
         d_spectral = None
         dirichlet_results = None
         cls_per_bot_list = None
+        cls_per_bot_tensor = None
+        cls_per_bot_contract = None
+        spectral_pole_diagnostics = None
 
         # ------------------------------------------------------------------
         # Stable IDs + timestamp normalization (thesis-ready joins)
@@ -1658,9 +1762,11 @@ class BeliefTransformerPipeline:
                     # (use the pre-aggregated path for curvature stats)
                     cls_per_bot_list = [pair.get("cls_per_bot") for pair in nli_pairs if pair.get("cls_per_bot") is not None]
                     if cls_per_bot_list:
-                        cls_per_bot = torch.stack(cls_per_bot_list, dim=0)
-                        # Preserve geometric magnitude for downstream manifold projection.
-                        cls_per_bot_list = list(cls_per_bot)
+                        cls_per_bot_tensor, cls_per_bot_list, cls_per_bot_contract = _canonicalize_cls_per_bot_for_spectral(
+                            cls_per_bot_list,
+                            normalize_features_flag=self.normalize_features,
+                        )
+                        cls_per_bot = cls_per_bot_tensor
                         curv_out = self.dirichlet_fusion(cls_per_bot, compute_curvature=True)
                         curvature_stats = curv_out["curvature"]
                     else:
@@ -1694,9 +1800,11 @@ class BeliefTransformerPipeline:
                 # Legacy fallback: pre-aggregated cls_per_bot (no paragraph data)
                 cls_per_bot_list = [pair.get("cls_per_bot") for pair in nli_pairs if pair.get("cls_per_bot") is not None]
                 if cls_per_bot_list:
-                    cls_per_bot = torch.stack(cls_per_bot_list, dim=0)  # [N, 8, hidden]
-                    # Preserve geometric magnitude for downstream manifold projection.
-                    cls_per_bot_list = list(cls_per_bot)
+                    cls_per_bot_tensor, cls_per_bot_list, cls_per_bot_contract = _canonicalize_cls_per_bot_for_spectral(
+                        cls_per_bot_list,
+                        normalize_features_flag=self.normalize_features,
+                    )
+                    cls_per_bot = cls_per_bot_tensor  # [N, 8, hidden]
 
                     # ASTER v3.2: Use Sequential Annealing if enabled
                     if hasattr(self.dirichlet_fusion, 'config') and getattr(self.dirichlet_fusion.config, 'use_annealing', False):
@@ -1777,8 +1885,8 @@ class BeliefTransformerPipeline:
                 # T1: Save semantic embeddings (pre-kernel)
                 if final_features is not None:
                     embeddings_per_bot = None
-                    if cls_per_bot_list:
-                        embeddings_per_bot = torch.stack(cls_per_bot_list, dim=0).detach().cpu().numpy()
+                    if cls_per_bot_tensor is not None:
+                        embeddings_per_bot = cls_per_bot_tensor.detach().cpu().numpy()
                     waterfall_ckpt.save_t1_embeddings(
                         embeddings=final_features.detach().cpu().numpy(),
                         embeddings_per_bot=embeddings_per_bot,
@@ -1887,7 +1995,7 @@ class BeliefTransformerPipeline:
                 if run_social_texture and cls_per_bot_list and hasattr(self, 'dirichlet_fusion'):
                     try:
                         from .dirichlet_fusion import AtmosphericAnnealer
-                        cls_stacked = torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
+                        cls_stacked = cls_per_bot_tensor if cls_per_bot_tensor is not None else torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
                         annealer = AtmosphericAnnealer(
                             fusion=self.dirichlet_fusion,
                             alphas=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
@@ -1918,6 +2026,8 @@ class BeliefTransformerPipeline:
                         from .spectral_polarity import SpectralPolarity, SpectralPolarityConfig
                         sp = SpectralPolarity(SpectralPolarityConfig(multi_scale_enabled=True))
                         spectral_results = sp.compute_batch(cls_per_bot_list)
+                        if cls_per_bot_contract is not None:
+                            diagnostics["spectral_cls_per_bot_contract"] = cls_per_bot_contract
                         # Project directional antagonism through shared RKS basis
                         if hasattr(self.dirichlet_fusion, 'basis') and self.dirichlet_fusion.basis is not None:
                             antagonism_t15 = self.dirichlet_fusion.basis(spectral_results.antagonism)  # [N, D]
@@ -1957,8 +2067,10 @@ class BeliefTransformerPipeline:
                 if cls_per_bot_list and hasattr(self, 'dirichlet_fusion') and self.dirichlet_fusion is not None:
                     try:
                         from .physarum_walk import compute_walker_resistance
-                        cls_stacked = torch.stack(cls_per_bot_list, dim=0)  # [N, 8, hidden]
+                        cls_stacked = cls_per_bot_tensor if cls_per_bot_tensor is not None else torch.stack(cls_per_bot_list, dim=0)  # [N, 8, hidden]
                         walker_outputs = []
+                        hysteresis_memory_matrix = None
+                        hysteresis_stats_last = None
                         rks_dim = self.dirichlet_fusion.basis.output_dim if hasattr(self.dirichlet_fusion.basis, 'output_dim') else 2048
                         device = cls_stacked.device
 
@@ -1978,7 +2090,16 @@ class BeliefTransformerPipeline:
                                 temperature=0.5,
                                 n_walkers=20,
                                 n_steps=walker_n_steps,
+                                existing_memory=hysteresis_memory_matrix,
                             )
+                            if result_t4.get("memory_matrix") is not None:
+                                _mem = result_t4["memory_matrix"]
+                                if torch.is_tensor(_mem):
+                                    hysteresis_memory_matrix = _mem.detach().clone()
+                                else:
+                                    hysteresis_memory_matrix = torch.as_tensor(_mem).detach().clone()
+                            if result_t4.get("hysteresis_stats") is not None:
+                                hysteresis_stats_last = result_t4.get("hysteresis_stats")
                             walker_outputs.append(result_t4["walker_output"])  # [D]
                             walker_work_integrals.append(result_t4["work_integral"])
                             walker_states.append(result_t4["state"]) # State name (string)
@@ -2026,6 +2147,14 @@ class BeliefTransformerPipeline:
                             mean_work = np.mean(walker_work_integrals) # Calculate mean from the list
                             print(f"[Track 4] Walker: W={mean_work:.3f}, "
                                   f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B1:{state_counts['Type 1 Rupture']}, B2:{state_counts['Type 2 Rupture']}}}")
+                            if hysteresis_memory_matrix is not None:
+                                out["hysteresis_memory"] = (
+                                    hysteresis_memory_matrix.detach().cpu().numpy()
+                                    if torch.is_tensor(hysteresis_memory_matrix)
+                                    else np.asarray(hysteresis_memory_matrix)
+                                )
+                            if hysteresis_stats_last is not None:
+                                out["hysteresis_stats"] = hysteresis_stats_last
                     except Exception as e:
                         import traceback
                         print(f"[Track 4] Walker computation failed: {e}")
@@ -2038,24 +2167,13 @@ class BeliefTransformerPipeline:
                     from .spectral_polarity import SpectralPolarity, SpectralPolarityConfig
                     sp = SpectralPolarity(SpectralPolarityConfig())
 
-                    # Stack embeddings to get pole embeddings for weighted distance
-                    G = torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
-                    # Use probe extremes as pole embeddings (max/min projection articles)
-                    # For each article, emb_start = mean of positive probes, emb_end = mean of negative probes
+                    # Build positive/negative poles from sign buckets with explicit
+                    # degeneracy fallback state (no silent clamp-floor behavior).
+                    G = cls_per_bot_tensor if cls_per_bot_tensor is not None else torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
                     probe_mags = spectral_results.probe_magnitudes  # [N, 8]
-                    pos_mask = probe_mags > 0  # [N, 8]
-                    neg_mask = probe_mags <= 0  # [N, 8]
-
-                    # Compute weighted mean of positive/negative probe embeddings
-                    # Shape: [N, 8, H] * [N, 8, 1] -> [N, H]
-                    pos_weights = (probe_mags * pos_mask.float()).unsqueeze(-1)  # [N, 8, 1]
-                    neg_weights = (-probe_mags * neg_mask.float()).unsqueeze(-1)  # [N, 8, 1]
-
-                    pos_sum = pos_weights.sum(dim=1).clamp(min=1e-9)  # [N, 1]
-                    neg_sum = neg_weights.sum(dim=1).clamp(min=1e-9)  # [N, 1]
-
-                    emb_pos = (G * pos_weights).sum(dim=1) / pos_sum  # [N, H]
-                    emb_neg = (G * neg_weights).sum(dim=1) / neg_sum  # [N, H]
+                    spectral_pole_diagnostics = _construct_spectral_poles(G, probe_mags)
+                    emb_pos = spectral_pole_diagnostics["emb_pos"]  # [N, H]
+                    emb_neg = spectral_pole_diagnostics["emb_neg"]  # [N, H]
 
                     # Compute weighted spectral distance using dynamic K
                     d_spectral = sp.compute_weighted_spectral_distance(
@@ -2078,8 +2196,9 @@ class BeliefTransformerPipeline:
 
                     # Log dynamic K statistics
                     mean_k = spectral_results.dynamic_k.float().mean().item()
+                    n_fallback = int(spectral_pole_diagnostics["fallback_used"].sum().item()) if spectral_pole_diagnostics is not None else 0
                     print(f"[Track 1.5] Weighted spectral distance: mean_d={d_spectral.mean():.3f}, "
-                          f"dynamic_K={mean_k:.1f}")
+                          f"dynamic_K={mean_k:.1f}, pole_fallback={n_fallback}/{len(G)}")
 
                 # Compute Phantom Differential verdicts (Panic Function)
                 phantom_verdicts = []
@@ -2349,6 +2468,7 @@ class BeliefTransformerPipeline:
             out["spectral_n_persistent_scales"] = spectral_results.n_persistent_scales.detach().cpu().numpy()
             out["spectral_evr_per_scale"] = spectral_results.evr_per_scale.detach().cpu().numpy()
             out["spectral_dipole_state"] = spectral_results.dipole_state
+            out["spectral_cls_normalization_contract"] = SPECTRAL_CLS_NORMALIZATION_CONTRACT
             # Contract: spectral_u_axis must remain the directional axis.
             # Expose scaled force separately to avoid semantic ambiguity.
             out["spectral_u_axis"] = spectral_results.u_axis.detach().cpu().numpy()
@@ -2406,12 +2526,31 @@ class BeliefTransformerPipeline:
                 )
             except Exception as e:
                 raise RuntimeError(f"[Track 4] Failed to persist walker_paths.npz: {e}") from e
+        if run_output_dir is not None and "hysteresis_memory" in out:
+            try:
+                np.save(
+                    run_output_dir / "hysteresis_memory.npy",
+                    np.asarray(out["hysteresis_memory"], dtype=np.float32),
+                )
+            except Exception as e:
+                print(f"[Track 4] Warning: failed to persist hysteresis_memory.npy: {e}")
+        if run_output_dir is not None and "hysteresis_stats" in out:
+            try:
+                with open(run_output_dir / "hysteresis_stats.json", "w", encoding="utf-8") as f:
+                    json.dump(out["hysteresis_stats"], f, indent=2)
+            except Exception as e:
+                print(f"[Track 4] Warning: failed to persist hysteresis_stats.json: {e}")
 
         # NEW: Include Phantom Differential verdicts (ASTER v3.2)
         if phantom_verdicts:
             out["phantom_verdicts"] = phantom_verdicts
         if d_spectral is not None:
             out["d_spectral"] = d_spectral.detach().cpu().numpy()
+        if spectral_pole_diagnostics is not None:
+            out["spectral_pole_fallback_used"] = spectral_pole_diagnostics["fallback_used"].detach().cpu().numpy()
+            out["spectral_pole_fallback_state"] = list(spectral_pole_diagnostics["fallback_state"])
+            out["spectral_pole_pos_mass"] = spectral_pole_diagnostics["pos_mass"].detach().cpu().numpy()
+            out["spectral_pole_neg_mass"] = spectral_pole_diagnostics["neg_mass"].detach().cpu().numpy()
 
         # NEW: Include Social Texture (Track 3 extended) crack/bond topology
         if social_texture_results is not None:
@@ -2532,6 +2671,56 @@ def run_multi_observer_experiment(
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    def _compute_validation_metrics(features_np, metadata):
+        """
+        Compute contract-grade validation metrics from final features using
+        explicit article labels when available.
+        """
+        if features_np is None:
+            return None
+        X = np.asarray(features_np, dtype=np.float64)
+        if X.ndim != 2 or X.shape[0] < 3:
+            return None
+        if metadata is None or len(metadata) != X.shape[0]:
+            return None
+
+        labels = []
+        for row in metadata:
+            if not isinstance(row, dict):
+                labels.append("unknown")
+                continue
+            lbl = (
+                row.get("perspective_tag")
+                or row.get("label")
+                or row.get("bias")
+                or row.get("affiliation")
+                or row.get("source")
+                or "unknown"
+            )
+            labels.append(str(lbl))
+        unique = sorted(set(labels))
+        if len(unique) < 2:
+            return None
+        label_to_idx = {label: idx for idx, label in enumerate(unique)}
+        y = np.array([label_to_idx[v] for v in labels], dtype=np.int32)
+
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+
+            n_clusters = min(len(unique), max(2, min(8, X.shape[0] - 1)))
+            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            pred = km.fit_predict(X)
+            return {
+                "nmi": float(normalized_mutual_info_score(y, pred)),
+                "ari": float(adjusted_rand_score(y, pred)),
+                "n_clusters": int(n_clusters),
+                "label_cardinality": int(len(unique)),
+                "label_source": "article_metadata",
+            }
+        except Exception:
+            return None
+
     all_results = {}
 
     for kernel in kernels:
@@ -2567,6 +2756,7 @@ def run_multi_observer_experiment(
             )
 
             run_results = {}
+            validation_records = []
             for month_name, articles in months_data.items():
                 month_out = pipeline.process_month(articles, month_name=month_name)
 
@@ -2598,11 +2788,53 @@ def run_multi_observer_experiment(
                         indent=2,
                     )
 
+                metrics = _compute_validation_metrics(
+                    month_out.get("features"),
+                    month_out.get("article_metadata"),
+                )
+                validation_payload = {
+                    "schema_version": "1.0",
+                    "seed": int(seed),
+                    "kernel": str(kernel),
+                    "corpus": str(corpus_name),
+                    "month": str(month_name),
+                    "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    "nmi": metrics.get("nmi") if metrics else None,
+                    "ari": metrics.get("ari") if metrics else None,
+                    "metric_source": "kmeans_on_final_features" if metrics else "unavailable",
+                    "label_source": metrics.get("label_source") if metrics else "unavailable",
+                    "label_cardinality": metrics.get("label_cardinality") if metrics else None,
+                    "n_clusters": metrics.get("n_clusters") if metrics else None,
+                    "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
+                }
+                validation_records.append(validation_payload)
+
                 run_results[month_name] = {
                     "features_path": month_path,
                     "metadata_path": meta_path,
                     "n_articles": len(articles),
                 }
+
+            available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
+            available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
+            aggregate_validation = {
+                "schema_version": "1.0",
+                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                "corpus": str(corpus_name),
+                "kernel": str(kernel),
+                "seed": int(seed),
+                "n_months": int(len(validation_records)),
+                "nmi": float(np.mean(available_nmi)) if available_nmi else None,
+                "ari": float(np.mean(available_ari)) if available_ari else None,
+                "nmi_std": float(np.std(available_nmi)) if available_nmi else None,
+                "ari_std": float(np.std(available_ari)) if available_ari else None,
+                "metric_source": "kmeans_on_final_features",
+                "per_month": validation_records,
+                "trust_level": "MEASURED" if available_nmi else "UNAVAILABLE",
+            }
+            validation_path = os.path.join(run_dir, "validation.json")
+            with open(validation_path, "w", encoding="utf-8") as f:
+                json.dump(aggregate_validation, f, indent=2)
 
             # Save attention if requested
             if record_attention and components.get("recorder") is not None:
@@ -2680,6 +2912,57 @@ def run_multi_observer_experiment_simple(
                 print(f"  [CACHE ERROR] Could not load {nli_cache_file}: {e}")
     
     results = {}
+    validation_records = []
+
+    def _compute_validation_metrics(features_np, metadata):
+        """
+        Compute contract-grade validation metrics from final features using
+        explicit article labels when available.
+        """
+        if features_np is None:
+            return None
+        X = np.asarray(features_np, dtype=np.float64)
+        if X.ndim != 2 or X.shape[0] < 3:
+            return None
+        if metadata is None or len(metadata) != X.shape[0]:
+            return None
+
+        labels = []
+        for row in metadata:
+            if not isinstance(row, dict):
+                labels.append("unknown")
+                continue
+            lbl = (
+                row.get("perspective_tag")
+                or row.get("label")
+                or row.get("bias")
+                or row.get("affiliation")
+                or row.get("source")
+                or "unknown"
+            )
+            labels.append(str(lbl))
+        unique = sorted(set(labels))
+        if len(unique) < 2:
+            return None
+        label_to_idx = {label: idx for idx, label in enumerate(unique)}
+        y = np.array([label_to_idx[v] for v in labels], dtype=np.int32)
+
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+
+            n_clusters = min(len(unique), max(2, min(8, X.shape[0] - 1)))
+            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            pred = km.fit_predict(X)
+            return {
+                "nmi": float(normalized_mutual_info_score(y, pred)),
+                "ari": float(adjusted_rand_score(y, pred)),
+                "n_clusters": int(n_clusters),
+                "label_cardinality": int(len(unique)),
+                "label_source": "article_metadata",
+            }
+        except Exception:
+            return None
     
     for seed in seeds:
         print(f"\n{'='*70}")
@@ -2847,11 +3130,51 @@ def run_multi_observer_experiment_simple(
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / f"observer_{seed}.pt"
         torch.save(output_artifact, output_file)
+
+        metrics = _compute_validation_metrics(
+            output_artifact.get("features"),
+            output_artifact.get("article_metadata"),
+        )
+        validation_payload = {
+            "schema_version": "1.0",
+            "seed": int(seed),
+            "kernel": str(kernel_type),
+            "channel": str(channel),
+            "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "nmi": metrics.get("nmi") if metrics else None,
+            "ari": metrics.get("ari") if metrics else None,
+            "metric_source": "kmeans_on_final_features" if metrics else "unavailable",
+            "label_source": metrics.get("label_source") if metrics else "unavailable",
+            "label_cardinality": metrics.get("label_cardinality") if metrics else None,
+            "n_clusters": metrics.get("n_clusters") if metrics else None,
+            "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
+        }
+        with open(output_dir / f"validation_seed{seed}.json", "w", encoding="utf-8") as f:
+            json.dump(validation_payload, f, indent=2)
+        validation_records.append(validation_payload)
         
         print(f"[OK] Saved: {output_file}")
         print(f"  -> {len(result.get('bt_uid_list', []))} articles with stable IDs")
         results[seed] = result
-    
+
+    if validation_records:
+        available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
+        available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
+        aggregate_validation = {
+            "schema_version": "1.0",
+            "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "n_observers": int(len(validation_records)),
+            "nmi": float(np.mean(available_nmi)) if available_nmi else None,
+            "ari": float(np.mean(available_ari)) if available_ari else None,
+            "nmi_std": float(np.std(available_nmi)) if available_nmi else None,
+            "ari_std": float(np.std(available_ari)) if available_ari else None,
+            "metric_source": "kmeans_on_final_features",
+            "per_seed": validation_records,
+            "trust_level": "MEASURED" if available_nmi else "UNAVAILABLE",
+        }
+        with open(output_dir / "validation.json", "w", encoding="utf-8") as f:
+            json.dump(aggregate_validation, f, indent=2)
+
     return results
 
 
