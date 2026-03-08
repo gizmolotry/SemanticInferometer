@@ -4131,59 +4131,104 @@ def create_monolith_cockpit(
 
     # Deterministic XY normalization (no runtime source fallback):
     # keep relative geometry, center XY, and scale into a stable display range.
-    xy_ptp = np.ptp(positions_3d[:, :2], axis=0)
+    positions_xy_raw = np.asarray(positions_3d[:, :2], dtype=float).copy()
+    xy_ptp = np.ptp(positions_xy_raw, axis=0)
     if xy_ptp.size != 2 or not np.isfinite(xy_ptp).all() or np.any(xy_ptp <= 1e-12):
         raise DimensionalCollapseError(
             f"CRITICAL: XY manifold collapsed at projection stage (ptp={xy_ptp})."
         )
     target_xy_span = np.array([6.0, 6.0], dtype=float)
-    xy_center = np.mean(positions_3d[:, 0:2], axis=0, keepdims=True)
+    xy_center = np.mean(positions_xy_raw, axis=0, keepdims=True)
     xy_scale = target_xy_span / xy_ptp
-    article_xy_ptp = np.ptp(positions_3d[:, :2], axis=0)
-    article_span_ref = (
-        float(np.max(article_xy_ptp))
-        if article_xy_ptp.size == 2 and np.isfinite(article_xy_ptp).all()
-        else 0.0
-    )
-    positions_3d[:, 0:2] = (positions_3d[:, 0:2] - xy_center) * xy_scale
-    # Normalize path XY per-path with an anchored fallback for incompatible frames.
+    positions_3d[:, 0:2] = (positions_xy_raw - xy_center) * xy_scale
+    positions_xy_norm = np.asarray(positions_3d[:, :2], dtype=float)
+    n_pts = int(positions_xy_raw.shape[0])
+    local_k = int(max(1, min(12, n_pts - 1)))
+    article_local_span_raw = np.zeros(n_pts, dtype=float)
+    article_local_span_norm = np.zeros(n_pts, dtype=float)
+    if local_k > 0:
+        for _i in range(n_pts):
+            _delta_raw = positions_xy_raw - positions_xy_raw[_i]
+            _dist2 = np.sum(_delta_raw * _delta_raw, axis=1)
+            _order = np.argsort(_dist2, kind="mergesort")
+            _nbr = _order[1:1 + local_k]
+            _sel = np.concatenate(([int(_i)], _nbr.astype(int)))
+            _raw_local = positions_xy_raw[_sel]
+            _norm_local = positions_xy_norm[_sel]
+            _raw_span = float(np.max(np.ptp(_raw_local, axis=0)))
+            _norm_span = float(np.max(np.ptp(_norm_local, axis=0)))
+            article_local_span_raw[_i] = _raw_span if np.isfinite(_raw_span) else 0.0
+            article_local_span_norm[_i] = _norm_span if np.isfinite(_norm_span) else 0.0
+    global_norm_span = float(np.max(np.ptp(positions_xy_norm, axis=0)))
+    if not np.isfinite(global_norm_span) or global_norm_span <= 1e-12:
+        global_norm_span = float(np.max(target_xy_span))
+    min_norm_span = max(1e-3, global_norm_span * 0.02)
+    max_segment_norm_len = max(1e-3, global_norm_span * 0.20)
+    max_total_path_norm_span = max(1e-3, global_norm_span * 0.90)
+    max_target_path_norm_span = max(1e-3, global_norm_span * 0.60)
+
+    # Normalize path XY via local span mapping and anchor each path to source article XY.
     compatible_paths: Dict[int, np.ndarray] = {}
     skipped_invalid_paths = 0
-    anchored_fallback_paths = 0
-    max_allowed_norm_span = float(np.max(target_xy_span) * 2.0)
+    clipped_segment_count = 0
+    clipped_path_span_count = 0
     for _idx, _path in walker_paths_pure.items():
+        idx = int(_idx)
+        if idx < 0 or idx >= n_pts:
+            skipped_invalid_paths += 1
+            continue
         if _path.ndim != 2 or _path.shape[0] < 2 or _path.shape[1] < 2:
             skipped_invalid_paths += 1
             continue
-        _xy = np.asarray(_path[:, 0:2], dtype=float)
+        _path_arr = np.asarray(_path, dtype=float)
+        _xy = np.asarray(_path_arr[:, 0:2], dtype=float)
         finite_rows = np.isfinite(_xy).all(axis=1)
-        _xy_finite = _xy[finite_rows]
-        if _xy_finite.shape[0] < 2:
+        if _path_arr.shape[1] > 2:
+            finite_rows = finite_rows & np.isfinite(_path_arr[:, 2])
+        _path_finite = _path_arr[finite_rows]
+        if _path_finite.shape[0] < 2:
             skipped_invalid_paths += 1
             continue
-        path_span = float(np.max(np.ptp(_xy_finite, axis=0)))
-        is_compatible = (
-            np.isfinite(path_span)
-            and article_span_ref > 1e-12
-            and path_span <= (article_span_ref * 10.0)
-        )
-        _path_norm = np.asarray(_path, dtype=float).copy()
-        if is_compatible:
-            _path_norm[:, 0:2] = (_path_norm[:, 0:2] - xy_center) * xy_scale
-        else:
-            # Fallback: preserve local trajectory shape but anchor to its source article.
-            anchor_xy = np.asarray(positions_3d[_idx, 0:2], dtype=float)
-            start_xy = np.asarray(_path_norm[0, 0:2], dtype=float)
-            _path_norm[:, 0:2] = (_path_norm[:, 0:2] - start_xy) * xy_scale + anchor_xy
-            norm_finite = np.isfinite(_path_norm[:, 0:2]).all(axis=1)
-            norm_xy = _path_norm[norm_finite, 0:2]
-            if norm_xy.shape[0] >= 2:
-                norm_span = float(np.max(np.ptp(norm_xy, axis=0)))
-                if np.isfinite(norm_span) and norm_span > max_allowed_norm_span and norm_span > 1e-9:
-                    shrink = max_allowed_norm_span / norm_span
-                    _path_norm[:, 0:2] = anchor_xy + ((_path_norm[:, 0:2] - anchor_xy) * shrink)
-            anchored_fallback_paths += 1
-        compatible_paths[int(_idx)] = _path_norm
+        raw_xy = np.asarray(_path_finite[:, 0:2], dtype=float)
+        raw_anchor = np.asarray(raw_xy[0], dtype=float)
+        raw_rel = raw_xy - raw_anchor
+        raw_span = float(np.max(np.ptp(raw_xy, axis=0)))
+        local_raw_span = float(article_local_span_raw[idx])
+        local_norm_span = float(article_local_span_norm[idx])
+        if not np.isfinite(raw_span) or raw_span <= 1e-12:
+            skipped_invalid_paths += 1
+            continue
+        if not np.isfinite(local_raw_span) or local_raw_span <= 1e-12:
+            local_raw_span = raw_span
+        if not np.isfinite(local_norm_span) or local_norm_span <= 1e-12:
+            local_norm_span = min(global_norm_span, max_target_path_norm_span)
+        target_span = local_norm_span * (raw_span / local_raw_span)
+        if not np.isfinite(target_span):
+            skipped_invalid_paths += 1
+            continue
+        target_span = float(np.clip(target_span, min_norm_span, max_target_path_norm_span))
+        scale_local = target_span / max(raw_span, 1e-12)
+        anchor_xy = np.asarray(positions_xy_norm[idx], dtype=float)
+        norm_xy = anchor_xy + (raw_rel * scale_local)
+        if norm_xy.shape[0] >= 2:
+            clipped_xy = [np.asarray(norm_xy[0], dtype=float)]
+            for _pt in norm_xy[1:]:
+                prev = clipped_xy[-1]
+                step = np.asarray(_pt, dtype=float) - prev
+                step_len = float(np.linalg.norm(step))
+                if np.isfinite(step_len) and step_len > max_segment_norm_len and step_len > 1e-12:
+                    _pt = prev + (step * (max_segment_norm_len / step_len))
+                    clipped_segment_count += 1
+                clipped_xy.append(np.asarray(_pt, dtype=float))
+            norm_xy = np.asarray(clipped_xy, dtype=float)
+        norm_span = float(np.max(np.ptp(norm_xy, axis=0)))
+        if np.isfinite(norm_span) and norm_span > max_total_path_norm_span and norm_span > 1e-12:
+            shrink = max_total_path_norm_span / norm_span
+            norm_xy = anchor_xy + ((norm_xy - anchor_xy) * shrink)
+            clipped_path_span_count += 1
+        _path_norm = np.asarray(_path_finite, dtype=float).copy()
+        _path_norm[:, 0:2] = norm_xy
+        compatible_paths[idx] = _path_norm
     walker_paths_pure = compatible_paths
     normalize_paths = bool(walker_paths_pure)
     if skipped_invalid_paths > 0:
@@ -4191,15 +4236,20 @@ def create_monolith_cockpit(
             "[MONOLITH] Skipped invalid walker paths during XY normalization: "
             f"{skipped_invalid_paths}"
         )
-    if anchored_fallback_paths > 0:
+    if clipped_segment_count > 0:
         print(
-            "[MONOLITH] Applied anchored fallback normalization to walker paths: "
-            f"{anchored_fallback_paths}"
+            "[MONOLITH] Clipped long walker path segments during XY normalization: "
+            f"{clipped_segment_count}"
+        )
+    if clipped_path_span_count > 0:
+        print(
+            "[MONOLITH] Capped walker path span during XY normalization: "
+            f"{clipped_path_span_count}"
         )
     if not normalize_paths and len(walker_paths_raw) > 0:
         print(
-            "[MONOLITH] No compatible walker paths after per-path frame gating; "
-            f"article_span={article_span_ref:.6f}"
+            "[MONOLITH] No compatible walker paths after per-path normalization guardrails; "
+            f"raw_paths={len(walker_paths_raw)}"
         )
     print(
         "[MONOLITH] Applied deterministic per-axis XY normalization: "
@@ -5463,8 +5513,12 @@ def create_monolith_cockpit(
         raise DimensionalCollapseError("CRITICAL: Point cloud Z-variance collapsed.")
     if float(np.ptp(np.asarray(energy_values_for_terrain, dtype=float))) <= 1e-2:
         raise DimensionalCollapseError("CRITICAL: Terrain stress gradient collapsed.")
-    if len(walker_paths_pure) <= 0:
+    if len(walker_paths_raw) <= 0:
         raise DimensionalCollapseError("CRITICAL: Walker paths not loaded.")
+    if len(walker_paths_pure) <= 0:
+        raise DimensionalCollapseError(
+            "CRITICAL: Walker paths loaded but rejected by normalization guardrails."
+        )
 
     # Final validation gate: fail fast if canonical zone semantics or synthesis NMI drift.
     validation_errors = []

@@ -233,3 +233,52 @@ def test_axis_labels_fallback_when_spectral_absent(monkeypatch, tmp_path):
     assert str(fig.layout.scene.xaxis.title.text) == "Semantic Axis X"
     assert str(fig.layout.scene.yaxis.title.text) == "Semantic Axis Y"
     assert str(fig.layout.scene.zaxis.title.text) == "Semantic Axis Z"
+
+
+def test_extreme_mismatched_path_scale_is_bounded_relative_to_article_manifold(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    exp.walker_paths[1] = np.array(
+        [
+            [1_000_000.0, -1_000_000.0, 0.0],
+            [1_200_000.0, -800_000.0, 0.1],
+            [1_400_000.0, -1_100_000.0, 0.2],
+        ],
+        dtype=float,
+    )
+    output_path = tmp_path / "extreme_mismatch.html"
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    fig = create_monolith_cockpit(
+        exp=exp,
+        output_path=output_path,
+        physics_mode="synthesis",
+        show_terrain=False,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+
+    article_traces = [t for t in fig.data if str(getattr(t, "name", "")) == "Articles"]
+    assert article_traces, "Expected article manifold trace"
+    article_trace = article_traces[0]
+    article_x = np.asarray(article_trace.x, dtype=float)
+    article_y = np.asarray(article_trace.y, dtype=float)
+    article_xy_span = float(max(np.ptp(article_x), np.ptp(article_y)))
+    assert np.isfinite(article_xy_span) and article_xy_span > 0.0
+
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Walker Broken", "Walker Trapped"}
+    path_traces = [
+        t
+        for t in fig.data
+        if str(getattr(t, "mode", "")) == "lines" and str(getattr(t, "name", "")) in path_names
+    ]
+    assert path_traces, "Expected rendered path traces"
+
+    max_span_ratio = 2.01
+    for t in path_traces:
+        tx = np.asarray(t.x, dtype=float)
+        ty = np.asarray(t.y, dtype=float)
+        path_xy_span = float(max(np.ptp(tx), np.ptp(ty)))
+        assert np.isfinite(path_xy_span)
+        assert path_xy_span <= article_xy_span * max_span_ratio
