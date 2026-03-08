@@ -58,9 +58,9 @@ def test_article_z_uses_surface_interpolator_path_when_terrain_exists():
     assert "interp_terrain_z = RegularGridInterpolator(" in s
 
     # Surface-Z helper must route through the interpolator when available.
-    assert "def get_surface_z(x_coords, y_coords, offset=0.0):" in s
+    assert "def get_surface_z(x_coords, y_coords, offset=0.0, preserve_nan=False):" in s
     assert "if interp_terrain_z is not None:" in s
-    assert "interp_z = interp_terrain_z(points_for_interp)" in s
+    assert "interp_terrain_z(points_for_interp)" in s
 
     # Article markers should consume surface-anchored marker Z.
     assert "article_marker_z = np.asarray(energy_values_for_points, dtype=float)" in s

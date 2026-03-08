@@ -311,6 +311,7 @@ class ExperimentData:
     seed: int
     n_articles: int
     features: np.ndarray
+    logits: Optional[np.ndarray] = None
     integrated: Optional[np.ndarray] = None
     dirichlet_fused: Optional[np.ndarray] = None
     dirichlet_fused_std: Optional[np.ndarray] = None
@@ -487,6 +488,10 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         seed = 42
 
     # Optional arrays
+    logits = None
+    if (experiment_dir / "logits.npy").exists():
+        logits = np.load(experiment_dir / "logits.npy")
+
     integrated = None
     if (experiment_dir / "integrated_vectors.npy").exists():
         integrated = np.load(experiment_dir / "integrated_vectors.npy")
@@ -613,9 +618,17 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
 
     # Smart Discovery for checkpoints
     checkpoint_dir = None
-    candidates = list(experiment_dir.rglob("T0_substrate.npy"))
-    if candidates:
-        checkpoint_dir = candidates[0].parent
+    checkpoint_candidates = [
+        "T0_substrate.npy",
+        "T2_kernel_projections.npz",
+        "T1.5_spectral_state.npz",
+        "T3_topology.npz",
+    ]
+    for marker in checkpoint_candidates:
+        candidates = list(experiment_dir.rglob(marker))
+        if candidates:
+            checkpoint_dir = candidates[0].parent
+            break
 
     if checkpoint_dir and checkpoint_dir.exists():
         # T0: Raw logits [N, 8, 3]
@@ -646,13 +659,20 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     if spectral_probe_magnitudes is None and cp_t15_spectral is not None:
         spectral_probe_magnitudes = cp_t15_spectral
 
-        # T3: Blinker/topology
+    # T3: Blinker/topology
+    if checkpoint_dir and checkpoint_dir.exists():
         t3_path = checkpoint_dir / "T3_topology.npz"
         if t3_path.exists():
             t3_data = np.load(t3_path)
             if 'dirichlet_fused' in t3_data.files:
                 cp_t3_blinker = t3_data['dirichlet_fused']
-                print(f"[MONOLITH] Loaded T3 blinker: {cp_t3_blinker.shape}")
+                print(f"[MONOLITH] Loaded T3 blinker (dirichlet_fused): {cp_t3_blinker.shape}")
+            elif 'bond_matrix' in t3_data.files:
+                cp_t3_blinker = t3_data['bond_matrix']
+                print(f"[MONOLITH] Loaded T3 blinker (bond_matrix fallback): {cp_t3_blinker.shape}")
+            elif 'crack_matrix' in t3_data.files:
+                cp_t3_blinker = t3_data['crack_matrix']
+                print(f"[MONOLITH] Loaded T3 blinker (crack_matrix fallback): {cp_t3_blinker.shape}")
 
     # Ground truth labels (from article metadata or corpus file)
     ground_truth_labels = None
@@ -717,6 +737,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         seed=seed,
         n_articles=n_articles,
         features=features,
+        logits=logits,
         integrated=integrated,
         dirichlet_fused=dirichlet_fused,
         dirichlet_fused_std=dirichlet_fused_std,
@@ -1117,6 +1138,8 @@ def render_terrain_surface(
     global_density_median: float = 0.5, # For consistent zone mapping
     global_stress_median: float = 0.5,  # For consistent zone mapping
     opacity: float = 0.9,               # New opacity parameter
+    rupture_segments_2d: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    rupture_tear_radius_scale: float = 0.02,
 ) -> Tuple[Optional[Any], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     ASTER v3.2 BI-AXIAL TERRAIN SURFACE
@@ -1178,6 +1201,34 @@ def render_terrain_surface(
             support_mask = (simplex >= 0).reshape(Xi.shape)
     except Exception:
         support_mask = None
+    tear_mask = np.zeros(Xi.shape, dtype=bool)
+    if rupture_segments_2d:
+        tear_radius = max(x_range_safe, y_range_safe) * float(max(rupture_tear_radius_scale, 1e-6))
+        tear_radius_sq = tear_radius * tear_radius
+        for seg in rupture_segments_2d:
+            try:
+                p0 = np.asarray(seg[0], dtype=float).reshape(2)
+                p1 = np.asarray(seg[1], dtype=float).reshape(2)
+                if not (np.isfinite(p0).all() and np.isfinite(p1).all()):
+                    continue
+                vx = p1[0] - p0[0]
+                vy = p1[1] - p0[1]
+                seg_len_sq = (vx * vx) + (vy * vy)
+                if seg_len_sq <= 1e-12:
+                    dx = Xi - p0[0]
+                    dy = Yi - p0[1]
+                    dist_sq = (dx * dx) + (dy * dy)
+                else:
+                    t = ((Xi - p0[0]) * vx + (Yi - p0[1]) * vy) / seg_len_sq
+                    t = np.clip(t, 0.0, 1.0)
+                    proj_x = p0[0] + t * vx
+                    proj_y = p0[1] + t * vy
+                    dx = Xi - proj_x
+                    dy = Yi - proj_y
+                    dist_sq = (dx * dx) + (dy * dy)
+                tear_mask |= (dist_sq <= tear_radius_sq)
+            except Exception:
+                continue
 
     # =========================================
     # 1. THE GEOMETRY (Z-AXIS) = STRESS
@@ -1235,6 +1286,8 @@ def render_terrain_surface(
         pass
     if support_mask is not None:
         z_geometry = np.where(support_mask, z_geometry, np.nan)
+    if np.any(tear_mask):
+        z_geometry = np.where(tear_mask, np.nan, z_geometry)
     # =========================================
     # 2. THE SKIN (COLOR) = CONTINUOUS MANIFOLD GRADIENT
     # =========================================
@@ -1296,6 +1349,8 @@ def render_terrain_surface(
         terrain_scalar_grid = np.clip(terrain_scalar_grid, 0.0, 1.0)
         if support_mask is not None:
             terrain_scalar_grid = np.where(support_mask, terrain_scalar_grid, np.nan)
+        if np.any(tear_mask):
+            terrain_scalar_grid = np.where(tear_mask, np.nan, terrain_scalar_grid)
 
         # Use continuous manifold colorscale
         colorscale = get_continuous_manifold_colorscale()
@@ -1321,6 +1376,8 @@ def render_terrain_surface(
         )
         if support_mask is not None:
             color_values = np.where(support_mask, color_values, np.nan)
+        if np.any(tear_mask):
+            color_values = np.where(tear_mask, np.nan, color_values)
         colorscale = get_terrain_colorscale()
         surfacecolor = color_values
         cmin, cmax = 0, 1
@@ -1344,6 +1401,38 @@ def render_terrain_surface(
         cmin, cmax = None, None
         colorbar_config = dict(title="Height", len=0.5, x=1.02)
 
+    z_finite = z_geometry[np.isfinite(z_geometry)]
+    contour_cfg = dict(
+        z=dict(
+            show=True,
+            usecolormap=False,
+            color="black",
+            width=2,
+            highlightcolor="white",
+            project_z=False,
+        )
+    )
+    if z_finite.size >= 2:
+        z_min = float(np.min(z_finite))
+        z_max = float(np.max(z_finite))
+        z_span = z_max - z_min
+        if z_span > 1e-9:
+            n_iso = 30
+            z_step = z_span / float(n_iso)
+            contour_cfg = dict(
+                z=dict(
+                    show=True,
+                    start=z_min,
+                    end=z_max,
+                    size=z_step,
+                    usecolormap=False,
+                    color="black",
+                    width=2,
+                    highlightcolor="white",
+                    project_z=False,
+                )
+            )
+
     return go.Surface(
         x=Xi, y=Yi, z=z_geometry,
         surfacecolor=surfacecolor,
@@ -1360,9 +1449,7 @@ def render_terrain_surface(
             fresnel=0.1,
         ),
         lightposition=dict(x=100, y=100, z=300),
-        contours=dict(
-            z=dict(show=True, usecolormap=True, width=2, highlightcolor='white'),
-        ),
+        contours=contour_cfg,
         hoverinfo='skip',
         name='Energy Terrain',
     ), Xi, Yi, z_geometry, grid_density if 'grid_density' in locals() else None, grid_stress_color if 'grid_stress_color' in locals() else None
@@ -1398,7 +1485,7 @@ def render_terrain_contours(
     # Three levels demarcate Void / Swamp / Bridge zone boundaries while
     # preserving the smooth gradient (no discrete blocks).
     contour_levels = [0.25, 0.5, 0.75]
-    z_offset = 0.02 * (z_geometry.max() - z_geometry.min()) if z_geometry.size > 0 else 0.02
+    z_offset = 0.06 * (z_geometry.max() - z_geometry.min()) if z_geometry.size > 0 else 0.06
 
     # Visual style per level: inner boundary dim, outer boundaries bright
     density_level_styles = {
@@ -1443,8 +1530,9 @@ def render_terrain_contours(
                     order = np.argsort(angles)
                     traces.append(go.Scatter3d(
                         x=ex[order], y=ey[order], z=ez[order],
-                        mode='markers',
-                        marker=dict(size=style['size'], color=style['color']),
+                        mode='lines+markers',
+                        line=dict(color=style['color'], width=max(2, style['size'])),
+                        marker=dict(size=max(3, style['size'] + 1), color=style['color']),
                         hoverinfo='skip',
                         showlegend=True,
                         name=f'Density isoline {level:.0%}',
@@ -1464,8 +1552,9 @@ def render_terrain_contours(
                     order = np.argsort(angles)
                     traces.append(go.Scatter3d(
                         x=ex[order], y=ey[order], z=ez[order],
-                        mode='markers',
-                        marker=dict(size=style['size'], color=style['color']),
+                        mode='lines+markers',
+                        line=dict(color=style['color'], width=max(2, style['size'])),
+                        marker=dict(size=max(3, style['size'] + 1), color=style['color']),
                         hoverinfo='skip',
                         showlegend=True,
                         name=f'Stress isoline {level:.0%}',
@@ -1925,6 +2014,9 @@ def render_phantom_paths_3d(
     surface_z_func=None,
     article_metadata: Optional[List[Dict]] = None,
     spectral_evr: Optional[np.ndarray] = None,
+    spectral_probe_magnitudes: Optional[np.ndarray] = None,
+    hysteresis_memory: Optional[np.ndarray] = None,
+    path_ablation_mode: str = "none",
 ) -> List[Any]:
     """
     Render real Track-4 trajectories (no synthetic centroid stubs).
@@ -1957,12 +2049,119 @@ def render_phantom_paths_3d(
     max_terrain_z = max(max_terrain_z, 1e-6)
     z_cap = max_terrain_z * 2.0
 
+    mode_key = str(path_ablation_mode or "none").strip().lower()
+    thermodynamic_mode = mode_key == "thermodynamic"
+    semantic_tether_mode = mode_key == "semantic_tether"
+    drape_paths = os.environ.get("MONOLITH_DRAPE_PATHS", "0").strip() == "1"
+
+    def _resample_polyline_xy(path_xy: np.ndarray, n_steps: int = 120) -> Tuple[np.ndarray, np.ndarray]:
+        pts = np.asarray(path_xy, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] < 2:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        valid = np.isfinite(pts).all(axis=1)
+        pts = pts[valid]
+        if pts.shape[0] < 2:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        s = np.concatenate(([0.0], np.cumsum(seg)))
+        if s[-1] <= 1e-12:
+            return np.full(n_steps, pts[0, 0], dtype=float), np.full(n_steps, pts[0, 1], dtype=float)
+        sq = np.linspace(0.0, s[-1], n_steps, dtype=float)
+        xq = np.interp(sq, s, pts[:, 0])
+        yq = np.interp(sq, s, pts[:, 1])
+        return xq, yq
+
+    def _split_finite_segments(path_xyz: np.ndarray) -> List[np.ndarray]:
+        pts = np.asarray(path_xyz, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] < 3:
+            return []
+        finite = np.isfinite(pts[:, :3]).all(axis=1)
+        if not np.any(finite):
+            return []
+        segments: List[np.ndarray] = []
+        start = None
+        for j, is_valid in enumerate(finite):
+            if is_valid and start is None:
+                start = j
+            elif (not is_valid) and start is not None:
+                seg = pts[start:j, :3]
+                if seg.shape[0] >= 2:
+                    segments.append(seg)
+                start = None
+        if start is not None:
+            seg = pts[start:, :3]
+            if seg.shape[0] >= 2:
+                segments.append(seg)
+        return segments
+
+    def _dominant_probe_label(article_idx: int) -> str:
+        if (
+            spectral_probe_magnitudes is None
+            or not isinstance(spectral_probe_magnitudes, np.ndarray)
+            or spectral_probe_magnitudes.ndim < 2
+            or article_idx < 0
+            or article_idx >= spectral_probe_magnitudes.shape[0]
+        ):
+            return "Unknown Axis"
+        mags = np.asarray(spectral_probe_magnitudes[article_idx], dtype=float)
+        if mags.size <= 0 or not np.any(np.isfinite(mags)):
+            return "Unknown Axis"
+        mags = np.nan_to_num(mags, nan=0.0, posinf=0.0, neginf=0.0)
+        dominant_idx = int(np.argmax(np.abs(mags)))
+        if 0 <= dominant_idx < len(PROBE_LABELS):
+            return PROBE_LABELS[dominant_idx]
+        return f"Axis {dominant_idx}"
+
+    def _asymmetry_delta(path_source_idx: int, end_xyz: np.ndarray) -> Optional[Dict[str, float]]:
+        if hysteresis_memory is None:
+            return None
+        try:
+            mem = np.asarray(hysteresis_memory, dtype=float)
+            if mem.ndim != 2 or mem.shape[0] != mem.shape[1] or mem.shape[0] < 2:
+                return None
+            if spectral_probe_magnitudes is None or not isinstance(spectral_probe_magnitudes, np.ndarray):
+                return None
+            if path_source_idx < 0 or path_source_idx >= len(positions_3d):
+                return None
+            if end_xyz is None or np.asarray(end_xyz).size < 3:
+                return None
+
+            endpoint = np.asarray(end_xyz[:3], dtype=float)
+            if not np.isfinite(endpoint).all():
+                return None
+            d_to_articles = np.linalg.norm(positions_3d[:, :3] - endpoint.reshape(1, 3), axis=1)
+            target_article_idx = int(np.argmin(d_to_articles))
+
+            n_bots = mem.shape[0]
+            if (
+                path_source_idx >= spectral_probe_magnitudes.shape[0]
+                or target_article_idx >= spectral_probe_magnitudes.shape[0]
+                or spectral_probe_magnitudes.shape[1] < 1
+            ):
+                return None
+            src_mags = np.asarray(spectral_probe_magnitudes[path_source_idx], dtype=float)
+            tgt_mags = np.asarray(spectral_probe_magnitudes[target_article_idx], dtype=float)
+            src_idx = int(np.argmax(np.abs(src_mags[:n_bots])))
+            tgt_idx = int(np.argmax(np.abs(tgt_mags[:n_bots])))
+            forward = float(mem[src_idx, tgt_idx])
+            reverse = float(mem[tgt_idx, src_idx])
+            delta = abs(forward - reverse)
+            norm = delta / (abs(forward) + abs(reverse) + 1e-9)
+            return {
+                "delta": float(delta),
+                "norm": float(norm),
+                "start_probe": float(src_idx),
+                "target_probe": float(tgt_idx),
+            }
+        except Exception:
+            return None
+
     for article_idx, path in walker_paths.items():
         i = int(article_idx)
         if i < 0 or i >= n_articles:
             continue
         v_info = phantom_verdicts[i]
-        verdict = v_info.get("verdict", "UNKNOWN")
+        verdict = str(v_info.get("verdict", "UNKNOWN")).upper()
         walker_state = str(v_info.get("walker_state", "success")).lower()
         meta = article_metadata[i] if article_metadata and i < len(article_metadata) else {}
         title = str(meta.get('title', f'Article {i}'))[:60]
@@ -1982,25 +2181,250 @@ def render_phantom_paths_3d(
         rendered_path[0, 1] = float(positions_3d[i, 1])
         rendered_path[0, 2] = source_z
         all_path_starts.append(rendered_path[0, :3].copy())
+        if semantic_tether_mode:
+            finite_rows = np.isfinite(rendered_path[:, :3]).all(axis=1)
+            finite_path = rendered_path[finite_rows]
+            if finite_path.shape[0] < 2:
+                continue
+            start_xyz = finite_path[0, :3].astype(float)
+            end_xyz = finite_path[-1, :3].astype(float)
+            if callable(surface_z_func):
+                try:
+                    tether_z = np.asarray(
+                        surface_z_func(
+                            np.array([start_xyz[0], end_xyz[0]], dtype=float),
+                            np.array([start_xyz[1], end_xyz[1]], dtype=float),
+                            offset=0.01,
+                            preserve_nan=True,
+                        ),
+                        dtype=float,
+                    )
+                    if tether_z.shape[0] == 2 and np.isfinite(tether_z).all():
+                        start_xyz[2] = float(tether_z[0])
+                        end_xyz[2] = float(tether_z[1])
+                except Exception:
+                    pass
+            if verdict == "HONEST":
+                path_color = "#7FFBFF"
+                line_width = 2
+                line_opacity = 0.15
+                legend_group = "semantic-tether-honest"
+                legend_name = "Honest Tether"
+            elif verdict == "TAUTOLOGY":
+                path_color = "#9A9A9A"
+                line_width = 2
+                line_opacity = 0.18
+                legend_group = "semantic-tether-tautology"
+                legend_name = "Tautology Tether"
+            elif verdict == "PHANTOM":
+                path_color = "#FF00FF"
+                line_width = 7
+                line_opacity = 0.96
+                legend_group = "semantic-tether-phantom"
+                legend_name = "Phantom Tether"
+            else:
+                path_color = "#FFD700"
+                line_width = 3
+                line_opacity = 0.4
+                legend_group = "semantic-tether-unknown"
+                legend_name = "Unknown Tether"
+
+            traces.append(go.Scatter3d(
+                x=[start_xyz[0], end_xyz[0]],
+                y=[start_xyz[1], end_xyz[1]],
+                z=[start_xyz[2], end_xyz[2]],
+                mode='lines',
+                line=dict(color=path_color, width=line_width),
+                opacity=line_opacity,
+                name=legend_name,
+                text=[hover_text, hover_text],
+                hoverinfo='skip',
+                legendgroup=legend_group,
+                showlegend=legend_group not in legend_shown,
+            ))
+            legend_shown.add(legend_group)
+
+            asym = _asymmetry_delta(i, end_xyz)
+            if asym is not None:
+                asym_delta = float(asym["delta"])
+                asym_norm = float(asym["norm"])
+                if asym_norm <= 0.05:
+                    asym_color = "#8A8A8A"
+                    asym_width = 1
+                    asym_opacity = 0.10
+                    asym_name = "Symmetric Tether"
+                elif asym_norm >= 0.35:
+                    asym_color = "#00FFFF"
+                    asym_width = 7
+                    asym_opacity = 0.96
+                    asym_name = "Asymmetric Tether"
+                else:
+                    asym_color = "#4FD1FF"
+                    asym_width = 4
+                    asym_opacity = 0.55
+                    asym_name = "Moderate Asymmetry"
+                asym_hover = f"{hover_text}<br>[ASYMMETRY DELTA: {asym_delta:.3f}]"
+                traces.append(go.Scatter3d(
+                    x=[start_xyz[0], end_xyz[0]],
+                    y=[start_xyz[1], end_xyz[1]],
+                    z=[start_xyz[2], end_xyz[2]],
+                    mode='lines',
+                    line=dict(color=asym_color, width=asym_width),
+                    opacity=asym_opacity,
+                    name=asym_name,
+                    text=[asym_hover, asym_hover],
+                    hoverinfo='skip',
+                    legendgroup='semantic-asymmetry',
+                    showlegend='semantic-asymmetry' not in legend_shown,
+                ))
+                legend_shown.add('semantic-asymmetry')
+
+            if verdict == "PHANTOM":
+                mid_xyz = (start_xyz + end_xyz) / 2.0
+                shear_axis = _dominant_probe_label(i)
+                asym_note = ""
+                if asym is not None:
+                    asym_note = f" | Δ={float(asym['delta']):.3f}"
+                shear_text = f"[SHEAR: {shear_axis}{asym_note}]"
+                traces.append(go.Scatter3d(
+                    x=[mid_xyz[0]],
+                    y=[mid_xyz[1]],
+                    z=[mid_xyz[2] + 0.08],
+                    mode='text',
+                    text=[shear_text],
+                    textfont=dict(
+                        color="#FF5CFF",
+                        size=12,
+                        family="JetBrains Mono, monospace",
+                    ),
+                    name="Ideological Shear",
+                    hovertext=[f"{hover_text}<br>{shear_text}"],
+                    hovertemplate="%{hovertext}<extra></extra>",
+                    legendgroup="semantic-shear-labels",
+                    showlegend=False,
+                ))
+            continue
+        if thermodynamic_mode:
+            scorch_x, scorch_y = _resample_polyline_xy(rendered_path[:, :2], n_steps=120)
+            if scorch_x.size < 2:
+                continue
+            if callable(surface_z_func):
+                try:
+                    scorch_z = np.asarray(
+                        surface_z_func(
+                            scorch_x,
+                            scorch_y,
+                            offset=0.015,
+                            preserve_nan=True,
+                        ),
+                        dtype=float,
+                    )
+                except Exception:
+                    scorch_z = np.full_like(scorch_x, source_z + 0.015, dtype=float)
+            else:
+                scorch_z = np.full_like(scorch_x, source_z + 0.015, dtype=float)
+
+            if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
+                path_color = ("#00FFFF" if verdict == "HONEST" else "#FF2DFF" if verdict == "PHANTOM" else "#39FF14")
+                legend_group = f'thermo-scorch-{verdict.lower()}'
+                legend_name = f'{verdict.capitalize()} Scorch'
+                traces.append(go.Scatter3d(
+                    x=scorch_x, y=scorch_y, z=scorch_z, mode='lines',
+                    line=dict(color='rgba(0,0,0,0.62)', width=12),
+                    opacity=0.78,
+                    name=legend_name,
+                    text=[hover_text] * len(scorch_x),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=False,
+                ))
+                traces.append(go.Scatter3d(
+                    x=scorch_x, y=scorch_y, z=scorch_z, mode='lines',
+                    line=dict(color=path_color, width=7),
+                    opacity=1.0,
+                    name=legend_name,
+                    text=[hover_text] * len(scorch_x),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in legend_shown,
+                ))
+                legend_shown.add(legend_group)
+            elif verdict == "RUPTURE":
+                rupture_color = "#FFFFFF"
+                legend_group = "thermo-tear-rupture"
+                legend_name = "Rupture Tear"
+                traces.append(go.Scatter3d(
+                    x=scorch_x, y=scorch_y, z=scorch_z, mode='lines',
+                    line=dict(color='rgba(120,0,0,0.75)', width=12),
+                    opacity=0.85,
+                    name=legend_name,
+                    text=[hover_text] * len(scorch_x),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=False,
+                ))
+                traces.append(go.Scatter3d(
+                    x=scorch_x, y=scorch_y, z=scorch_z, mode='lines',
+                    line=dict(color=rupture_color, width=6, dash='dot'),
+                    opacity=1.0,
+                    name=legend_name,
+                    text=[hover_text] * len(scorch_x),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in legend_shown,
+                ))
+                legend_shown.add(legend_group)
+            continue
+
         # Keep true trajectory endpoint from dynamics; only enforce finite values.
-        rendered_path = np.nan_to_num(rendered_path, nan=0.0, posinf=0.0, neginf=0.0)
-        # Keep paths grounded to the same System-2 terrain coordinate space.
-        if callable(surface_z_func):
-            try:
-                terrain_z = np.asarray(
-                    surface_z_func(rendered_path[:, 0], rendered_path[:, 1], offset=0.0),
-                    dtype=float
-                )
-                if terrain_z.shape == rendered_path[:, 2].shape:
-                    rendered_path[:, 2] = terrain_z
-                    rendered_path[0, 2] = source_z
-            except Exception:
-                pass
-        # Atmospheric cap: prevent rogue trajectories from blowing out camera scale.
-        rendered_path[:, 2] = np.clip(rendered_path[:, 2], -z_cap, z_cap)
+        path_segments = _split_finite_segments(rendered_path[:, :3])
+        if not path_segments:
+            continue
+        if drape_paths and callable(surface_z_func):
+            for seg_idx in range(len(path_segments)):
+                seg = path_segments[seg_idx].copy()
+                try:
+                    terrain_z = np.asarray(
+                        surface_z_func(seg[:, 0], seg[:, 1], offset=0.0),
+                        dtype=float
+                    )
+                    if terrain_z.shape == seg[:, 2].shape and np.isfinite(terrain_z).any():
+                        seg[:, 2] = terrain_z
+                        if seg_idx == 0:
+                            seg[0, 2] = source_z
+                except Exception:
+                    pass
+                seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
+                path_segments[seg_idx] = seg
+        else:
+            for seg_idx in range(len(path_segments)):
+                seg = path_segments[seg_idx].copy()
+                seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
+                path_segments[seg_idx] = seg
+        end_xyz = path_segments[-1][-1, :3] if path_segments else None
 
         if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
-            path_color = ("#00F0FF" if verdict == "HONEST" else "#FF00FF" if verdict == "PHANTOM" else "#FFFF00")
+            asym = _asymmetry_delta(i, end_xyz)
+            if asym is not None:
+                delta_val = float(asym["delta"])
+                norm_val = float(asym["norm"])
+                if norm_val <= 0.05:
+                    path_color = "#8A8A8A"
+                    width_val = 1
+                    opacity_val = 0.10
+                elif norm_val >= 0.35:
+                    path_color = "#00FFFF"
+                    width_val = 7
+                    opacity_val = 0.95
+                else:
+                    path_color = "#4FD1FF"
+                    width_val = 3
+                    opacity_val = 0.55
+                hover_text = f"{hover_text}<br>[ASYMMETRY DELTA: {delta_val:.3f}]"
+            else:
+                path_color = ("#00F0FF" if verdict == "HONEST" else "#FF00FF" if verdict == "PHANTOM" else "#FFFF00")
+                width_val = 3
+                opacity_val = 0.8
             legend_group = f'path-{verdict.lower()}'
             legend_name = f'{verdict.capitalize()} Path'
             # Optional forensic probe: print exact rendered coordinates for the first
@@ -2014,29 +2438,31 @@ def render_phantom_paths_3d(
                 print(f"[RAW_MATRIX_PROBE] Path Midpoint (Vertex {mid_idx}): {rendered_path[mid_idx, :3].tolist()}")
                 print(f"[RAW_MATRIX_PROBE] Path End (Vertex {len(rendered_path)-1}): {rendered_path[-1, :3].tolist()}")
                 debug_printed += 1
-            traces.append(go.Scatter3d(
-                x=rendered_path[:, 0], y=rendered_path[:, 1], z=rendered_path[:, 2], mode='lines',
-                line=dict(color=path_color, width=3), opacity=0.8,
-                name=legend_name,
-                text=[hover_text] * len(rendered_path),
-                hovertemplate="%{text}<extra></extra>",
-                legendgroup=legend_group,
-                showlegend=legend_group not in legend_shown,
-            ))
+            for seg_idx, seg in enumerate(path_segments):
+                traces.append(go.Scatter3d(
+                    x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode='lines',
+                    line=dict(color=path_color, width=width_val), opacity=opacity_val,
+                    name=legend_name,
+                    text=[hover_text] * len(seg),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
+                ))
             legend_shown.add(legend_group)
         elif verdict == "RUPTURE":
             rupture_color = "#FF2222" if walker_state == "broken" else "#FF00FF"
             legend_group = 'path-rupture-broken' if walker_state == "broken" else 'path-rupture-trapped'
             legend_name = 'Walker Broken' if walker_state == "broken" else 'Walker Trapped'
-            traces.append(go.Scatter3d(
-                x=rendered_path[:, 0], y=rendered_path[:, 1], z=rendered_path[:, 2], mode='lines',
-                line=dict(color=rupture_color, width=4 if walker_state == "broken" else 2),
-                name=legend_name,
-                text=[hover_text] * len(rendered_path),
-                hovertemplate="%{text}<extra></extra>",
-                legendgroup=legend_group,
-                showlegend=legend_group not in legend_shown,
-            ))
+            for seg_idx, seg in enumerate(path_segments):
+                traces.append(go.Scatter3d(
+                    x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode='lines',
+                    line=dict(color=rupture_color, width=4 if walker_state == "broken" else 2),
+                    name=legend_name,
+                    text=[hover_text] * len(seg),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
+                ))
             legend_shown.add(legend_group)
 
     # ANTI-SINGULARITY LOCK: renderer must never collapse all starts to one origin.
@@ -2691,10 +3117,11 @@ def render_spectral_axis_3d(
     radius = np.linalg.norm(positions_3d - centroid, axis=1).max() * 0.7
 
     # Axis colors and labels
-    axis_colors = [PALETTE.cyan, PALETTE.rupture_core, PALETTE.yellow]
+    axis_colors = [PALETTE.cyan, PALETTE.rupture_core, "#39FF14"]
     axis_labels = ['Primary Conflict', 'Secondary Conflict', 'Nuance']
     axis_names = ['X-Axis (Primary War)', 'Y-Axis (Secondary War)', 'Z-Axis (Nuance)']
 
+    axis_dirs_xy: List[Tuple[float, float]] = []
     for i in range(min(3, len(pca.components_))):
         component = pca.components_[i]
         explained_var = pca.explained_variance_ratio_[i]
@@ -2726,6 +3153,15 @@ def render_spectral_axis_3d(
             x_direction = 1.0
             y_direction = 0.0
 
+        if i == 2 and axis_dirs_xy:
+            # Keep Nuance vector visually separable when PC3 projects nearly parallel to PC1/PC2 in XY.
+            for _ax, _ay in axis_dirs_xy:
+                _dot = abs(x_direction * _ax + y_direction * _ay)
+                if _dot > 0.92:
+                    x_direction, y_direction = -y_direction, x_direction
+                    break
+        axis_dirs_xy.append((x_direction, y_direction))
+
         # Calculate start and end points for the 2D projection
         vec_start_x = centroid[0] - x_direction * vector_length * 0.5
         vec_start_y = centroid[1] - y_direction * vector_length * 0.5
@@ -2741,18 +3177,32 @@ def render_spectral_axis_3d(
         # Clamp Z to surface using get_surface_z_func
         # Add a small offset so the vector "floats" slightly above the surface
         if get_surface_z_func is not None:
-            sample_zs = get_surface_z_func(sample_xs, sample_ys, offset=0.03) 
+            _offset = 0.12 if i == 2 else 0.05
+            sample_zs = get_surface_z_func(sample_xs, sample_ys, offset=_offset) 
         else:
             # Fallback (should not happen if interpolator is used)
             sample_zs = np.full_like(sample_xs, centroid[2] + 0.03) # Use average Z + offset
+
+        if i == 2:
+            traces.append(go.Scatter3d(
+                x=sample_xs,
+                y=sample_ys,
+                z=sample_zs,
+                mode='lines',
+                line=dict(color='rgba(0,0,0,0.70)', width=10),
+                opacity=0.9,
+                name='Nuance Underlay',
+                hoverinfo='skip',
+                showlegend=False,
+            ))
 
         traces.append(go.Scatter3d(
             x=sample_xs,
             y=sample_ys,
             z=sample_zs,
             mode='lines',
-            line=dict(color=axis_colors[i], width=5 - i*1.5), # Wider for PC1, narrower for PC3
-            opacity=0.9,
+            line=dict(color=axis_colors[i], width=(7 if i == 2 else 5 - i*1.2)),
+            opacity=1.0 if i == 2 else 0.95,
             name=f'Vector: {semantic_label} (EVR={explained_var*100:.1f}%)',
             hovertemplate=f'<b>Vector: {semantic_label}</b><br>Explained Var: {explained_var*100:.1f}%<extra></extra>',
             showlegend=True,
@@ -2819,7 +3269,7 @@ def render_data_points_3d(
             # Fallback to existing verdict-based coloring
             verdict = "UNKNOWN"
             if phantom_verdicts and i < len(phantom_verdicts):
-                verdict = phantom_verdicts[i].get('verdict', 'UNKNOWN')
+                verdict = str(phantom_verdicts[i].get('verdict', 'UNKNOWN')).upper()
             r, g, b = verdict_colors.get(verdict, verdict_colors['UNKNOWN'])
         
         core_opacity = 0.95 # Core point opacity, always solid
@@ -2879,8 +3329,32 @@ def render_data_points_3d(
         name='glow_mid',
     ))
 
-    # Layer 3: Core ARTICLE POINTS (with hover enabled) - CLICKABLE
-    # These are the main article markers that show full metadata on hover
+    # Layer 3: Invisible interaction hitbox (hover/click reliability layer)
+    traces.append(go.Scatter3d(
+        x=positions[:, 0],
+        y=positions[:, 1],
+        z=elevated_z,
+        mode='markers',
+        marker=dict(
+            size=np.maximum(adjusted_sizes * 2.0, 10),
+            color='rgba(255,255,255,0.001)',
+            line=dict(width=0),
+            symbol='circle',
+        ),
+        hovertext=hover_texts,
+        customdata=list(range(n)),
+        hoverinfo='text',
+        hovertemplate='%{hovertext}<extra></extra>',
+        hoverlabel=dict(
+            bgcolor='rgba(0,0,0,0.95)',
+            bordercolor='#00F0FF',
+            font=dict(family='JetBrains Mono, monospace', size=11, color='white'),
+        ),
+        name='article_hitbox',
+        showlegend=False,
+    ))
+
+    # Layer 4: Core ARTICLE POINTS (visual only)
     traces.append(go.Scatter3d(
         x=positions[:, 0],
         y=positions[:, 1],
@@ -2892,15 +3366,7 @@ def render_data_points_3d(
             line=dict(color='white', width=1.5),  # Thicker white outline
             symbol='circle',  # Explicit circle shape
         ),
-        hovertext=hover_texts,
-        customdata=list(range(n)),
-        hoverinfo='text',
-        hovertemplate='%{hovertext}<extra></extra>',
-        hoverlabel=dict(
-            bgcolor='rgba(0,0,0,0.95)',
-            bordercolor='#00F0FF',
-            font=dict(family='JetBrains Mono, monospace', size=11, color='white'),
-        ),
+        hoverinfo='skip',
         name=name,
         showlegend=True,  # Show in legend as "Articles"
     ))
@@ -2950,7 +3416,8 @@ def render_analysis_planes(
     n_articles = exp.n_articles
 
     # Ground truth labels for coloring
-    if exp.ground_truth_labels is not None:
+    labels_available = exp.ground_truth_labels is not None and len(np.unique(exp.ground_truth_labels)) > 1
+    if labels_available:
         labels = exp.ground_truth_labels
     else:
         labels = np.zeros(n_articles, dtype=int)
@@ -2976,28 +3443,50 @@ def render_analysis_planes(
         return proj
 
     # Helper to compute NMI if sklearn available
-    def compute_nmi(features: np.ndarray, labels: np.ndarray) -> float:
+    def compute_nmi(features: np.ndarray, labels: np.ndarray, labels_valid: bool) -> float:
         try:
             from sklearn.cluster import KMeans
             from sklearn.metrics import normalized_mutual_info_score
-            if features is None or len(features) < 3:
-                return 0.0
+            if features is None or len(features) < 3 or not labels_valid:
+                return float("nan")
             if features.ndim > 2:
                 features = features.reshape(len(features), -1)
             n_clusters = min(len(np.unique(labels)), 8)
+            if n_clusters < 2:
+                return float("nan")
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             pred = kmeans.fit_predict(features)
             return normalized_mutual_info_score(labels, pred)
         except Exception:
-            return 0.0
+            return float("nan")
 
     # Track definitions: (name, z_level, features, label)
-    # Each track shown in ISOLATION to see individual discriminative power
+    # Track 1 must be true logits only; missing logits should surface as unavailable.
+    nmi_scores["T1"] = float("nan")
+    t1_features = exp.cp_t0_logits
+    t1_track_name = "T1: Logits (NLI raw)"
+    if t1_features is None and exp.logits is not None:
+        t1_features = exp.logits
+        t1_track_name = "T1: Logits (base logits)"
+    t2_features = exp.cp_t2_kernels if exp.cp_t2_kernels is not None else exp.dirichlet_fused
+    if t2_features is None:
+        t2_features = exp.integrated if exp.integrated is not None else exp.features
+    t15_features = exp.cp_t15_spectral if exp.cp_t15_spectral is not None else exp.spectral_probe_magnitudes
+    t3_features = exp.cp_t3_blinker
+    if t3_features is None:
+        t3_features = exp.dirichlet_fused_std
+    if t3_features is None:
+        t3_features = exp.dirichlet_fused
+    if t3_features is None:
+        t3_features = exp.integrated
+    if t3_features is None:
+        t3_features = exp.features
+
     track_configs = [
-        ("T1: Logits (NLI raw)", 0.0, exp.cp_t0_logits, "T1"),
-        ("T2: RKS (δ_μν kernel)", plane_spacing, exp.cp_t2_kernels, "T2"),
-        ("T1.5: Spectral (∇Φ∇Φ)", plane_spacing * 2, exp.cp_t15_spectral, "T1.5"),
-        ("T3: Blinker (1/ρ)", plane_spacing * 3, exp.cp_t3_blinker, "T3"),
+        (t1_track_name, 0.0, t1_features, "T1"),
+        ("T2: RKS (δ_μν kernel)", plane_spacing, t2_features, "T2"),
+        ("T1.5: Spectral (∇Φ∇Φ)", plane_spacing * 2, t15_features, "T1.5"),
+        ("T3: Blinker (1/ρ)", plane_spacing * 3, t3_features, "T3"),
         # Add SYNTHESIS at the top - the final integrated features
         ("SYNTHESIS (Integrated)", plane_spacing * 4, exp.features, "SYN"),
     ]
@@ -3012,7 +3501,7 @@ def render_analysis_planes(
             continue
 
         # Compute NMI
-        nmi = compute_nmi(features, labels)
+        nmi = compute_nmi(features, labels, labels_available)
         nmi_scores[cp_label] = nmi
 
         # Create semi-transparent plane surface
@@ -3058,7 +3547,7 @@ def render_analysis_planes(
             ))
 
         # Track label (3D text annotation)
-        nmi_str = f"NMI={nmi:.3f}" if nmi > 0 else "NMI=N/A"
+        nmi_str = f"NMI={nmi:.3f}" if np.isfinite(nmi) else "NMI=UNAVAILABLE"
         traces.append(go.Scatter3d(
             x=[-plane_size/2 - 0.5],
             y=[0],
@@ -3137,30 +3626,7 @@ def render_analysis_planes(
                 visible=False,
             ))
 
-    # Add NMI waterfall bar on the side
-    bar_x = plane_size/2 + 1.5
-    bar_width = 0.3
-    for i, (track_name, z_level, features, cp_label) in enumerate(track_configs):
-        if cp_label in nmi_scores:
-            nmi = nmi_scores[cp_label]
-            bar_height = nmi * plane_spacing * 0.8  # Scale NMI to visible bar
-            # Bar representing NMI
-            traces.append(go.Mesh3d(
-                x=[bar_x, bar_x + bar_width, bar_x + bar_width, bar_x,
-                   bar_x, bar_x + bar_width, bar_x + bar_width, bar_x],
-                y=[-0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5],
-                z=[z_level, z_level, z_level, z_level,
-                   z_level + bar_height, z_level + bar_height, z_level + bar_height, z_level + bar_height],
-                i=[0, 0, 0, 1, 4, 4],
-                j=[1, 2, 4, 2, 5, 6],
-                k=[2, 3, 5, 6, 6, 7],
-                color=PALETTE.cyan if nmi > 0.7 else PALETTE.yellow if nmi > 0.5 else PALETTE.red,
-                opacity=0.7,
-                name=f'{cp_label} NMI',
-                showlegend=False,
-                hoverinfo='skip',
-                visible=False,
-            ))
+    # Side-bar mesh removed: produced unstable yellow mesh artifacts in 3D.
 
     return traces, nmi_scores
 
@@ -3371,6 +3837,7 @@ def create_monolith_cockpit(
     show_hott: bool = True,
     show_spectral_axis: bool = True,
     strict_validation: bool = False,
+    path_ablation_mode: str = "none",
 ) -> Any:
     """
     Create the MONOLITH visualization with ALL tracks.
@@ -3388,6 +3855,9 @@ def create_monolith_cockpit(
         raise ImportError("Plotly required")
 
     output_path = Path(output_path)
+    path_ablation_mode = str(path_ablation_mode or "none").strip().lower()
+    if path_ablation_mode not in {"none", "thermodynamic", "semantic_tether"}:
+        raise ValueError(f"Unknown path_ablation_mode: {path_ablation_mode}")
 
     # Choose features
     if physics_mode == "synthesis" and exp.integrated is not None:
@@ -3676,33 +4146,90 @@ def create_monolith_cockpit(
         else 0.0
     )
     positions_3d[:, 0:2] = (positions_3d[:, 0:2] - xy_center) * xy_scale
-    # Normalize path XY only when path frame appears compatible with article frame.
-    path_spans = []
-    for _path in walker_paths_pure.values():
-        if _path.ndim == 2 and _path.shape[1] >= 2 and len(_path) > 1:
-            path_spans.append(float(np.max(np.ptp(_path[:, 0:2], axis=0))))
-    median_path_span = float(np.median(path_spans)) if path_spans else 0.0
-    normalize_paths = (
-        bool(path_spans)
-        and np.isfinite(median_path_span)
-        and article_span_ref > 1e-12
-        and median_path_span <= (article_span_ref * 10.0)
-    )
-    if normalize_paths:
-        for _idx, _path in walker_paths_pure.items():
-            if _path.ndim == 2 and _path.shape[1] >= 2:
-                _path[:, 0:2] = (_path[:, 0:2] - xy_center) * xy_scale
-                walker_paths_pure[_idx] = _path
-    else:
+    # Normalize path XY per-path with an anchored fallback for incompatible frames.
+    compatible_paths: Dict[int, np.ndarray] = {}
+    skipped_invalid_paths = 0
+    anchored_fallback_paths = 0
+    max_allowed_norm_span = float(np.max(target_xy_span) * 2.0)
+    for _idx, _path in walker_paths_pure.items():
+        if _path.ndim != 2 or _path.shape[0] < 2 or _path.shape[1] < 2:
+            skipped_invalid_paths += 1
+            continue
+        _xy = np.asarray(_path[:, 0:2], dtype=float)
+        finite_rows = np.isfinite(_xy).all(axis=1)
+        _xy_finite = _xy[finite_rows]
+        if _xy_finite.shape[0] < 2:
+            skipped_invalid_paths += 1
+            continue
+        path_span = float(np.max(np.ptp(_xy_finite, axis=0)))
+        is_compatible = (
+            np.isfinite(path_span)
+            and article_span_ref > 1e-12
+            and path_span <= (article_span_ref * 10.0)
+        )
+        _path_norm = np.asarray(_path, dtype=float).copy()
+        if is_compatible:
+            _path_norm[:, 0:2] = (_path_norm[:, 0:2] - xy_center) * xy_scale
+        else:
+            # Fallback: preserve local trajectory shape but anchor to its source article.
+            anchor_xy = np.asarray(positions_3d[_idx, 0:2], dtype=float)
+            start_xy = np.asarray(_path_norm[0, 0:2], dtype=float)
+            _path_norm[:, 0:2] = (_path_norm[:, 0:2] - start_xy) * xy_scale + anchor_xy
+            norm_finite = np.isfinite(_path_norm[:, 0:2]).all(axis=1)
+            norm_xy = _path_norm[norm_finite, 0:2]
+            if norm_xy.shape[0] >= 2:
+                norm_span = float(np.max(np.ptp(norm_xy, axis=0)))
+                if np.isfinite(norm_span) and norm_span > max_allowed_norm_span and norm_span > 1e-9:
+                    shrink = max_allowed_norm_span / norm_span
+                    _path_norm[:, 0:2] = anchor_xy + ((_path_norm[:, 0:2] - anchor_xy) * shrink)
+            anchored_fallback_paths += 1
+        compatible_paths[int(_idx)] = _path_norm
+    walker_paths_pure = compatible_paths
+    normalize_paths = bool(walker_paths_pure)
+    if skipped_invalid_paths > 0:
         print(
-            "[MONOLITH] Skipping walker path XY normalization due to frame mismatch: "
-            f"article_span={article_span_ref:.6f}, median_path_span={median_path_span:.6f}"
+            "[MONOLITH] Skipped invalid walker paths during XY normalization: "
+            f"{skipped_invalid_paths}"
+        )
+    if anchored_fallback_paths > 0:
+        print(
+            "[MONOLITH] Applied anchored fallback normalization to walker paths: "
+            f"{anchored_fallback_paths}"
+        )
+    if not normalize_paths and len(walker_paths_raw) > 0:
+        print(
+            "[MONOLITH] No compatible walker paths after per-path frame gating; "
+            f"article_span={article_span_ref:.6f}"
         )
     print(
         "[MONOLITH] Applied deterministic per-axis XY normalization: "
         f"scale_x={xy_scale[0]:.1f}, scale_y={xy_scale[1]:.1f}, "
         f"ptp=({xy_ptp[0]:.6f},{xy_ptp[1]:.6f})->(6.0,6.0)"
     )
+
+    rupture_segments_2d: List[Tuple[np.ndarray, np.ndarray]] = []
+    if path_ablation_mode == "thermodynamic":
+        for _idx, _path in walker_paths_pure.items():
+            if _idx < 0 or _idx >= n_articles:
+                continue
+            pv = phantom_verdicts[_idx] if (_idx < len(phantom_verdicts)) else {}
+            verdict = str(pv.get("verdict", "UNKNOWN")).upper()
+            if verdict != "RUPTURE":
+                continue
+            if _path.ndim != 2 or _path.shape[0] < 2 or _path.shape[1] < 2:
+                continue
+            xy = np.asarray(_path[:, 0:2], dtype=float)
+            finite_rows = np.isfinite(xy).all(axis=1)
+            xy = xy[finite_rows]
+            if xy.shape[0] < 2:
+                continue
+            xy[0, 0] = float(positions_3d[_idx, 0])
+            xy[0, 1] = float(positions_3d[_idx, 1])
+            for _j in range(xy.shape[0] - 1):
+                start_xy = np.asarray(xy[_j], dtype=float)
+                end_xy = np.asarray(xy[_j + 1], dtype=float)
+                if np.isfinite(start_xy).all() and np.isfinite(end_xy).all():
+                    rupture_segments_2d.append((start_xy, end_xy))
 
     # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
     energy_values_for_terrain = pure_z.copy()
@@ -3783,10 +4310,10 @@ def create_monolith_cockpit(
         n_honest = int((verdict_series == 'HONEST').sum())
         n_tautology = int((verdict_series == 'TAUTOLOGY').sum())
     else:
-        n_ruptures = sum(1 for v in phantom_verdicts if v.get('verdict') == 'RUPTURE')
-        n_phantoms = sum(1 for v in phantom_verdicts if v.get('verdict') == 'PHANTOM')
-        n_honest = sum(1 for v in phantom_verdicts if v.get('verdict') == 'HONEST')
-        n_tautology = sum(1 for v in phantom_verdicts if v.get('verdict') == 'TAUTOLOGY')
+        n_ruptures = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'RUPTURE')
+        n_phantoms = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'PHANTOM')
+        n_honest = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'HONEST')
+        n_tautology = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'TAUTOLOGY')
 
     # Default knn_overlap as it's no longer computed from local_density
     knn_overlap = 0.0
@@ -3986,6 +4513,8 @@ def create_monolith_cockpit(
             global_density_median=global_density_median,
             global_stress_median=global_stress_median,
             opacity=surface_opacity,
+            rupture_segments_2d=rupture_segments_2d if path_ablation_mode == "thermodynamic" else None,
+            rupture_tear_radius_scale=0.02,
         )
         if terrain:
             terrain.visible = True
@@ -4038,7 +4567,7 @@ def create_monolith_cockpit(
         return np.asarray(energy_values_for_points, dtype=float)[idx]
 
     # Helper function to get surface Z from interpolator
-    def get_surface_z(x_coords, y_coords, offset=0.0):
+    def get_surface_z(x_coords, y_coords, offset=0.0, preserve_nan=False):
         if interp_terrain_z is not None:
             # Ensure x_coord and y_coord are numpy arrays for interpolation
             x_coord_np = np.atleast_1d(x_coords)
@@ -4049,7 +4578,7 @@ def create_monolith_cockpit(
             
             interp_z = np.asarray(interp_terrain_z(points_for_interp), dtype=float)
             invalid = ~np.isfinite(interp_z)
-            if np.any(invalid):
+            if np.any(invalid) and not preserve_nan:
                 interp_z[invalid] = _nearest_article_surface_z(
                     x_coord_np[invalid],
                     y_coord_np[invalid],
@@ -4091,6 +4620,9 @@ def create_monolith_cockpit(
             surface_z_func=get_surface_z,
             article_metadata=metadata,
             spectral_evr=spectral_evr,
+            spectral_probe_magnitudes=spectral_mags,
+            hysteresis_memory=exp.hysteresis_memory,
+            path_ablation_mode=path_ablation_mode,
         )
         for t in path_traces:
             t.visible = True
@@ -4109,20 +4641,27 @@ def create_monolith_cockpit(
                 t.meta = {'custom_mode': 'synthesis'}
                 fig.add_trace(t)
 
-        # Layer 6: Spectral Axis (Track 1.5) - SYNTHESIS shows single arrow
-        if show_spectral_axis and len(spectral_mags) > 0:
-            print("[MONOLITH] Rendering Track 1.5 spectral axis (Synthesis)...")
-            axis_traces = render_spectral_axis_3d(
-                positions_3d, spectral_mags, float(spectral_evr.mean()),
-                get_surface_z_func=get_surface_z, # Pass helper function
+    # Layer 6: Spectral Axis (Track 1.5) - synthesis overlay when data is available
+    if (
+        show_spectral_axis
+        and spectral_mags_available
+        and isinstance(spectral_mags, np.ndarray)
+        and spectral_mags.ndim == 2
+        and spectral_mags.shape[0] >= n_articles
+    ):
+        try:
+            spectral_axis_traces = render_spectral_axis_3d(
+                positions_3d=positions_3d,
+                spectral_probe_magnitudes=spectral_mags[:n_articles],
+                evr=float(np.nanmean(spectral_evr)) if np.size(spectral_evr) > 0 else 0.5,
+                get_surface_z_func=get_surface_z,
             )
-            for t in axis_traces:
-                # Cone arrowheads are hidden by default (Diagnostics mode)
-                # Only show axis lines in Synthesis mode
-                if t.visible is not False:
-                    t.visible = True
+            for t in spectral_axis_traces:
+                t.visible = True
                 t.meta = {'custom_mode': 'synthesis'}
                 fig.add_trace(t)
+        except Exception as spectral_axis_err:
+            print(f"[MONOLITH] Skipping spectral axis overlay due to error: {spectral_axis_err}")
 
 
     # Layer 7: Data Points (glowing muons) - Both modes
@@ -4149,7 +4688,9 @@ def create_monolith_cockpit(
     # =========================================
     # DIAGNOSTICS + ANALYSIS MODE TRACES
     # =========================================
-    render_all_modes = (physics_mode == "analysis") or (os.environ.get("MONOLITH_RENDER_ALL_MODES", "0").strip() == "1")
+    # Analysis and diagnostics traces must exist for mode switching to work.
+    # Opt-out only via explicit fast-path env override.
+    render_all_modes = os.environ.get("MONOLITH_FAST_SYNTHESIS_ONLY", "0").strip() != "1"
     diagnostics_trace_start = len(fig.data)
     analysis_nmi_scores = {}
 
@@ -4256,7 +4797,7 @@ def create_monolith_cockpit(
         diagnostics_trace_end = diagnostics_trace_start
         analysis_trace_start = diagnostics_trace_end
         analysis_trace_end = analysis_trace_start
-        print("[MONOLITH] Fast synthesis render: skipped diagnostics/analysis traces (set MONOLITH_RENDER_ALL_MODES=1 for full cockpit).")
+        print("[MONOLITH] Fast synthesis render: skipped diagnostics/analysis traces (MONOLITH_FAST_SYNTHESIS_ONLY=1).")
 
     # Count traces per mode for JS toggle
     n_synthesis = synthesis_trace_end - synthesis_trace_start
@@ -4270,45 +4811,55 @@ def create_monolith_cockpit(
     # Find which probe dominates PC1 and PC2 so axis labels are data-driven,
     # not hard-coded to PROBE_LABELS[0/1].
     # ==========================================================================
-    axis_label_x = PROBE_LABELS[0] if PROBE_LABELS else "Semantic Axis 1"
-    axis_label_y = PROBE_LABELS[1] if len(PROBE_LABELS) > 1 else "Semantic Axis 2"
-    try:
-        if spectral_mags_available and HAS_SCIPY and spectral_mags is not None and spectral_mags.shape[0] > 1 and spectral_mags.shape[1] >= 2:
-            _n_comp = min(2, spectral_mags.shape[1])
-            _pca = PCA(n_components=_n_comp)
-            _pca.fit(spectral_mags)
-            _dom_x = int(np.argmax(np.abs(_pca.components_[0])))
-            _evr_x = _pca.explained_variance_ratio_[0]
-            axis_label_x = (
-                f"{PROBE_LABELS[_dom_x]}" if _dom_x < len(PROBE_LABELS)
-                else f"Spectral PC1 (probe {_dom_x})"
-            ) + f"  [EVR {_evr_x:.1%}]"
-            if _n_comp >= 2:
-                _dom_y = int(np.argmax(np.abs(_pca.components_[1])))
-                _evr_y = _pca.explained_variance_ratio_[1]
-                axis_label_y = (
-                    f"{PROBE_LABELS[_dom_y]}" if _dom_y < len(PROBE_LABELS)
-                    else f"Spectral PC2 (probe {_dom_y})"
-                ) + f"  [EVR {_evr_y:.1%}]"
-            _lx = axis_label_x.encode('ascii', errors='replace').decode('ascii')
-            _ly = axis_label_y.encode('ascii', errors='replace').decode('ascii')
-            print(f"[MONOLITH] Spectral axis labels: X='{_lx}' | Y='{_ly}'")
-    except Exception as _e:
-        print(f"[MONOLITH] Spectral axis label computation failed: {_e}; using defaults.")
+    axis_label_x = "Semantic Axis X"
+    axis_label_y = "Semantic Axis Y"
+    axis_label_z = "Semantic Axis Z"
+    if (
+        spectral_mags_available
+        and isinstance(spectral_mags, np.ndarray)
+        and spectral_mags.ndim == 2
+        and spectral_mags.shape[0] >= 2
+        and spectral_mags.shape[1] >= 1
+    ):
+        try:
+            n_axis_components = min(3, spectral_mags.shape[0], spectral_mags.shape[1])
+            if n_axis_components >= 1:
+                axis_pca = PCA(n_components=n_axis_components, random_state=42, whiten=False)
+                axis_pca.fit(np.asarray(spectral_mags[:n_articles], dtype=float))
+                derived_labels: List[str] = []
+                for _k in range(n_axis_components):
+                    _component = np.asarray(axis_pca.components_[_k], dtype=float)
+                    _probe_idx = int(np.argmax(np.abs(_component)))
+                    _probe_label = (
+                        PROBE_LABELS[_probe_idx]
+                        if 0 <= _probe_idx < len(PROBE_LABELS)
+                        else f"Probe {_probe_idx}"
+                    )
+                    derived_labels.append(_probe_label)
+                if len(derived_labels) >= 1:
+                    axis_label_x = f"PC1: {derived_labels[0]}"
+                if len(derived_labels) >= 2:
+                    axis_label_y = f"PC2: {derived_labels[1]}"
+                if len(derived_labels) >= 3:
+                    axis_label_z = f"PC3: {derived_labels[2]}"
+        except Exception as axis_label_err:
+            print(f"[MONOLITH] Axis label fallback to defaults due to PCA error: {axis_label_err}")
 
     # ==========================================================================
     # LAYOUT
     # ==========================================================================
+    show_axes_initial = physics_mode != "synthesis"
+    camera_presets = {
+        "synthesis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=1.5, y=1.5, z=1.2)),
+        "diagnostics": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=2.1, y=0.8, z=1.7)),
+        "analysis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=0.0, y=2.4, z=1.3)),
+    }
     scene_layout = dict(
-        xaxis=dict(title=axis_label_x, visible=False, showgrid=False, zeroline=False),
-        yaxis=dict(title=axis_label_y, visible=False, showgrid=False, zeroline=False),
-        zaxis=dict(title="Terrain Stress (Walker Resistance)", visible=False, showgrid=False, zeroline=False),
+        xaxis=dict(title=axis_label_x, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial),
+        yaxis=dict(title=axis_label_y, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial),
+        zaxis=dict(title=axis_label_z, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial),
         bgcolor=PALETTE.void,
-        camera=dict(
-            up=dict(x=0, y=0, z=1),
-            center=dict(x=0, y=0, z=0),
-            eye=dict(x=1.5, y=1.5, z=1.2),
-        ),
+        camera=camera_presets.get(physics_mode, camera_presets["synthesis"]),
         dragmode='orbit',
         **LAYOUT_CONSTRAINTS,
     )
@@ -4475,11 +5026,16 @@ def create_monolith_cockpit(
     # Build NMI display from analysis_nmi_scores
     nmi_items = ""
     for cp_label, nmi_val in analysis_nmi_scores.items():
-        color = PALETTE.green if nmi_val > 0.7 else PALETTE.yellow if nmi_val > 0.5 else PALETTE.red
+        if np.isfinite(nmi_val):
+            color = PALETTE.green if nmi_val > 0.7 else PALETTE.yellow if nmi_val > 0.5 else PALETTE.red
+            nmi_text = f"NMI={nmi_val:.3f}"
+        else:
+            color = "#777777"
+            nmi_text = "NMI=UNAVAILABLE"
         nmi_items += f'''
         <div class="legend-item">
             <div class="legend-dot" style="background: {color};"></div>
-            <span>{cp_label}: NMI={nmi_val:.3f}</span>
+            <span>{cp_label}: {nmi_text}</span>
         </div>'''
 
     legend_analysis = f'''
@@ -4487,6 +5043,9 @@ def create_monolith_cockpit(
         <div class="legend-title" style="color: {PALETTE.green};">ANALYSIS MODE</div>
         <div class="legend-subtitle" style="color: #888; font-size: 10px; margin-bottom: 8px;">
             Stacked Track Planes (Waterfall NMI)
+        </div>
+        <div style="font-size: 9px; color: #777; margin-bottom: 8px;">
+            NMI shown here is analysis proxy (cluster alignment), not validation.json contract NMI.
         </div>
         <div class="legend-item">
             <div class="legend-line" style="background: rgba(0,240,255,0.3); height: 3px;"></div>
@@ -4634,6 +5193,10 @@ def create_monolith_cockpit(
     '''
 
 
+    synthesis_active = " active" if physics_mode == "synthesis" else ""
+    analysis_active = " active" if physics_mode == "analysis" else ""
+    diagnostics_active = " active" if physics_mode == "diagnostics" else ""
+
     html_template = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -4649,9 +5212,9 @@ def create_monolith_cockpit(
 
     <!-- MODE TOGGLE SWITCH -->
     <div class="mode-toggle">
-        <button class="mode-btn synthesis active" onclick="setMode('synthesis')">SYNTHESIS</button>
-        <button class="mode-btn analysis" onclick="setMode('analysis')">ANALYSIS</button>
-        <button class="mode-btn diagnostics" onclick="setMode('diagnostics')">DIAGNOSTICS</button>
+        <button class="mode-btn synthesis{synthesis_active}" onclick="setMode('synthesis')">SYNTHESIS</button>
+        <button class="mode-btn analysis{analysis_active}" onclick="setMode('analysis')">ANALYSIS</button>
+        <button class="mode-btn diagnostics{diagnostics_active}" onclick="setMode('diagnostics')">DIAGNOSTICS</button>
     </div>
     {layer_panel}
 
@@ -4665,7 +5228,7 @@ def create_monolith_cockpit(
 
     <script>
         // Trace configuration
-        var currentMode = 'synthesis';
+        var currentMode = {json.dumps(physics_mode)};
         var DASH_BASE_URL = 'http://127.0.0.1:8050/';
         var DASH_RUN_KEY = {json.dumps(dash_run_key)};
 
@@ -4731,6 +5294,30 @@ def create_monolith_cockpit(
             setMode(currentMode);
         }}
 
+        function sceneRelayoutForMode(mode) {{
+            var showAxes = mode === 'diagnostics' || mode === 'analysis';
+            return {{
+                'scene.xaxis.visible': showAxes,
+                'scene.xaxis.showticklabels': showAxes,
+                'scene.xaxis.showgrid': showAxes,
+                'scene.xaxis.showline': showAxes,
+                'scene.yaxis.visible': showAxes,
+                'scene.yaxis.showticklabels': showAxes,
+                'scene.yaxis.showgrid': showAxes,
+                'scene.yaxis.showline': showAxes,
+                'scene.zaxis.visible': showAxes,
+                'scene.zaxis.showticklabels': showAxes,
+                'scene.zaxis.showgrid': showAxes,
+                'scene.zaxis.showline': showAxes
+            }};
+        }}
+
+        var CAMERA_PRESETS = {{
+            synthesis: {{up: {{x: 0, y: 0, z: 1}}, center: {{x: 0, y: 0, z: 0}}, eye: {{x: 1.5, y: 1.5, z: 1.2}}}},
+            diagnostics: {{up: {{x: 0, y: 0, z: 1}}, center: {{x: 0, y: 0, z: 0}}, eye: {{x: 2.1, y: 0.8, z: 1.7}}}},
+            analysis: {{up: {{x: 0, y: 0, z: 1}}, center: {{x: 0, y: 0, z: 0}}, eye: {{x: 0.0, y: 2.4, z: 1.3}}}}
+        }};
+
         function setMode(mode) {{
             currentMode = mode;
 
@@ -4793,7 +5380,9 @@ def create_monolith_cockpit(
             // Update plot
             Plotly.restyle('cockpit', {{'visible': visibility}});
 
-            // Camera remains fixed to avoid mode-dependent geometry perception drift.
+            var relayoutUpdate = sceneRelayoutForMode(mode);
+            relayoutUpdate['scene.camera'] = CAMERA_PRESETS[mode] || CAMERA_PRESETS.synthesis;
+            Plotly.relayout('cockpit', relayoutUpdate);
 
             // Update HUD mode indicator
             var hudMode = document.querySelector('.hud-item');
@@ -4811,6 +5400,8 @@ def create_monolith_cockpit(
             if (key === 'a') setMode('analysis');
             if (key === 'd') setMode('diagnostics');
         }});
+
+        setMode(currentMode);
 
     </script>
 </body>
@@ -4921,6 +5512,12 @@ def main():
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output HTML path")
     parser.add_argument("--mode", choices=["synthesis", "analysis"], default="synthesis")
     parser.add_argument("--observer-idx", type=int, default=None, help="Optional article index to emphasize in the render.")
+    parser.add_argument(
+        "--path-ablation",
+        choices=["none", "thermodynamic", "semantic_tether"],
+        default="none",
+        help="Optional path rendering ablation mode (thermodynamic=scorch+tears, semantic_tether=straight annotated tethers).",
+    )
     parser.add_argument("--strict", action="store_true",
                         help="Fail generation if canonical zone/NMI validation checks fail.")
     args = parser.parse_args()
@@ -4943,6 +5540,7 @@ def main():
         physics_mode=args.mode,
         observer_idx=args.observer_idx,
         strict_validation=args.strict,
+        path_ablation_mode=args.path_ablation,
     )
 
 
