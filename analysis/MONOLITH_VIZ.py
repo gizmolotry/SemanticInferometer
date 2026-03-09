@@ -4755,7 +4755,7 @@ def create_monolith_cockpit(
 
     # Count verdicts (force from MONOLITH_DATA.csv when available).
     if 'monolith_df' in locals() and 'verdict' in monolith_df.columns:
-        verdict_series = monolith_df['verdict'].astype(str).str.upper()
+        verdict_series = monolith_df['verdict'].map(canonicalize_walker_verdict)
         n_ruptures = int((verdict_series == 'RUPTURE').sum())
         n_phantoms = int((verdict_series == 'PHANTOM').sum())
         n_honest = int((verdict_series == 'HONEST').sum())
