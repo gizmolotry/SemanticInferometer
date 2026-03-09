@@ -344,6 +344,8 @@ class ExperimentData:
     hysteresis_stats: Optional[Dict] = None           # max_rut, highway_count, etc.
     # Track 5 Synthesis NMI
     synthesis_nmi: Optional[float] = None             # NMI score from validation.json
+    track_nmi: Dict[str, float] = field(default_factory=dict)
+    track_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Epistemic UI contract data
     verification_status: str = "UNVERIFIED"           # VERIFIED/NON_COMPARABLE/MISSING_ARTIFACTS/UNVERIFIED
     verification_global_pass: Optional[bool] = None
@@ -738,12 +740,28 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
 
     # Track 5 Synthesis NMI
     synthesis_nmi = None
+    track_nmi = {}
+    track_metrics = {}
     if (experiment_dir / "validation.json").exists():
         try:
             with open(experiment_dir / "validation.json") as f:
                 validation_data = json.load(f)
                 # validation.json uses key "nmi" (not "normalized_mutual_info")
                 synthesis_nmi = validation_data.get("nmi", validation_data.get("normalized_mutual_info"))
+                raw_track_nmi = validation_data.get("track_nmi", {})
+                if isinstance(raw_track_nmi, dict):
+                    track_nmi = {
+                        str(k): float(v)
+                        for k, v in raw_track_nmi.items()
+                        if isinstance(v, (int, float)) and np.isfinite(float(v))
+                    }
+                raw_track_metrics = validation_data.get("track_metrics", {})
+                if isinstance(raw_track_metrics, dict):
+                    track_metrics = {
+                        str(k): v
+                        for k, v in raw_track_metrics.items()
+                        if isinstance(v, dict)
+                    }
                 if synthesis_nmi is not None:
                     print(f"[MONOLITH] Loaded Track 5 Synthesis NMI: {synthesis_nmi:.3f}")
         except Exception as e:
@@ -786,6 +804,8 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         hysteresis_memory=hysteresis_memory,
         hysteresis_stats=hysteresis_stats,
         synthesis_nmi=synthesis_nmi,
+        track_nmi=track_nmi,
+        track_metrics=track_metrics,
         verification_status=str(epistemic.get("status", "UNVERIFIED")),
         verification_global_pass=epistemic.get("global_pass"),
         verification_seed_stability=epistemic.get("seed_stability"),
@@ -2023,6 +2043,16 @@ def generate_lightning_path(
     return path_x, path_y, []
 
 
+def canonicalize_walker_verdict(verdict: Any) -> str:
+    """Normalize persisted verdict names to the renderer contract."""
+    text = str(verdict or "UNKNOWN").strip().upper()
+    if text in {"TYPE_1_RUPTURE", "TYPE 1 RUPTURE", "BROKEN"}:
+        return "RUPTURE"
+    if text in {"TYPE_2_RUPTURE", "TYPE 2 RUPTURE", "TRAPPED", "FAILED"}:
+        return "RUPTURE"
+    return text
+
+
 # =============================================================================
 # PHANTOM PATH RENDERING (Track 5) — Field Theory Visualizations
 # =============================================================================
@@ -2116,6 +2146,23 @@ def render_phantom_paths_3d(
             if seg.shape[0] >= 2:
                 segments.append(seg)
         return segments
+
+    def _resample_segment_xyz(seg_xyz: np.ndarray, max_points: int = 48) -> np.ndarray:
+        seg = np.asarray(seg_xyz, dtype=float)
+        if seg.ndim != 2 or seg.shape[0] <= 2 or seg.shape[1] < 3 or seg.shape[0] <= max_points:
+            return seg
+        deltas = np.linalg.norm(np.diff(seg[:, :3], axis=0), axis=1)
+        arc = np.concatenate(([0.0], np.cumsum(deltas)))
+        total = float(arc[-1])
+        if total <= 1e-9:
+            return np.repeat(seg[:1, :3], repeats=min(max_points, seg.shape[0]), axis=0)
+        sample_arc = np.linspace(0.0, total, max_points, dtype=float)
+        out = np.column_stack([
+            np.interp(sample_arc, arc, seg[:, 0]),
+            np.interp(sample_arc, arc, seg[:, 1]),
+            np.interp(sample_arc, arc, seg[:, 2]),
+        ])
+        return out.astype(float)
 
     def _dominant_probe_label(article_idx: int) -> str:
         if (
@@ -2241,12 +2288,30 @@ def render_phantom_paths_3d(
         return 2.5 + 7.0 * norm
 
     def _step_event_lookup(path_diag: Dict[str, Any]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        cumulative = _step_scalar_lookup(path_diag, "step_cumulative_work", "cumulative_work")
+        if cumulative is not None and cumulative.size >= 2:
+            delta = np.diff(cumulative, prepend=cumulative[0])
+        else:
+            delta = _step_scalar_lookup(path_diag, "step_work")
+        if delta is not None and delta.size > 0:
+            delta = np.asarray(delta, dtype=float).reshape(-1)
+            delta = np.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+            positive = delta > 1e-9
+            finite_positive = delta[positive]
+            if finite_positive.size > 0:
+                cutoff = float(np.percentile(finite_positive, 95.0))
+                peak = float(np.max(finite_positive))
+                denom = max(peak - cutoff, 1e-9)
+                severity = np.clip((delta - cutoff) / denom, 0.0, 1.0)
+                mask = positive & (delta >= cutoff)
+                return mask.astype(bool), severity.astype(float)
+
         mask = _step_scalar_lookup(path_diag, "step_event_mask")
         severity = _step_scalar_lookup(path_diag, "step_event_severity")
         if mask is None and severity is None:
             return None, None
         if mask is None and severity is not None:
-            mask = severity >= 0.85
+            mask = severity >= 0.95
         if severity is None and mask is not None:
             severity = np.where(mask > 0, 1.0, 0.0)
         return np.asarray(mask > 0, dtype=bool), np.asarray(severity, dtype=float)
@@ -2279,32 +2344,37 @@ def render_phantom_paths_3d(
             return
         legend_group = "track4-shear-flares"
         legend_name = "Shear Flares"
+        candidates: List[Tuple[float, np.ndarray]] = []
         step_cursor = 0
-        for seg_idx, seg in enumerate(path_segments):
+        for seg in path_segments:
             for j in range(max(0, seg.shape[0] - 1)):
                 step_idx = min(step_cursor + j, len(event_mask) - 1)
                 if not bool(event_mask[step_idx]):
                     continue
                 severity = float(event_severity[min(step_idx, len(event_severity) - 1)])
                 mid_xyz = 0.5 * (seg[j, :3] + seg[j + 1, :3])
-                traces.append(go.Scatter3d(
-                    x=[mid_xyz[0]],
-                    y=[mid_xyz[1]],
-                    z=[mid_xyz[2]],
-                    mode='markers',
-                    marker=dict(
-                        size=5.0 + 10.0 * float(np.clip(severity, 0.0, 1.0)),
-                        color=_flare_color(severity, verdict_name),
-                        opacity=0.40 + 0.55 * float(np.clip(severity, 0.0, 1.0)),
-                        line=dict(color="#FFFFFF", width=1),
-                    ),
-                    name=legend_name,
-                    hovertext=[f"{hover_label}<br>Localized shear severity={severity:.2f}"],
-                    hovertemplate="%{hovertext}<extra></extra>",
-                    legendgroup=legend_group,
-                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0) and (j == 0),
-                ))
+                candidates.append((severity, np.asarray(mid_xyz, dtype=float)))
             step_cursor += max(1, seg.shape[0] - 1)
+        if not candidates:
+            return
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for idx, (severity, mid_xyz) in enumerate(candidates[:2]):
+            traces.append(go.Scatter3d(
+                x=[mid_xyz[0]],
+                y=[mid_xyz[1]],
+                z=[mid_xyz[2]],
+                mode='markers',
+                marker=dict(
+                    size=3,
+                    color=_flare_color(severity, verdict_name),
+                    opacity=0.8,
+                ),
+                name=legend_name,
+                hovertext=[f"{hover_label}<br>Localized shear severity={severity:.2f}"],
+                hovertemplate="%{hovertext}<extra></extra>",
+                legendgroup=legend_group,
+                showlegend=(legend_group not in legend_shown) and (idx == 0),
+            ))
         legend_shown.add(legend_group)
 
     def _build_shear_text(
@@ -2426,7 +2496,7 @@ def render_phantom_paths_3d(
         if i < 0 or i >= n_articles:
             continue
         v_info = phantom_verdicts[i]
-        verdict = str(v_info.get("verdict", "UNKNOWN")).upper()
+        verdict = canonicalize_walker_verdict(v_info.get("verdict", "UNKNOWN"))
         walker_state = str(v_info.get("walker_state", "success")).lower()
         meta = article_metadata[i] if article_metadata and i < len(article_metadata) else {}
         title = str(meta.get('title', f'Article {i}'))[:60]
@@ -2465,15 +2535,18 @@ def render_phantom_paths_3d(
                             np.array([start_xyz[0], end_xyz[0]], dtype=float),
                             np.array([start_xyz[1], end_xyz[1]], dtype=float),
                             offset=0.05,
-                            preserve_nan=True,
+                            preserve_nan=False,
                         ),
                         dtype=float,
                     )
-                    if tether_z.shape[0] == 2 and np.isfinite(tether_z).all():
-                        start_xyz[2] = float(tether_z[0])
-                        end_xyz[2] = float(tether_z[1])
+                    if tether_z.shape[0] == 2:
+                        tether_z = np.nan_to_num(tether_z, nan=source_z + 0.05, posinf=source_z + 0.05, neginf=source_z + 0.05)
+                        start_xyz[2] = float(np.clip(tether_z[0], -z_cap, z_cap))
+                        end_xyz[2] = float(np.clip(tether_z[1], -z_cap, z_cap))
                 except Exception:
                     pass
+            start_xyz[2] = float(np.clip(start_xyz[2], -z_cap, z_cap))
+            end_xyz[2] = float(np.clip(end_xyz[2], -z_cap, z_cap))
             if verdict not in {"HONEST", "TAUTOLOGY", "PHANTOM"}:
                 path_color = "#FFD700"
                 line_width = 3
@@ -2678,12 +2751,12 @@ def render_phantom_paths_3d(
                 except Exception:
                     pass
                 seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
-                path_segments[seg_idx] = seg
+                path_segments[seg_idx] = _resample_segment_xyz(seg)
         else:
             for seg_idx in range(len(path_segments)):
                 seg = path_segments[seg_idx].copy()
                 seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
-                path_segments[seg_idx] = seg
+                path_segments[seg_idx] = _resample_segment_xyz(seg)
         end_xyz = path_segments[-1][-1, :3] if path_segments else None
 
         if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
@@ -2753,24 +2826,25 @@ def render_phantom_paths_3d(
             rupture_color = "#FF2222" if walker_state == "broken" else "#FF00FF"
             legend_group = 'path-rupture-broken' if walker_state == "broken" else 'path-rupture-trapped'
             legend_name = 'Walker Broken' if walker_state == "broken" else 'Walker Trapped'
-            step_cursor = 0
             for seg_idx, seg in enumerate(path_segments):
-                for j in range(max(0, seg.shape[0] - 1)):
-                    width_idx = min(step_cursor + j, len(step_widths) - 1) if step_widths is not None and len(step_widths) > 0 else None
-                    seg_width = float(step_widths[width_idx]) if width_idx is not None else (4.5 if walker_state == "broken" else 2.5)
-                    traces.append(go.Scatter3d(
-                        x=[seg[j, 0], seg[j + 1, 0]],
-                        y=[seg[j, 1], seg[j + 1, 1]],
-                        z=[seg[j, 2], seg[j + 1, 2]],
-                        mode='lines',
-                        line=dict(color=rupture_color, width=seg_width),
-                        name=legend_name,
-                        text=[hover_text, hover_text],
-                        hoverinfo='skip',
-                        legendgroup=legend_group,
-                        showlegend=(legend_group not in legend_shown) and (seg_idx == 0) and (j == 0),
-                    ))
-                step_cursor += max(1, seg.shape[0] - 1)
+                seg_width = 4.5 if walker_state == "broken" else 2.5
+                if step_widths is not None and len(step_widths) > 0:
+                    finite_widths = np.asarray(step_widths, dtype=float)
+                    finite_widths = finite_widths[np.isfinite(finite_widths)]
+                    if finite_widths.size > 0:
+                        seg_width = float(np.clip(np.percentile(finite_widths, 75.0), 2.5, 7.0))
+                traces.append(go.Scatter3d(
+                    x=seg[:, 0],
+                    y=seg[:, 1],
+                    z=seg[:, 2],
+                    mode='lines',
+                    line=dict(color=rupture_color, width=seg_width),
+                    name=legend_name,
+                    text=[hover_text] * len(seg),
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
+                ))
             legend_shown.add(legend_group)
             _append_step_flares(path_segments, step_event_mask, step_event_severity, hover_text, verdict)
 
@@ -3817,8 +3891,18 @@ def render_analysis_planes(
         if proj_2d is None:
             continue
 
-        # Compute NMI
-        nmi = compute_nmi(features, labels, labels_available)
+        persisted_nmi = None
+        if isinstance(exp.track_nmi, dict):
+            candidate = exp.track_nmi.get(cp_label)
+            if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)):
+                persisted_nmi = float(candidate)
+        if persisted_nmi is None and cp_label == "SYN" and isinstance(exp.synthesis_nmi, (int, float)):
+            if np.isfinite(float(exp.synthesis_nmi)):
+                persisted_nmi = float(exp.synthesis_nmi)
+
+        # Prefer canonical persisted per-track NMI from validation.json, then
+        # fall back to on-the-fly clustering for legacy runs.
+        nmi = persisted_nmi if persisted_nmi is not None else compute_nmi(features, labels, labels_available)
         nmi_scores[cp_label] = nmi
 
         # Create semi-transparent plane surface
@@ -4264,7 +4348,7 @@ def create_monolith_cockpit(
             for i, row in monolith_df.iterrows():
                 phantom_verdicts.append({
                     'article_id': row.get('article_id', f'art_{i}'),
-                    'verdict': str(row['verdict']).upper(),
+                    'verdict': canonicalize_walker_verdict(row['verdict']),
                     'w_actual': row.get('stress', 0.5) * 5.0, # Approximate work for HUD
                     'delta': 1.0 # Default delta
                 })

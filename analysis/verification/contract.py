@@ -2,6 +2,7 @@
 
 import csv
 import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 SCHEMA_VERSION = "1.0"
 CONTRACT_VERSION = "1.0"
-REQUIRED_CONSUMER_ARTIFACTS = ("baseline_meta.json", "baseline_state.json", "verification_report.json")
+REQUIRED_CONSUMER_ARTIFACTS = ("baseline_meta.json", "baseline_state.json", "verification_report.json", "validation.json")
 OPTIONAL_CONSUMER_ARTIFACTS = (
     "verification_summary.csv",
     "labels/hidden_groups.csv",
@@ -223,12 +224,64 @@ def validate_baseline_state(state: Dict[str, Any]) -> ValidationResult:
     return ValidationResult(len(errors) == 0, errors, warnings)
 
 
+def validate_validation_json(validation: Dict[str, Any]) -> ValidationResult:
+    errors: List[str] = []
+    warnings: List[str] = []
+    if "nmi" not in validation:
+        errors.append("validation missing 'nmi'")
+        return ValidationResult(False, errors, warnings)
+
+    nmi = validation.get("nmi")
+    if isinstance(nmi, bool) or not isinstance(nmi, (int, float)):
+        errors.append("validation.nmi must be a numeric value in [0, 1] (bool not allowed)")
+        return ValidationResult(False, errors, warnings)
+
+    nmi_value = float(nmi)
+    if not math.isfinite(nmi_value):
+        errors.append("validation.nmi must be finite")
+    elif not (0.0 <= nmi_value <= 1.0):
+        errors.append("validation.nmi must be in [0, 1]")
+
+    track_nmi = validation.get("track_nmi")
+    if track_nmi is not None:
+        if not isinstance(track_nmi, dict):
+            errors.append("validation.track_nmi must be an object when present")
+        else:
+            for key, value in track_nmi.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    errors.append(f"validation.track_nmi.{key} must be numeric")
+                    continue
+                val = float(value)
+                if not math.isfinite(val) or not (0.0 <= val <= 1.0):
+                    errors.append(f"validation.track_nmi.{key} must be in [0, 1]")
+
+    track_metrics = validation.get("track_metrics")
+    if track_metrics is not None:
+        if not isinstance(track_metrics, dict):
+            errors.append("validation.track_metrics must be an object when present")
+        else:
+            for key, value in track_metrics.items():
+                if not isinstance(value, dict):
+                    errors.append(f"validation.track_metrics.{key} must be an object")
+                    continue
+                nmi_item = value.get("nmi")
+                if nmi_item is not None:
+                    if isinstance(nmi_item, bool) or not isinstance(nmi_item, (int, float)):
+                        errors.append(f"validation.track_metrics.{key}.nmi must be numeric")
+                    else:
+                        nmi_item = float(nmi_item)
+                        if not math.isfinite(nmi_item) or not (0.0 <= nmi_item <= 1.0):
+                            errors.append(f"validation.track_metrics.{key}.nmi must be in [0, 1]")
+    return ValidationResult(len(errors) == 0, errors, warnings)
+
+
 def _artifact_map(run_dir: Path) -> Dict[str, Optional[Path]]:
     run_dir = Path(run_dir)
     return {
         "baseline_meta.json": run_dir / "baseline_meta.json",
         "baseline_state.json": run_dir / "baseline_state.json",
         "verification_report.json": run_dir / "verification_report.json",
+        "validation.json": run_dir / "validation.json",
         "verification_summary.csv": run_dir / "verification_summary.csv",
         "labels/hidden_groups.csv": run_dir / "labels" / "hidden_groups.csv",
         "labels/derived/group_summaries.json": run_dir / "labels" / "derived" / "group_summaries.json",
@@ -282,6 +335,16 @@ def evaluate_consumer_contract(run_dir: Path) -> ConsumerDiagnostics:
         vs = validate_baseline_state(state)
         schema_errors.extend(vs.errors)
         warnings.extend(vs.warnings)
+
+    validation_path = paths["validation.json"]
+    if validation_path.exists():
+        try:
+            validation_data = _safe_json(validation_path)
+            vv = validate_validation_json(validation_data)
+            schema_errors.extend(vv.errors)
+            warnings.extend(vv.warnings)
+        except Exception as exc:
+            schema_errors.append(f"validation.json parse error: {exc}")
 
     contract_ok = (len(missing_required) == 0) and (len(schema_errors) == 0)
     return ConsumerDiagnostics(

@@ -24,12 +24,21 @@ Author: Belief Transformer Project (ASTER v3.2)
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import numpy as np
+import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Union
 from datetime import datetime
+
+if sys.platform == "win32":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
 
 # =============================================================================
 # OPTIONAL IMPORTS
@@ -146,6 +155,8 @@ class WaterfallData:
     run_id: str = ""
     n_articles: int = 0
     checkpoint_dir: Optional[Path] = None
+    contract_track_nmi: Dict[str, float] = field(default_factory=dict)
+    contract_track_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Computed 2D projections for visualization
     cp1_2d: Optional[np.ndarray] = None             # [N, 2] PCA of logits (Track 1 only)
@@ -158,6 +169,7 @@ class WaterfallData:
     cp2_raw: Optional[np.ndarray] = None            # [N, D] Track 2 features
     cp3_raw: Optional[np.ndarray] = None            # [N, D+8] Track 2 + Track 1.5 concatenated
     cp4_raw: Optional[np.ndarray] = None            # [N, D+8+1] Full metric with Track 3
+    synthesis_features: Optional[np.ndarray] = None # [N, D] Final synthesis feature fallback
 
 
 def load_waterfall_checkpoints(
@@ -280,6 +292,11 @@ def load_waterfall_checkpoints(
             data.t3_blinker = 1.0 - conf  # Convert confidence to uncertainty
             print(f"[Waterfall] Loaded Track 3 (from logit_confidence): {data.t3_blinker.shape}")
 
+    synthesis_path = exp_dir / "features.npy"
+    if synthesis_path.exists():
+        data.synthesis_features = np.load(synthesis_path)
+        print(f"[Waterfall] Loaded synthesis features: {data.synthesis_features.shape}")
+
     # T3: Topology
     t3_path = checkpoint_dir / "T3_topology.npz"
     if t3_path.exists():
@@ -308,7 +325,62 @@ def load_waterfall_checkpoints(
         data.label_names = label_set
         print(f"[Waterfall] Loaded {len(label_set)} ground truth labels")
 
+    validation_path = exp_dir / "validation.json"
+    if validation_path.exists():
+        try:
+            payload = json.loads(validation_path.read_text(encoding="utf-8"))
+            raw_track_nmi = payload.get("track_nmi", {})
+            if isinstance(raw_track_nmi, dict):
+                data.contract_track_nmi = {
+                    str(k): float(v)
+                    for k, v in raw_track_nmi.items()
+                    if isinstance(v, (int, float))
+                }
+            raw_track_metrics = payload.get("track_metrics", {})
+            if isinstance(raw_track_metrics, dict):
+                data.contract_track_metrics = {
+                    str(k): v
+                    for k, v in raw_track_metrics.items()
+                    if isinstance(v, dict)
+                }
+        except Exception as e:
+            print(f"[Waterfall] Failed to load persisted track metrics: {e}")
+
     return data
+
+
+def _override_with_contract_metrics(
+    metrics: Dict[str, Any],
+    data: WaterfallData,
+    track_key: str,
+) -> Dict[str, Any]:
+    """
+    Prefer persisted per-track NMI from validation.json when available so the
+    dashboard and MONOLITH use the same ledger-backed values.
+    """
+    out = dict(metrics or {})
+    contract = data.contract_track_metrics.get(track_key, {})
+    if not isinstance(contract, dict):
+        contract = {}
+    contract_nmi = data.contract_track_nmi.get(track_key)
+    if isinstance(contract_nmi, (int, float)):
+        out["nmi"] = float(contract_nmi)
+        if out["nmi"] > 0.5:
+            out["signal_status"] = "GOOD"
+            out["signal_color"] = PALETTE.good_signal
+        elif out["nmi"] > 0.2:
+            out["signal_status"] = "DEGRADED"
+            out["signal_color"] = PALETTE.degraded_signal
+        else:
+            out["signal_status"] = "NOISE"
+            out["signal_color"] = PALETTE.no_signal
+    if isinstance(contract.get("ari"), (int, float)):
+        out["ari"] = float(contract["ari"])
+    if isinstance(contract.get("n_clusters"), int):
+        out["n_clusters"] = int(contract["n_clusters"])
+    if isinstance(contract.get("label_source"), str):
+        out["label_source"] = contract["label_source"]
+    return out
 
 
 # =============================================================================
@@ -422,6 +494,9 @@ def compute_projections(data: WaterfallData, method: str = "pca") -> WaterfallDa
 
         data.cp4_raw = np.concatenate([data.cp3_raw, blinker_scaled], axis=1)
         print(f"[Waterfall] CP4 = CP3 {data.cp3_raw.shape} + Track3 {blinker_scaled.shape} = {data.cp4_raw.shape}")
+    elif data.synthesis_features is not None:
+        data.cp4_raw = data.synthesis_features
+        print(f"[Waterfall] CP4 fallback = synthesis features {data.cp4_raw.shape}")
 
     # =========================================================================
     # COMPUTE NMI ON RAW ACCUMULATIVE FEATURES
@@ -726,6 +801,7 @@ def create_waterfall_dashboard(
     cp1_metrics = {"status": "NO DATA"}
     if data.cp1_2d is not None:
         cp1_metrics = compute_signal_quality(data.cp1_2d, data.labels)
+        cp1_metrics = _override_with_contract_metrics(cp1_metrics, data, "T1")
 
         fig.add_trace(
             go.Scatter(
@@ -768,6 +844,7 @@ def create_waterfall_dashboard(
     cp2_metrics = {"status": "NO DATA"}
     if data.cp2_2d is not None:
         cp2_metrics = compute_signal_quality(data.cp2_2d, data.labels)
+        cp2_metrics = _override_with_contract_metrics(cp2_metrics, data, "T2")
 
         fig.add_trace(
             go.Scatter(
@@ -809,6 +886,7 @@ def create_waterfall_dashboard(
     cp3_metrics = {"status": "NO DATA"}
     if data.cp3_2d is not None:
         cp3_metrics = compute_signal_quality(data.cp3_2d, data.labels)
+        cp3_metrics = _override_with_contract_metrics(cp3_metrics, data, "T1.5")
 
         fig.add_trace(
             go.Scatter(
@@ -850,6 +928,7 @@ def create_waterfall_dashboard(
     cp4_metrics = {"status": "NO DATA"}
     if data.cp4_2d is not None:
         cp4_metrics = compute_signal_quality(data.cp4_2d, data.labels)
+        cp4_metrics = _override_with_contract_metrics(cp4_metrics, data, "SYN")
 
         fig.add_trace(
             go.Scatter(
@@ -980,6 +1059,14 @@ def generate_diagnostic_report(data: WaterfallData) -> str:
     for name, coords in checkpoints:
         if coords is not None:
             metrics = compute_signal_quality(coords, data.labels)
+            track_key = {
+                "CP-1: Track 1 (Logits)": "T1",
+                "CP-2: Track 2 (δ_μν)": "T2",
+                "CP-3: T2+T1.5 (+∇Φ∇Φ)": "T1.5",
+                "CP-4: Full (+1/ρ)": "SYN",
+            }.get(name)
+            if track_key is not None:
+                metrics = _override_with_contract_metrics(metrics, data, track_key)
             status = metrics.get("signal_status", "N/A")
             silh = metrics.get("silhouette", 0.0)
             nmi = metrics.get("nmi", None)
@@ -1164,6 +1251,8 @@ def run_waterfall_analysis(
             "cp3_2d": data.cp3_2d is not None,
             "cp4_2d": data.cp4_2d is not None,
         },
+        "track_nmi": data.contract_track_nmi,
+        "track_metrics": data.contract_track_metrics,
     }
 
     # Save metrics

@@ -286,6 +286,7 @@ def test_load_contract_state_invalid_schema_missing_keys(monkeypatch, mod, tmp_p
 
     _write_json(run_dir / "baseline_meta.json", {"verification_status": "VERIFIED"})
     _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(run_dir / "validation.json", {"nmi": 0.5})
     (run_dir / "labels").mkdir(parents=True, exist_ok=True)
     (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
     _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "g1", "n_articles": 1}]})
@@ -309,6 +310,7 @@ def test_load_contract_state_valid_with_observer_artifacts(monkeypatch, mod, tmp
 
     _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
     _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(run_dir / "validation.json", {"nmi": 0.75})
     _write_json(
         run_dir / "verification_report.json",
         {
@@ -343,3 +345,124 @@ def test_load_contract_state_valid_with_observer_artifacts(monkeypatch, mod, tmp
     state = mod.load_contract_state("rk", "article:7")
     assert state["status"] == "OK", f"Expected status OK, got: {state['status']} with errors: {state['errors']}"
     assert state["errors"] == [], f"Expected no contract errors for fully valid contract, got: {state['errors']}"
+
+
+def test_load_contract_state_accepts_track_nmi_schema(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_track_nmi"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(
+        run_dir / "validation.json",
+        {
+            "nmi": 0.75,
+            "track_nmi": {"T1": 0.31, "T2": 0.47, "T1.5": 0.55, "SYN": 0.62},
+            "track_metrics": {
+                "T1": {"nmi": 0.31, "ari": 0.12, "n_clusters": 8, "label_source": "corpus_semantic_label"},
+                "SYN": {"nmi": 0.62, "ari": 0.28, "n_clusters": 8, "label_source": "corpus_semantic_label"},
+            },
+        },
+    )
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {
+                    "layer_id": "rbf/cls",
+                    "layer_name": "cls",
+                    "status": "VERIFIED",
+                    "checks": [{"name": "crn_locked", "pass": True}],
+                    "fail_reasons": [],
+                }
+            ],
+            "global_pass": True,
+        },
+    )
+    (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
+    _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "topic", "n_articles": 1}]})
+    _write_json(run_dir / "labels" / "derived" / "group_matrix.json", {"groups": ["topic"], "cost_matrix": [[0.0]]})
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_contract_state("rk", "global")
+    assert state["status"] == "OK", f"Expected status OK, got: {state['status']} with errors: {state['errors']}"
+
+
+def test_load_contract_state_rejects_invalid_track_nmi_schema(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_bad_track_nmi"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(
+        run_dir / "validation.json",
+        {
+            "nmi": 0.75,
+            "track_nmi": {"T1": 1.5},
+            "track_metrics": {"T2": {"nmi": "bad"}},
+        },
+    )
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {
+                    "layer_id": "rbf/cls",
+                    "layer_name": "cls",
+                    "status": "VERIFIED",
+                    "checks": [{"name": "crn_locked", "pass": True}],
+                    "fail_reasons": [],
+                }
+            ],
+            "global_pass": True,
+        },
+    )
+    (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
+    _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "topic", "n_articles": 1}]})
+    _write_json(run_dir / "labels" / "derived" / "group_matrix.json", {"groups": ["topic"], "cost_matrix": [[0.0]]})
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_contract_state("rk", "global")
+    assert state["status"] == "INVALID_SCHEMA", f"Expected INVALID_SCHEMA, got: {state['status']}"
+    assert any("validation.track_nmi.T1 must be in [0, 1]" in e for e in state["errors"])
+    assert any("validation.track_metrics.T2.nmi must be numeric" in e for e in state["errors"])
+
+
+def test_load_contract_state_invalid_schema_missing_validation_nmi(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_bad_validation"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(run_dir / "validation.json", {"ari": 0.2})
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {
+                    "layer_id": "rbf/cls",
+                    "layer_name": "cls",
+                    "status": "VERIFIED",
+                    "checks": [{"name": "crn_locked", "pass": True}],
+                    "fail_reasons": [],
+                }
+            ],
+            "global_pass": True,
+        },
+    )
+    (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
+    _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "topic", "n_articles": 1}]})
+    _write_json(run_dir / "labels" / "derived" / "group_matrix.json", {"groups": ["topic"], "cost_matrix": [[0.0]]})
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_contract_state("rk", "global")
+    assert state["status"] == "INVALID_SCHEMA", f"Expected INVALID_SCHEMA, got: {state['status']}"
+    assert any("validation missing 'nmi'" in e for e in state["errors"]), (
+        f"Expected missing validation nmi error in contract path, got: {state['errors']}"
+    )

@@ -152,6 +152,30 @@ def test_missing_logits_keeps_t1_nmi_unavailable_via_function():
     assert np.isnan(nmi_scores["T1"])
 
 
+def test_persisted_track_nmi_overrides_proxy_recompute():
+    _require_plotly()
+    n = 6
+    exp = ExperimentData(
+        kernel="rbf",
+        seed=0,
+        n_articles=n,
+        features=np.random.default_rng(1).normal(size=(n, 4)),
+        cp_t2_kernels=np.random.default_rng(2).normal(size=(n, 4)),
+        cp_t15_spectral=np.random.default_rng(3).normal(size=(n, 4)),
+        dirichlet_fused=np.random.default_rng(4).normal(size=(n, 4)),
+        ground_truth_labels=np.array([0, 1, 0, 1, 0, 1], dtype=int),
+        track_nmi={"T2": 0.42, "T1.5": 0.24, "T3": 0.18, "SYN": 0.81},
+        synthesis_nmi=0.81,
+    )
+
+    _, nmi_scores = render_analysis_planes(exp)
+
+    assert nmi_scores["T2"] == pytest.approx(0.42)
+    assert nmi_scores["T1.5"] == pytest.approx(0.24)
+    assert nmi_scores["T3"] == pytest.approx(0.18)
+    assert nmi_scores["SYN"] == pytest.approx(0.81)
+
+
 def test_mode_specific_camera_presets_are_applied(monkeypatch, tmp_path):
     fig_syn, html_syn = _render_html_for_mode(tmp_path / "syn", "synthesis", None, monkeypatch)
     fig_ana, html_ana = _render_html_for_mode(tmp_path / "ana", "analysis", None, monkeypatch)
@@ -265,6 +289,64 @@ def test_track4_chroma_ribbons_emit_variable_widths_and_shear_flares():
     ]
     assert chroma_widths
     assert max(chroma_widths) > min(chroma_widths), chroma_widths
+
+
+def test_type2_rupture_is_canonicalized_and_rendered():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, 0.2, 0.1],
+                [0.4, 0.4, 0.2],
+            ],
+            dtype=float,
+        )
+    }
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=[{"verdict": "TYPE_2_RUPTURE", "walker_state": "trapped"}],
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+    )
+
+    names = [str(getattr(t, "name", "")) for t in traces]
+    assert "Walker Trapped" in names, names
+
+
+def test_shear_flares_are_thresholded_and_capped():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    path_xyz = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [0.3, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [0.6, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=[{"verdict": "PHANTOM", "walker_state": "success"}],
+        positions_3d=positions_3d,
+        walker_paths={0: path_xyz},
+        walker_path_diagnostics={
+            0: {
+                "step_axis_idx": np.array([0, 1, 2, 3, 4, 5], dtype=int),
+                "step_cumulative_work": np.array([0.1, 0.2, 0.3, 4.5, 4.7, 9.9], dtype=float),
+            }
+        },
+    )
+
+    flare_traces = [t for t in traces if str(getattr(t, "name", "")) == "Shear Flares"]
+    assert 1 <= len(flare_traces) <= 2
+    for trace in flare_traces:
+        assert float(trace.marker.size) == pytest.approx(3.0)
+        assert float(trace.marker.opacity) == pytest.approx(0.8)
 
 
 def test_cumulative_work_prevents_markovian_width_snapback():

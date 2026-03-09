@@ -177,6 +177,18 @@ def compute_variance_stats(tensor: torch.Tensor, name: str) -> Dict[str, float]:
 
 
 SPECTRAL_CLS_NORMALIZATION_CONTRACT = "magnitude_preserving"
+_VALIDATION_MISSING = {"", "unknown", "none", "nan", "n/a", "na"}
+_PRIMARY_LABEL_KEYS = (
+    "perspective_tag",
+    "label",
+    "ground_truth_label",
+    "frame_label",
+    "viewpoint",
+    "ideology",
+)
+_SECONDARY_LABEL_KEYS = ("bias", "affiliation")
+_SOURCE_LABEL_KEYS = ("source", "publisher", "publication", "outlet")
+_TRACK_VALIDATION_ORDER = ("T1", "T2", "T1.5", "T3", "SYN")
 
 
 def _canonicalize_cls_per_bot_for_spectral(
@@ -275,6 +287,196 @@ def _construct_spectral_poles(
         "fallback_used": fallback_used,
         "fallback_state": fallback_state,
     }
+
+
+def _extract_validation_label_info(
+    articles_for_labels=None,
+    metadata_for_labels=None,
+    *,
+    allow_source_fallback: bool = False,
+):
+    def _try_records(records, keys, label_source):
+        if records is None:
+            return None
+        labels = []
+        for row in records:
+            if not isinstance(row, dict):
+                return None
+            value = None
+            for key in keys:
+                raw = row.get(key)
+                if raw is None:
+                    continue
+                text = str(raw).strip()
+                if text and text.lower() not in _VALIDATION_MISSING:
+                    value = text
+                    break
+            if value is None:
+                return None
+            labels.append(value)
+        unique = sorted(set(labels))
+        if len(unique) < 2:
+            return None
+        return {
+            "labels": labels,
+            "label_cardinality": int(len(unique)),
+            "label_source": label_source,
+        }
+
+    candidates = [
+        (articles_for_labels, _PRIMARY_LABEL_KEYS, "corpus_semantic_label"),
+        (metadata_for_labels, _PRIMARY_LABEL_KEYS, "article_metadata"),
+        (metadata_for_labels, _SECONDARY_LABEL_KEYS, "article_metadata"),
+    ]
+    if allow_source_fallback:
+        candidates.append((metadata_for_labels, _SOURCE_LABEL_KEYS, "source_fallback"))
+
+    for records, keys, label_source in candidates:
+        info = _try_records(records, keys, label_source)
+        if info is not None:
+            return info
+    return None
+
+
+def _compute_alignment_metrics(features_np, label_info):
+    """
+    Compute contract-grade clustering alignment metrics from final features
+    against explicit label information.
+    """
+    if features_np is None or label_info is None:
+        return None
+    X = np.asarray(features_np, dtype=np.float64)
+    if X.ndim != 2 or X.shape[0] < 3:
+        return None
+    labels = list(label_info.get("labels", []))
+    if len(labels) != X.shape[0]:
+        return None
+
+    unique = sorted(set(labels))
+    if len(unique) < 2:
+        return None
+    label_to_idx = {label: idx for idx, label in enumerate(unique)}
+    y = np.array([label_to_idx[v] for v in labels], dtype=np.int32)
+
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+        n_clusters = int(len(unique))
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        pred = km.fit_predict(X)
+        return {
+            "nmi": float(normalized_mutual_info_score(y, pred)),
+            "ari": float(adjusted_rand_score(y, pred)),
+            "n_clusters": n_clusters,
+            "label_cardinality": int(len(unique)),
+            "label_source": str(label_info.get("label_source", "unknown")),
+        }
+    except Exception:
+        return None
+
+
+def _load_track_feature_sets(run_dir: str, synthesis_features=None) -> Dict[str, np.ndarray]:
+    run_path = Path(run_dir)
+    checkpoint_dir = run_path / "checkpoints" / "batch"
+    track_features: Dict[str, np.ndarray] = {}
+
+    t0_path = checkpoint_dir / "T0_substrate.npy"
+    if t0_path.exists():
+        t0 = np.load(t0_path)
+        if t0.ndim > 2:
+            t0 = t0.reshape(t0.shape[0], -1)
+        track_features["T1"] = np.asarray(t0, dtype=np.float64)
+
+    t2_path = checkpoint_dir / "T2_kernel_projections.npz"
+    if t2_path.exists():
+        t2_data = np.load(t2_path, allow_pickle=True)
+        selected = None
+        for key in ("z_rbf", "z_matern", "z_laplacian", "z_imq"):
+            if key in t2_data.files:
+                selected = np.asarray(t2_data[key], dtype=np.float64)
+                break
+        if selected is None:
+            for key in t2_data.files:
+                if str(key).startswith("z_"):
+                    selected = np.asarray(t2_data[key], dtype=np.float64)
+                    break
+        if selected is not None and selected.ndim == 2:
+            track_features["T2"] = selected
+
+    t15_path = checkpoint_dir / "T1.5_spectral_state.npz"
+    if t15_path.exists():
+        t15_data = np.load(t15_path, allow_pickle=True)
+        if "probe_magnitudes" in t15_data.files:
+            probe_mags = np.asarray(t15_data["probe_magnitudes"], dtype=np.float64)
+            if probe_mags.ndim == 2:
+                track_features["T1.5"] = probe_mags
+
+    t3_std_path = run_path / "dirichlet_fused_std.npy"
+    if t3_std_path.exists():
+        t3_std = np.asarray(np.load(t3_std_path), dtype=np.float64)
+        if t3_std.ndim == 2:
+            track_features["T3"] = t3_std
+    else:
+        t3_path = checkpoint_dir / "T3_topology.npz"
+        if t3_path.exists():
+            t3_data = np.load(t3_path, allow_pickle=True)
+            for key in ("dirichlet_fused", "bond_matrix", "crack_matrix"):
+                if key in t3_data.files:
+                    candidate = np.asarray(t3_data[key], dtype=np.float64)
+                    if candidate.ndim == 2:
+                        track_features["T3"] = candidate
+                        break
+
+    if synthesis_features is not None:
+        syn = np.asarray(synthesis_features, dtype=np.float64)
+        if syn.ndim == 2:
+            track_features["SYN"] = syn
+    else:
+        features_path = run_path / "features.npy"
+        if features_path.exists():
+            syn = np.asarray(np.load(features_path), dtype=np.float64)
+            if syn.ndim == 2:
+                track_features["SYN"] = syn
+
+    return track_features
+
+
+def _compute_track_validation_metrics(
+    run_dir: str,
+    label_info,
+    synthesis_features=None,
+) -> Dict[str, Dict[str, Any]]:
+    track_metrics: Dict[str, Dict[str, Any]] = {}
+    for track_key, features_np in _load_track_feature_sets(run_dir, synthesis_features=synthesis_features).items():
+        metrics = _compute_alignment_metrics(features_np, label_info)
+        if metrics is not None:
+            track_metrics[track_key] = metrics
+    return track_metrics
+
+
+def _summarize_track_validation_records(
+    validation_records: List[Dict[str, Any]]
+) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    track_nmi_summary: Dict[str, float] = {}
+    track_metrics_summary: Dict[str, Dict[str, Any]] = {}
+    for track_key in _TRACK_VALIDATION_ORDER:
+        per_track = [
+            rec.get("track_metrics", {}).get(track_key)
+            for rec in validation_records
+            if isinstance(rec.get("track_metrics", {}).get(track_key), dict)
+        ]
+        nmis = [float(m["nmi"]) for m in per_track if isinstance(m.get("nmi"), (int, float))]
+        aris = [float(m["ari"]) for m in per_track if isinstance(m.get("ari"), (int, float))]
+        if not nmis:
+            continue
+        track_nmi_summary[track_key] = float(np.mean(nmis))
+        summary_payload = dict(per_track[0])
+        summary_payload["nmi"] = float(np.mean(nmis))
+        if aris:
+            summary_payload["ari"] = float(np.mean(aris))
+        track_metrics_summary[track_key] = summary_payload
+    return track_nmi_summary, track_metrics_summary
 
 
 class VarianceTracker:
@@ -2417,6 +2619,8 @@ class BeliefTransformerPipeline:
                 "source": source_val,
                 "affiliation": affiliation_val,
                 "bias": bias_val,
+                "perspective_tag": art.get("perspective_tag", None) if isinstance(art, dict) else None,
+                "label": art.get("label", None) if isinstance(art, dict) else None,
                 "title": art.get("title", None) if isinstance(art, dict) else None,
             }
             metadata.append(meta)
@@ -2718,56 +2922,6 @@ def run_multi_observer_experiment(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    def _compute_validation_metrics(features_np, metadata):
-        """
-        Compute contract-grade validation metrics from final features using
-        explicit article labels when available.
-        """
-        if features_np is None:
-            return None
-        X = np.asarray(features_np, dtype=np.float64)
-        if X.ndim != 2 or X.shape[0] < 3:
-            return None
-        if metadata is None or len(metadata) != X.shape[0]:
-            return None
-
-        labels = []
-        for row in metadata:
-            if not isinstance(row, dict):
-                labels.append("unknown")
-                continue
-            lbl = (
-                row.get("perspective_tag")
-                or row.get("label")
-                or row.get("bias")
-                or row.get("affiliation")
-                or row.get("source")
-                or "unknown"
-            )
-            labels.append(str(lbl))
-        unique = sorted(set(labels))
-        if len(unique) < 2:
-            return None
-        label_to_idx = {label: idx for idx, label in enumerate(unique)}
-        y = np.array([label_to_idx[v] for v in labels], dtype=np.int32)
-
-        try:
-            from sklearn.cluster import KMeans
-            from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
-
-            n_clusters = min(len(unique), max(2, min(8, X.shape[0] - 1)))
-            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            pred = km.fit_predict(X)
-            return {
-                "nmi": float(normalized_mutual_info_score(y, pred)),
-                "ari": float(adjusted_rand_score(y, pred)),
-                "n_clusters": int(n_clusters),
-                "label_cardinality": int(len(unique)),
-                "label_source": "article_metadata",
-            }
-        except Exception:
-            return None
-
     all_results = {}
 
     for kernel in kernels:
@@ -2835,9 +2989,18 @@ def run_multi_observer_experiment(
                         indent=2,
                     )
 
-                metrics = _compute_validation_metrics(
+                label_info = _extract_validation_label_info(
+                    articles_for_labels=articles,
+                    metadata_for_labels=month_out.get("article_metadata"),
+                )
+                metrics = _compute_alignment_metrics(
                     month_out.get("features"),
-                    month_out.get("article_metadata"),
+                    label_info,
+                )
+                track_metrics = _compute_track_validation_metrics(
+                    run_dir,
+                    label_info,
+                    synthesis_features=month_out.get("features"),
                 )
                 validation_payload = {
                     "schema_version": "1.0",
@@ -2852,6 +3015,12 @@ def run_multi_observer_experiment(
                     "label_source": metrics.get("label_source") if metrics else "unavailable",
                     "label_cardinality": metrics.get("label_cardinality") if metrics else None,
                     "n_clusters": metrics.get("n_clusters") if metrics else None,
+                    "track_nmi": {
+                        k: float(v["nmi"])
+                        for k, v in track_metrics.items()
+                        if isinstance(v.get("nmi"), (int, float))
+                    },
+                    "track_metrics": track_metrics,
                     "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
                 }
                 validation_records.append(validation_payload)
@@ -2864,6 +3033,7 @@ def run_multi_observer_experiment(
 
             available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
             available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
+            track_nmi_summary, track_metrics_summary = _summarize_track_validation_records(validation_records)
             aggregate_validation = {
                 "schema_version": "1.0",
                 "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
@@ -2876,6 +3046,8 @@ def run_multi_observer_experiment(
                 "nmi_std": float(np.std(available_nmi)) if available_nmi else None,
                 "ari_std": float(np.std(available_ari)) if available_ari else None,
                 "metric_source": "kmeans_on_final_features",
+                "track_nmi": track_nmi_summary,
+                "track_metrics": track_metrics_summary,
                 "per_month": validation_records,
                 "trust_level": "MEASURED" if available_nmi else "UNAVAILABLE",
             }
@@ -2960,56 +3132,6 @@ def run_multi_observer_experiment_simple(
     
     results = {}
     validation_records = []
-
-    def _compute_validation_metrics(features_np, metadata):
-        """
-        Compute contract-grade validation metrics from final features using
-        explicit article labels when available.
-        """
-        if features_np is None:
-            return None
-        X = np.asarray(features_np, dtype=np.float64)
-        if X.ndim != 2 or X.shape[0] < 3:
-            return None
-        if metadata is None or len(metadata) != X.shape[0]:
-            return None
-
-        labels = []
-        for row in metadata:
-            if not isinstance(row, dict):
-                labels.append("unknown")
-                continue
-            lbl = (
-                row.get("perspective_tag")
-                or row.get("label")
-                or row.get("bias")
-                or row.get("affiliation")
-                or row.get("source")
-                or "unknown"
-            )
-            labels.append(str(lbl))
-        unique = sorted(set(labels))
-        if len(unique) < 2:
-            return None
-        label_to_idx = {label: idx for idx, label in enumerate(unique)}
-        y = np.array([label_to_idx[v] for v in labels], dtype=np.int32)
-
-        try:
-            from sklearn.cluster import KMeans
-            from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
-
-            n_clusters = min(len(unique), max(2, min(8, X.shape[0] - 1)))
-            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            pred = km.fit_predict(X)
-            return {
-                "nmi": float(normalized_mutual_info_score(y, pred)),
-                "ari": float(adjusted_rand_score(y, pred)),
-                "n_clusters": int(n_clusters),
-                "label_cardinality": int(len(unique)),
-                "label_source": "article_metadata",
-            }
-        except Exception:
-            return None
     
     for seed in seeds:
         print(f"\n{'='*70}")
@@ -3178,9 +3300,18 @@ def run_multi_observer_experiment_simple(
         output_file = output_dir / f"observer_{seed}.pt"
         torch.save(output_artifact, output_file)
 
-        metrics = _compute_validation_metrics(
+        label_info = _extract_validation_label_info(
+            articles_for_labels=articles,
+            metadata_for_labels=output_artifact.get("article_metadata"),
+        )
+        metrics = _compute_alignment_metrics(
             output_artifact.get("features"),
-            output_artifact.get("article_metadata"),
+            label_info,
+        )
+        track_metrics = _compute_track_validation_metrics(
+            output_dir,
+            label_info,
+            synthesis_features=output_artifact.get("features"),
         )
         validation_payload = {
             "schema_version": "1.0",
@@ -3194,6 +3325,12 @@ def run_multi_observer_experiment_simple(
             "label_source": metrics.get("label_source") if metrics else "unavailable",
             "label_cardinality": metrics.get("label_cardinality") if metrics else None,
             "n_clusters": metrics.get("n_clusters") if metrics else None,
+            "track_nmi": {
+                k: float(v["nmi"])
+                for k, v in track_metrics.items()
+                if isinstance(v.get("nmi"), (int, float))
+            },
+            "track_metrics": track_metrics,
             "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
         }
         with open(output_dir / f"validation_seed{seed}.json", "w", encoding="utf-8") as f:
@@ -3207,6 +3344,7 @@ def run_multi_observer_experiment_simple(
     if validation_records:
         available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
         available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
+        track_nmi_summary, track_metrics_summary = _summarize_track_validation_records(validation_records)
         aggregate_validation = {
             "schema_version": "1.0",
             "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
@@ -3216,6 +3354,8 @@ def run_multi_observer_experiment_simple(
             "nmi_std": float(np.std(available_nmi)) if available_nmi else None,
             "ari_std": float(np.std(available_ari)) if available_ari else None,
             "metric_source": "kmeans_on_final_features",
+            "track_nmi": track_nmi_summary,
+            "track_metrics": track_metrics_summary,
             "per_seed": validation_records,
             "trust_level": "MEASURED" if available_nmi else "UNAVAILABLE",
         }
