@@ -466,3 +466,99 @@ def test_load_contract_state_invalid_schema_missing_validation_nmi(monkeypatch, 
     assert any("validation missing 'nmi'" in e for e in state["errors"]), (
         f"Expected missing validation nmi error in contract path, got: {state['errors']}"
     )
+
+
+def test_build_artifact_index_discovers_modern_run_layouts(monkeypatch, mod, tmp_path):
+    honest_run = tmp_path / "outputs" / "honest_matern"
+    honest_run.mkdir(parents=True, exist_ok=True)
+    (honest_run / "MONOLITH.html").write_text("<html>honest</html>", encoding="utf-8")
+    (honest_run / "MONOLITH_DATA.csv").write_text("index,title,bt_uid\n0,Honest,uid-0\n", encoding="utf-8")
+
+    modern_run = (
+        tmp_path
+        / "outputs"
+        / "experiments"
+        / "runs"
+        / "experiments_20260309_050500"
+        / "matern"
+        / "cls"
+        / "sythgen"
+        / "int"
+        / "high_quality_articles.jsonl"
+    )
+    modern_run.mkdir(parents=True, exist_ok=True)
+    (modern_run / "MONOLITH.html").write_text("<html>modern</html>", encoding="utf-8")
+    (modern_run / "MONOLITH_DATA.csv").write_text("index,title,bt_uid\n7,Modern,uid-7\n", encoding="utf-8")
+    _write_json(modern_run / "validation.json", {"nmi": 0.42, "ari": 0.19})
+
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    roots = mod._discover_artifact_roots()
+    root_labels = {str(p.relative_to(tmp_path)).replace("\\", "/") for p in roots}
+    assert "outputs" in root_labels
+    assert "outputs/experiments/runs/experiments_20260309_050500/matern/cls/sythgen" in root_labels
+
+    monkeypatch.setattr(mod, "ARTIFACT_ROOTS", roots)
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", roots[0] if roots else None)
+    index = mod.build_artifact_index()
+
+    modern_key = "outputs/experiments/runs/experiments_20260309_050500/matern/cls/sythgen/int/high_quality_articles.jsonl"
+    assert "outputs/honest_matern" in index["run_keys"]
+    assert modern_key in index["run_keys"]
+    assert index["runs"][modern_key]["kernel"] == "matern"
+    assert index["runs"][modern_key]["nmi"] == 0.42
+    assert index["runs"][modern_key]["ari"] == 0.19
+
+
+def test_apply_url_state_observer_uid_overrides_query_observer(monkeypatch, mod):
+    monkeypatch.setattr(mod, "_observer_value_from_uid", lambda run_key, uid: "article:7" if uid == "uid-7" else None)
+    run_options = [{"label": "rk", "value": "rk"}]
+
+    out = mod.apply_url_state(
+        "?run_key=rk&observer=article:1&observer_uid=uid-7&view_mode=global&compare=1&embedded=1",
+        run_options,
+        "rk",
+    )
+
+    assert out == ("rk", "article:7", "observer", [])
+
+
+def test_apply_url_state_preserves_explicit_observer_when_uid_missing(monkeypatch, mod):
+    monkeypatch.setattr(mod, "_observer_value_from_uid", lambda run_key, uid: None)
+    run_options = [{"label": "rk", "value": "rk"}]
+
+    out = mod.apply_url_state(
+        "?run_key=missing&observer=article:3&observer_uid=missing&view_mode=invalid&compare=yes",
+        run_options,
+        "rk",
+    )
+
+    assert out == ("rk", "article:3", "observer", ["on"])
+
+
+def test_refresh_variants_hydrates_observer_from_uid(monkeypatch, mod):
+    monkeypatch.setattr(
+        mod,
+        "INDEX",
+        {
+            "runs": {"rk": {"variants": ["MONOLITH.html", "ALT.html"]}},
+            "observers_by_run": {
+                "rk": [
+                    {"label": "Global Mean", "value": "global"},
+                    {"label": "Article #7", "value": "article:7"},
+                ]
+            },
+            "article_rows_by_run": {"rk": {7: {"bt_uid": "uid-7"}}},
+        },
+    )
+
+    out = mod.refresh_variants(
+        "rk",
+        "?observer=article:1&observer_uid=uid-7",
+        "MONOLITH.html",
+        "ALT.html",
+        "global",
+    )
+
+    assert out[1] == "MONOLITH.html"
+    assert out[3] == "ALT.html"
+    assert out[5] == "article:7"

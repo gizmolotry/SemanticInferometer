@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import dash_bootstrap_components as dbc
-from dash import Dash, Input, Output, State, callback_context, dcc, html
+from dash import Dash, Input, Output, State, callback_context, dcc, html, no_update
 import plotly.graph_objects as go
 try:
     from analysis.verification.contract import (
@@ -69,13 +69,35 @@ def _is_run_directory(path: Path) -> bool:
     return (path / "MONOLITH_DATA.csv").exists()
 
 
+def _root_has_run_directory(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    try:
+        for child in path.iterdir():
+            if not child.is_dir():
+                continue
+            if _is_run_directory(child):
+                return True
+            for grandchild in child.iterdir():
+                if grandchild.is_dir() and _is_run_directory(grandchild):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 def _discover_artifact_roots() -> List[Path]:
-    explicit = ROOT / "experiments_20260221_175416" / "synthetic"
+    explicit_roots = [
+        ROOT / "experiments_20260221_175416" / "synthetic",
+        ROOT / "outputs",
+    ]
     patterns = (
         "experiments_*/synthetic",
         "experiments/experiments_*/synthetic",
         "outputs/experiments/runs/experiments_*/synthetic",
         "outputs/experiments/runs/*/synthetic",
+        "outputs/experiments/runs/experiments_*/*/*/*",
+        "outputs/experiments/runs/*/*/*/*",
         "outputs/experiments/*/synthetic",
     )
     seen = set()
@@ -83,14 +105,17 @@ def _discover_artifact_roots() -> List[Path]:
     for pattern in patterns:
         for synthetic in ROOT.glob(pattern):
             key = str(synthetic.resolve())
-            if key not in seen and synthetic.exists():
+            if key not in seen and synthetic.exists() and synthetic.is_dir():
                 seen.add(key)
                 candidate_roots.append(synthetic)
-    if explicit.exists():
+    for explicit in explicit_roots:
+        if not explicit.exists():
+            continue
         key = str(explicit.resolve())
         if key not in seen:
+            seen.add(key)
             candidate_roots.append(explicit)
-    viable = [p for p in candidate_roots if any(_is_run_directory(d) for d in p.iterdir() if d.is_dir())]
+    viable = [p for p in candidate_roots if _root_has_run_directory(p)]
     viable.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return viable
 
@@ -310,6 +335,21 @@ def _observer_id_from_value(observer_value: str) -> Optional[int]:
         return int(str(observer_value).split(":", 1)[1])
     except Exception:
         return None
+
+
+def _observer_value_from_uid(run_key: Optional[str], observer_uid: Optional[str]) -> Optional[str]:
+    uid = str(observer_uid or "").strip()
+    if not uid:
+        return None
+    rows = INDEX.get("article_rows_by_run", {}).get(str(run_key), {})
+    for idx, row in rows.items():
+        try:
+            row_uid = str((row or {}).get("bt_uid", "")).strip()
+        except Exception:
+            row_uid = ""
+        if row_uid and row_uid == uid:
+            return f"article:{int(idx)}"
+    return None
 
 
 def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
@@ -563,6 +603,32 @@ def _collect_variant_names(run_dir: Path) -> List[str]:
         )
     )
     return [p.name for p in html_files]
+
+
+def _infer_run_metrics(run_dir: Path, summary_item: dict) -> dict:
+    item = dict(summary_item or {})
+    validation = _safe_json(run_dir / "validation.json", {}) if (run_dir / "validation.json").exists() else {}
+
+    if item.get("nmi") is None and _is_number(validation.get("nmi")):
+        item["nmi"] = float(validation.get("nmi"))
+    if item.get("ari") is None and _is_number(validation.get("ari")):
+        item["ari"] = float(validation.get("ari"))
+
+    kernel = str(item.get("kernel", "unknown") or "unknown")
+    if kernel == "unknown":
+        try:
+            rel_parts = run_dir.relative_to(ROOT).parts
+        except Exception:
+            rel_parts = ()
+        if len(rel_parts) >= 5 and rel_parts[:3] == ("outputs", "experiments", "runs"):
+            kernel = str(rel_parts[4] or "unknown")
+        elif "_" in run_dir.name:
+            kernel = str(run_dir.name.rsplit("_", 1)[-1] or "unknown")
+        item["kernel"] = kernel
+
+    seed = item.get("seed", "unknown")
+    item["seed"] = str(seed if seed not in (None, "") else "unknown")
+    return item
 
 
 def _fmt_pass(v: Optional[bool]) -> str:
@@ -1031,8 +1097,10 @@ def build_artifact_index() -> dict:
     run_keys: List[str] = []
     for run_dir in all_run_dirs:
         run_key = _run_display_key(run_dir)
+        if run_key in runs:
+            continue
         root_key = str(run_dir.parent)
-        item = metrics_by_root.get(root_key, {}).get(run_dir.name, {})
+        item = _infer_run_metrics(run_dir, metrics_by_root.get(root_key, {}).get(run_dir.name, {}))
         variants = _collect_variant_names(run_dir)
         run = {
             "run_key": run_key,
@@ -1430,11 +1498,12 @@ def reindex_runs(n_clicks: Optional[int], current_run: Optional[str]):
     Output("observer-dropdown", "options"),
     Output("observer-dropdown", "value"),
     Input("run-dropdown", "value"),
+    Input("url", "search"),
     State("variant-a-dropdown", "value"),
     State("variant-b-dropdown", "value"),
     State("observer-dropdown", "value"),
 )
-def refresh_variants(run_key: str, current_a: str, current_b: str, current_observer: str):
+def refresh_variants(run_key: str, search: Optional[str], current_a: str, current_b: str, current_observer: str):
     run = INDEX["runs"].get(run_key, {})
     variants = run.get("variants", ["MONOLITH.html"])
     if not variants:
@@ -1445,6 +1514,17 @@ def refresh_variants(run_key: str, current_a: str, current_b: str, current_obser
     obs_opts = INDEX["observers_by_run"].get(run_key, [{"label": "Global Mean", "value": "global"}])
     obs_values = [o["value"] for o in obs_opts]
     observer = current_observer if current_observer in obs_values else "global"
+    try:
+        qs = parse_qs((search or "").lstrip("?"))
+    except Exception:
+        qs = {}
+    requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
+    requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+    observer_from_uid = _observer_value_from_uid(run_key, requested_uid)
+    if observer_from_uid and observer_from_uid in obs_values:
+        observer = observer_from_uid
+    elif requested_observer in obs_values:
+        observer = requested_observer
     return opts, a, opts, b, obs_opts, observer
 
 
@@ -1460,22 +1540,32 @@ def refresh_variants(run_key: str, current_a: str, current_b: str, current_obser
 )
 def apply_url_state(search: Optional[str], run_options, current_run):
     if not search:
-        return current_run, "global", "observer", []
+        return no_update, no_update, no_update, no_update
     try:
         qs = parse_qs((search or "").lstrip("?"))
     except Exception:
-        return current_run, "global", "observer", []
+        return no_update, no_update, no_update, no_update
 
     run_values = [o.get("value") for o in (run_options or []) if isinstance(o, dict)]
     requested_run = str((qs.get("run_key") or [current_run])[0] or current_run)
     run_value = requested_run if requested_run in run_values else current_run
 
     observer = str((qs.get("observer") or ["global"])[0] or "global")
+    observer_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+    observer_from_uid = _observer_value_from_uid(run_value, observer_uid)
+    if observer_from_uid:
+        observer = observer_from_uid
     view_mode = str((qs.get("view_mode") or ["observer"])[0] or "observer").lower()
     if view_mode not in {"global", "observer"}:
         view_mode = "observer"
     compare_raw = str((qs.get("compare") or ["0"])[0]).strip().lower()
     compare_values = ["on"] if compare_raw in {"1", "true", "on", "yes"} else []
+    embedded_raw = str((qs.get("embedded") or ["0"])[0]).strip().lower()
+    embedded = embedded_raw in {"1", "true", "on", "yes"}
+    if embedded:
+        compare_values = []
+        if observer != "global":
+            view_mode = "observer"
     return run_value, observer, view_mode, compare_values
 
 
@@ -2117,9 +2207,27 @@ def _render_dashboard_impl(
     group_panel = _build_group_panel(contract, label_column, label_values or [])
     empathy_fig = _build_empathy_figure(contract, label_column, label_values or [])
 
-    watermark_visible = False
-    watermark_text = ""
-    watermark_style = {"display": "none"}
+    watermark_visible = bool(gate.get("watermark_visible"))
+    if watermark_visible:
+        watermark_text = "UNVERIFIED / EXPLORATORY"
+        watermark_style = {
+            "display": "flex",
+            "position": "fixed",
+            "inset": "0",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "pointerEvents": "none",
+            "zIndex": 2000,
+            "fontSize": "2.8rem",
+            "fontWeight": "800",
+            "letterSpacing": "0.18em",
+            "textTransform": "uppercase",
+            "color": "rgba(255, 42, 0, 0.16)",
+            "textShadow": "0 0 24px rgba(255, 42, 0, 0.20)",
+        }
+    else:
+        watermark_text = ""
+        watermark_style = {"display": "none"}
 
     return (
         container,
