@@ -322,6 +322,7 @@ class ExperimentData:
     walker_work_integrals: Optional[np.ndarray] = None
     walker_states: Optional[List[str]] = None
     walker_paths: Optional[Dict[int, np.ndarray]] = None
+    walker_path_diagnostics: Optional[Dict[int, Dict[str, Any]]] = None
     phantom_verdicts: Optional[List[Dict]] = None
     d_spectral: Optional[np.ndarray] = None
     antagonism: Optional[np.ndarray] = None  # Track 1.5: spectral polarity vectors
@@ -532,6 +533,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
             walker_states = json.load(f)
 
     walker_paths = None
+    walker_path_diagnostics = None
     walker_paths_path = experiment_dir / "walker_paths.npz"
     if walker_paths_path.exists():
         try:
@@ -540,10 +542,28 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
             path_xyz = path_data["path_xyz"] if "path_xyz" in path_data else None
             if article_idx is not None and path_xyz is not None:
                 walker_paths = {}
+                walker_path_diagnostics = {}
                 n_items = min(len(article_idx), len(path_xyz))
+                extra_keys = [
+                    k for k in path_data.files
+                    if k not in {"article_idx", "path_xyz", "bt_uid"}
+                ]
                 for i in range(n_items):
                     idx = int(article_idx[i])
                     walker_paths[idx] = np.asarray(path_xyz[i], dtype=float)
+                    if extra_keys:
+                        diag_payload: Dict[str, Any] = {}
+                        for k in extra_keys:
+                            raw_val = path_data[k]
+                            try:
+                                if hasattr(raw_val, "__len__") and len(raw_val) > i:
+                                    diag_payload[k] = raw_val[i]
+                            except Exception:
+                                continue
+                        if diag_payload:
+                            walker_path_diagnostics[idx] = diag_payload
+                if walker_path_diagnostics is not None and len(walker_path_diagnostics) == 0:
+                    walker_path_diagnostics = None
                 print(f"[MONOLITH] Loaded walker_paths.npz: {len(walker_paths)} trajectories")
         except Exception as e:
             print(f"[MONOLITH] Warning: failed to load walker_paths.npz: {e}")
@@ -748,6 +768,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         walker_work_integrals=walker_work_integrals,
         walker_states=walker_states,
         walker_paths=walker_paths,
+        walker_path_diagnostics=walker_path_diagnostics,
         phantom_verdicts=phantom_verdicts,
         d_spectral=d_spectral,
         antagonism=antagonism,
@@ -2009,6 +2030,7 @@ def render_phantom_paths_3d(
     phantom_verdicts: List[Dict],
     positions_3d: np.ndarray,
     walker_paths: Optional[Dict[int, np.ndarray]] = None,
+    walker_path_diagnostics: Optional[Dict[int, Dict[str, Any]]] = None,
     article_z_height: Optional[np.ndarray] = None,
     terrain_z_values: Optional[np.ndarray] = None,
     surface_z_func=None,
@@ -2038,6 +2060,7 @@ def render_phantom_paths_3d(
     legend_shown = set()
     n_articles = min(len(phantom_verdicts), len(positions_3d))
     walker_paths = walker_paths or {}
+    walker_path_diagnostics = walker_path_diagnostics or {}
     all_path_starts: List[np.ndarray] = []
     debug_printed = 0
     enable_raw_probe = os.environ.get("MONOLITH_RAW_MATRIX_PROBE", "0").strip() == "1"
@@ -2112,6 +2135,156 @@ def render_phantom_paths_3d(
             return PROBE_LABELS[dominant_idx]
         return f"Axis {dominant_idx}"
 
+    def _axis_rgb_from_vector(axis_vec: Any) -> str:
+        try:
+            v = np.asarray(axis_vec, dtype=float).reshape(-1)
+        except Exception:
+            return "#88CCFF"
+        if v.size <= 0 or not np.any(np.isfinite(v)):
+            return "#88CCFF"
+        v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        if v.size >= 3:
+            comp = np.abs(v[:3])
+        elif v.size == 2:
+            comp = np.array([abs(v[0]), abs(v[1]), 0.5 * (abs(v[0]) + abs(v[1]))], dtype=float)
+        else:
+            comp = np.array([abs(v[0]), abs(v[0]), abs(v[0])], dtype=float)
+        denom = float(np.max(comp))
+        if denom <= 1e-12:
+            comp = np.array([0.52, 0.80, 1.00], dtype=float)
+        else:
+            comp = comp / denom
+        comp = np.clip(comp, 0.12, 1.0)
+        rgb = (comp * 255.0).astype(int)
+        return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+    axis_index_palette = [
+        "#00F0FF", "#00FF41", "#FFD700", "#FF8C00",
+        "#FF00FF", "#4A9EFF", "#FF2222", "#AAAAAA",
+    ]
+
+    def _step_color_lookup(path_diag: Dict[str, Any]):
+        if not isinstance(path_diag, dict):
+            return None
+        for key in (
+            "dominant_axis_vectors",
+            "local_dominant_axis_vectors",
+            "step_axis_vectors",
+            "axis_vectors",
+            "u_axis_steps",
+        ):
+            if key in path_diag:
+                try:
+                    arr = np.asarray(path_diag[key], dtype=float)
+                except Exception:
+                    continue
+                if arr.ndim == 2 and arr.shape[0] >= 2:
+                    return ("vector", arr)
+        for key in ("dominant_axis_idx", "dominant_probe_idx", "step_axis_idx"):
+            if key in path_diag:
+                try:
+                    arr = np.asarray(path_diag[key], dtype=float).reshape(-1)
+                except Exception:
+                    continue
+                if arr.size >= 2:
+                    return ("index", arr)
+        return None
+
+    def _step_scalar_lookup(path_diag: Dict[str, Any], *keys: str) -> Optional[np.ndarray]:
+        if not isinstance(path_diag, dict):
+            return None
+        for key in keys:
+            if key not in path_diag:
+                continue
+            try:
+                arr = np.asarray(path_diag[key], dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if arr.size >= 1:
+                return arr
+        return None
+
+    def _step_width_lookup(path_diag: Dict[str, Any]) -> Optional[np.ndarray]:
+        values = _step_scalar_lookup(path_diag, "step_local_friction", "step_work")
+        if values is None:
+            return None
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return np.full(values.shape, 3.5, dtype=float)
+        lo = float(np.percentile(finite, 25.0))
+        hi = float(np.percentile(finite, 90.0))
+        if hi <= lo + 1e-9:
+            return np.full(values.shape, 3.5, dtype=float)
+        norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+        return 2.5 + 7.0 * norm
+
+    def _step_event_lookup(path_diag: Dict[str, Any]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        mask = _step_scalar_lookup(path_diag, "step_event_mask")
+        severity = _step_scalar_lookup(path_diag, "step_event_severity")
+        if mask is None and severity is None:
+            return None, None
+        if mask is None and severity is not None:
+            mask = severity >= 0.85
+        if severity is None and mask is not None:
+            severity = np.where(mask > 0, 1.0, 0.0)
+        return np.asarray(mask > 0, dtype=bool), np.asarray(severity, dtype=float)
+
+    def _fallback_path_style(verdict_name: str) -> Tuple[str, float, float, str]:
+        if verdict_name == "HONEST":
+            return "#00F0FF", 3.5, 0.88, "Honest Path"
+        if verdict_name == "PHANTOM":
+            return "#FF00FF", 4.5, 0.92, "Phantom Path"
+        if verdict_name == "TAUTOLOGY":
+            return "#888888", 3.0, 0.70, "Tautology Path"
+        return "#FFD700", 3.0, 0.60, "Semantic Path"
+
+    def _flare_color(severity: float, verdict_name: str) -> str:
+        sev = float(np.clip(severity, 0.0, 1.0))
+        if verdict_name == "RUPTURE":
+            return "#FF2222" if sev < 0.6 else "#FFFF66"
+        if verdict_name == "PHANTOM":
+            return "#FF8C00" if sev < 0.6 else "#FF44FF"
+        return "#FFD700" if sev < 0.6 else "#FFFFFF"
+
+    def _append_step_flares(
+        path_segments: List[np.ndarray],
+        event_mask: Optional[np.ndarray],
+        event_severity: Optional[np.ndarray],
+        hover_label: str,
+        verdict_name: str,
+    ) -> None:
+        if event_mask is None or event_severity is None or not np.any(event_mask):
+            return
+        legend_group = "track4-shear-flares"
+        legend_name = "Shear Flares"
+        step_cursor = 0
+        for seg_idx, seg in enumerate(path_segments):
+            for j in range(max(0, seg.shape[0] - 1)):
+                step_idx = min(step_cursor + j, len(event_mask) - 1)
+                if not bool(event_mask[step_idx]):
+                    continue
+                severity = float(event_severity[min(step_idx, len(event_severity) - 1)])
+                mid_xyz = 0.5 * (seg[j, :3] + seg[j + 1, :3])
+                traces.append(go.Scatter3d(
+                    x=[mid_xyz[0]],
+                    y=[mid_xyz[1]],
+                    z=[mid_xyz[2]],
+                    mode='markers',
+                    marker=dict(
+                        size=5.0 + 10.0 * float(np.clip(severity, 0.0, 1.0)),
+                        color=_flare_color(severity, verdict_name),
+                        opacity=0.40 + 0.55 * float(np.clip(severity, 0.0, 1.0)),
+                        line=dict(color="#FFFFFF", width=1),
+                    ),
+                    name=legend_name,
+                    hovertext=[f"{hover_label}<br>Localized shear severity={severity:.2f}"],
+                    hovertemplate="%{hovertext}<extra></extra>",
+                    legendgroup=legend_group,
+                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0) and (j == 0),
+                ))
+            step_cursor += max(1, seg.shape[0] - 1)
+        legend_shown.add(legend_group)
+
     def _asymmetry_delta(path_source_idx: int, end_xyz: np.ndarray) -> Optional[Dict[str, float]]:
         if hysteresis_memory is None:
             return None
@@ -2181,6 +2354,11 @@ def render_phantom_paths_3d(
         rendered_path[0, 1] = float(positions_3d[i, 1])
         rendered_path[0, 2] = source_z
         all_path_starts.append(rendered_path[0, :3].copy())
+        path_diag = walker_path_diagnostics.get(i, {}) if isinstance(walker_path_diagnostics, dict) else {}
+        step_color_spec = _step_color_lookup(path_diag)
+        step_widths = _step_width_lookup(path_diag)
+        step_event_mask, step_event_severity = _step_event_lookup(path_diag)
+
         if semantic_tether_mode:
             finite_rows = np.isfinite(rendered_path[:, :3]).all(axis=1)
             finite_path = rendered_path[finite_rows]
@@ -2204,45 +2382,75 @@ def render_phantom_paths_3d(
                         end_xyz[2] = float(tether_z[1])
                 except Exception:
                     pass
-            if verdict == "HONEST":
-                path_color = "#7FFBFF"
-                line_width = 2
-                line_opacity = 0.15
-                legend_group = "semantic-tether-honest"
-                legend_name = "Honest Tether"
-            elif verdict == "TAUTOLOGY":
-                path_color = "#9A9A9A"
-                line_width = 2
-                line_opacity = 0.18
-                legend_group = "semantic-tether-tautology"
-                legend_name = "Tautology Tether"
-            elif verdict == "PHANTOM":
-                path_color = "#FF00FF"
-                line_width = 7
-                line_opacity = 0.96
-                legend_group = "semantic-tether-phantom"
-                legend_name = "Phantom Tether"
-            else:
+            if verdict not in {"HONEST", "TAUTOLOGY", "PHANTOM"}:
                 path_color = "#FFD700"
                 line_width = 3
                 line_opacity = 0.4
                 legend_group = "semantic-tether-unknown"
                 legend_name = "Unknown Tether"
+                traces.append(go.Scatter3d(
+                    x=[start_xyz[0], end_xyz[0]],
+                    y=[start_xyz[1], end_xyz[1]],
+                    z=[start_xyz[2], end_xyz[2]],
+                    mode='lines',
+                    line=dict(color=path_color, width=line_width),
+                    opacity=line_opacity,
+                    name=legend_name,
+                    text=[hover_text, hover_text],
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in legend_shown,
+                ))
+                legend_shown.add(legend_group)
+                continue
 
-            traces.append(go.Scatter3d(
-                x=[start_xyz[0], end_xyz[0]],
-                y=[start_xyz[1], end_xyz[1]],
-                z=[start_xyz[2], end_xyz[2]],
-                mode='lines',
-                line=dict(color=path_color, width=line_width),
-                opacity=line_opacity,
-                name=legend_name,
-                text=[hover_text, hover_text],
-                hoverinfo='skip',
-                legendgroup=legend_group,
-                showlegend=legend_group not in legend_shown,
-            ))
-            legend_shown.add(legend_group)
+            if step_color_spec is not None:
+                step_mode, step_values = step_color_spec
+                legend_group = "track4-axis-chroma"
+                legend_name = "Track 4 Axis Chroma"
+                n_tether_segments = max(8, min(64, int(len(step_values))))
+                t_vals = np.linspace(0.0, 1.0, n_tether_segments + 1, dtype=float)
+                xs = start_xyz[0] + (end_xyz[0] - start_xyz[0]) * t_vals
+                ys = start_xyz[1] + (end_xyz[1] - start_xyz[1]) * t_vals
+                zs = start_xyz[2] + (end_xyz[2] - start_xyz[2]) * t_vals
+                for j in range(n_tether_segments):
+                    color_idx = min(j, len(step_values) - 1)
+                    if step_mode == "vector":
+                        seg_color = _axis_rgb_from_vector(step_values[color_idx])
+                    else:
+                        axis_idx = int(step_values[color_idx]) if np.isfinite(step_values[color_idx]) else 0
+                        seg_color = axis_index_palette[axis_idx % len(axis_index_palette)]
+                    traces.append(go.Scatter3d(
+                        x=[xs[j], xs[j + 1]],
+                        y=[ys[j], ys[j + 1]],
+                        z=[zs[j], zs[j + 1]],
+                        mode='lines',
+                        line=dict(color=seg_color, width=4),
+                        opacity=0.95,
+                        name=legend_name,
+                        text=[hover_text, hover_text],
+                        hoverinfo='skip',
+                        legendgroup=legend_group,
+                        showlegend=(legend_group not in legend_shown) and (j == 0),
+                    ))
+                legend_shown.add(legend_group)
+            else:
+                fallback_color, fallback_width, fallback_opacity, fallback_name = _fallback_path_style(verdict)
+                legend_group = fallback_name.lower().replace(" ", "-")
+                traces.append(go.Scatter3d(
+                    x=[start_xyz[0], end_xyz[0]],
+                    y=[start_xyz[1], end_xyz[1]],
+                    z=[start_xyz[2], end_xyz[2]],
+                    mode='lines',
+                    line=dict(color=fallback_color, width=fallback_width),
+                    opacity=fallback_opacity,
+                    name=fallback_name,
+                    text=[hover_text, hover_text],
+                    hoverinfo='skip',
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in legend_shown,
+                ))
+                legend_shown.add(legend_group)
 
             asym = _asymmetry_delta(i, end_xyz)
             if asym is not None:
@@ -2279,30 +2487,6 @@ def render_phantom_paths_3d(
                 ))
                 legend_shown.add('semantic-asymmetry')
 
-            if verdict == "PHANTOM":
-                mid_xyz = (start_xyz + end_xyz) / 2.0
-                shear_axis = _dominant_probe_label(i)
-                asym_note = ""
-                if asym is not None:
-                    asym_note = f" | Δ={float(asym['delta']):.3f}"
-                shear_text = f"[SHEAR: {shear_axis}{asym_note}]"
-                traces.append(go.Scatter3d(
-                    x=[mid_xyz[0]],
-                    y=[mid_xyz[1]],
-                    z=[mid_xyz[2] + 0.08],
-                    mode='text',
-                    text=[shear_text],
-                    textfont=dict(
-                        color="#FF5CFF",
-                        size=12,
-                        family="JetBrains Mono, monospace",
-                    ),
-                    name="Ideological Shear",
-                    hovertext=[f"{hover_text}<br>{shear_text}"],
-                    hovertemplate="%{hovertext}<extra></extra>",
-                    legendgroup="semantic-shear-labels",
-                    showlegend=False,
-                ))
             continue
         if thermodynamic_mode:
             scorch_x, scorch_y = _resample_polyline_xy(rendered_path[:, :2], n_steps=120)
@@ -2404,72 +2588,88 @@ def render_phantom_paths_3d(
         end_xyz = path_segments[-1][-1, :3] if path_segments else None
 
         if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
-            asym = _asymmetry_delta(i, end_xyz)
-            if asym is not None:
-                delta_val = float(asym["delta"])
-                norm_val = float(asym["norm"])
-                if norm_val <= 0.05:
-                    path_color = "#8A8A8A"
-                    width_val = 1
-                    opacity_val = 0.10
-                elif norm_val >= 0.35:
-                    path_color = "#00FFFF"
-                    width_val = 7
-                    opacity_val = 0.95
-                else:
-                    path_color = "#4FD1FF"
-                    width_val = 3
-                    opacity_val = 0.55
-                hover_text = f"{hover_text}<br>[ASYMMETRY DELTA: {delta_val:.3f}]"
+            if step_color_spec is not None:
+                step_mode, step_values = step_color_spec
+                legend_group = "track4-axis-chroma"
+                legend_name = "Track 4 Axis Chroma"
+                step_cursor = 0
+                for seg_idx, seg in enumerate(path_segments):
+                    for j in range(max(0, seg.shape[0] - 1)):
+                        color_idx = min(step_cursor + j, len(step_values) - 1)
+                        if step_mode == "vector":
+                            seg_color = _axis_rgb_from_vector(step_values[color_idx])
+                        else:
+                            axis_idx = int(step_values[color_idx]) if np.isfinite(step_values[color_idx]) else 0
+                            seg_color = axis_index_palette[axis_idx % len(axis_index_palette)]
+                        seg_width = (
+                            float(step_widths[min(color_idx, len(step_widths) - 1)])
+                            if step_widths is not None and len(step_widths) > 0
+                            else 3.5
+                        )
+                        traces.append(go.Scatter3d(
+                            x=[seg[j, 0], seg[j + 1, 0]],
+                            y=[seg[j, 1], seg[j + 1, 1]],
+                            z=[seg[j, 2], seg[j + 1, 2]],
+                            mode='lines',
+                            line=dict(color=seg_color, width=seg_width),
+                            opacity=0.95,
+                            name=legend_name,
+                            text=[hover_text, hover_text],
+                            hoverinfo='skip',
+                            legendgroup=legend_group,
+                            showlegend=(legend_group not in legend_shown) and (seg_idx == 0) and (j == 0),
+                        ))
+                    step_cursor += max(1, seg.shape[0] - 1)
+                legend_shown.add(legend_group)
             else:
-                path_color = ("#00F0FF" if verdict == "HONEST" else "#FF00FF" if verdict == "PHANTOM" else "#FFFF00")
-                width_val = 3
-                opacity_val = 0.8
-            legend_group = f'path-{verdict.lower()}'
-            legend_name = f'{verdict.capitalize()} Path'
-            # Optional forensic probe: print exact rendered coordinates for the first
-            # few paths. Disabled by default to keep normal runs readable.
-            if enable_raw_probe and debug_printed < 3 and len(rendered_path) >= 2:
-                mid_idx = len(rendered_path) // 2
-                article_coord = np.array([positions_3d[i, 0], positions_3d[i, 1], source_z], dtype=float)
-                print(f"[RAW_MATRIX_PROBE] Path ID: {debug_printed} | Target Article Index: {i}")
-                print(f"[RAW_MATRIX_PROBE] Article 3D Coordinate: {article_coord.tolist()}")
-                print(f"[RAW_MATRIX_PROBE] Path Start (Vertex 0): {rendered_path[0, :3].tolist()}")
-                print(f"[RAW_MATRIX_PROBE] Path Midpoint (Vertex {mid_idx}): {rendered_path[mid_idx, :3].tolist()}")
-                print(f"[RAW_MATRIX_PROBE] Path End (Vertex {len(rendered_path)-1}): {rendered_path[-1, :3].tolist()}")
-                debug_printed += 1
-            for seg_idx, seg in enumerate(path_segments):
-                traces.append(go.Scatter3d(
-                    x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode='lines',
-                    line=dict(color=path_color, width=width_val), opacity=opacity_val,
-                    name=legend_name,
-                    text=[hover_text] * len(seg),
-                    hoverinfo='skip',
-                    legendgroup=legend_group,
-                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
-                ))
-            legend_shown.add(legend_group)
+                fallback_color, fallback_width, fallback_opacity, fallback_name = _fallback_path_style(verdict)
+                legend_group = fallback_name.lower().replace(" ", "-")
+                for seg_idx, seg in enumerate(path_segments):
+                    traces.append(go.Scatter3d(
+                        x=seg[:, 0],
+                        y=seg[:, 1],
+                        z=seg[:, 2],
+                        mode='lines',
+                        line=dict(color=fallback_color, width=fallback_width),
+                        opacity=fallback_opacity,
+                        name=fallback_name,
+                        text=[hover_text] * len(seg),
+                        hoverinfo='skip',
+                        legendgroup=legend_group,
+                        showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
+                    ))
+                legend_shown.add(legend_group)
+            _append_step_flares(path_segments, step_event_mask, step_event_severity, hover_text, verdict)
         elif verdict == "RUPTURE":
             rupture_color = "#FF2222" if walker_state == "broken" else "#FF00FF"
             legend_group = 'path-rupture-broken' if walker_state == "broken" else 'path-rupture-trapped'
             legend_name = 'Walker Broken' if walker_state == "broken" else 'Walker Trapped'
+            step_cursor = 0
             for seg_idx, seg in enumerate(path_segments):
-                traces.append(go.Scatter3d(
-                    x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode='lines',
-                    line=dict(color=rupture_color, width=4 if walker_state == "broken" else 2),
-                    name=legend_name,
-                    text=[hover_text] * len(seg),
-                    hoverinfo='skip',
-                    legendgroup=legend_group,
-                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
-                ))
+                for j in range(max(0, seg.shape[0] - 1)):
+                    width_idx = min(step_cursor + j, len(step_widths) - 1) if step_widths is not None and len(step_widths) > 0 else None
+                    seg_width = float(step_widths[width_idx]) if width_idx is not None else (4.5 if walker_state == "broken" else 2.5)
+                    traces.append(go.Scatter3d(
+                        x=[seg[j, 0], seg[j + 1, 0]],
+                        y=[seg[j, 1], seg[j + 1, 1]],
+                        z=[seg[j, 2], seg[j + 1, 2]],
+                        mode='lines',
+                        line=dict(color=rupture_color, width=seg_width),
+                        name=legend_name,
+                        text=[hover_text, hover_text],
+                        hoverinfo='skip',
+                        legendgroup=legend_group,
+                        showlegend=(legend_group not in legend_shown) and (seg_idx == 0) and (j == 0),
+                    ))
+                step_cursor += max(1, seg.shape[0] - 1)
             legend_shown.add(legend_group)
+            _append_step_flares(path_segments, step_event_mask, step_event_severity, hover_text, verdict)
 
     # ANTI-SINGULARITY LOCK: renderer must never collapse all starts to one origin.
     if all_path_starts:
         starts_arr = np.asarray(all_path_starts, dtype=float)
         unique_origins = len(np.unique(np.round(starts_arr, decimals=4), axis=0))
-        if unique_origins <= 1:
+        if starts_arr.shape[0] > 1 and unique_origins <= 1:
             raise DimensionalCollapseError(
                 "CRITICAL: Path Singularity Detected. All origins collapsed to a single point."
             )
@@ -3224,6 +3424,7 @@ def render_data_points_3d(
     is_fog: np.ndarray = None,
     article_z_height: Optional[np.ndarray] = None, # New parameter for exact Z positioning
     article_color_codes: Optional[np.ndarray] = None, # New parameter for exact color coding
+    article_uids: Optional[List[str]] = None,
 ) -> List[Any]:
     """
     Render data points with bloom effect.
@@ -3243,6 +3444,12 @@ def render_data_points_3d(
 
     traces = []
     n = len(positions)
+    custom_point_identity = []
+    for i in range(n):
+        uid = ""
+        if article_uids is not None and i < len(article_uids):
+            uid = str(article_uids[i] or "").strip()
+        custom_point_identity.append({"idx": int(i), "uid": uid})
 
     # Build per-point colors based on provided article_color_codes or verdict (using RGBA for transparency)
     point_colors = []
@@ -3342,7 +3549,7 @@ def render_data_points_3d(
             symbol='circle',
         ),
         hovertext=hover_texts,
-        customdata=list(range(n)),
+        customdata=custom_point_identity,
         hoverinfo='text',
         hovertemplate='%{hovertext}<extra></extra>',
         hoverlabel=dict(
@@ -3366,6 +3573,7 @@ def render_data_points_3d(
             line=dict(color='white', width=1.5),  # Thicker white outline
             symbol='circle',  # Explicit circle shape
         ),
+        customdata=custom_point_identity,
         hoverinfo='skip',
         name=name,
         showlegend=True,  # Show in legend as "Articles"
@@ -4405,6 +4613,7 @@ def create_monolith_cockpit(
 
     # Build hover texts - RICH METADATA for each article
     hover_texts = []
+    article_uid_values: List[str] = []
     for i in range(n_articles):
         meta: Dict[str, Any] = {}
         csv_row = None
@@ -4420,10 +4629,12 @@ def create_monolith_cockpit(
             (csv_row.get('title') if csv_row is not None and pd.notna(csv_row.get('title')) else None)
             or meta.get('title', f'Article {i}')
         )[:80]
-        bt_uid = str(
+        bt_uid_raw = str(
             (csv_row.get('bt_uid') if csv_row is not None and pd.notna(csv_row.get('bt_uid')) else None)
             or meta.get('bt_uid', '')
-        )[:16]
+        ).strip()
+        bt_uid = bt_uid_raw[:16]
+        article_uid_values.append(bt_uid_raw)
         evr = spectral_evr[i] if i < len(spectral_evr) else 0.5
 
         if spectral_mags_hover is not None and i < len(spectral_mags_hover):
@@ -4665,6 +4876,7 @@ def create_monolith_cockpit(
         path_traces = render_phantom_paths_3d(
             phantom_verdicts, positions_3d,
             walker_paths=walker_paths_pure,
+            walker_path_diagnostics=exp.walker_path_diagnostics,
             article_z_height=article_marker_z,
             terrain_z_values=energy_values_for_terrain,
             surface_z_func=get_surface_z,
@@ -4727,6 +4939,7 @@ def create_monolith_cockpit(
         phantom_verdicts=phantom_verdicts, is_fog=is_fog,
         article_z_height=article_marker_z, # Prefer terrain-manifold Z for marker anchoring
         article_color_codes=unified_color_codes, # Pass unified_color_codes for coloring
+        article_uids=article_uid_values,
     )
     for t in point_traces:
         t.visible = True
@@ -5003,23 +5216,23 @@ def create_monolith_cockpit(
         <div class="legend-title">SYNTHESIS MODE</div>
         <div class="legend-item">
             <div class="legend-line" style="background: #00F0FF;"></div>
-            <span>Cyan: Honest Path (Logically valid, geometrically cheap)</span>
+            <span>Chromatic ribbons: local prosecutor pressure along the path</span>
         </div>
         <div class="legend-item">
-            <div class="legend-line" style="background: #FF00FF;"></div>
-            <span>Magenta: Phantom Path (Logically forced, geometrically warped)</span>
+            <div class="legend-line" style="background: linear-gradient(90deg, #00F0FF, #FF8C00, #FF00FF);"></div>
+            <span>Ribbon thickness: local thermodynamic friction / hysteresis wake</span>
         </div>
         <div class="legend-item">
-            <div class="legend-dot" style="background: #888888;"></div>
-            <span>Grey: Tautology (Topological collapse / Echo chamber)</span>
+            <div class="legend-dot" style="background: #FFD700;"></div>
+            <span>Shear flares: localized rupture or stress spikes</span>
         </div>
         <div class="legend-item">
             <div class="legend-dot" style="background: #FF2222;"></div>
-            <span>Red 'X': Walker Broken (System 2 Kinetic failure)</span>
+            <span>Red path family: rupture / broken traversal</span>
         </div>
         <div class="legend-item">
             <div class="legend-dot" style="background: #FFB347;"></div>
-            <span>Orange 'O': Walker Trapped (System 1 Topological trap)</span>
+            <span>Orange wake: high friction, observer-history drag</span>
         </div>
     </div>
     '''
@@ -5235,7 +5448,7 @@ def create_monolith_cockpit(
             <span id="dash-embed-title">DASH OBSERVER VIEW</span>
             <button onclick="closeDashEmbed()" style="background: transparent; color: #9adce8; border: 1px solid #2f7688; border-radius: 4px; font-size: 10px; cursor: pointer; padding: 2px 8px;">CLOSE</button>
         </div>
-        <iframe id="dash-embed-frame" style="width: 100%; height: calc(100% - 34px); border: 0; background: #070912;"></iframe>
+        <iframe id="dash-embed-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="no-referrer" style="width: 100%; height: calc(100% - 34px); border: 0; background: #070912;"></iframe>
     </div>
     <div id="dash-embed-hint" style="position: fixed; left: 18px; bottom: 18px; z-index: 1050; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #7ca3af; background: rgba(5,8,12,0.7); border: 1px solid #1f2e35; border-radius: 6px; padding: 5px 8px;">
         Click an article point to open embedded Dash observer lab
@@ -5281,6 +5494,7 @@ def create_monolith_cockpit(
         var currentMode = {json.dumps(physics_mode)};
         var DASH_BASE_URL = 'http://127.0.0.1:8050/';
         var DASH_RUN_KEY = {json.dumps(dash_run_key)};
+        var DASH_ALLOWED_ORIGINS = {{'http://127.0.0.1:8050': true, 'http://localhost:8050': true}};
 
         // Initialize plot
         var figData = {{PLOT_DATA}};
@@ -5297,20 +5511,45 @@ def create_monolith_cockpit(
             if (frame) frame.src = 'about:blank';
         }}
 
-        function openDashForArticle(articleIdx) {{
+        function openDashForArticle(articleRef) {{
             var panel = document.getElementById('dash-embed-panel');
             var frame = document.getElementById('dash-embed-frame');
             var title = document.getElementById('dash-embed-title');
             if (!panel || !frame) return;
+            var dashUrl = null;
+            try {{
+                dashUrl = new URL(DASH_BASE_URL, window.location.href);
+            }} catch (urlErr) {{
+                console.warn('invalid dash base url', urlErr);
+                return;
+            }}
+            if (!DASH_ALLOWED_ORIGINS[dashUrl.origin]) {{
+                console.warn('blocked dash embed origin', dashUrl.origin);
+                return;
+            }}
             var qs = new URLSearchParams();
             qs.set('run_key', DASH_RUN_KEY);
-            qs.set('observer', 'article:' + String(articleIdx));
             qs.set('view_mode', 'observer');
             qs.set('compare', '0');
             qs.set('embedded', '1');
-            frame.src = DASH_BASE_URL + '?' + qs.toString();
+            if (articleRef && typeof articleRef === 'object') {{
+                if (typeof articleRef.uid === 'string' && articleRef.uid.trim().length > 0) {{
+                    qs.set('observer_uid', articleRef.uid.trim());
+                }}
+                if (typeof articleRef.idx === 'number' && isFinite(articleRef.idx)) {{
+                    qs.set('observer', 'article:' + String(Math.floor(articleRef.idx)));
+                }}
+            }} else if (typeof articleRef === 'number' && isFinite(articleRef)) {{
+                qs.set('observer', 'article:' + String(Math.floor(articleRef)));
+            }}
+            if (!qs.get('observer') && !qs.get('observer_uid')) return;
+            frame.src = dashUrl.origin + '/?' + qs.toString();
             if (title) {{
-                title.textContent = 'DASH OBSERVER VIEW | article:' + String(articleIdx);
+                if (qs.get('observer_uid')) {{
+                    title.textContent = 'DASH OBSERVER VIEW | uid:' + qs.get('observer_uid');
+                }} else {{
+                    title.textContent = 'DASH OBSERVER VIEW | ' + (qs.get('observer') || 'article');
+                }}
             }}
             panel.style.display = 'block';
         }}
@@ -5321,16 +5560,22 @@ def create_monolith_cockpit(
                 try {{
                     var point = (evt && evt.points && evt.points.length) ? evt.points[0] : null;
                     if (!point) return;
-                    var traceName = ((point.data && point.data.name) || '').toString();
-                    if (traceName !== 'Articles') return;
-                    var idx = null;
-                    if (typeof point.customdata === 'number' && isFinite(point.customdata)) {{
-                        idx = Math.floor(point.customdata);
-                    }} else if (typeof point.pointNumber === 'number' && isFinite(point.pointNumber)) {{
-                        idx = Math.floor(point.pointNumber);
+                    var ref = {{uid: '', idx: null}};
+                    var cd = point.customdata;
+                    if (cd && typeof cd === 'object' && !Array.isArray(cd)) {{
+                        if (typeof cd.uid === 'string') ref.uid = cd.uid.trim();
+                        if (typeof cd.idx === 'number' && isFinite(cd.idx)) ref.idx = Math.floor(cd.idx);
+                    }} else if (Array.isArray(cd)) {{
+                        if (cd.length > 0 && typeof cd[0] === 'string') ref.uid = cd[0].trim();
+                        if (cd.length > 1 && typeof cd[1] === 'number' && isFinite(cd[1])) ref.idx = Math.floor(cd[1]);
+                    }} else if (typeof cd === 'number' && isFinite(cd)) {{
+                        ref.idx = Math.floor(cd);
                     }}
-                    if (idx === null || idx < 0) return;
-                    openDashForArticle(idx);
+                    if ((ref.idx === null || ref.idx < 0) && typeof point.pointNumber === 'number' && isFinite(point.pointNumber)) {{
+                        ref.idx = Math.floor(point.pointNumber);
+                    }}
+                    if (!ref.uid && (ref.idx === null || ref.idx < 0)) return;
+                    openDashForArticle(ref);
                 }} catch (err) {{
                     console.warn('dash embed click handler failed', err);
                 }}

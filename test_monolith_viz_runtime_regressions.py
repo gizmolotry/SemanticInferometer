@@ -213,6 +213,76 @@ def test_path_invalid_points_are_filtered_not_origin_injected():
     assert not np.any(np.all(np.isclose(coords, 0.0), axis=1)), coords
 
 
+def test_track4_chroma_ribbons_emit_variable_widths_and_shear_flares():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, 0.1, 0.0],
+                [0.4, 0.2, 0.1],
+                [0.6, 0.4, 0.2],
+            ],
+            dtype=float,
+        )
+    }
+    walker_path_diagnostics = {
+        0: {
+            "step_axis_idx": np.array([0, 3, 5], dtype=int),
+            "step_local_friction": np.array([0.2, 0.9, 1.6], dtype=float),
+            "step_work": np.array([0.1, 0.8, 1.5], dtype=float),
+            "step_event_mask": np.array([False, True, False], dtype=bool),
+            "step_event_severity": np.array([0.1, 0.95, 0.2], dtype=float),
+        }
+    }
+    phantom_verdicts = [{"verdict": "PHANTOM", "walker_state": "success"}]
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        walker_path_diagnostics=walker_path_diagnostics,
+    )
+
+    names = [str(getattr(t, "name", "")) for t in traces]
+    assert "Track 4 Axis Chroma" in names
+    assert "Shear Flares" in names
+
+    chroma_widths = [
+        float(getattr(getattr(t, "line", None), "width", 0.0))
+        for t in traces
+        if str(getattr(t, "name", "")) == "Track 4 Axis Chroma"
+    ]
+    assert chroma_widths
+    assert max(chroma_widths) > min(chroma_widths), chroma_widths
+
+
+def test_honest_path_falls_back_cleanly_when_chroma_diagnostics_absent():
+    _require_plotly()
+    positions_3d = np.array([[1.0, 2.0, 3.0]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [1.2, 2.3, 3.2],
+            ],
+            dtype=float,
+        )
+    }
+    phantom_verdicts = [{"verdict": "HONEST", "walker_state": "success"}]
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        walker_path_diagnostics=None,
+    )
+
+    names = [str(getattr(t, "name", "")) for t in traces]
+    assert "Honest Path" in names
+
+
 def test_axis_labels_are_data_driven_when_spectral_present(monkeypatch, tmp_path):
     spectral = np.zeros((4, 8), dtype=float)
     spectral[:, 3] = np.array([10.0, 9.0, 8.0, 7.0], dtype=float)

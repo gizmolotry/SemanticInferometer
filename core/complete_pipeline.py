@@ -1939,6 +1939,9 @@ class BeliefTransformerPipeline:
         walker_states = []  # Track 4 state classifications
         walker_state_records = []  # Track 4 persisted physics metadata
         walker_path_records = []  # Track 4 persisted trajectories (article_idx/bt_uid -> path_xyz)
+        walker_step_diagnostics = []  # Track 4 per-step diagnostics per article
+        last_hysteresis_memory_matrix = None  # Track 4 per-article memory (no cross-article chaining)
+        hysteresis_stats_last = None
         walker_n_steps = int((config or {}).get("walker_n_steps", 150))
         if HAS_PHASE_SPACE and dirichlet_results is not None:
             t_phase = time.time()
@@ -2069,8 +2072,9 @@ class BeliefTransformerPipeline:
                         from .physarum_walk import compute_walker_resistance
                         cls_stacked = cls_per_bot_tensor if cls_per_bot_tensor is not None else torch.stack(cls_per_bot_list, dim=0)  # [N, 8, hidden]
                         walker_outputs = []
-                        hysteresis_memory_matrix = None
+                        last_hysteresis_memory_matrix = None
                         hysteresis_stats_last = None
+                        walker_step_diagnostics = []
                         rks_dim = self.dirichlet_fusion.basis.output_dim if hasattr(self.dirichlet_fusion.basis, 'output_dim') else 2048
                         device = cls_stacked.device
 
@@ -2090,16 +2094,23 @@ class BeliefTransformerPipeline:
                                 temperature=0.5,
                                 n_walkers=20,
                                 n_steps=walker_n_steps,
-                                existing_memory=hysteresis_memory_matrix,
+                                hysteresis_mode=str((config or {}).get("walker_hysteresis_mode", "momentum")),
+                                hysteresis_lambda=float((config or {}).get("walker_hysteresis_lambda", 1.0)),
                             )
                             if result_t4.get("memory_matrix") is not None:
                                 _mem = result_t4["memory_matrix"]
                                 if torch.is_tensor(_mem):
-                                    hysteresis_memory_matrix = _mem.detach().clone()
+                                    last_hysteresis_memory_matrix = _mem.detach().clone()
                                 else:
-                                    hysteresis_memory_matrix = torch.as_tensor(_mem).detach().clone()
+                                    last_hysteresis_memory_matrix = torch.as_tensor(_mem).detach().clone()
                             if result_t4.get("hysteresis_stats") is not None:
                                 hysteresis_stats_last = result_t4.get("hysteresis_stats")
+                            if result_t4.get("step_diagnostics") is not None:
+                                walker_step_diagnostics.append({
+                                    "article_idx": i,
+                                    "bt_uid": bt_uids[i] if i < len(bt_uids) else f"article_{i}",
+                                    "steps": result_t4.get("step_diagnostics"),
+                                })
                             walker_outputs.append(result_t4["walker_output"])  # [D]
                             walker_work_integrals.append(result_t4["work_integral"])
                             walker_states.append(result_t4["state"]) # State name (string)
@@ -2111,6 +2122,7 @@ class BeliefTransformerPipeline:
                                     "article_idx": i,
                                     "bt_uid": bt_uids[i] if i < len(bt_uids) else f"article_{i}",
                                     "path_xyz": path_xyz,
+                                    "step_diagnostics": result_t4.get("step_diagnostics", []),
                                 })
                             walker_energy_budget = 50.0
                             if hasattr(self, "thermo_config") and getattr(self, "thermo_config", None) is not None:
@@ -2147,14 +2159,6 @@ class BeliefTransformerPipeline:
                             mean_work = np.mean(walker_work_integrals) # Calculate mean from the list
                             print(f"[Track 4] Walker: W={mean_work:.3f}, "
                                   f"states={{T:{state_counts['tautology']}, H:{state_counts['honest']}, P:{state_counts['phantom']}, R:{state_counts['rupture']}, B1:{state_counts['Type 1 Rupture']}, B2:{state_counts['Type 2 Rupture']}}}")
-                            if hysteresis_memory_matrix is not None:
-                                out["hysteresis_memory"] = (
-                                    hysteresis_memory_matrix.detach().cpu().numpy()
-                                    if torch.is_tensor(hysteresis_memory_matrix)
-                                    else np.asarray(hysteresis_memory_matrix)
-                                )
-                            if hysteresis_stats_last is not None:
-                                out["hysteresis_stats"] = hysteresis_stats_last
                     except Exception as e:
                         import traceback
                         print(f"[Track 4] Walker computation failed: {e}")
@@ -2487,6 +2491,16 @@ class BeliefTransformerPipeline:
             out["walker_states"] = walker_state_records if walker_state_records else walker_states
         if walker_path_records:
             out["walker_paths"] = walker_path_records
+        if last_hysteresis_memory_matrix is not None:
+            out["hysteresis_memory"] = (
+                last_hysteresis_memory_matrix.detach().cpu().numpy()
+                if torch.is_tensor(last_hysteresis_memory_matrix)
+                else np.asarray(last_hysteresis_memory_matrix)
+            )
+        if hysteresis_stats_last is not None:
+            out["hysteresis_stats"] = hysteresis_stats_last
+        if walker_step_diagnostics:
+            out["walker_step_diagnostics"] = walker_step_diagnostics
 
         # Persist run-level artifacts needed by downstream visualizers/loaders.
         run_output_dir = None
@@ -2518,11 +2532,41 @@ class BeliefTransformerPipeline:
                 else:
                     # Support variable-length trajectories without dropping the artifact.
                     path_xyz_payload = np.array(path_arrays, dtype=object)
+
+                def _pack_step_field(
+                    field_name: str,
+                    dtype,
+                    *,
+                    source_key: Optional[str] = None,
+                ):
+                    packed = []
+                    for record, path_xyz in zip(walker_path_records, path_arrays):
+                        step_diag = record.get("step_diagnostics", []) or []
+                        values = [step.get(source_key or field_name) for step in step_diag]
+                        arr = np.asarray(values, dtype=dtype)
+                        max_segments = max(int(path_xyz.shape[0]) - 1, 0)
+                        if arr.ndim == 0:
+                            arr = arr.reshape(1)
+                        if max_segments > 0:
+                            arr = arr[:max_segments]
+                        packed.append(arr)
+                    if not packed:
+                        return np.array([], dtype=object)
+                    if len({tuple(np.asarray(v).shape) for v in packed}) == 1:
+                        return np.stack(packed, axis=0)
+                    return np.array(packed, dtype=object)
+
                 np.savez_compressed(
                     run_output_dir / "walker_paths.npz",
                     article_idx=np.array([int(r["article_idx"]) for r in walker_path_records], dtype=np.int32),
                     bt_uid=np.array([str(r["bt_uid"]) for r in walker_path_records]),
                     path_xyz=path_xyz_payload,
+                    step_axis_idx=_pack_step_field("step_axis_idx", np.int32),
+                    step_local_friction=_pack_step_field("step_local_friction", np.float32, source_key="local_friction"),
+                    step_work=_pack_step_field("step_work", np.float32),
+                    step_debt_axis=_pack_step_field("step_debt_axis", np.float32, source_key="debt_axis"),
+                    step_event_mask=_pack_step_field("step_event_mask", np.bool_, source_key="event_active"),
+                    step_event_severity=_pack_step_field("step_event_severity", np.float32, source_key="event_severity"),
                 )
             except Exception as e:
                 raise RuntimeError(f"[Track 4] Failed to persist walker_paths.npz: {e}") from e

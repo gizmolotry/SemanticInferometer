@@ -42,7 +42,7 @@ the bot-weight simplex via gradient-informed Metropolis steps.
 """
 import torch
 import numpy as np
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
 from .thermo_config import ThermodynamicConfig
@@ -107,6 +107,8 @@ class WalkerResult:
     memory_matrix: Optional[torch.Tensor] = None  # [n_bots, n_bots] rut depths
     # Energy Tank (Track 4 Thermodynamics)
     energy_survival_rate: Optional[float] = None  # Fraction of walkers that didn't exhaust budget
+    # Per-step diagnostics for Track 4 rendering
+    step_diagnostics: Optional[List[Dict[str, Any]]] = None
 
 
 class SemanticWalker:
@@ -156,6 +158,8 @@ class SemanticWalker:
         memory_decay: float = 0.95,
         reinforcement_rate: float = 0.1,
         memory_sensitivity: float = 1.0,
+        hysteresis_mode: str = "momentum",
+        hysteresis_lambda: float = 1.0,
         thermo_config: Optional[ThermodynamicConfig] = None,
     ):
         """
@@ -190,6 +194,9 @@ class SemanticWalker:
         self.memory_decay = memory_decay
         self.reinforcement_rate = reinforcement_rate
         self.memory_sensitivity = memory_sensitivity
+        mode = str(hysteresis_mode).strip().lower()
+        self.hysteresis_mode = mode if mode in {"momentum", "fatigue"} else "momentum"
+        self.hysteresis_lambda = float(hysteresis_lambda)
 
         # Initialize memory as zeros (fresh snow, no ruts)
         self.memory_tensor = torch.zeros(self.n_bots, self.n_bots)
@@ -356,13 +363,99 @@ class SemanticWalker:
         potential = (fused_emb * self.u_axis).sum(dim=-1)
         return potential
 
+    def _compute_base_friction(self, weights: torch.Tensor) -> torch.Tensor:
+        """Base terrain friction from local density."""
+        local_density = self._compute_density(weights)
+        return self.thermo_config.friction_coefficient / local_density.clamp(
+            min=self.thermo_config.density_clamp_min
+        )
+
+    def _compute_effective_friction(
+        self,
+        base_friction: torch.Tensor,
+        debt_axis: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Hysteresis friction law.
+
+        fatigue:  base * (1 + lambda * debt_axis)
+        momentum: base / (1 + lambda * debt_axis)
+        """
+        scale = 1.0 + self.hysteresis_lambda * torch.clamp(debt_axis, min=0.0)
+        if self.hysteresis_mode == "fatigue":
+            effective = base_friction * scale
+        else:
+            effective = base_friction / scale.clamp(min=1e-6)
+        return effective.clamp(max=1e3)
+
+    def _annotate_step_events(
+        self,
+        step_diagnostics: List[Dict[str, Any]],
+        state_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Mark localized shear/rupture candidates from per-step thermodynamic spikes.
+
+        Events are derived from relative stepwise work/friction/debt spikes within
+        a single article path so the viz can highlight exact failure coordinates.
+        """
+        if not step_diagnostics:
+            return step_diagnostics
+
+        def _normalize(values: np.ndarray) -> np.ndarray:
+            if values.size == 0:
+                return values
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                return np.zeros_like(values, dtype=np.float32)
+            lo = float(np.percentile(finite, 50.0))
+            hi = float(np.percentile(finite, 90.0))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-9:
+                lo = float(np.min(finite))
+                hi = float(np.max(finite))
+            if hi <= lo + 1e-9:
+                return np.zeros_like(values, dtype=np.float32)
+            return np.clip((values - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+        work = np.asarray(
+            [float(step.get("step_work", 0.0)) for step in step_diagnostics],
+            dtype=np.float32,
+        )
+        friction = np.asarray(
+            [float(step.get("local_friction", 0.0)) for step in step_diagnostics],
+            dtype=np.float32,
+        )
+        debt = np.asarray(
+            [float(step.get("debt_axis", 0.0)) for step in step_diagnostics],
+            dtype=np.float32,
+        )
+
+        severity = np.maximum.reduce([
+            _normalize(work),
+            _normalize(friction),
+            0.5 * _normalize(debt),
+        ]).astype(np.float32)
+
+        threshold = 0.85
+        if state_name in {"phantom", "rupture"}:
+            threshold = 0.70
+        event_mask = severity >= threshold
+        if state_name in {"phantom", "rupture"} and severity.size > 0 and not event_mask.any():
+            event_mask[int(np.argmax(severity))] = True
+
+        for idx, step in enumerate(step_diagnostics):
+            step["step_axis_idx"] = int(step.get("dominant_axis_index", 0))
+            step["event_severity"] = float(severity[idx])
+            step["event_active"] = bool(event_mask[idx])
+        return step_diagnostics
+
     def run_swarm(
         self,
         n_walkers: int = 100,
         n_steps: int = 50,
         start_seed: Optional[int] = None,
         start_from_poles: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
         Release a swarm of walkers to explore the simplex.
 
@@ -425,6 +518,9 @@ class SemanticWalker:
         # History: [Steps, Walkers, Weights]
         trajectory_weights = [current_weights.clone()]
         trajectory_energies = [current_energy.clone()]
+        step_effective_friction = []
+        step_work = []
+        step_diagnostics: List[Dict[str, Any]] = []
 
         # The Walk Loop (with Hysteresis)
         for t in range(n_steps):
@@ -456,17 +552,25 @@ class SemanticWalker:
             # B. Check the wall (calculate energy)
             proposal_energy = self._compute_energy(proposal)
 
-            # C. Metropolis criterion with HYSTERESIS DISCOUNT
+            # C. Metropolis criterion with hysteretic frictional move-cost
             delta_E = proposal_energy - current_energy
 
-            # HYSTERESIS: Memory discounts the effective energy barrier
-            # Traversed paths have lower effective cost (ruts in the snow)
             if self.enable_hysteresis:
                 memory_bonus = self._compute_transition_memory(current_weights, proposal)
-                # Effective delta_E is reduced by memory (easier to follow ruts)
-                effective_delta_E = delta_E * torch.exp(-memory_bonus * self.memory_sensitivity)
             else:
-                effective_delta_E = delta_E
+                memory_bonus = torch.zeros_like(delta_E)
+
+            debt_axis = memory_bonus * self.memory_sensitivity
+            proposal_midpoint = (current_weights + proposal) / 2.0
+            proposal_base_friction = self._compute_base_friction(proposal_midpoint)
+            proposal_effective_friction = self._compute_effective_friction(proposal_base_friction, debt_axis)
+            proposal_step_distance = torch.norm(
+                torch.matmul(proposal, self.embeddings) - torch.matmul(current_weights, self.embeddings),
+                p=2,
+                dim=-1,
+            )
+            proposal_move_cost = proposal_effective_friction * proposal_step_distance
+            effective_delta_E = delta_E + proposal_move_cost
 
             acceptance_prob = torch.exp(-effective_delta_E / self.T)
             dice_roll = torch.rand(n_walkers)
@@ -490,12 +594,37 @@ class SemanticWalker:
             step_distance = torch.norm(next_pos - current_pos, p=2, dim=-1)
 
             midpoint_weights = (current_weights + next_weights) / 2.0
-            local_density = self._compute_density(midpoint_weights)
-            local_friction = self.thermo_config.friction_coefficient / local_density.clamp(
-                min=self.thermo_config.density_clamp_min
-            )
+            base_friction = self._compute_base_friction(midpoint_weights)
+            applied_debt_axis = torch.where(mask_accept, debt_axis, torch.zeros_like(debt_axis))
+            local_friction = self._compute_effective_friction(base_friction, applied_debt_axis)
             energy_cost = local_friction * step_distance
             energy_tank = energy_tank - torch.where(mask_accept, energy_cost, torch.zeros_like(energy_cost))
+
+            midpoint_emb = torch.matmul(midpoint_weights, self.embeddings)
+            midpoint_proj = self.kernel(midpoint_emb)
+            midpoint_xyz = midpoint_proj[:, :3]
+            if midpoint_xyz.shape[1] < 3:
+                midpoint_xyz = torch.nn.functional.pad(midpoint_xyz, (0, 3 - midpoint_xyz.shape[1]))
+            mean_mid_weights = midpoint_weights.mean(dim=0)
+            dominant_axis_index = int(torch.argmax(mean_mid_weights).item())
+            dominant_axis_contribution = float(mean_mid_weights[dominant_axis_index].item())
+            step_diagnostics.append({
+                "step_index": int(t),
+                "midpoint_xyz": midpoint_xyz.mean(dim=0).detach().cpu().tolist(),
+                "local_friction": float(local_friction.mean().item()),
+                "base_friction": float(base_friction.mean().item()),
+                "debt_axis": float(applied_debt_axis.mean().item()),
+                "dominant_axis_index": dominant_axis_index,
+                "dominant_axis_label": f"bot_{dominant_axis_index}",
+                "dominant_axis_contribution": dominant_axis_contribution,
+                "mean_midpoint_weights": mean_mid_weights.detach().cpu().tolist(),
+                "acceptance_rate": float(mask_accept.float().mean().item()),
+                "step_distance": float(step_distance.mean().item()),
+                "step_work": float(energy_cost.mean().item()),
+                "step_axis_idx": dominant_axis_index,
+            })
+            step_effective_friction.append(local_friction.clone())
+            step_work.append(energy_cost.clone())
 
             if target_weights is not None:
                 to_target = torch.norm(next_weights - target_weights, p=2, dim=-1)
@@ -510,7 +639,12 @@ class SemanticWalker:
             trajectory_weights.append(current_weights.clone())
             trajectory_energies.append(current_energy.clone())
 
-        return torch.stack(trajectory_weights), broken_mask, reached_target
+        swarm_trace = {
+            "step_effective_friction": torch.stack(step_effective_friction) if step_effective_friction else torch.zeros(0),
+            "step_work": torch.stack(step_work) if step_work else torch.zeros(0),
+            "step_diagnostics": step_diagnostics,
+        }
+        return torch.stack(trajectory_weights), broken_mask, reached_target, swarm_trace
 
     def _compute_density(self, weights: torch.Tensor) -> torch.Tensor:
         """
@@ -548,6 +682,7 @@ class SemanticWalker:
     def compute_work_integral(
         self,
         trajectory_weights: torch.Tensor,
+        precomputed_step_work: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         RIEMANNIAN WEB ROUTER — Pure Slope Physics
@@ -597,24 +732,16 @@ class SemanticWalker:
         step_distances = torch.norm(deltas, p=2, dim=-1)  # [n_steps, n_walkers]
 
         # =========================================
-        # 2. TERRAIN FRICTION: Cost = 1/rho (no wind!)
+        # 2. TERRAIN FRICTION + 3. WORK INTEGRAL
         # =========================================
-        midpoint_weights = (trajectory_weights[1:] + trajectory_weights[:-1]) / 2
-        density = self._compute_density(midpoint_weights)  # [n_steps, n_walkers]
-
-        # Physical friction model: inverse density.
-        # Clamp to keep extreme voids finite and avoid INF work explosions.
-        DENSITY_EPSILON = self.thermo_config.density_clamp_min
-        MAX_FRICTION = 1e3
-        terrain_friction = (
-            self.thermo_config.friction_coefficient / density.clamp(min=DENSITY_EPSILON)
-        ).clamp(max=MAX_FRICTION)
-
-        # =========================================
-        # 3. WORK INTEGRAL: W = ∫ (1/ρ) ds
-        # =========================================
-        # Pure slope physics — no wind term
-        step_work = terrain_friction * step_distances
+        if precomputed_step_work is not None:
+            step_work = precomputed_step_work
+        else:
+            midpoint_weights = (trajectory_weights[1:] + trajectory_weights[:-1]) / 2
+            base_friction = self._compute_base_friction(midpoint_weights)
+            zero_debt = torch.zeros_like(base_friction)
+            terrain_friction = self._compute_effective_friction(base_friction, zero_debt)
+            step_work = terrain_friction * step_distances
         work = step_work.sum(dim=0)  # [n_walkers]
         path_length = step_distances.sum(dim=0)  # [n_walkers]
 
@@ -737,7 +864,7 @@ class SemanticWalker:
             WalkerResult with work integral, divergence ratio, state, and trajectory info
         """
         # Run the swarm and track per-walker kinetic failures.
-        trajectory, broken_mask, reached_target = self.run_swarm(
+        trajectory, broken_mask, reached_target, swarm_trace = self.run_swarm(
             n_walkers=n_walkers,
             n_steps=n_steps,
             start_seed=start_seed,
@@ -745,7 +872,10 @@ class SemanticWalker:
         )
 
         # Compute work integral with calibration metrics
-        work, path_length, spectral_distance, divergence_ratio = self.compute_work_integral(trajectory)
+        work, path_length, spectral_distance, divergence_ratio = self.compute_work_integral(
+            trajectory,
+            precomputed_step_work=swarm_trace.get("step_work"),
+        )
 
         # Topological death: walker ran max_steps and stayed near origin.
         trapped_distance_threshold = self.thermo_config.tautology_disp_threshold
@@ -801,6 +931,8 @@ class SemanticWalker:
             memory_matrix=self.get_memory_matrix() if self.enable_hysteresis else None,
             # ENERGY TANK: fraction of walkers that survived the terrain
             energy_survival_rate=energy_survival_rate,
+            # Track 4 per-step diagnostics
+            step_diagnostics=swarm_trace.get("step_diagnostics"),
         )
 
 
@@ -816,7 +948,9 @@ def compute_walker_resistance(
     memory_decay: float = 0.95,
     reinforcement_rate: float = 0.1,
     memory_sensitivity: float = 1.0,
-    existing_memory: Optional[torch.Tensor] = None,  # [n_bots, n_bots] to continue from
+    hysteresis_mode: str = "momentum",
+    hysteresis_lambda: float = 1.0,
+    existing_memory: Optional[torch.Tensor] = None,  # Deprecated: ignored (kept for compatibility)
     thermo_config: Optional[ThermodynamicConfig] = None,
 ) -> Dict[str, Any]:
     """
@@ -832,7 +966,7 @@ def compute_walker_resistance(
     HYSTERESIS (Path Memory):
     When enable_hysteresis=True, the walker tracks traversed paths and
     makes them easier to traverse again (ant colony / pheromone logic).
-    Pass existing_memory to continue building on previous walker runs.
+    `existing_memory` is intentionally ignored to prevent cross-article memory chaining.
 
     Args:
         cls_per_bot: [8, H] — per-bot embeddings
@@ -845,7 +979,9 @@ def compute_walker_resistance(
         memory_decay: How fast memory fades (0.95 = 5% decay per step)
         reinforcement_rate: How much each traversal reinforces the path
         memory_sensitivity: How strongly memory affects energy costs
-        existing_memory: [n_bots, n_bots] memory tensor to continue from
+        hysteresis_mode: "momentum" (default) or "fatigue" friction law
+        hysteresis_lambda: λ scaling factor used in hysteresis friction law
+        existing_memory: Deprecated compatibility arg; external injection disabled
 
     Returns:
         Dict with:
@@ -858,7 +994,8 @@ def compute_walker_resistance(
         - walker_output: [D] trajectory endpoint for Track 5
         - final_position: [H] final position in embedding space
         - hysteresis_stats: Path memory statistics (if enabled)
-        - memory_matrix: [n_bots, n_bots] final memory state (for chaining)
+        - memory_matrix: [n_bots, n_bots] final intra-run memory state
+        - step_diagnostics: per-step friction/midpoint/axis diagnostics for viz
     """
     # Compute gradients as deviation from mean
     bot_grads = cls_per_bot - cls_per_bot.mean(dim=0, keepdim=True)
@@ -873,12 +1010,11 @@ def compute_walker_resistance(
         memory_decay=memory_decay,
         reinforcement_rate=reinforcement_rate,
         memory_sensitivity=memory_sensitivity,
+        hysteresis_mode=hysteresis_mode,
+        hysteresis_lambda=hysteresis_lambda,
         thermo_config=thermo_config,
     )
-
-    # If continuing from existing memory, load it
-    if existing_memory is not None and enable_hysteresis:
-        explorer.memory_tensor = existing_memory.clone()
+    _ = existing_memory  # Explicitly ignored to disable external memory injection.
 
     result = explorer.run_full_integration(
         n_walkers=n_walkers,
@@ -889,6 +1025,10 @@ def compute_walker_resistance(
     state_names = ["tautology", "honest", "phantom", "rupture", "Type 1 Rupture", "Type 2 Rupture"]
     state_code = result.state.item()
     state_name = state_names[min(state_code, len(state_names) - 1)]  # Safety clamp
+    step_diagnostics = explorer._annotate_step_events(
+        result.step_diagnostics if result.step_diagnostics is not None else [],
+        state_name=state_name,
+    )
     if state_name == "Type 1 Rupture":
         walker_status = "FAILED"
     elif state_name == "Type 2 Rupture":
@@ -912,6 +1052,9 @@ def compute_walker_resistance(
         "tautology_threshold": explorer.tautology_threshold,
         "honest_threshold": explorer.honest_threshold,
         "rupture_threshold": explorer.rupture_threshold,
+        "hysteresis_mode": explorer.hysteresis_mode,
+        "hysteresis_lambda": explorer.hysteresis_lambda,
+        "step_diagnostics": step_diagnostics,
     }
 
     # HYSTERESIS: Include path memory state
