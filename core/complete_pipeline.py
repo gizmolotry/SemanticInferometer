@@ -2562,9 +2562,12 @@ class BeliefTransformerPipeline:
                     bt_uid=np.array([str(r["bt_uid"]) for r in walker_path_records]),
                     path_xyz=path_xyz_payload,
                     step_axis_idx=_pack_step_field("step_axis_idx", np.int32),
+                    step_axis_vectors=_pack_step_field("step_axis_vectors", np.float32, source_key="step_axis_vector"),
                     step_local_friction=_pack_step_field("step_local_friction", np.float32, source_key="local_friction"),
                     step_work=_pack_step_field("step_work", np.float32),
+                    step_cumulative_work=_pack_step_field("step_cumulative_work", np.float32, source_key="cumulative_work"),
                     step_debt_axis=_pack_step_field("step_debt_axis", np.float32, source_key="debt_axis"),
+                    step_memory_integral=_pack_step_field("step_memory_integral", np.float32, source_key="memory_integral"),
                     step_event_mask=_pack_step_field("step_event_mask", np.bool_, source_key="event_active"),
                     step_event_severity=_pack_step_field("step_event_severity", np.float32, source_key="event_severity"),
                 )

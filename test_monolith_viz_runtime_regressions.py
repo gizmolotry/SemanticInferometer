@@ -230,8 +230,17 @@ def test_track4_chroma_ribbons_emit_variable_widths_and_shear_flares():
     walker_path_diagnostics = {
         0: {
             "step_axis_idx": np.array([0, 3, 5], dtype=int),
+            "step_axis_vectors": np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                ],
+                dtype=float,
+            ),
             "step_local_friction": np.array([0.2, 0.9, 1.6], dtype=float),
             "step_work": np.array([0.1, 0.8, 1.5], dtype=float),
+            "step_cumulative_work": np.array([0.1, 0.9, 2.4], dtype=float),
             "step_event_mask": np.array([False, True, False], dtype=bool),
             "step_event_severity": np.array([0.1, 0.95, 0.2], dtype=float),
         }
@@ -258,6 +267,51 @@ def test_track4_chroma_ribbons_emit_variable_widths_and_shear_flares():
     assert max(chroma_widths) > min(chroma_widths), chroma_widths
 
 
+def test_cumulative_work_prevents_markovian_width_snapback():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+                [0.4, 0.0, 0.0],
+                [0.6, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+    }
+    walker_path_diagnostics = {
+        0: {
+            "step_axis_vectors": np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=float,
+            ),
+            "step_local_friction": np.array([1.2, 0.1, 0.1], dtype=float),
+            "step_cumulative_work": np.array([0.3, 1.1, 2.0], dtype=float),
+        }
+    }
+    phantom_verdicts = [{"verdict": "PHANTOM", "walker_state": "success"}]
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        walker_path_diagnostics=walker_path_diagnostics,
+    )
+
+    chroma_widths = [
+        float(getattr(getattr(t, "line", None), "width", 0.0))
+        for t in traces
+        if str(getattr(t, "name", "")) == "Track 4 Axis Chroma"
+    ]
+    assert chroma_widths == sorted(chroma_widths), chroma_widths
+
+
 def test_honest_path_falls_back_cleanly_when_chroma_diagnostics_absent():
     _require_plotly()
     positions_3d = np.array([[1.0, 2.0, 3.0]], dtype=float)
@@ -281,6 +335,68 @@ def test_honest_path_falls_back_cleanly_when_chroma_diagnostics_absent():
 
     names = [str(getattr(t, "name", "")) for t in traces]
     assert "Honest Path" in names
+
+
+def test_phantom_path_restores_visible_shear_label_without_step_diagnostics():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.1]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [0.0, 0.0, 0.1],
+                [0.3, 0.2, 0.2],
+                [0.5, 0.4, 0.3],
+            ],
+            dtype=float,
+        )
+    }
+    phantom_verdicts = [{"verdict": "PHANTOM", "walker_state": "success"}]
+    spectral_probe_magnitudes = np.array([[0.1, 0.2, 0.4, 1.8, 0.3, 0.0, 0.1, 0.2]], dtype=float)
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        walker_path_diagnostics=None,
+        spectral_probe_magnitudes=spectral_probe_magnitudes,
+    )
+
+    shear_traces = [t for t in traces if str(getattr(t, "name", "")) == "Ideological Shear"]
+    assert shear_traces, "Expected visible PHANTOM shear text label on old-schema path data"
+    text_values = [str(txt) for t in shear_traces for txt in getattr(t, "text", [])]
+    assert any(text.startswith("[SHEAR:") for text in text_values), text_values
+
+
+def test_paths_are_draped_to_surface_height_with_positive_offset():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, -5.0]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [0.0, 0.0, -5.0],
+                [0.2, 0.3, -4.0],
+            ],
+            dtype=float,
+        )
+    }
+    phantom_verdicts = [{"verdict": "HONEST", "walker_state": "success"}]
+
+    def _surface_z(xs, ys, offset=0.0, preserve_nan=False):
+        xs_arr = np.asarray(xs, dtype=float)
+        return np.full(xs_arr.shape, 1.0 + offset, dtype=float)
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        surface_z_func=_surface_z,
+    )
+
+    honest_traces = [t for t in traces if str(getattr(t, "name", "")) == "Honest Path"]
+    assert honest_traces, "Expected draped honest path trace"
+    for trace in honest_traces:
+        zs = np.asarray(trace.z, dtype=float)
+        assert np.allclose(zs, 1.05), zs
 
 
 def test_axis_labels_are_data_driven_when_spectral_present(monkeypatch, tmp_path):

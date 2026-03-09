@@ -2075,7 +2075,7 @@ def render_phantom_paths_3d(
     mode_key = str(path_ablation_mode or "none").strip().lower()
     thermodynamic_mode = mode_key == "thermodynamic"
     semantic_tether_mode = mode_key == "semantic_tether"
-    drape_paths = os.environ.get("MONOLITH_DRAPE_PATHS", "0").strip() == "1"
+    drape_paths = os.environ.get("MONOLITH_DRAPE_PATHS", "1").strip() == "1"
 
     def _resample_polyline_xy(path_xy: np.ndarray, n_steps: int = 120) -> Tuple[np.ndarray, np.ndarray]:
         pts = np.asarray(path_xy, dtype=float)
@@ -2143,6 +2143,19 @@ def render_phantom_paths_3d(
         if v.size <= 0 or not np.any(np.isfinite(v)):
             return "#88CCFF"
         v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        if v.size >= len(axis_index_palette):
+            weights = np.abs(v[:len(axis_index_palette)])
+            denom = float(np.sum(weights))
+            if denom > 1e-12:
+                rgb_palette = np.asarray(
+                    [
+                        [int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)]
+                        for color in axis_index_palette
+                    ],
+                    dtype=float,
+                )
+                rgb = np.clip((weights / denom) @ rgb_palette, 0.0, 255.0).astype(int)
+                return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
         if v.size >= 3:
             comp = np.abs(v[:3])
         elif v.size == 2:
@@ -2179,7 +2192,10 @@ def render_phantom_paths_3d(
                 except Exception:
                     continue
                 if arr.ndim == 2 and arr.shape[0] >= 2:
-                    return ("vector", arr)
+                    bleed = arr.copy()
+                    for idx in range(1, bleed.shape[0]):
+                        bleed[idx] = 0.72 * bleed[idx - 1] + 0.28 * arr[idx]
+                    return ("vector", bleed)
         for key in ("dominant_axis_idx", "dominant_probe_idx", "step_axis_idx"):
             if key in path_diag:
                 try:
@@ -2205,7 +2221,13 @@ def render_phantom_paths_3d(
         return None
 
     def _step_width_lookup(path_diag: Dict[str, Any]) -> Optional[np.ndarray]:
-        values = _step_scalar_lookup(path_diag, "step_local_friction", "step_work")
+        values = _step_scalar_lookup(
+            path_diag,
+            "step_cumulative_work",
+            "cumulative_work",
+            "step_local_friction",
+            "step_work",
+        )
         if values is None:
             return None
         finite = values[np.isfinite(values)]
@@ -2284,6 +2306,76 @@ def render_phantom_paths_3d(
                 ))
             step_cursor += max(1, seg.shape[0] - 1)
         legend_shown.add(legend_group)
+
+    def _build_shear_text(
+        article_idx: int,
+        asym: Optional[Dict[str, float]] = None,
+    ) -> str:
+        shear_axis = _dominant_probe_label(article_idx)
+        asym_note = ""
+        if asym is not None and "delta" in asym:
+            asym_note = f" | Δ={float(asym['delta']):.3f}"
+        return f"[SHEAR: {shear_axis}{asym_note}]"
+
+    def _select_shear_anchor_xyz(
+        path_segments: List[np.ndarray],
+        event_mask: Optional[np.ndarray],
+        event_severity: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        if not path_segments:
+            return None
+        if event_mask is not None and event_severity is not None and np.any(event_mask):
+            best_xyz = None
+            best_severity = -1.0
+            step_cursor = 0
+            for seg in path_segments:
+                for j in range(max(0, seg.shape[0] - 1)):
+                    step_idx = min(step_cursor + j, len(event_mask) - 1)
+                    if not bool(event_mask[step_idx]):
+                        continue
+                    severity = float(event_severity[min(step_idx, len(event_severity) - 1)])
+                    if severity > best_severity:
+                        best_severity = severity
+                        best_xyz = 0.5 * (seg[j, :3] + seg[j + 1, :3])
+                step_cursor += max(1, seg.shape[0] - 1)
+            if best_xyz is not None:
+                return np.asarray(best_xyz, dtype=float)
+        start_xyz = np.asarray(path_segments[0][0, :3], dtype=float)
+        end_xyz = np.asarray(path_segments[-1][-1, :3], dtype=float)
+        return 0.5 * (start_xyz + end_xyz)
+
+    def _append_shear_label(
+        article_idx: int,
+        path_segments: List[np.ndarray],
+        hover_label: str,
+        *,
+        event_mask: Optional[np.ndarray] = None,
+        event_severity: Optional[np.ndarray] = None,
+        asym: Optional[Dict[str, float]] = None,
+    ) -> None:
+        if not path_segments:
+            return
+        anchor_xyz = _select_shear_anchor_xyz(path_segments, event_mask, event_severity)
+        if anchor_xyz is None or not np.isfinite(anchor_xyz).all():
+            return
+        shear_text = _build_shear_text(article_idx, asym=asym)
+        traces.append(go.Scatter3d(
+            x=[float(anchor_xyz[0])],
+            y=[float(anchor_xyz[1])],
+            z=[float(anchor_xyz[2]) + 0.08],
+            mode='text',
+            text=[shear_text],
+            textfont=dict(
+                color="#FF5CFF",
+                size=12,
+                family="JetBrains Mono, monospace",
+            ),
+            name="Ideological Shear",
+            hovertext=[f"{hover_label}<br>{shear_text}"],
+            hovertemplate="%{hovertext}<extra></extra>",
+            legendgroup="semantic-shear-labels",
+            showlegend=False,
+        ))
 
     def _asymmetry_delta(path_source_idx: int, end_xyz: np.ndarray) -> Optional[Dict[str, float]]:
         if hysteresis_memory is None:
@@ -2372,7 +2464,7 @@ def render_phantom_paths_3d(
                         surface_z_func(
                             np.array([start_xyz[0], end_xyz[0]], dtype=float),
                             np.array([start_xyz[1], end_xyz[1]], dtype=float),
-                            offset=0.01,
+                            offset=0.05,
                             preserve_nan=True,
                         ),
                         dtype=float,
@@ -2487,6 +2579,15 @@ def render_phantom_paths_3d(
                 ))
                 legend_shown.add('semantic-asymmetry')
 
+            if verdict == "PHANTOM":
+                _append_shear_label(
+                    i,
+                    [np.vstack([start_xyz, end_xyz])],
+                    hover_text,
+                    event_mask=step_event_mask,
+                    event_severity=step_event_severity,
+                    asym=asym,
+                )
             continue
         if thermodynamic_mode:
             scorch_x, scorch_y = _resample_polyline_xy(rendered_path[:, :2], n_steps=120)
@@ -2498,15 +2599,15 @@ def render_phantom_paths_3d(
                         surface_z_func(
                             scorch_x,
                             scorch_y,
-                            offset=0.015,
+                            offset=0.05,
                             preserve_nan=True,
                         ),
                         dtype=float,
                     )
                 except Exception:
-                    scorch_z = np.full_like(scorch_x, source_z + 0.015, dtype=float)
+                    scorch_z = np.full_like(scorch_x, source_z + 0.05, dtype=float)
             else:
-                scorch_z = np.full_like(scorch_x, source_z + 0.015, dtype=float)
+                scorch_z = np.full_like(scorch_x, source_z + 0.05, dtype=float)
 
             if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
                 path_color = ("#00FFFF" if verdict == "HONEST" else "#FF2DFF" if verdict == "PHANTOM" else "#39FF14")
@@ -2569,13 +2670,11 @@ def render_phantom_paths_3d(
                 seg = path_segments[seg_idx].copy()
                 try:
                     terrain_z = np.asarray(
-                        surface_z_func(seg[:, 0], seg[:, 1], offset=0.0),
+                        surface_z_func(seg[:, 0], seg[:, 1], offset=0.05),
                         dtype=float
                     )
                     if terrain_z.shape == seg[:, 2].shape and np.isfinite(terrain_z).any():
                         seg[:, 2] = terrain_z
-                        if seg_idx == 0:
-                            seg[0, 2] = source_z
                 except Exception:
                     pass
                 seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
@@ -2640,6 +2739,16 @@ def render_phantom_paths_3d(
                     ))
                 legend_shown.add(legend_group)
             _append_step_flares(path_segments, step_event_mask, step_event_severity, hover_text, verdict)
+            if verdict == "PHANTOM":
+                asym = _asymmetry_delta(i, end_xyz) if end_xyz is not None else None
+                _append_shear_label(
+                    i,
+                    path_segments,
+                    hover_text,
+                    event_mask=step_event_mask,
+                    event_severity=step_event_severity,
+                    asym=asym,
+                )
         elif verdict == "RUPTURE":
             rupture_color = "#FF2222" if walker_state == "broken" else "#FF00FF"
             legend_group = 'path-rupture-broken' if walker_state == "broken" else 'path-rupture-trapped'

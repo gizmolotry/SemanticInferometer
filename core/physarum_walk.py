@@ -187,9 +187,9 @@ class SemanticWalker:
         # =========================================
         # HYSTERESIS STATE (Path Memory)
         # =========================================
-        # Memory tensor tracks "rut depth" for each bot→bot transition
-        # Shape: [n_bots, n_bots] — transition matrix
-        # memory[i,j] = accumulated traversals from bot_i → bot_j
+        # Per-walker hysteresis memory. Runtime memory is NEVER shared across walkers.
+        # walker_memory_tensor[w, i, j] = accumulated traversal history for walker w
+        # transitioning from bot_i → bot_j along its own trajectory.
         self.enable_hysteresis = enable_hysteresis
         self.memory_decay = memory_decay
         self.reinforcement_rate = reinforcement_rate
@@ -198,8 +198,9 @@ class SemanticWalker:
         self.hysteresis_mode = mode if mode in {"momentum", "fatigue"} else "momentum"
         self.hysteresis_lambda = float(hysteresis_lambda)
 
-        # Initialize memory as zeros (fresh snow, no ruts)
-        self.memory_tensor = torch.zeros(self.n_bots, self.n_bots)
+        # Aggregate compatibility snapshot for downstream visualization/export.
+        self.aggregate_memory_matrix = torch.zeros(self.n_bots, self.n_bots)
+        self.walker_memory_tensor: Optional[torch.Tensor] = None
 
         # Track hysteresis statistics
         self.hysteresis_stats = {
@@ -265,6 +266,14 @@ class SemanticWalker:
         """
         if not self.enable_hysteresis:
             return torch.zeros(prev_weights.shape[0])
+        if self.walker_memory_tensor is None:
+            self.walker_memory_tensor = torch.zeros(
+                prev_weights.shape[0],
+                self.n_bots,
+                self.n_bots,
+                dtype=prev_weights.dtype,
+                device=prev_weights.device,
+            )
 
         # Compute weight deltas: which bots gained/lost weight?
         deltas = next_weights - prev_weights  # [n_walkers, n_bots]
@@ -285,8 +294,8 @@ class SemanticWalker:
         # memory_bonus[w] = sum_{i,j} sources[w,i] * sinks[w,j] * memory[i,j]
         # = sources[w] @ memory @ sinks[w].T (but we want scalar per walker)
 
-        # Reshape for batch matmul: [n_walkers, 1, n_bots] @ [n_bots, n_bots] @ [n_walkers, n_bots, 1]
-        memory_bonus = torch.einsum('wi,ij,wj->w', sources, self.memory_tensor, sinks)
+        # Per-walker hysteresis: each walker reads only its own memory field.
+        memory_bonus = torch.einsum('wi,wij,wj->w', sources, self.walker_memory_tensor, sinks)
 
         return memory_bonus
 
@@ -307,6 +316,14 @@ class SemanticWalker:
         """
         if not self.enable_hysteresis:
             return
+        if self.walker_memory_tensor is None:
+            self.walker_memory_tensor = torch.zeros(
+                prev_weights.shape[0],
+                self.n_bots,
+                self.n_bots,
+                dtype=prev_weights.dtype,
+                device=prev_weights.device,
+            )
 
         # Compute weight deltas for accepted transitions only
         deltas = next_weights - prev_weights  # [n_walkers, n_bots]
@@ -318,24 +335,24 @@ class SemanticWalker:
         sources = torch.clamp(-accepted_deltas, min=0)  # Weight lost
         sinks = torch.clamp(accepted_deltas, min=0)      # Weight gained
 
-        # Reinforcement: sum over walkers of outer(sources, sinks)
-        # reinforcement[i,j] = sum_w sources[w,i] * sinks[w,j]
-        reinforcement = torch.einsum('wi,wj->ij', sources, sinks)
+        reinforcement = torch.einsum('wi,wj->wij', sources, sinks)
+        reinforcement = reinforcement * accepted_mask.to(prev_weights.dtype).view(-1, 1, 1)
 
-        # Apply reinforcement
-        self.memory_tensor += self.reinforcement_rate * reinforcement
-
-        # Decay entire memory (the "snow fills back in")
-        self.memory_tensor *= self.memory_decay
+        # Decay and reinforce each walker independently.
+        self.walker_memory_tensor = (self.walker_memory_tensor * self.memory_decay) + (
+            self.reinforcement_rate * reinforcement
+        )
+        self.aggregate_memory_matrix = self.walker_memory_tensor.mean(dim=0)
 
         # Update statistics
         self.hysteresis_stats["total_reinforcements"] += int(accepted_mask.sum().item())
-        self.hysteresis_stats["max_rut_depth"] = float(self.memory_tensor.max().item())
-        self.hysteresis_stats["highway_count"] = int((self.memory_tensor > 0.5).sum().item())
+        self.hysteresis_stats["max_rut_depth"] = float(self.walker_memory_tensor.max().item())
+        self.hysteresis_stats["highway_count"] = int((self.aggregate_memory_matrix > 0.5).sum().item())
 
     def reset_memory(self) -> None:
         """Reset the memory tensor (fresh snow)."""
-        self.memory_tensor.zero_()
+        self.aggregate_memory_matrix.zero_()
+        self.walker_memory_tensor = None
         self.hysteresis_stats = {
             "total_reinforcements": 0,
             "max_rut_depth": 0.0,
@@ -344,7 +361,7 @@ class SemanticWalker:
 
     def get_memory_matrix(self) -> torch.Tensor:
         """Return the current memory tensor (for visualization)."""
-        return self.memory_tensor.clone()
+        return self.aggregate_memory_matrix.clone()
 
     def _compute_potential(self, weights: torch.Tensor) -> torch.Tensor:
         """
@@ -520,20 +537,31 @@ class SemanticWalker:
         trajectory_energies = [current_energy.clone()]
         step_effective_friction = []
         step_work = []
+        step_cumulative_work = []
         step_diagnostics: List[Dict[str, Any]] = []
+        cumulative_work_integral = torch.zeros_like(current_energy)
+        cumulative_memory_integral = torch.zeros_like(current_energy)
+        if self.enable_hysteresis:
+            self.walker_memory_tensor = torch.zeros(
+                n_walkers,
+                self.n_bots,
+                self.n_bots,
+                dtype=current_weights.dtype,
+                device=current_weights.device,
+            )
+            self.aggregate_memory_matrix = torch.zeros(
+                self.n_bots,
+                self.n_bots,
+                dtype=current_weights.dtype,
+                device=current_weights.device,
+            )
 
         # The Walk Loop (with Hysteresis)
         for t in range(n_steps):
             # A. Propose a step (perturb weights)
             noise = torch.randn_like(current_weights) * self.thermo_config.noise_sigma
-            
-            # RESTORE WIND FORCE: Push walkers across the manifold using the u_axis field.
-            # We guide walkers towards their opposing pole target if defined by the field.
-            wind_drift = 0
-            if self.u_axis is not None and target_weights is not None:
-                wind_drift = (target_weights - current_weights) * 0.1
 
-            proposal = torch.abs(current_weights + noise + wind_drift)
+            proposal = torch.abs(current_weights + noise)
             proposal = proposal / proposal.sum(dim=-1, keepdim=True)
 
             # Optional kinetic dampening on proposed move.
@@ -561,9 +589,13 @@ class SemanticWalker:
                 memory_bonus = torch.zeros_like(delta_E)
 
             debt_axis = memory_bonus * self.memory_sensitivity
+            non_markovian_memory = debt_axis + cumulative_memory_integral
             proposal_midpoint = (current_weights + proposal) / 2.0
             proposal_base_friction = self._compute_base_friction(proposal_midpoint)
-            proposal_effective_friction = self._compute_effective_friction(proposal_base_friction, debt_axis)
+            proposal_effective_friction = self._compute_effective_friction(
+                proposal_base_friction,
+                non_markovian_memory,
+            )
             proposal_step_distance = torch.norm(
                 torch.matmul(proposal, self.embeddings) - torch.matmul(current_weights, self.embeddings),
                 p=2,
@@ -596,9 +628,20 @@ class SemanticWalker:
             midpoint_weights = (current_weights + next_weights) / 2.0
             base_friction = self._compute_base_friction(midpoint_weights)
             applied_debt_axis = torch.where(mask_accept, debt_axis, torch.zeros_like(debt_axis))
-            local_friction = self._compute_effective_friction(base_friction, applied_debt_axis)
+            applied_non_markovian_memory = torch.where(
+                mask_accept,
+                non_markovian_memory,
+                torch.zeros_like(non_markovian_memory),
+            )
+            local_friction = self._compute_effective_friction(base_friction, applied_non_markovian_memory)
             energy_cost = local_friction * step_distance
             energy_tank = energy_tank - torch.where(mask_accept, energy_cost, torch.zeros_like(energy_cost))
+            cumulative_work_integral = cumulative_work_integral + torch.where(
+                mask_accept,
+                energy_cost,
+                torch.zeros_like(energy_cost),
+            )
+            cumulative_memory_integral = cumulative_memory_integral + applied_debt_axis
 
             midpoint_emb = torch.matmul(midpoint_weights, self.embeddings)
             midpoint_proj = self.kernel(midpoint_emb)
@@ -614,6 +657,7 @@ class SemanticWalker:
                 "local_friction": float(local_friction.mean().item()),
                 "base_friction": float(base_friction.mean().item()),
                 "debt_axis": float(applied_debt_axis.mean().item()),
+                "memory_integral": float(cumulative_memory_integral.mean().item()),
                 "dominant_axis_index": dominant_axis_index,
                 "dominant_axis_label": f"bot_{dominant_axis_index}",
                 "dominant_axis_contribution": dominant_axis_contribution,
@@ -621,10 +665,13 @@ class SemanticWalker:
                 "acceptance_rate": float(mask_accept.float().mean().item()),
                 "step_distance": float(step_distance.mean().item()),
                 "step_work": float(energy_cost.mean().item()),
+                "cumulative_work": float(cumulative_work_integral.mean().item()),
                 "step_axis_idx": dominant_axis_index,
+                "step_axis_vector": mean_mid_weights.detach().cpu().tolist(),
             })
             step_effective_friction.append(local_friction.clone())
             step_work.append(energy_cost.clone())
+            step_cumulative_work.append(cumulative_work_integral.clone())
 
             if target_weights is not None:
                 to_target = torch.norm(next_weights - target_weights, p=2, dim=-1)
@@ -642,6 +689,7 @@ class SemanticWalker:
         swarm_trace = {
             "step_effective_friction": torch.stack(step_effective_friction) if step_effective_friction else torch.zeros(0),
             "step_work": torch.stack(step_work) if step_work else torch.zeros(0),
+            "step_cumulative_work": torch.stack(step_cumulative_work) if step_cumulative_work else torch.zeros(0),
             "step_diagnostics": step_diagnostics,
         }
         return torch.stack(trajectory_weights), broken_mask, reached_target, swarm_trace
