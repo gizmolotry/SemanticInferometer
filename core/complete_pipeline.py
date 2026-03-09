@@ -2717,13 +2717,20 @@ class BeliefTransformerPipeline:
                 run_output_dir = None
 
         if run_output_dir is not None and spectral_results is not None:
-            try:
-                np.save(
-                    run_output_dir / "spectral_probe_magnitudes.npy",
-                    spectral_results.probe_magnitudes.detach().cpu().numpy(),
-                )
-            except Exception as e:
-                print(f"[Track 1.5] Warning: failed to persist spectral_probe_magnitudes.npy: {e}")
+            spectral_root_artifacts = {
+                "spectral_evr.npy": spectral_results.evr.detach().cpu().numpy(),
+                "spectral_probe_magnitudes.npy": spectral_results.probe_magnitudes.detach().cpu().numpy(),
+                "spectral_dipole_valid.npy": spectral_results.dipole_valid.detach().cpu().numpy(),
+                "spectral_n_persistent_scales.npy": spectral_results.n_persistent_scales.detach().cpu().numpy(),
+                "spectral_evr_per_scale.npy": spectral_results.evr_per_scale.detach().cpu().numpy(),
+                "spectral_u_axis.npy": spectral_results.u_axis.detach().cpu().numpy(),
+                "spectral_antagonism.npy": spectral_results.antagonism.detach().cpu().numpy(),
+            }
+            for artifact_name, artifact_value in spectral_root_artifacts.items():
+                try:
+                    np.save(run_output_dir / artifact_name, artifact_value)
+                except Exception as e:
+                    print(f"[Track 1.5] Warning: failed to persist {artifact_name}: {e}")
 
         if run_output_dir is not None and walker_path_records:
             try:

@@ -11,6 +11,7 @@ from analysis.MONOLITH_VIZ import (
     PROBE_LABELS,
     ExperimentData,
     create_monolith_cockpit,
+    load_experiment_data,
     render_analysis_planes,
     render_phantom_paths_3d,
 )
@@ -150,6 +151,42 @@ def test_missing_logits_keeps_t1_nmi_unavailable_via_function():
 
     assert "T1" in nmi_scores
     assert np.isnan(nmi_scores["T1"])
+
+
+def test_load_experiment_data_recovers_spectral_evr_from_checkpoint(monkeypatch, tmp_path):
+    exp_dir = tmp_path / "matern" / "seed_42"
+    checkpoint_dir = exp_dir / "checkpoints" / "batch"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    np.save(exp_dir / "features.npy", np.array([[0.1, 0.2], [0.3, 0.4]], dtype=float))
+    singular_values = np.array([[3.0, 1.0], [4.0, 2.0]], dtype=float)
+    probe_magnitudes = np.array([[0.1, 0.2], [0.3, 0.4]], dtype=float)
+    dipole_valid = np.array([True, False], dtype=bool)
+    np.savez(
+        checkpoint_dir / "T1.5_spectral_state.npz",
+        singular_values=singular_values,
+        probe_magnitudes=probe_magnitudes,
+        dipole_valid=dipole_valid,
+    )
+
+    class _ContractStub:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def verify(self):
+            return None
+
+    monkeypatch.setattr("analysis.MONOLITH_VIZ.ArtifactContract", _ContractStub)
+
+    exp = load_experiment_data(exp_dir)
+    expected_evr = (singular_values[:, 0] ** 2) / np.clip((singular_values ** 2).sum(axis=1), 1e-12, None)
+
+    assert exp.spectral_evr is not None
+    assert exp.spectral_probe_magnitudes is not None
+    assert exp.spectral_dipole_valid is not None
+    assert np.allclose(exp.spectral_evr, expected_evr)
+    assert np.array_equal(exp.spectral_probe_magnitudes, probe_magnitudes)
+    assert np.array_equal(exp.spectral_dipole_valid, dipole_valid)
 
 
 def test_persisted_track_nmi_overrides_proxy_recompute():

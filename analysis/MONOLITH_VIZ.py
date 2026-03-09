@@ -635,6 +635,8 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     cp_t0_logits = None
     cp_t2_kernels = None
     cp_t15_spectral = None
+    cp_t15_evr = None
+    cp_t15_dipole_valid = None
     cp_t3_blinker = None
     ground_truth_labels = None
 
@@ -673,10 +675,29 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         # T1.5: Spectral probe magnitudes
         t15_path = checkpoint_dir / "T1.5_spectral_state.npz"
         if t15_path.exists():
-            t15_data = np.load(t15_path)
-            if 'probe_magnitudes' in t15_data.files:
-                cp_t15_spectral = t15_data['probe_magnitudes']
-                print(f"[MONOLITH] Loaded T1.5 spectral: {cp_t15_spectral.shape}")
+            with np.load(t15_path) as t15_data:
+                if 'probe_magnitudes' in t15_data.files:
+                    cp_t15_spectral = t15_data['probe_magnitudes']
+                    print(f"[MONOLITH] Loaded T1.5 spectral: {cp_t15_spectral.shape}")
+                if 'evr' in t15_data.files:
+                    candidate_evr = np.asarray(t15_data['evr'], dtype=float)
+                    if candidate_evr.ndim == 1 and candidate_evr.shape[0] == n_articles:
+                        cp_t15_evr = candidate_evr
+                elif 'singular_values' in t15_data.files:
+                    singular_values = np.asarray(t15_data['singular_values'], dtype=float)
+                    if singular_values.ndim == 2 and singular_values.shape[0] == n_articles and singular_values.shape[1] >= 1:
+                        sigma_sq = singular_values ** 2
+                        cp_t15_evr = sigma_sq[:, 0] / np.clip(sigma_sq.sum(axis=1), 1e-12, None)
+                if 'dipole_valid' in t15_data.files:
+                    candidate_valid = np.asarray(t15_data['dipole_valid'])
+                    if candidate_valid.ndim == 1 and candidate_valid.shape[0] == n_articles:
+                        cp_t15_dipole_valid = candidate_valid.astype(bool)
+                if spectral_evr is None and cp_t15_evr is not None:
+                    spectral_evr = cp_t15_evr
+                    print(f"[MONOLITH] Reconstructed T1.5 EVR from checkpoint: {spectral_evr.shape}")
+                if spectral_dipole_valid is None and cp_t15_dipole_valid is not None:
+                    spectral_dipole_valid = cp_t15_dipole_valid
+                    print(f"[MONOLITH] Recovered T1.5 dipole validity from checkpoint: {spectral_dipole_valid.shape}")
 
     if spectral_probe_magnitudes is None and cp_t15_spectral is not None:
         spectral_probe_magnitudes = cp_t15_spectral
