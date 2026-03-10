@@ -3,9 +3,12 @@ from dataclasses import dataclass
 
 @dataclass
 class ThermodynamicConfig:
-    # Walker Dynamics (Cranked up to be deadly)
-    friction_coefficient: float = 0.5  # High drag (sharpens cracks)
+    # Walker Dynamics
+    # The prior "deadly" calibration froze balanced corpora at Track 4.
+    # Keep enough drag to expose barriers, but allow meaningful path formation.
+    friction_coefficient: float = 0.2
     noise_sigma: float = 0.1
+    directed_drift_strength: float = 0.02
     tautology_work_threshold: float = 5.0  # Example high threshold
     tautology_disp_threshold: float = 0.2
 
@@ -16,4 +19,4 @@ class ThermodynamicConfig:
     stress_threshold: float = 0.75  # Tightened to expose more cracks
 
     # Walker Energy Budget (Track 4 Thermodynamics)
-    walker_energy_budget: float = 50.0  # Total work units before walker dies on the mountain
+    walker_energy_budget: float = 120.0

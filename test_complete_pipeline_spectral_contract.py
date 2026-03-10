@@ -4,6 +4,7 @@ from core.complete_pipeline import (
     SPECTRAL_CLS_NORMALIZATION_CONTRACT,
     _canonicalize_cls_per_bot_for_spectral,
     _construct_spectral_poles,
+    _map_track4_state_to_track5_verdict,
 )
 
 
@@ -57,3 +58,10 @@ def test_construct_spectral_poles_explicit_both_empty_fallback():
     assert poles["fallback_state"][0] == "fallback_both_sign_buckets_empty"
     assert torch.allclose(poles["emb_pos"][0], G[0, 0])
     assert torch.allclose(poles["emb_neg"][0], G[0, 1])
+
+
+def test_track4_panic_bypass_preserves_native_states():
+    assert _map_track4_state_to_track5_verdict("phantom", phantom_ratio=0.1) == "PHANTOM"
+    assert _map_track4_state_to_track5_verdict("honest", phantom_ratio=9.0) == "HONEST"
+    assert _map_track4_state_to_track5_verdict("tautology", phantom_ratio=9.0) == "TAUTOLOGY"
+    assert _map_track4_state_to_track5_verdict("Type 2 Rupture", phantom_ratio=0.1) == "RUPTURE"

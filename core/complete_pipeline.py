@@ -455,6 +455,29 @@ def _compute_track_validation_metrics(
     return track_metrics
 
 
+def _map_track4_state_to_track5_verdict(
+    state_name: str,
+    *,
+    phantom_ratio: Optional[float] = None,
+) -> str:
+    state = str(state_name or "").strip()
+    if state in {"Type 1 Rupture", "Type 2 Rupture", "rupture"}:
+        return "RUPTURE"
+    if state in {"trapped", "tautology"}:
+        return "TAUTOLOGY"
+    if state == "phantom":
+        return "PHANTOM"
+    if state == "honest":
+        return "HONEST"
+
+    ratio = 1.0 if phantom_ratio is None else float(phantom_ratio)
+    if ratio > 2.0:
+        return "PHANTOM"
+    if ratio < 0.5:
+        return "TAUTOLOGY"
+    return "HONEST"
+
+
 def _summarize_track_validation_records(
     validation_records: List[Dict[str, Any]]
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
@@ -2445,20 +2468,11 @@ class BeliefTransformerPipeline:
                         tautology_delta_cutoff = float(np.quantile(delta_arr, 0.10))
                         for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
                             ratio = float(phantom_ratio[i]) if i < len(phantom_ratio) else 1.0
-                            
-                            # 3+2+1 OVERHAUL: Family B (Topological Breaks) have priority
-                            if s == "Type 1 Rupture" or s == "Type 2 Rupture" or s == "rupture":
-                                verdict = "RUPTURE" # Map to Rupture for HUD, UI handles Laser
-                            elif s == "trapped":
-                                verdict = "TAUTOLOGY" # Map to Tautology for HUD, UI handles Stall
-                            # Family A (Spectral Paths) based on Ratio
-                            elif ratio > 2.0: # ratio >> 1
-                                verdict = "PHANTOM"
-                            elif ratio < 0.5: # ratio << 1
-                                verdict = "TAUTOLOGY"
-                            else: # ratio approx 1
-                                verdict = "HONEST"
-                            
+                            verdict = _map_track4_state_to_track5_verdict(
+                                s,
+                                phantom_ratio=ratio,
+                            )
+
                             phantom_verdicts.append({
                                 "verdict": verdict,
                                 "delta": float(delta_arr[i]),
