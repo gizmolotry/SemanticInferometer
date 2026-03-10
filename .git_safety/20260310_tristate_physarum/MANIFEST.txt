@@ -1,0 +1,3 @@
+branch=feature/track4-ribbons-flares-20260308
+head=05863dfa684da64358288b690dba970ba46255d8
+files=core/physarum_walk.py
