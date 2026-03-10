@@ -25,8 +25,10 @@ from .artifact_ledger import ArtifactContract
 
 def _canonicalize_track5_verdict(raw_verdict: object) -> str:
     text = str(raw_verdict or "").strip().upper()
-    if text in {"TYPE_1_RUPTURE", "TYPE_2_RUPTURE", "RUPTURE"}:
-        return "RUPTURE"
+    if text in {"TYPE_2_RUPTURE", "TYPE 2 RUPTURE", "TRAPPED", "FAILED"}:
+        return "TAUTOLOGY"
+    if text in {"TYPE_1_RUPTURE", "TYPE 1 RUPTURE", "RUPTURE", "BROKEN"}:
+        return "PHANTOM"
     if text in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
         return text
     return "UNKNOWN"
@@ -151,24 +153,15 @@ def calculate_unified_metric(
     d_spectral = np.linalg.norm(embeddings[:, :2] - centroid_2d, axis=1)
     d_spectral = np.clip(d_spectral, 0.1, None)
 
-    rupture_states = {
-        "BROKEN",
-        "TRAPPED",
-        "RUPTURE",
-        "TYPE_1_RUPTURE",
-        "TYPE_2_RUPTURE",
-        "FAILED",
-    }
-
     # 1) Calculate absolute curvature penalty for surviving walkers.
     valid_indices = []
     for i in range(len(metadata_df)):
         raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
         if isinstance(raw_state, dict):
-            state = str(raw_state.get("status", "UNKNOWN")).upper()
+            state = _canonicalize_track5_verdict(raw_state.get("label", raw_state.get("status", "UNKNOWN")))
         else:
-            state = str(raw_state).upper()
-        if state not in rupture_states and state != "UNKNOWN":
+            state = _canonicalize_track5_verdict(raw_state)
+        if state in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
             valid_indices.append(i)
 
     delta_values = []
@@ -202,15 +195,12 @@ def calculate_unified_metric(
 
         raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
         if isinstance(raw_state, dict):
-            state = str(raw_state.get("label", raw_state.get("status", "UNKNOWN"))).upper()
+            state = _canonicalize_track5_verdict(raw_state.get("label", raw_state.get("status", "UNKNOWN")))
         else:
-            state = str(raw_state).upper()
+            state = _canonicalize_track5_verdict(raw_state)
 
-        if state in {"BROKEN", "TYPE_1_RUPTURE"}:
-            verdicts.append("TYPE_1_RUPTURE") # Kinetic crash
-            continue
-        if state in {"TRAPPED", "TYPE_2_RUPTURE", "RUPTURE", "FAILED"}:
-            verdicts.append("TYPE_2_RUPTURE") # Topological/behavioral failure
+        if state in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
+            verdicts.append(state)
             continue
 
         delta = w_actual[i] / (d_spectral[i] + 1e-8)

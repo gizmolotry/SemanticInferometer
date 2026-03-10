@@ -69,7 +69,9 @@ def test_track4_panic_bypass_preserves_native_states():
     assert _map_track4_state_to_track5_verdict("phantom", phantom_ratio=0.1) == "PHANTOM"
     assert _map_track4_state_to_track5_verdict("honest", phantom_ratio=9.0) == "HONEST"
     assert _map_track4_state_to_track5_verdict("tautology", phantom_ratio=9.0) == "TAUTOLOGY"
-    assert _map_track4_state_to_track5_verdict("Type 2 Rupture", phantom_ratio=0.1) == "RUPTURE"
+    assert _map_track4_state_to_track5_verdict("Type 2 Rupture", phantom_ratio=0.1) == "TAUTOLOGY"
+    assert _map_track4_state_to_track5_verdict("Type 1 Rupture", phantom_ratio=0.1) == "PHANTOM"
+    assert _map_track4_state_to_track5_verdict("rupture", phantom_ratio=0.1) == "PHANTOM"
 
 
 def test_metric_fusion_prefers_track5_verdict_ledger():
@@ -107,4 +109,4 @@ def test_metric_fusion_prefers_track5_verdict_ledger():
         knn_k=1,
     )
 
-    assert list(df["verdict"]) == ["PHANTOM", "RUPTURE"]
+    assert list(df["verdict"]) == ["PHANTOM", "PHANTOM"]

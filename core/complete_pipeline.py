@@ -461,11 +461,9 @@ def _map_track4_state_to_track5_verdict(
     phantom_ratio: Optional[float] = None,
 ) -> str:
     state = str(state_name or "").strip()
-    if state in {"Type 1 Rupture", "Type 2 Rupture", "rupture"}:
-        return "RUPTURE"
-    if state in {"trapped", "tautology"}:
+    if state in {"trapped", "tautology", "Type 2 Rupture", "TRAPPED", "FAILED"}:
         return "TAUTOLOGY"
-    if state == "phantom":
+    if state in {"phantom", "rupture", "Type 1 Rupture", "BROKEN", "RUPTURE"}:
         return "PHANTOM"
     if state == "honest":
         return "HONEST"
@@ -2355,6 +2353,9 @@ class BeliefTransformerPipeline:
                             walker_state_records.append({
                                 "label": result_t4.get("state", "unknown"),
                                 "status": result_t4.get("status", "SUCCESS"),
+                                "raw_state": result_t4.get("raw_state", result_t4.get("state", "unknown")),
+                                "anomaly_flag": bool(result_t4.get("anomaly_flag", False)),
+                                "anomaly_kind": result_t4.get("anomaly_kind", "none"),
                                 "energy_rem": float(walker_energy_budget - float(result_t4["work_integral"])),
                                 "steps": walker_n_steps,
                                 "terrain_state": None,
@@ -2450,13 +2451,25 @@ class BeliefTransformerPipeline:
                             d_spectral, walker_work_integrals, walker_states,
                             blinker_variance=blinker_variance
                         )
+                        for i, verdict_payload in enumerate(phantom_verdicts):
+                            verdict_payload["verdict"] = _map_track4_state_to_track5_verdict(
+                                verdict_payload.get("verdict"),
+                            )
+                            if i < len(walker_state_records):
+                                verdict_payload["anomaly_flag"] = bool(
+                                    walker_state_records[i].get("anomaly_flag", False)
+                                )
+                                verdict_payload["anomaly_kind"] = walker_state_records[i].get(
+                                    "anomaly_kind",
+                                    "none",
+                                )
                         # Log verdict summary with TAUTOLOGY
-                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0, "BROKEN": 0, "TRAPPED": 0}
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0}
                         for v in phantom_verdicts:
                             verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
                         print(f"[Panic Function] Verdicts: T={verdict_counts['TAUTOLOGY']}, "
                               f"H={verdict_counts['HONEST']}, P={verdict_counts['PHANTOM']}, "
-                              f"R={verdict_counts['RUPTURE']}")
+                              f"A={sum(1 for rec in walker_state_records if rec.get('anomaly_flag'))}")
                     else:
                         EPS = 1e-9
                         work_arr = np.array(walker_work_integrals, dtype=float)
@@ -2480,14 +2493,20 @@ class BeliefTransformerPipeline:
                                 "w_actual": float(w),
                                 "confidence": 1.0,
                                 "walker_state": s,
+                                "anomaly_flag": bool(
+                                    walker_state_records[i].get("anomaly_flag", False)
+                                ) if i < len(walker_state_records) else False,
+                                "anomaly_kind": (
+                                    walker_state_records[i].get("anomaly_kind", "none")
+                                ) if i < len(walker_state_records) else "none",
                             })
-                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0, "RUPTURE": 0, "BROKEN": 0, "TRAPPED": 0}
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0}
                         for v in phantom_verdicts:
                             verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
                         print(f"[Track 5] Using Track 4 states (panic bypass): "
                               f"T={verdict_counts['TAUTOLOGY']}, H={verdict_counts['HONEST']}, "
-                              f"P={verdict_counts['PHANTOM']}, R={verdict_counts['RUPTURE']}, "
-                              f"B={verdict_counts['BROKEN']}, Tr={verdict_counts['TRAPPED']}")
+                              f"P={verdict_counts['PHANTOM']}, "
+                              f"A={sum(1 for rec in walker_state_records if rec.get('anomaly_flag'))}")
 
                 # Bind per-article terrain class to walker state records for waterfall persistence.
                 if walker_state_records and phantom_verdicts and len(walker_state_records) == len(phantom_verdicts):
@@ -2552,7 +2571,6 @@ class BeliefTransformerPipeline:
                             "TAUTOLOGY": sum(1 for p in particles if p.phantom_verdict == "TAUTOLOGY"),
                             "HONEST": sum(1 for p in particles if p.phantom_verdict == "HONEST"),
                             "PHANTOM": sum(1 for p in particles if p.phantom_verdict == "PHANTOM"),
-                            "RUPTURE": sum(1 for p in particles if p.phantom_verdict == "RUPTURE"),
                         }
 
                         phase_space_results = {

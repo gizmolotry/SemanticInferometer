@@ -28,7 +28,7 @@ VISUAL ELEMENTS:
 - Bonds/Cracks (alpha-sweep topology)
 - Semantic Walker paths (MCMC walker trails)
 - Walker diamonds (trapped/broken states)
-- Phantom paths (HONEST=cyan, PHANTOM=white dashed, RUPTURE=lightning)
+- Phantom paths (HONEST=cyan, PHANTOM=white dashed, TAUTOLOGY=green)
 - Lightning arcs (rupture visualization)
 - Spectral axis arrow (Track 1.5 endogenous compass)
 - HoTT verdict icons (✓/✗/?)
@@ -2080,12 +2080,12 @@ def generate_lightning_path(
 
 
 def canonicalize_walker_verdict(verdict: Any) -> str:
-    """Normalize persisted verdict names to the renderer contract."""
+    """Normalize persisted verdict names to the tri-state renderer contract."""
     text = str(verdict or "UNKNOWN").strip().upper()
-    if text in {"TYPE_1_RUPTURE", "TYPE 1 RUPTURE", "BROKEN"}:
-        return "RUPTURE"
+    if text in {"TYPE_1_RUPTURE", "TYPE 1 RUPTURE", "BROKEN", "RUPTURE"}:
+        return "PHANTOM"
     if text in {"TYPE_2_RUPTURE", "TYPE 2 RUPTURE", "TRAPPED", "FAILED"}:
-        return "RUPTURE"
+        return "TAUTOLOGY"
     return text
 
 
@@ -4074,7 +4074,7 @@ def render_analysis_planes(
 def generate_hud_html(
     mode: str,
     signal: float,
-    n_ruptures: int,
+    n_anomalies: int,
     n_phantoms: int,
     n_honest: int,
     n_tautology: int,
@@ -4082,15 +4082,13 @@ def generate_hud_html(
     kernel_name: str = "rbf",
     n_cracks: int = 0,
     n_bonds: int = 0,
-    n_broken: int = 0,
-    n_trapped: int = 0,
     mean_action: float = 0.0,
     survival_rate: float = 1.0,
     synthesis_nmi: Optional[float] = None,
 ) -> str:
     """Generate the terminal-style HUD bar HTML."""
     signal_class = "good" if signal > 0.7 else "warn" if signal > 0.5 else "alert"
-    rupture_class = "alert" if n_ruptures > 0 else "good"
+    anomaly_class = "warn" if n_anomalies > 0 else "good"
     phantom_class = "warn" if (n_phantoms + n_tautology) > 0 else "good"
     crack_class = "warn" if n_cracks > 0 else "good"
     walker_class = "good" if survival_rate >= 0.95 else "warn" if survival_rate >= 0.8 else "alert"
@@ -4099,7 +4097,7 @@ def generate_hud_html(
     t5_section = (
         f'<span class="hud-item {phantom_class}">'
         f'T5: {n_honest}H / {n_phantoms}P / {n_tautology}T | '
-        f'RUPTURES: {n_broken} Broken / {n_trapped} Trapped'
+        f'ANOMALIES: {n_anomalies}'
     )
     if synthesis_nmi is not None:
         nmi_class = "good" if synthesis_nmi > 0.7 else "warn" if synthesis_nmi > 0.5 else "alert"
@@ -4114,7 +4112,7 @@ def generate_hud_html(
         <span class="hud-sep">//</span>
         <span class="hud-item {signal_class}">SIG: {signal:.2f}</span>
         <span class="hud-sep">//</span>
-        <span class="hud-item {rupture_class}">T1.5: {n_ruptures}R</span>
+        <span class="hud-item {anomaly_class}">ANOM: {n_anomalies}</span>
         <span class="hud-sep">//</span>
         <span class="hud-item {crack_class}">T3: HYST COOL {n_bonds}:{n_cracks}</span>
         <span class="hud-sep">//</span>
@@ -4810,15 +4808,13 @@ def create_monolith_cockpit(
     # Count verdicts (force from MONOLITH_DATA.csv when available).
     if 'monolith_df' in locals() and 'verdict' in monolith_df.columns:
         verdict_series = monolith_df['verdict'].map(canonicalize_walker_verdict)
-        n_ruptures = int((verdict_series == 'RUPTURE').sum())
         n_phantoms = int((verdict_series == 'PHANTOM').sum())
         n_honest = int((verdict_series == 'HONEST').sum())
         n_tautology = int((verdict_series == 'TAUTOLOGY').sum())
     else:
-        n_ruptures = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'RUPTURE')
-        n_phantoms = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'PHANTOM')
-        n_honest = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'HONEST')
-        n_tautology = sum(1 for v in phantom_verdicts if str(v.get('verdict', 'UNKNOWN')).upper() == 'TAUTOLOGY')
+        n_phantoms = sum(1 for v in phantom_verdicts if canonicalize_walker_verdict(v.get('verdict', 'UNKNOWN')) == 'PHANTOM')
+        n_honest = sum(1 for v in phantom_verdicts if canonicalize_walker_verdict(v.get('verdict', 'UNKNOWN')) == 'HONEST')
+        n_tautology = sum(1 for v in phantom_verdicts if canonicalize_walker_verdict(v.get('verdict', 'UNKNOWN')) == 'TAUTOLOGY')
 
     # Default knn_overlap as it's no longer computed from local_density
     knn_overlap = 0.0
@@ -4826,29 +4822,26 @@ def create_monolith_cockpit(
 
     # Track 4 physics summary for HUD (status comes from persisted physics metadata)
     def _normalize_walker_status(s_raw: Any) -> str:
-        """Normalize legacy/new walker-state formats into SUCCESS/BROKEN/TRAPPED/UNKNOWN."""
+        """Normalize legacy/new walker-state formats into SUCCESS/ANOMALY/UNKNOWN."""
         if isinstance(s_raw, dict):
+            if bool(s_raw.get("anomaly_flag", False)):
+                return "ANOMALY"
             s = str(s_raw.get("status") or s_raw.get("state") or "").strip().upper()
         else:
             s = str(s_raw).strip().upper()
 
-        # Canonical persisted physics statuses
-        if s in {"SUCCESS", "BROKEN", "TRAPPED"}:
+        if s == "SUCCESS":
             return s
-        # Legacy labels fallback
-        if s in {"HONEST"}:
+        if s in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
             return "SUCCESS"
-        if s in {"RUPTURE", "BROKEN"}:
-            return "BROKEN"
-        if s in {"TRAPPED", "TAUTOLOGY", "PHANTOM"}:
-            return "TRAPPED"
+        if s in {"RUPTURE", "BROKEN", "TRAPPED", "FAILED", "TYPE_1_RUPTURE", "TYPE_2_RUPTURE"}:
+            return "ANOMALY"
         return "UNKNOWN"
 
     walker_statuses = [_normalize_walker_status(s) for s in walker_states] if walker_states else []
     n_total_walkers = len(walker_statuses)
     n_success = sum(1 for s in walker_statuses if s == "SUCCESS")
-    n_broken = sum(1 for s in walker_statuses if s == "BROKEN")
-    n_trapped = sum(1 for s in walker_statuses if s == "TRAPPED")
+    n_anomalies = sum(1 for s in walker_statuses if s == "ANOMALY")
 
     finite_work = walker_work[np.isfinite(walker_work)] if walker_work is not None else np.array([])
     mean_action = float(np.mean(finite_work)) if finite_work.size > 0 else 0.0
@@ -4983,7 +4976,7 @@ def create_monolith_cockpit(
             f'<b>EVR:</b> {evr:.3f}<br>'
             f'<b>Zone:</b> {unified_zones[i]}<br>' # Add this line
             f'<b>T4 Walker:</b> {ws}<br>'
-            f'<b>T5 Verdict:</b> <span style="color:{"#00F0FF" if pv=="HONEST" else "#FF00FF" if pv=="PHANTOM" else "#FF2222" if pv=="RUPTURE" else "#888"}">{pv}</span><br>'
+            f'<b>T5 Verdict:</b> <span style="color:{"#00F0FF" if pv=="HONEST" else "#FF00FF" if pv=="PHANTOM" else "#39FF14" if pv=="TAUTOLOGY" else "#888"}">{pv}</span><br>'
             f'<b>  d={d_str}, W={w_str}, Delta={delta:.2f}</b><br>'
             f'<b>T6 HoTT:</b> {hott_status}<br>'
             f'<b>═══════════════════════</b><br>'
@@ -5414,7 +5407,7 @@ def create_monolith_cockpit(
     hud_html = generate_hud_html(
         mode=physics_mode,
         signal=mean_signal,
-        n_ruptures=n_ruptures,
+        n_anomalies=n_anomalies,
         n_phantoms=n_phantoms,
         n_honest=n_honest,
         n_tautology=n_tautology,
@@ -5422,8 +5415,6 @@ def create_monolith_cockpit(
         kernel_name=exp.kernel,
         n_cracks=n_cracks,
         n_bonds=n_bonds,
-        n_broken=n_broken,
-        n_trapped=n_trapped,
         mean_action=mean_action,
         survival_rate=survival_rate,
         synthesis_nmi=exp.synthesis_nmi,
@@ -6049,7 +6040,7 @@ def create_monolith_cockpit(
     print(f"  T1.5 Spectral: Signal={mean_signal:.3f}")
     print(f"  T3 Dirichlet: Bonds={n_bonds}, Cracks={n_cracks}")
     print(f"  T4 Walker: MeanAction={mean_action:.2f}, Survival={survival_rate:.1%}")
-    print(f"  T5 Verdicts: Honest={n_honest}, Phantom={n_phantoms}, Rupture={n_ruptures}, Tautology={n_tautology}")
+    print(f"  T5 Verdicts: Honest={n_honest}, Phantom={n_phantoms}, Tautology={n_tautology}, Anomalies={n_anomalies}")
 
     return fig
 

@@ -1081,30 +1081,38 @@ def compute_walker_resistance(
         n_steps=n_steps,
     )
 
-    # 4-state system: TAUTOLOGY / HONEST / PHANTOM / RUPTURE
+    # Internal raw states still preserve failure diagnostics, but the exported
+    # semantic contract is tri-state only: tautology / honest / phantom.
     state_names = ["tautology", "honest", "phantom", "rupture", "Type 1 Rupture", "Type 2 Rupture"]
     state_code = result.state.item()
-    state_name = state_names[min(state_code, len(state_names) - 1)]  # Safety clamp
+    raw_state_name = state_names[min(state_code, len(state_names) - 1)]  # Safety clamp
+
+    anomaly_flag = raw_state_name in {"rupture", "Type 1 Rupture", "Type 2 Rupture"}
+    anomaly_kind = "none"
+    semantic_state_name = raw_state_name
+    if raw_state_name in {"Type 2 Rupture"}:
+        semantic_state_name = "tautology"
+        anomaly_kind = "trapped_stall"
+    elif raw_state_name in {"rupture", "Type 1 Rupture"}:
+        semantic_state_name = "phantom"
+        anomaly_kind = "kinetic_break"
+
     step_diagnostics = explorer._annotate_step_events(
         result.step_diagnostics if result.step_diagnostics is not None else [],
-        state_name=state_name,
+        state_name=semantic_state_name,
     )
-    if state_name == "Type 1 Rupture":
-        walker_status = "FAILED"
-    elif state_name == "Type 2 Rupture":
-        walker_status = "FAILED"
-    elif state_name == "rupture":
-        walker_status = "FAILED"
-    else:
-        walker_status = "SUCCESS"
+    walker_status = "SUCCESS"
 
     output = {
         "status": walker_status,
         "work_integral": result.work_integral.item(),
         "divergence_ratio": result.divergence_ratio.item(),
         "spectral_distance": result.spectral_distance.item(),
-        "state": state_name,
+        "state": semantic_state_name,
         "state_code": state_code,
+        "raw_state": raw_state_name,
+        "anomaly_flag": bool(anomaly_flag),
+        "anomaly_kind": anomaly_kind,
         "walker_output": result.trajectory_endpoint,
         "path_xyz": result.trajectory_path,
         "final_position": result.final_position,
