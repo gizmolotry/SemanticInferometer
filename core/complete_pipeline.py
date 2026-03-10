@@ -476,6 +476,68 @@ def _map_track4_state_to_track5_verdict(
     return "HONEST"
 
 
+def _classify_track5_semantic_verdicts(
+    work_arr: np.ndarray,
+    d_arr: np.ndarray,
+    walker_state_records: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Tri-state semantic classifier for Track 5.
+
+    Policy:
+    - TAUTOLOGY: true stalls / trapped anomalies / near-zero displacement
+    - PHANTOM: kinetic/pathology anomalies or high article-level delta
+    - HONEST: lower article-level delta among non-tautological, non-anomalous paths
+    """
+    from sklearn.cluster import KMeans
+
+    EPS = 1e-9
+    work_arr = np.asarray(work_arr, dtype=float)
+    d_arr = np.asarray(d_arr, dtype=float)
+    delta_arr = work_arr / np.maximum(d_arr, EPS)
+    verdicts = np.full(delta_arr.shape, "HONEST", dtype=object)
+
+    records = walker_state_records or []
+    tautology_mask = np.zeros(delta_arr.shape, dtype=bool)
+    anomaly_mask = np.zeros(delta_arr.shape, dtype=bool)
+    for i in range(len(delta_arr)):
+        rec = records[i] if i < len(records) else {}
+        raw_state = str(rec.get("raw_state", rec.get("label", ""))).strip().lower()
+        anomaly_kind = str(rec.get("anomaly_kind", "none")).strip().lower()
+        if raw_state in {"tautology", "trapped"} or anomaly_kind == "trapped_stall":
+            tautology_mask[i] = True
+        elif anomaly_kind in {"kinetic_break", "linalg_pathology"}:
+            anomaly_mask[i] = True
+
+    # Physical tautology safeguard: negligible displacement is still tautology.
+    tautology_mask |= d_arr < 1e-3
+    verdicts[tautology_mask] = "TAUTOLOGY"
+    verdicts[anomaly_mask] = "PHANTOM"
+
+    candidate_mask = ~(tautology_mask | anomaly_mask)
+    candidate_delta = delta_arr[candidate_mask]
+    honest_cutoff = float(np.median(delta_arr)) if delta_arr.size else 0.0
+    threshold_mode = "median_fallback"
+    if candidate_delta.size >= 8 and np.unique(np.round(candidate_delta, 8)).size >= 2:
+        km = KMeans(n_clusters=2, random_state=42, n_init=10).fit(candidate_delta.reshape(-1, 1))
+        centers = np.sort(km.cluster_centers_.flatten())
+        honest_cutoff = float(centers[0] + (centers[1] - centers[0]) / 2.0)
+        threshold_mode = "kmeans_2cluster"
+
+    verdicts[candidate_mask] = np.where(
+        candidate_delta <= honest_cutoff,
+        "HONEST",
+        "PHANTOM",
+    )
+    return verdicts, {
+        "honest_cutoff": honest_cutoff,
+        "threshold_mode": threshold_mode,
+        "delta_min": float(delta_arr.min()) if delta_arr.size else 0.0,
+        "delta_mean": float(delta_arr.mean()) if delta_arr.size else 0.0,
+        "delta_max": float(delta_arr.max()) if delta_arr.size else 0.0,
+    }
+
+
 def _summarize_track_validation_records(
     validation_records: List[Dict[str, Any]]
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
@@ -2476,15 +2538,13 @@ class BeliefTransformerPipeline:
                         d_arr = np.array([float(d_spectral[i]) if i < len(d_spectral) else 0.0
                                           for i in range(len(walker_work_integrals))], dtype=float)
                         delta_arr = work_arr / np.maximum(d_arr, EPS)
-                        rupture_work_cutoff = float(np.quantile(work_arr, 0.90))
-                        honest_delta_cutoff = float(np.quantile(delta_arr, 0.80))
-                        tautology_delta_cutoff = float(np.quantile(delta_arr, 0.10))
+                        semantic_verdicts, semantic_stats = _classify_track5_semantic_verdicts(
+                            work_arr,
+                            d_arr,
+                            walker_state_records=walker_state_records,
+                        )
                         for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
-                            ratio = float(phantom_ratio[i]) if i < len(phantom_ratio) else 1.0
-                            verdict = _map_track4_state_to_track5_verdict(
-                                s,
-                                phantom_ratio=ratio,
-                            )
+                            verdict = str(semantic_verdicts[i])
 
                             phantom_verdicts.append({
                                 "verdict": verdict,
@@ -2506,7 +2566,8 @@ class BeliefTransformerPipeline:
                         print(f"[Track 5] Using Track 4 states (panic bypass): "
                               f"T={verdict_counts['TAUTOLOGY']}, H={verdict_counts['HONEST']}, "
                               f"P={verdict_counts['PHANTOM']}, "
-                              f"A={sum(1 for rec in walker_state_records if rec.get('anomaly_flag'))}")
+                              f"A={sum(1 for rec in walker_state_records if rec.get('anomaly_flag'))}, "
+                              f"cut={semantic_stats['honest_cutoff']:.4f} ({semantic_stats['threshold_mode']})")
 
                 # Bind per-article terrain class to walker state records for waterfall persistence.
                 if walker_state_records and phantom_verdicts and len(walker_state_records) == len(phantom_verdicts):

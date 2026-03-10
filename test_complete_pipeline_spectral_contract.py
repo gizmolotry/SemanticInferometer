@@ -7,6 +7,7 @@ import torch
 from core.complete_pipeline import (
     SPECTRAL_CLS_NORMALIZATION_CONTRACT,
     _canonicalize_cls_per_bot_for_spectral,
+    _classify_track5_semantic_verdicts,
     _construct_spectral_poles,
     _map_track4_state_to_track5_verdict,
 )
@@ -110,3 +111,19 @@ def test_metric_fusion_prefers_track5_verdict_ledger():
     )
 
     assert list(df["verdict"]) == ["PHANTOM", "PHANTOM"]
+
+
+def test_track5_semantic_classifier_uses_article_delta_and_anomalies():
+    work = np.array([1.0, 2.0, 9.0, 0.5], dtype=np.float32)
+    disp = np.array([100.0, 40.0, 50.0, 1e-6], dtype=np.float32)
+    records = [
+        {"label": "phantom", "anomaly_kind": "none"},
+        {"label": "phantom", "anomaly_kind": "none"},
+        {"label": "phantom", "anomaly_kind": "kinetic_break"},
+        {"label": "tautology", "anomaly_kind": "trapped_stall"},
+    ]
+
+    verdicts, stats = _classify_track5_semantic_verdicts(work, disp, records)
+
+    assert verdicts.tolist() == ["HONEST", "HONEST", "PHANTOM", "TAUTOLOGY"]
+    assert stats["threshold_mode"] in {"kmeans_2cluster", "median_fallback"}
