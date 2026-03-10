@@ -1,0 +1,3 @@
+branch=feature/track4-ribbons-flares-20260308
+head=601481a9c2dbec97c666e1f104542ed78e42a829
+files=core/complete_pipeline.py,core/metric_fusion.py,analysis/MONOLITH_VIZ.py,core/thermo_config.py,test_complete_pipeline_spectral_contract.py
