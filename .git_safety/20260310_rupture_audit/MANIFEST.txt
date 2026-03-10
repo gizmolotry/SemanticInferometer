@@ -1,0 +1,3 @@
+branch=feature/track4-ribbons-flares-20260308
+head=8806a68705b223032faac2fe1516ea0b26750380
+files=core/physarum_walk.py,core/complete_pipeline.py,run_full_experiment_suite.py,test_suite_bundle_hooks.py,test_monolith_viz_runtime_regressions.py
