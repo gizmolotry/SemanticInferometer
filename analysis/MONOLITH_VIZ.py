@@ -1202,6 +1202,7 @@ def render_terrain_surface(
     opacity: float = 0.9,               # New opacity parameter
     rupture_segments_2d: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     rupture_tear_radius_scale: float = 0.02,
+    terrain_support_xy: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[Any], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     ASTER v3.2 BI-AXIAL TERRAIN SURFACE
@@ -1237,25 +1238,39 @@ def render_terrain_surface(
 
     x = positions_3d[:, 0]
     y = positions_3d[:, 1]
+    terrain_xy = np.column_stack([x, y])
+    support_xy = terrain_xy
+    if terrain_support_xy is not None:
+        support_arr = np.asarray(terrain_support_xy, dtype=float)
+        if support_arr.ndim == 2 and support_arr.shape[1] >= 2:
+            support_arr = support_arr[:, :2]
+            support_arr = support_arr[np.isfinite(support_arr).all(axis=1)]
+            if support_arr.size > 0:
+                support_xy = np.vstack([support_xy, support_arr])
 
     margin = 0.15
-    x_range = x.max() - x.min()
-    y_range = y.max() - y.min()
+    x_support = support_xy[:, 0]
+    y_support = support_xy[:, 1]
+    x_range = x_support.max() - x_support.min()
+    y_range = y_support.max() - y_support.min()
     # Guard against degenerate axes so mesh construction cannot collapse to a line.
     x_range_safe = max(float(x_range), 1e-6)
     y_range_safe = max(float(y_range), 1e-6)
 
-    x_min = x.min() - margin * x_range_safe
-    x_max = x.max() + margin * x_range_safe
-    y_min = y.min() - margin * y_range_safe
-    y_max = y.max() + margin * y_range_safe
+    x_min = x_support.min() - margin * x_range_safe
+    x_max = x_support.max() + margin * x_range_safe
+    y_min = y_support.min() - margin * y_range_safe
+    y_max = y_support.max() + margin * y_range_safe
 
     xi = np.linspace(x_min, x_max, grid_resolution)
     yi = np.linspace(y_min, y_max, grid_resolution)
     Xi, Yi = np.meshgrid(xi, yi)
     support_mask = None
     try:
-        xy_points = np.column_stack([x, y])
+        xy_points = np.asarray(support_xy, dtype=float)
+        if xy_points.shape[0] > 0:
+            _, uniq_idx = np.unique(np.round(xy_points, decimals=9), axis=0, return_index=True)
+            xy_points = xy_points[np.sort(uniq_idx)]
         if xy_points.shape[0] >= 3:
             tri = Delaunay(xy_points)
             grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
@@ -4703,6 +4718,24 @@ def create_monolith_cockpit(
                 if np.isfinite(start_xy).all() and np.isfinite(end_xy).all():
                     rupture_segments_2d.append((start_xy, end_xy))
 
+    terrain_support_xy = None
+    if walker_paths_pure:
+        terrain_support_parts = []
+        for _path in walker_paths_pure.values():
+            path_arr = np.asarray(_path, dtype=float)
+            if path_arr.ndim != 2 or path_arr.shape[0] < 2 or path_arr.shape[1] < 2:
+                continue
+            xy = np.asarray(path_arr[:, :2], dtype=float)
+            xy = xy[np.isfinite(xy).all(axis=1)]
+            if xy.shape[0] < 2:
+                continue
+            xy_sample = xy[::4]
+            if xy_sample.shape[0] == 0 or not np.allclose(xy_sample[-1], xy[-1]):
+                xy_sample = np.vstack([xy_sample, xy[-1:]])
+            terrain_support_parts.append(xy_sample)
+        if terrain_support_parts:
+            terrain_support_xy = np.vstack(terrain_support_parts)
+
     # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
     energy_values_for_terrain = pure_z.copy()
     # Contract guardrail: preserve explicit invalid-array fallback path.
@@ -4990,6 +5023,7 @@ def create_monolith_cockpit(
             opacity=surface_opacity,
             rupture_segments_2d=rupture_segments_2d if path_ablation_mode == "thermodynamic" else None,
             rupture_tear_radius_scale=0.02,
+            terrain_support_xy=terrain_support_xy,
         )
         if terrain:
             terrain.visible = True
@@ -5020,7 +5054,7 @@ def create_monolith_cockpit(
             terrain_grid_z, # Z values
             method="linear",
             bounds_error=False,
-            fill_value=None # Extrapolate rather than fill with a constant
+            fill_value=np.nan,
         )
     
     # Calculate visual_z for each article using the interpolator
@@ -5047,6 +5081,13 @@ def create_monolith_cockpit(
             # Ensure x_coord and y_coord are numpy arrays for interpolation
             x_coord_np = np.atleast_1d(x_coords)
             y_coord_np = np.atleast_1d(y_coords)
+            if terrain_grid_x is not None and terrain_grid_y is not None:
+                x_min_grid = float(np.nanmin(terrain_grid_x[0, :]))
+                x_max_grid = float(np.nanmax(terrain_grid_x[0, :]))
+                y_min_grid = float(np.nanmin(terrain_grid_y[:, 0]))
+                y_max_grid = float(np.nanmax(terrain_grid_y[:, 0]))
+                x_coord_np = np.clip(x_coord_np, x_min_grid, x_max_grid)
+                y_coord_np = np.clip(y_coord_np, y_min_grid, y_max_grid)
             
             # Create points array for interpolator: (N, 2) where each row is (y, x)
             points_for_interp = np.column_stack((y_coord_np, x_coord_np))

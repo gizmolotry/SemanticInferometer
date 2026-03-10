@@ -587,3 +587,62 @@ def test_extreme_mismatched_path_scale_is_bounded_relative_to_article_manifold(m
         path_xy_span = float(max(np.ptp(tx), np.ptp(ty)))
         assert np.isfinite(path_xy_span)
         assert path_xy_span <= article_xy_span * max_span_ratio
+
+
+def test_terrain_footprint_expands_to_cover_rendered_paths(monkeypatch, tmp_path):
+    _require_plotly()
+    pytest.importorskip("scipy")
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    exp.walker_paths[1] = np.array(
+        [
+            [1_000_000.0, -1_000_000.0, 0.0],
+            [1_200_000.0, -800_000.0, 0.1],
+            [1_400_000.0, -1_100_000.0, 0.2],
+        ],
+        dtype=float,
+    )
+    output_path = tmp_path / "terrain_footprint.html"
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    fig = create_monolith_cockpit(
+        exp=exp,
+        output_path=output_path,
+        physics_mode="synthesis",
+        show_terrain=True,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+
+    terrain_traces = [t for t in fig.data if str(getattr(t, "name", "")) == "Energy Terrain"]
+    assert terrain_traces, "Expected terrain surface trace"
+    terrain = terrain_traces[0]
+    terrain_x = np.asarray(terrain.x, dtype=float)
+    terrain_y = np.asarray(terrain.y, dtype=float)
+    terrain_x_finite = terrain_x[np.isfinite(terrain_x)]
+    terrain_y_finite = terrain_y[np.isfinite(terrain_y)]
+    assert terrain_x_finite.size > 0 and terrain_y_finite.size > 0
+    terrain_x_min = float(np.min(terrain_x_finite))
+    terrain_x_max = float(np.max(terrain_x_finite))
+    terrain_y_min = float(np.min(terrain_y_finite))
+    terrain_y_max = float(np.max(terrain_y_finite))
+
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Walker Broken", "Walker Trapped"}
+    path_traces = [
+        t
+        for t in fig.data
+        if str(getattr(t, "mode", "")) == "lines" and str(getattr(t, "name", "")) in path_names
+    ]
+    assert path_traces, "Expected rendered path traces"
+
+    eps = 1e-6
+    for trace in path_traces:
+        tx = np.asarray(trace.x, dtype=float)
+        ty = np.asarray(trace.y, dtype=float)
+        tx = tx[np.isfinite(tx)]
+        ty = ty[np.isfinite(ty)]
+        assert tx.size > 0 and ty.size > 0
+        assert float(np.min(tx)) >= terrain_x_min - eps
+        assert float(np.max(tx)) <= terrain_x_max + eps
+        assert float(np.min(ty)) >= terrain_y_min - eps
+        assert float(np.max(ty)) <= terrain_y_max + eps
