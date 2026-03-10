@@ -22,6 +22,16 @@ import argparse
 from .thermo_config import ThermodynamicConfig
 from .artifact_ledger import ArtifactContract
 
+
+def _canonicalize_track5_verdict(raw_verdict: object) -> str:
+    text = str(raw_verdict or "").strip().upper()
+    if text in {"TYPE_1_RUPTURE", "TYPE_2_RUPTURE", "RUPTURE"}:
+        return "RUPTURE"
+    if text in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
+        return text
+    return "UNKNOWN"
+
+
 def calculate_unified_metric(
     embeddings_path: Path,
     gradients_path: Path,
@@ -111,6 +121,7 @@ def calculate_unified_metric(
     # Try to load walker work integrals and states for actual physics
     walker_work_path = embeddings_path.parent / "walker_work_integrals.npy"
     walker_states_path = embeddings_path.parent / "walker_states.json"
+    phantom_verdicts_path = embeddings_path.parent / "phantom_verdicts.json"
     
     if not walker_work_path.exists():
         raise FileNotFoundError(f"CRITICAL ERROR: Physics payload missing (work). {walker_work_path.name}")
@@ -124,6 +135,16 @@ def calculate_unified_metric(
         print(f"  [OK] Using actual walker states from {walker_states_path.name}")
     else:
         print(f"  [WARN] walker_states.json missing. Falling back to work-only classification.")
+
+    phantom_verdicts = None
+    if phantom_verdicts_path.exists():
+        with open(phantom_verdicts_path, 'r') as f:
+            phantom_verdicts = json.load(f)
+        if not isinstance(phantom_verdicts, list) or len(phantom_verdicts) != len(metadata_df):
+            print(f"  [WARN] phantom_verdicts.json shape mismatch. Ignoring verdict ledger.")
+            phantom_verdicts = None
+        else:
+            print(f"  [OK] Using Track 5 verdict ledger from {phantom_verdicts_path.name}")
 
     # Divergence Ratio Logic (Panic Function)
     centroid_2d = np.mean(embeddings[:, :2], axis=0)
@@ -173,9 +194,15 @@ def calculate_unified_metric(
 
     verdicts = []
     for i in range(len(metadata_df)):
+        if phantom_verdicts is not None:
+            verdict = _canonicalize_track5_verdict(phantom_verdicts[i].get("verdict"))
+            if verdict != "UNKNOWN":
+                verdicts.append(verdict)
+                continue
+
         raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
         if isinstance(raw_state, dict):
-            state = str(raw_state.get("status", "UNKNOWN")).upper()
+            state = str(raw_state.get("label", raw_state.get("status", "UNKNOWN"))).upper()
         else:
             state = str(raw_state).upper()
 
