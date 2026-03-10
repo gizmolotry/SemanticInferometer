@@ -560,8 +560,13 @@ class SemanticWalker:
         for t in range(n_steps):
             # A. Propose a step (perturb weights)
             noise = torch.randn_like(current_weights) * self.thermo_config.noise_sigma
+            drift_strength = float(getattr(self.thermo_config, "directed_drift_strength", 0.1) or 0.0)
+            wind_drift = 0.0
+            if drift_strength > 0.0 and self.u_axis is not None and target_weights is not None:
+                # Keep a weak pole-to-pole drift so walkers do not stall at the origin.
+                wind_drift = (target_weights - current_weights) * drift_strength
 
-            proposal = torch.abs(current_weights + noise)
+            proposal = torch.abs(current_weights + noise + wind_drift)
             proposal = proposal / proposal.sum(dim=-1, keepdim=True)
 
             # Optional kinetic dampening on proposed move.
@@ -602,7 +607,14 @@ class SemanticWalker:
                 dim=-1,
             )
             proposal_move_cost = proposal_effective_friction * proposal_step_distance
-            effective_delta_E = delta_E + proposal_move_cost
+
+            # Move-cost should drain the energy tank after an accepted move.
+            # Charging the full terrain cost inside Metropolis acceptance stalls the walker
+            # before it can accumulate a meaningful path integral.
+            if self.enable_hysteresis:
+                effective_delta_E = delta_E * torch.exp(-memory_bonus * self.memory_sensitivity)
+            else:
+                effective_delta_E = delta_E
 
             acceptance_prob = torch.exp(-effective_delta_E / self.T)
             dice_roll = torch.rand(n_walkers)
