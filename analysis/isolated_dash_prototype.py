@@ -352,6 +352,34 @@ def _observer_value_from_uid(run_key: Optional[str], observer_uid: Optional[str]
     return None
 
 
+def _is_synthetic_placeholder_blob(blob: Any) -> bool:
+    if not isinstance(blob, dict) or not blob:
+        return False
+    if bool(blob.get("synthetic_placeholder", False)):
+        return True
+    provenance = blob.get("provenance", {})
+    if isinstance(provenance, dict):
+        source = str(provenance.get("source", "")).strip().lower()
+        if source in {"suite-default", "suite-generated", "suite-generated-placeholder"}:
+            return True
+        if bool(provenance.get("synthetic_placeholder", False)):
+            return True
+    for key in ("dataset_hash", "code_hash_or_commit", "weights_hash", "provenance_source"):
+        val = str(blob.get(key, "")).strip().lower()
+        if val in {"suite-generated", "suite-generated-placeholder"}:
+            return True
+    return False
+
+
+def _artifact_iframe(src_doc: str) -> html.Iframe:
+    return html.Iframe(
+        srcDoc=src_doc,
+        sandbox="allow-scripts",
+        referrerPolicy="no-referrer",
+        style={"width": "100%", "height": "100%", "border": "0"},
+    )
+
+
 def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     run_dir = _resolve_run_dir(run_key)
     # Smart Discovery: Try to resolve deep nesting (rbf/cls/real) if path doesn't exist
@@ -395,6 +423,11 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
                 merged.update(provenance)
                 baseline_meta = merged
 
+    if _is_synthetic_placeholder_blob(baseline_meta):
+        missing_required.append("baseline_meta.json (synthetic placeholder)")
+        errors.append("baseline_meta is synthetic placeholder data")
+        baseline_meta = {}
+
     observer_id = _observer_id_from_value(observer_value)
     state_blob = {}
     delta_blob = {}
@@ -404,10 +437,16 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
         delta_path = rel_dir / f"delta_{observer_id}.json"
         if state_path.exists():
             state_blob = _safe_json(state_path, {})
+            if _is_synthetic_placeholder_blob(state_blob):
+                missing_optional.append(f"relativity_cache/state_{observer_id}.json (synthetic placeholder)")
+                state_blob = {}
         else:
             missing_optional.append(f"relativity_cache/state_{observer_id}.json")
         if delta_path.exists():
             delta_blob = _safe_json(delta_path, {})
+            if _is_synthetic_placeholder_blob(delta_blob):
+                missing_optional.append(f"relativity_cache/delta_{observer_id}.json (synthetic placeholder)")
+                delta_blob = {}
         else:
             missing_optional.append(f"relativity_cache/delta_{observer_id}.json")
 
@@ -2064,13 +2103,13 @@ def _render_dashboard_impl(
     text_b = _safe_read_text(p_b) if (p_b and p_b.exists()) else ""
 
     if text_a:
-        c_a = _transition_wrapper(html.Iframe(srcDoc=text_a, style={"width": "100%", "height": "100%", "border": "0"}), transition_style)
+        c_a = _transition_wrapper(_artifact_iframe(text_a), transition_style)
     else:
         c_a = build_terminal_fallback(effective_observer, run_key, variant_a, gallery_tick)
 
     if compare_enabled:
         if text_b:
-            c_b = _transition_wrapper(html.Iframe(srcDoc=text_b, style={"width": "100%", "height": "100%", "border": "0"}), transition_style)
+            c_b = _transition_wrapper(_artifact_iframe(text_b), transition_style)
         else:
             c_b = build_terminal_fallback(effective_observer, run_key, variant_b, gallery_tick)
         container = dbc.Row(
@@ -2085,12 +2124,13 @@ def _render_dashboard_impl(
     else:
         single_view_path = p_a
         single_view = c_a
-        if view_mode == "observer" and observer_value.startswith("article:") and p_b and p_b.exists():
-            single_view_path = p_b
-            single_view = _transition_wrapper(
-                html.Iframe(srcDoc=text_b, style={"width": "100%", "height": "100%", "border": "0"}),
-                transition_style,
-            )
+        if view_mode == "observer" and observer_value.startswith("article:"):
+            if p_b and p_b.exists() and text_b:
+                single_view_path = p_b
+                single_view = _transition_wrapper(_artifact_iframe(text_b), transition_style)
+            else:
+                single_view_path = None
+                single_view = build_terminal_fallback(observer_value, run_key, variant_b, gallery_tick)
         container = single_view
         path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 

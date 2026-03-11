@@ -205,6 +205,10 @@ def validate_baseline_meta(meta: Dict[str, Any]) -> ValidationResult:
     missing = sorted(required - set(meta.keys()))
     if missing:
         errors.append(f"baseline_meta missing keys: {', '.join(missing)}")
+    synthetic_placeholder = bool(meta.get("synthetic_placeholder", False))
+    provenance_source = str(meta.get("provenance_source", "")).strip().lower()
+    if synthetic_placeholder or provenance_source in {"suite-generated", "suite-generated-placeholder"}:
+        errors.append("baseline_meta must not be a synthetic placeholder")
     status = str(meta.get("verification_status", "")).upper()
     if status and status not in {s.value for s in LayerStatus}:
         errors.append(f"baseline_meta verification_status invalid: {status}")
