@@ -385,6 +385,139 @@ def _load_observer_focus_payloads(experiment_dir: Optional[Path], observer_idx: 
     return _read_json(state_path), _read_json(delta_path)
 
 
+def _load_primary_observer_payload(experiment_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if experiment_dir is None or not HAS_TORCH:
+        return None
+    exp_dir = Path(experiment_dir)
+    for payload_path in sorted(exp_dir.glob("observer_*.pt")):
+        try:
+            payload = torch.load(payload_path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            continue
+    return None
+
+
+def _restore_rks_basis_from_state(basis_state: Optional[Dict[str, Any]]) -> Optional[Any]:
+    if not isinstance(basis_state, dict):
+        return None
+    try:
+        from core.dirichlet_fusion import SharedRKSBasis
+    except Exception:
+        return None
+
+    try:
+        input_dim = int(basis_state.get("input_dim", 0) or 0)
+        output_dim = int(basis_state.get("output_dim", 0) or 0)
+        seed = int(basis_state.get("seed", 0) or 0)
+        kernel_type = str(basis_state.get("kernel_type", "rbf"))
+        nu = float(basis_state.get("nu", 1.5))
+        roughness = int(basis_state.get("roughness", 3) or 3)
+        omega = basis_state.get("omega")
+        b = basis_state.get("b")
+        if input_dim <= 0 or output_dim <= 0 or omega is None or b is None:
+            return None
+        basis = SharedRKSBasis(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            seed=seed,
+            kernel_type=kernel_type,
+            nu=nu,
+            roughness=roughness,
+        )
+        basis.omega.copy_(torch.as_tensor(omega, dtype=basis.omega.dtype))
+        basis.b.copy_(torch.as_tensor(b, dtype=basis.b.dtype))
+        sigma = basis_state.get("sigma")
+        if sigma is not None:
+            basis.set_sigma(float(sigma))
+        sigma_diagnostics = basis_state.get("sigma_diagnostics")
+        if isinstance(sigma_diagnostics, dict):
+            basis._sigma_diagnostics = sigma_diagnostics
+        return basis
+    except Exception:
+        return None
+
+
+def _recompute_focused_observer_track4(
+    exp: "ExperimentData",
+    focus_idx: Optional[int],
+    walker_paths_raw: Optional[Dict[int, np.ndarray]],
+) -> Optional[Dict[str, Any]]:
+    if focus_idx is None or focus_idx < 0 or not HAS_TORCH:
+        return None
+    payload = _load_primary_observer_payload(exp.experiment_dir)
+    if not isinstance(payload, dict):
+        return None
+
+    cls_per_bot = payload.get("cls_per_bot")
+    basis_state = payload.get("rks_basis_state")
+    if cls_per_bot is None or basis_state is None:
+        return None
+
+    try:
+        cls_per_bot_tensor = torch.as_tensor(cls_per_bot, dtype=torch.float32)
+    except Exception:
+        return None
+    if cls_per_bot_tensor.ndim != 3 or focus_idx >= int(cls_per_bot_tensor.shape[0]):
+        return None
+
+    basis = _restore_rks_basis_from_state(basis_state)
+    if basis is None:
+        return None
+
+    try:
+        from core.physarum_walk import compute_walker_resistance
+    except Exception:
+        return None
+
+    base_path = None
+    if isinstance(walker_paths_raw, dict):
+        base_path = walker_paths_raw.get(int(focus_idx))
+    base_steps = 10
+    try:
+        if base_path is not None:
+            base_path = np.asarray(base_path, dtype=float)
+            if base_path.ndim == 2 and base_path.shape[0] >= 2:
+                base_steps = max(int(base_path.shape[0]) - 1, 1)
+    except Exception:
+        base_steps = 10
+    replay_steps = int(min(max(base_steps, 10), 64))
+
+    observer_axis = cls_per_bot_tensor[focus_idx].mean(dim=0)
+    u_axis = None
+    if exp.antagonism is not None:
+        try:
+            antagonism = np.asarray(exp.antagonism, dtype=float)
+            if antagonism.ndim == 2 and antagonism.shape[0] > focus_idx:
+                u_axis = torch.as_tensor(antagonism[focus_idx], dtype=torch.float32)
+        except Exception:
+            u_axis = None
+
+    result = compute_walker_resistance(
+        cls_per_bot=cls_per_bot_tensor[focus_idx],
+        rks_basis=basis,
+        u_axis=u_axis,
+        observer_axis=observer_axis,
+        observer_cost_strength=1.0,
+        n_walkers=20,
+        n_steps=replay_steps,
+    )
+    path_xyz = result.get("path_xyz")
+    if torch.is_tensor(path_xyz):
+        path_xyz = path_xyz.detach().cpu().numpy()
+    if path_xyz is None:
+        return None
+
+    return {
+        "path_xyz": np.asarray(path_xyz, dtype=float),
+        "step_diagnostics": result.get("step_diagnostics", []),
+        "work_integral": float(result.get("work_integral", np.nan)),
+        "state": str(result.get("state", "unknown")),
+        "replay_steps": replay_steps,
+    }
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         out = float(value)
@@ -4415,6 +4548,23 @@ def create_monolith_cockpit(
     walker_states = exp.walker_states if exp.walker_states else ['elastic'] * n_articles
     walker_work = exp.walker_work_integrals
     walker_paths_raw = exp.walker_paths if exp.walker_paths else {}
+    walker_path_diagnostics = dict(exp.walker_path_diagnostics or {})
+
+    focused_track4_replay = _recompute_focused_observer_track4(exp, focus_idx, walker_paths_raw)
+    if focused_track4_replay is not None and focus_idx is not None:
+        walker_paths_raw = dict(walker_paths_raw)
+        walker_paths_raw[int(focus_idx)] = np.asarray(focused_track4_replay["path_xyz"], dtype=float)
+        walker_path_diagnostics[int(focus_idx)] = {
+            "focused_observer_replay": True,
+            "step_diagnostics": focused_track4_replay.get("step_diagnostics", []),
+        }
+        if walker_work is not None:
+            try:
+                walker_work = np.asarray(walker_work, dtype=float).copy()
+                if walker_work.ndim == 1 and walker_work.shape[0] > focus_idx:
+                    walker_work[int(focus_idx)] = float(focused_track4_replay.get("work_integral", walker_work[int(focus_idx)]))
+            except Exception:
+                pass
 
     # Track 5: Phantom
     phantom_verdicts = exp.phantom_verdicts if exp.phantom_verdicts else []
@@ -5234,7 +5384,7 @@ def create_monolith_cockpit(
         path_traces = render_phantom_paths_3d(
             phantom_verdicts, positions_3d,
             walker_paths=walker_paths_pure,
-            walker_path_diagnostics=exp.walker_path_diagnostics,
+            walker_path_diagnostics=walker_path_diagnostics,
             article_z_height=article_marker_z,
             terrain_z_values=energy_values_for_terrain,
             surface_z_func=get_surface_z,

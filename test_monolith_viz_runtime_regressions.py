@@ -6,15 +6,19 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from analysis.MONOLITH_VIZ import (
     PROBE_LABELS,
     ExperimentData,
+    _recompute_focused_observer_track4,
     create_monolith_cockpit,
     load_experiment_data,
     render_analysis_planes,
     render_phantom_paths_3d,
 )
+from core.complete_pipeline import _serialize_rks_basis_state
+from core.dirichlet_fusion import SharedRKSBasis
 
 
 def _require_plotly() -> None:
@@ -814,6 +818,52 @@ def test_focused_observer_render_uses_relativity_cache_geometry(monkeypatch, tmp
     assert "axis=17.5deg" in focus_html
     assert "Observer Probe Sim" in focus_html
     assert "Observer Coord Delta" in focus_html
+
+
+def test_recompute_focused_observer_track4_uses_payload_replay(tmp_path):
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    exp.antagonism = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+    cls_per_bot = torch.tensor(
+        [
+            [[2.0, 0.0, 0.0, 0.0], [1.8, 0.1, 0.0, 0.0], [1.5, 0.2, 0.0, 0.0], [1.2, 0.3, 0.0, 0.0], [0.8, 0.6, 0.0, 0.0], [0.5, 0.9, 0.0, 0.0], [0.2, 1.2, 0.0, 0.0], [0.0, 1.5, 0.0, 0.0]],
+            [[0.0, 2.0, 0.0, 0.0], [0.0, 1.8, 0.1, 0.0], [0.0, 1.5, 0.2, 0.0], [0.0, 1.2, 0.3, 0.0], [0.0, 0.8, 0.6, 0.0], [0.0, 0.5, 0.9, 0.0], [0.0, 0.2, 1.2, 0.0], [0.0, 0.0, 1.5, 0.0]],
+            [[0.0, 0.0, 2.0, 0.0], [0.1, 0.0, 1.8, 0.0], [0.2, 0.0, 1.5, 0.0], [0.3, 0.0, 1.2, 0.0], [0.6, 0.0, 0.8, 0.0], [0.9, 0.0, 0.5, 0.0], [1.2, 0.0, 0.2, 0.0], [1.5, 0.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0, 2.0], [0.0, 0.1, 0.0, 1.8], [0.0, 0.2, 0.0, 1.5], [0.0, 0.3, 0.0, 1.2], [0.0, 0.6, 0.0, 0.8], [0.0, 0.9, 0.0, 0.5], [0.0, 1.2, 0.0, 0.2], [0.0, 1.5, 0.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    basis = SharedRKSBasis(input_dim=4, output_dim=8, seed=17, kernel_type="rbf")
+    basis.set_sigma(1.0)
+    torch.save(
+        {
+            "cls_per_bot": cls_per_bot.numpy(),
+            "rks_basis_state": _serialize_rks_basis_state(basis),
+        },
+        exp.experiment_dir / "observer_42.pt",
+    )
+
+    replay = _recompute_focused_observer_track4(exp, 1, exp.walker_paths)
+
+    assert replay is not None
+    assert replay["replay_steps"] >= 10
+    assert np.asarray(replay["path_xyz"], dtype=float).ndim == 2
+    assert np.asarray(replay["path_xyz"], dtype=float).shape[0] >= 2
+    assert len(replay["step_diagnostics"]) > 0
+    assert np.isfinite(float(replay["work_integral"]))
+    assert not np.allclose(
+        np.asarray(replay["path_xyz"], dtype=float)[:2, :3],
+        np.asarray(exp.walker_paths[1], dtype=float),
+        atol=1e-5,
+    )
 
 
 def test_focused_observer_render_falls_back_to_global_z_when_observer_z_collapses(monkeypatch, tmp_path):
