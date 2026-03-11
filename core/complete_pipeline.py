@@ -2864,6 +2864,8 @@ class BeliefTransformerPipeline:
                     run_output_dir / "walker_paths.npz",
                     article_idx=np.array([int(r["article_idx"]) for r in walker_path_records], dtype=np.int32),
                     bt_uid=np.array([str(r["bt_uid"]) for r in walker_path_records]),
+                    path_space=np.array(["embedding"], dtype="<U16"),
+                    path_contract_version=np.array([2], dtype=np.int32),
                     path_xyz=path_xyz_payload,
                     step_axis_idx=_pack_step_field("step_axis_idx", np.int32),
                     step_axis_vectors=_pack_step_field("step_axis_vectors", np.float32, source_key="step_axis_vector"),

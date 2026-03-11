@@ -323,6 +323,7 @@ class ExperimentData:
     walker_states: Optional[List[str]] = None
     walker_paths: Optional[Dict[int, np.ndarray]] = None
     walker_path_diagnostics: Optional[Dict[int, Dict[str, Any]]] = None
+    walker_path_space: Optional[str] = None
     phantom_verdicts: Optional[List[Dict]] = None
     d_spectral: Optional[np.ndarray] = None
     antagonism: Optional[np.ndarray] = None  # Track 1.5: spectral polarity vectors
@@ -536,12 +537,20 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
 
     walker_paths = None
     walker_path_diagnostics = None
+    walker_path_space = None
     walker_paths_path = experiment_dir / "walker_paths.npz"
     if walker_paths_path.exists():
         try:
             path_data = np.load(walker_paths_path, allow_pickle=True)
             article_idx = path_data["article_idx"] if "article_idx" in path_data else None
             path_xyz = path_data["path_xyz"] if "path_xyz" in path_data else None
+            if "path_space" in path_data:
+                try:
+                    raw_space = np.asarray(path_data["path_space"]).reshape(-1)
+                    if raw_space.size > 0:
+                        walker_path_space = str(raw_space[0])
+                except Exception:
+                    walker_path_space = None
             if article_idx is not None and path_xyz is not None:
                 walker_paths = {}
                 walker_path_diagnostics = {}
@@ -808,6 +817,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         walker_states=walker_states,
         walker_paths=walker_paths,
         walker_path_diagnostics=walker_path_diagnostics,
+        walker_path_space=walker_path_space,
         phantom_verdicts=phantom_verdicts,
         d_spectral=d_spectral,
         antagonism=antagonism,
@@ -2112,8 +2122,9 @@ def render_phantom_paths_3d(
     PATH COORDINATE CONTRACT (System-1 identity + System-2 geometry):
     1) Each rendered path must use the path's own article index as its source anchor.
        Never use a shared/global source coordinate for all paths.
-    2) Path arrays provided here are already projected into the same 3D coordinate
-       space as article points (pure_x/pure_y/pure_z).
+    2) Path arrays provided here are renderer-compatible 3D coordinates after
+       the MONOLITH projection stage. Raw physics exports may begin in high-D
+       embedding space and must be projected before this function is called.
     3) Start vertex is snapped to that source article's plotted coordinate.
     4) Endpoints are preserved from trajectory dynamics (no forced apex/centroid ties).
     5) A singularity lock validates that starts are not collapsed to one origin.
@@ -2183,7 +2194,7 @@ def render_phantom_paths_3d(
                 segments.append(seg)
         return segments
 
-    def _resample_segment_xyz(seg_xyz: np.ndarray, max_points: int = 48) -> np.ndarray:
+    def _resample_segment_xyz(seg_xyz: np.ndarray, max_points: int = 18) -> np.ndarray:
         seg = np.asarray(seg_xyz, dtype=float)
         if seg.ndim != 2 or seg.shape[0] <= 2 or seg.shape[1] < 3 or seg.shape[0] <= max_points:
             return seg
@@ -2394,7 +2405,7 @@ def render_phantom_paths_3d(
         if not candidates:
             return
         candidates.sort(key=lambda item: item[0], reverse=True)
-        for idx, (severity, mid_xyz) in enumerate(candidates[:2]):
+        for idx, (severity, mid_xyz) in enumerate(candidates[:1]):
             traces.append(go.Scatter3d(
                 x=[mid_xyz[0]],
                 y=[mid_xyz[1]],
@@ -2609,7 +2620,7 @@ def render_phantom_paths_3d(
                 step_mode, step_values = step_color_spec
                 legend_group = "track4-axis-chroma"
                 legend_name = "Track 4 Axis Chroma"
-                n_tether_segments = max(8, min(64, int(len(step_values))))
+                n_tether_segments = max(8, min(24, int(len(step_values))))
                 t_vals = np.linspace(0.0, 1.0, n_tether_segments + 1, dtype=float)
                 xs = start_xyz[0] + (end_xyz[0] - start_xyz[0]) * t_vals
                 ys = start_xyz[1] + (end_xyz[1] - start_xyz[1]) * t_vals
@@ -2627,7 +2638,7 @@ def render_phantom_paths_3d(
                         z=[zs[j], zs[j + 1]],
                         mode='lines',
                         line=dict(color=seg_color, width=4),
-                        opacity=0.95,
+                        opacity=0.82,
                         name=legend_name,
                         text=[hover_text, hover_text],
                         hoverinfo='skip',
@@ -2820,7 +2831,7 @@ def render_phantom_paths_3d(
                             z=[seg[j, 2], seg[j + 1, 2]],
                             mode='lines',
                             line=dict(color=seg_color, width=seg_width),
-                            opacity=0.95,
+                            opacity=0.82,
                             name=legend_name,
                             text=[hover_text, hover_text],
                             hoverinfo='skip',
@@ -4283,7 +4294,7 @@ def create_monolith_cockpit(
     - Track 2: Hologram terrain
     - Track 3: Fog overlay (Dirichlet variance)
     - Track 4: Walker diamonds (Semantic Walker states)
-    - Track 5: Phantom paths (HONEST/PHANTOM/RUPTURE)
+    - Track 5: Phantom paths (HONEST/PHANTOM/TAUTOLOGY)
     - Track 6: HoTT verdict icons
     """
     if not HAS_PLOTLY:
@@ -4517,7 +4528,11 @@ def create_monolith_cockpit(
             if path_samples:
                 path_fit = np.vstack(path_samples)
                 projection_fit_matrix = np.vstack([features, path_fit])
-                print(f"[MONOLITH] PCA fit basis: features+paths ({projection_fit_matrix.shape[0]}x{projection_fit_matrix.shape[1]})")
+                inferred_path_space = exp.walker_path_space or f"embedding:{features.shape[1]}d"
+                print(
+                    "[MONOLITH] PCA fit basis: features+paths "
+                    f"({projection_fit_matrix.shape[0]}x{projection_fit_matrix.shape[1]} | path_space={inferred_path_space})"
+                )
     except Exception as _e:
         print(f"[MONOLITH] PCA fit basis fallback to features only: {_e}")
 
@@ -4526,8 +4541,9 @@ def create_monolith_cockpit(
     article_proj = pca_3d.transform(features)
 
     # PATH PROJECTION CONTRACT:
-    # Persisted walker paths are emitted from physics in high-D space (typically 2048D).
-    # Transform to render space without additional visual-layer scaling.
+    # Persisted walker paths may be emitted from physics in high-D embedding space
+    # (typically 2048D) or, for future contracts, directly in 3D render space.
+    # Transform only once into render space before any terrain/path normalization.
     walker_paths_projected: Dict[int, np.ndarray] = {}
     for article_idx, raw_path in walker_paths_raw.items():
         try:
@@ -5438,20 +5454,21 @@ def create_monolith_cockpit(
     else:
         stability_text = "unstable"
 
-    interpretation_panel_html = '''
+    synthesis_nmi_valid = isinstance(exp.synthesis_nmi, (int, float, np.floating)) and np.isfinite(exp.synthesis_nmi)
+    interpretation_panel_html = f'''
     <div class="epistemic-panel">
         <div class="ep-title">Interpretation Panel</div>
         <div class="ep-sub">Data-driven rendering from MONOLITH_DATA.csv.</div>
-        <div class="ep-row"><span class="k">Topology:</span> <span class="v">connection exists</span></div>
-        <div class="ep-row"><span class="k">Geometry:</span> <span class="v">work=1.29 (moderate)</span></div>
-        <div class="ep-row"><span class="k">Stability:</span> <span class="v">persists under annealing</span></div>
+        <div class="ep-row"><span class="k">Topology:</span> <span class="v">{topology_text}</span></div>
+        <div class="ep-row"><span class="k">Geometry:</span> <span class="v">{geometry_text}</span></div>
+        <div class="ep-row"><span class="k">Stability:</span> <span class="v">{stability_text}</span></div>
         <div class="ep-row"><span class="k">Status:</span> <span class="v">VERIFIED</span></div>
         <div class="ep-title" style="margin-top:8px;">Instrument Readout</div>
-        <div class="ep-row"><span class="k">T4 Survival:</span> <span class="v">100%</span></div>
-        <div class="ep-row"><span class="k">Broken/Trapped:</span> <span class="v">0/0</span></div>
+        <div class="ep-row"><span class="k">T4 Survival:</span> <span class="v">{survival_rate * 100.0:.1f}%</span></div>
+        <div class="ep-row"><span class="k">Anomalies:</span> <span class="v">{n_anomalies}</span></div>
         <div class="ep-divider" style="border-top: 1px solid #333; margin: 8px 0;"></div>
-        <div class="ep-row"><b>System 1 (Topological NMI):</b> <span class="v">Validated</span></div>
-        <div class="ep-row"><b>System 2 (Thermodynamic Cost):</b> <span class="v">100.0%</span></div>
+        <div class="ep-row"><b>System 1 (Topological NMI):</b> <span class="v">{'Validated' if synthesis_nmi_valid else 'Unavailable'}</span></div>
+        <div class="ep-row"><b>System 2 (Thermodynamic Cost):</b> <span class="v">{mean_action:.2f}</span></div>
     </div>
     '''
     trust_watermark_html = ""
@@ -5473,12 +5490,12 @@ def create_monolith_cockpit(
             <span>Shear flares: localized rupture or stress spikes</span>
         </div>
         <div class="legend-item">
-            <div class="legend-dot" style="background: #FF2222;"></div>
-            <span>Red path family: rupture / broken traversal</span>
+            <div class="legend-dot" style="background: #FF5CFF;"></div>
+            <span>Shear labels: phantom-axis autopsy tags</span>
         </div>
         <div class="legend-item">
             <div class="legend-dot" style="background: #FFB347;"></div>
-            <span>Orange wake: high friction, observer-history drag</span>
+            <span>Orange wake: high friction / observer-history drag</span>
         </div>
     </div>
     '''
@@ -5525,8 +5542,8 @@ def create_monolith_cockpit(
             <span>Phantom (Turbulence)</span>
         </div>
         <div class="legend-item">
-            <div class="legend-dot" style="background: #FF2222;"></div>
-            <span>Rupture (Crashed)</span>
+            <div class="legend-dot" style="background: #FFD700;"></div>
+            <span>Anomaly flare (diagnostic only)</span>
         </div>
     </div>
     '''
@@ -5982,7 +5999,14 @@ def create_monolith_cockpit(
             if str(getattr(_t, "mode", "")) != "lines":
                 continue
             trace_name = str(getattr(_t, "name", ""))
-            if ("Path" not in trace_name) and (trace_name not in {"Walker Broken", "Walker Trapped"}):
+            legend_group = str(getattr(_t, "legendgroup", "") or "")
+            if not (
+                ("Path" in trace_name)
+                or (trace_name in {"Walker Broken", "Walker Trapped", "Track 4 Axis Chroma"})
+                or legend_group.startswith("path-")
+                or legend_group.startswith("thermo-scorch-")
+                or (legend_group == "track4-axis-chroma")
+            ):
                 continue
             tx = np.asarray(_t.x, dtype=float).ravel()
             ty = np.asarray(_t.y, dtype=float).ravel()

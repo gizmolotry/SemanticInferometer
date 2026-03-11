@@ -112,7 +112,7 @@ def _render_html_for_mode(tmp_path: Path, mode: str, spectral_probe_magnitudes: 
     return fig, output_path.read_text(encoding="utf-8")
 
 
-def test_rupture_path_rendering_reachable_behavior_contract():
+def test_rupture_inputs_collapse_to_phantom_render_contract():
     _require_plotly()
     positions_3d = np.array([[5.0, 6.0, 7.0], [9.0, 8.0, 7.5]], dtype=float)
     walker_paths = {
@@ -131,7 +131,8 @@ def test_rupture_path_rendering_reachable_behavior_contract():
     )
 
     names = [str(getattr(t, "name", "")) for t in traces]
-    assert any(n in {"Walker Broken", "Walker Trapped"} for n in names), names
+    assert "Phantom Path" in names, names
+    assert "Ideological Shear" in names, names
 
 
 def test_missing_logits_keeps_t1_nmi_unavailable_via_function():
@@ -274,6 +275,27 @@ def test_path_invalid_points_are_filtered_not_origin_injected():
     assert not np.any(np.all(np.isclose(coords, 0.0), axis=1)), coords
 
 
+def test_non_3d_walker_paths_are_not_rendered():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=float)
+    walker_paths = {
+        0: np.array([[0.0, 0.0], [0.5, 0.5]], dtype=float),
+        1: np.array([0.0, 1.0, 2.0], dtype=float),
+    }
+    phantom_verdicts = [
+        {"verdict": "HONEST", "walker_state": "success"},
+        {"verdict": "PHANTOM", "walker_state": "success"},
+    ]
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+    )
+
+    assert traces == [], "Expected non-3D walker paths to be rejected without rendering"
+
+
 def test_track4_chroma_ribbons_emit_variable_widths_and_shear_flares():
     _require_plotly()
     positions_3d = np.array([[0.0, 0.0, 0.0]], dtype=float)
@@ -349,7 +371,7 @@ def test_type2_rupture_is_canonicalized_and_rendered():
     )
 
     names = [str(getattr(t, "name", "")) for t in traces]
-    assert "Walker Trapped" in names, names
+    assert "Tautology Path" in names, names
 
 
 def test_shear_flares_are_thresholded_and_capped():
@@ -572,7 +594,7 @@ def test_extreme_mismatched_path_scale_is_bounded_relative_to_article_manifold(m
     article_xy_span = float(max(np.ptp(article_x), np.ptp(article_y)))
     assert np.isfinite(article_xy_span) and article_xy_span > 0.0
 
-    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Walker Broken", "Walker Trapped"}
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Track 4 Axis Chroma"}
     path_traces = [
         t
         for t in fig.data
@@ -627,7 +649,7 @@ def test_terrain_footprint_expands_to_cover_rendered_paths(monkeypatch, tmp_path
     terrain_y_min = float(np.min(terrain_y_finite))
     terrain_y_max = float(np.max(terrain_y_finite))
 
-    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Walker Broken", "Walker Trapped"}
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Track 4 Axis Chroma"}
     path_traces = [
         t
         for t in fig.data
@@ -646,3 +668,71 @@ def test_terrain_footprint_expands_to_cover_rendered_paths(monkeypatch, tmp_path
         assert float(np.max(tx)) <= terrain_x_max + eps
         assert float(np.min(ty)) >= terrain_y_min - eps
         assert float(np.max(ty)) <= terrain_y_max + eps
+
+
+def test_non_rendered_non_3d_paths_do_not_expand_terrain_footprint(monkeypatch, tmp_path):
+    _require_plotly()
+    pytest.importorskip("scipy")
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    exp.walker_paths[0] = np.array(
+        [
+            [1_000_000.0, -1_000_000.0],
+            [1_400_000.0, -800_000.0],
+        ],
+        dtype=float,
+    )
+    output_path = tmp_path / "invalid_path_footprint.html"
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    fig = create_monolith_cockpit(
+        exp=exp,
+        output_path=output_path,
+        physics_mode="synthesis",
+        show_terrain=True,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+
+    terrain_traces = [t for t in fig.data if str(getattr(t, "name", "")) == "Energy Terrain"]
+    article_traces = [t for t in fig.data if str(getattr(t, "name", "")) == "Articles"]
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Track 4 Axis Chroma"}
+    path_traces = [
+        t
+        for t in fig.data
+        if str(getattr(t, "mode", "")) == "lines" and str(getattr(t, "name", "")) in path_names
+    ]
+
+    assert terrain_traces, "Expected terrain surface trace"
+    assert article_traces, "Expected article manifold trace"
+    assert path_traces, "Expected at least one valid rendered path trace"
+
+    terrain = terrain_traces[0]
+    article_trace = article_traces[0]
+    terrain_x = np.asarray(terrain.x, dtype=float)
+    terrain_y = np.asarray(terrain.y, dtype=float)
+    article_x = np.asarray(article_trace.x, dtype=float)
+    article_y = np.asarray(article_trace.y, dtype=float)
+
+    terrain_span = float(
+        max(
+            np.ptp(terrain_x[np.isfinite(terrain_x)]),
+            np.ptp(terrain_y[np.isfinite(terrain_y)]),
+        )
+    )
+    article_span = float(
+        max(
+            np.ptp(article_x[np.isfinite(article_x)]),
+            np.ptp(article_y[np.isfinite(article_y)]),
+        )
+    )
+    assert np.isfinite(terrain_span) and np.isfinite(article_span) and article_span > 0.0
+    assert terrain_span <= article_span * 3.0, (terrain_span, article_span)
+
+    rendered_xy = np.vstack(
+        [
+            np.column_stack([np.asarray(t.x, dtype=float), np.asarray(t.y, dtype=float)])
+            for t in path_traces
+        ]
+    )
+    assert np.nanmax(np.abs(rendered_xy)) < 100.0, rendered_xy
