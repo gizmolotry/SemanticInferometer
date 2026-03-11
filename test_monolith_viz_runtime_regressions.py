@@ -814,3 +814,42 @@ def test_focused_observer_render_uses_relativity_cache_geometry(monkeypatch, tmp
     assert "axis=17.5deg" in focus_html
     assert "Observer Probe Sim" in focus_html
     assert "Observer Coord Delta" in focus_html
+
+
+def test_focused_observer_render_falls_back_to_global_z_when_observer_z_collapses(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    rel_dir = exp.experiment_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    (rel_dir / "state_0.json").write_text(
+        """
+{
+  "observer_id": 0,
+  "articles": [
+    {"index": 0, "observer_x": -2.0, "observer_y": 0.0, "observer_z": 0.0},
+    {"index": 1, "observer_x": -0.5, "observer_y": 0.6, "observer_z": 0.0},
+    {"index": 2, "observer_x": 1.0, "observer_y": 1.2, "observer_z": 0.0},
+    {"index": 3, "observer_x": 2.5, "observer_y": 1.8, "observer_z": 0.0}
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    focus_output = tmp_path / "observer_focus_z_fallback.html"
+    focus_fig = create_monolith_cockpit(
+        exp=exp,
+        output_path=focus_output,
+        physics_mode="synthesis",
+        observer_idx=0,
+        show_terrain=False,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+
+    article_trace = next(t for t in focus_fig.data if str(getattr(t, "name", "")) == "Articles")
+    article_z = np.asarray(article_trace.z, dtype=float)
+    assert float(np.ptp(article_z)) > 1e-3

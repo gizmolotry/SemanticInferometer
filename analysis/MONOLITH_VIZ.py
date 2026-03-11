@@ -4638,17 +4638,24 @@ def create_monolith_cockpit(
     positions_2d = positions_3d[:, :2]
 
     # RAW POINT Z: use persisted pure_z from MONOLITH_DATA.csv when available.
-    if not observer_geometry_active:
-        if 'monolith_df' in locals() and 'pure_z' in monolith_df.columns:
-            pure_z = monolith_df['pure_z'].to_numpy(dtype=float)
-        elif 'unified_z_height' in locals() and len(unified_z_height) == n_articles:
-            pure_z = np.asarray(unified_z_height, dtype=float)
-        else:
-            pure_z = positions_3d[:, 2].astype(float)
+    if 'monolith_df' in locals() and 'pure_z' in monolith_df.columns:
+        global_pure_z = monolith_df['pure_z'].to_numpy(dtype=float)
+    elif 'unified_z_height' in locals() and len(unified_z_height) == n_articles:
+        global_pure_z = np.asarray(unified_z_height, dtype=float)
+    else:
+        global_pure_z = article_proj[:, 2].astype(float)
+    if len(global_pure_z) != n_articles:
+        global_pure_z = positions_3d[:, 2].astype(float)
+
+    if observer_geometry_active:
+        pure_z = positions_3d[:, 2].astype(float)
+        if len(pure_z) != n_articles or not np.isfinite(pure_z).all() or float(np.ptp(pure_z)) <= 1e-6:
+            pure_z = np.asarray(global_pure_z, dtype=float)
+        positions_3d[:, 2] = pure_z
+    else:
+        pure_z = np.asarray(global_pure_z, dtype=float)
         if len(pure_z) == n_articles:
             positions_3d[:, 2] = pure_z
-    else:
-        pure_z = positions_3d[:, 2].astype(float)
 
     # RAW PATHS: no additional normalization/clipping.
     walker_paths_pure: Dict[int, np.ndarray] = {}
