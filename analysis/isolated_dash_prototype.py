@@ -368,6 +368,33 @@ def _is_synthetic_placeholder_blob(blob: Any) -> bool:
         val = str(blob.get(key, "")).strip().lower()
         if val in {"suite-generated", "suite-generated-placeholder"}:
             return True
+    # Legacy suite-default observer deltas were emitted as an unannotated zero-delta skeleton.
+    # Treat that exact shape as synthetic so observer-mode claims do not get a false green light.
+    if {
+        "observer_id",
+        "null_observer_equivalence",
+        "path_flip_delta",
+        "metrics_delta",
+        "axis_delta",
+    }.issubset(blob.keys()):
+        n = blob.get("null_observer_equivalence", {})
+        m = blob.get("metrics_delta", {})
+        a = blob.get("axis_delta", {})
+        if (
+            isinstance(n, dict)
+            and isinstance(m, dict)
+            and isinstance(a, dict)
+            and blob.get("path_flip_delta", {}) in ({}, None)
+            and float(n.get("max_coord_delta", 1.0)) == 0.0
+            and int(n.get("path_flip_count", 1)) == 0
+            and float(n.get("axis_rotation_deg", 1.0)) == 0.0
+            and float(m.get("d_rupture_rate", 1.0)) == 0.0
+            and float(m.get("d_mean_work", 1.0)) == 0.0
+            and float(m.get("d_survival_pct", 1.0)) == 0.0
+            and float(a.get("rotation_deg", 1.0)) == 0.0
+            and float(a.get("d_explained_variance_axis1", 1.0)) == 0.0
+        ):
+            return True
     return False
 
 

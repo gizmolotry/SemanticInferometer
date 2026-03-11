@@ -515,11 +515,10 @@ def test_load_contract_state_marks_synthetic_observer_relativity_non_comparable(
         run_dir / "relativity_cache" / "delta_7.json",
         {
             "observer_id": 7,
-            "null_observer_equivalence": {"max_coord_delta": 0.0},
+            "null_observer_equivalence": {"max_coord_delta": 0.0, "path_flip_count": 0, "axis_rotation_deg": 0.0},
             "path_flip_delta": {},
-            "metrics_delta": {},
-            "axis_delta": {},
-            "synthetic_placeholder": True,
+            "metrics_delta": {"d_rupture_rate": 0.0, "d_mean_work": 0.0, "d_survival_pct": 0.0},
+            "axis_delta": {"rotation_deg": 0.0, "d_explained_variance_axis1": 0.0},
         },
     )
 
