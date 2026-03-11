@@ -160,6 +160,8 @@ class SemanticWalker:
         memory_sensitivity: float = 1.0,
         hysteresis_mode: str = "momentum",
         hysteresis_lambda: float = 1.0,
+        observer_axis: Optional[torch.Tensor] = None,
+        observer_cost_strength: float = 0.0,
         thermo_config: Optional[ThermodynamicConfig] = None,
     ):
         """
@@ -183,6 +185,13 @@ class SemanticWalker:
         self.n_bots = embeddings.shape[0]
         self.u_axis = u_axis.float() if u_axis is not None else None
         self.thermo_config = thermo_config or ThermodynamicConfig()
+        self.observer_axis = None
+        if observer_axis is not None:
+            observer_axis = observer_axis.float()
+            observer_norm = torch.norm(observer_axis, p=2)
+            if torch.isfinite(observer_norm) and float(observer_norm.item()) > 1e-12:
+                self.observer_axis = observer_axis / observer_norm
+        self.observer_cost_strength = max(0.0, float(observer_cost_strength))
 
         # =========================================
         # HYSTERESIS STATE (Path Memory)
@@ -245,6 +254,10 @@ class SemanticWalker:
         else:
             # Legacy: energy = norm of fused gradient
             energy = torch.norm(fused_grad, p=2, dim=-1)
+
+        if self.observer_axis is not None and self.observer_cost_strength > 0.0:
+            observer_penalty, _ = self._compute_observer_penalty(weights)
+            energy = energy + torch.clamp(observer_penalty - 1.0, min=0.0)
 
         return energy
 
@@ -383,9 +396,33 @@ class SemanticWalker:
     def _compute_base_friction(self, weights: torch.Tensor) -> torch.Tensor:
         """Base terrain friction from local density."""
         local_density = self._compute_density(weights)
-        return self.thermo_config.friction_coefficient / local_density.clamp(
+        base_friction = self.thermo_config.friction_coefficient / local_density.clamp(
             min=self.thermo_config.density_clamp_min
         )
+        observer_penalty, _ = self._compute_observer_penalty(weights)
+        return base_friction * observer_penalty
+
+    def _compute_observer_penalty(self, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Observer-conditioned friction multiplier.
+
+        When enabled, locally misaligned regions become more expensive relative
+        to an observer anchor in the same embedding space as the bot positions.
+        """
+        n_items = int(weights.shape[0]) if weights.dim() > 0 else 1
+        if self.observer_axis is None or self.observer_cost_strength <= 0.0:
+            ones = torch.ones(n_items, dtype=weights.dtype, device=weights.device)
+            zeros = torch.zeros(n_items, dtype=weights.dtype, device=weights.device)
+            return ones, zeros
+
+        midpoint_emb = torch.matmul(weights, self.embeddings)
+        observer_axis = self.observer_axis.to(midpoint_emb.device, dtype=midpoint_emb.dtype)
+        midpoint_norm = torch.norm(midpoint_emb, p=2, dim=-1).clamp(min=1e-12)
+        axis_norm = torch.norm(observer_axis, p=2).clamp(min=1e-12)
+        similarity = (midpoint_emb * observer_axis).sum(dim=-1) / (midpoint_norm * axis_norm)
+        similarity = torch.clamp(similarity, min=-1.0, max=1.0)
+        penalty = 1.0 + self.observer_cost_strength * torch.clamp(1.0 - similarity, min=0.0)
+        return penalty, similarity
 
     def _compute_effective_friction(
         self,
@@ -615,6 +652,12 @@ class SemanticWalker:
                 effective_delta_E = delta_E * torch.exp(-memory_bonus * self.memory_sensitivity)
             else:
                 effective_delta_E = delta_E
+            if self.observer_axis is not None and self.observer_cost_strength > 0.0:
+                observer_acceptance_penalty = proposal_step_distance * torch.clamp(
+                    proposal_effective_friction - proposal_base_friction,
+                    min=0.0,
+                )
+                effective_delta_E = effective_delta_E + observer_acceptance_penalty
 
             acceptance_prob = torch.exp(-effective_delta_E / self.T)
             dice_roll = torch.rand(n_walkers)
@@ -639,6 +682,7 @@ class SemanticWalker:
 
             midpoint_weights = (current_weights + next_weights) / 2.0
             base_friction = self._compute_base_friction(midpoint_weights)
+            observer_penalty, observer_similarity = self._compute_observer_penalty(midpoint_weights)
             applied_debt_axis = torch.where(mask_accept, debt_axis, torch.zeros_like(debt_axis))
             applied_non_markovian_memory = torch.where(
                 mask_accept,
@@ -680,6 +724,8 @@ class SemanticWalker:
                 "cumulative_work": float(cumulative_work_integral.mean().item()),
                 "step_axis_idx": dominant_axis_index,
                 "step_axis_vector": mean_mid_weights.detach().cpu().tolist(),
+                "observer_penalty": float(observer_penalty.mean().item()),
+                "observer_similarity": float(observer_similarity.mean().item()),
             })
             step_effective_friction.append(local_friction.clone())
             step_work.append(energy_cost.clone())
@@ -1000,6 +1046,8 @@ def compute_walker_resistance(
     cls_per_bot: torch.Tensor,
     rks_basis,
     u_axis: Optional[torch.Tensor] = None,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
     temperature: float = 0.5,
     n_walkers: int = 20,
     n_steps: int = 10,
@@ -1033,6 +1081,8 @@ def compute_walker_resistance(
         rks_basis: SharedRKSBasis for projection
         u_axis: [H] — compass direction from Track 1.5 (for pole init, NOT wind)
         temperature: Walker plasticity
+        observer_axis: Optional observer-conditioned friction anchor in embedding space
+        observer_cost_strength: Strength of observer-conditioned friction warp
         n_walkers: Number of MCMC walkers
         n_steps: Number of steps per walker
         enable_hysteresis: Enable path memory (default True)
@@ -1066,6 +1116,8 @@ def compute_walker_resistance(
         rks_basis=rks_basis,
         temperature=temperature,
         u_axis=u_axis,
+        observer_axis=observer_axis,
+        observer_cost_strength=observer_cost_strength,
         enable_hysteresis=enable_hysteresis,
         memory_decay=memory_decay,
         reinforcement_rate=reinforcement_rate,
@@ -1122,6 +1174,7 @@ def compute_walker_resistance(
         "rupture_threshold": explorer.rupture_threshold,
         "hysteresis_mode": explorer.hysteresis_mode,
         "hysteresis_lambda": explorer.hysteresis_lambda,
+        "observer_cost_strength": explorer.observer_cost_strength,
         "step_diagnostics": step_diagnostics,
     }
 

@@ -220,6 +220,33 @@ def _canonicalize_cls_per_bot_for_spectral(
     }
 
 
+def _serialize_rks_basis_state(basis: Any) -> Optional[Dict[str, Any]]:
+    """Serialize the active SharedRKSBasis state needed for Track 4 replay."""
+    if basis is None:
+        return None
+
+    def _cpu_tensor(value: Any) -> Optional[torch.Tensor]:
+        if value is None or not torch.is_tensor(value):
+            return None
+        return value.detach().cpu()
+
+    sigma = getattr(basis, "_sigma", None)
+    sigma_value = float(sigma) if sigma is not None else None
+    return {
+        "omega": _cpu_tensor(getattr(basis, "omega", None)),
+        "b": _cpu_tensor(getattr(basis, "b", None)),
+        "input_dim": int(getattr(basis, "input_dim", 0) or 0),
+        "output_dim": int(getattr(basis, "output_dim", 0) or 0),
+        "seed": int(getattr(basis, "seed", 0) or 0),
+        "kernel_type": str(getattr(basis, "kernel_type", "rbf")),
+        "nu": float(getattr(basis, "nu", 1.5)),
+        "roughness": int(getattr(basis, "roughness", 3) or 3),
+        "sigma": sigma_value,
+        "hash": str(getattr(basis, "basis_hash", getattr(basis, "_hash", ""))),
+        "sigma_diagnostics": getattr(basis, "_sigma_diagnostics", {}),
+    }
+
+
 def _construct_spectral_poles(
     cls_per_bot_tensor: torch.Tensor,
     probe_magnitudes: torch.Tensor,
@@ -2781,6 +2808,15 @@ class BeliefTransformerPipeline:
                 "antagonism": spectral_results.antagonism,
             }
 
+        if cls_per_bot_tensor is not None:
+            out["cls_per_bot"] = cls_per_bot_tensor.detach().cpu().numpy()
+        if cls_per_bot_contract is not None:
+            out["cls_per_bot_contract"] = cls_per_bot_contract
+        if hasattr(self, "dirichlet_fusion") and self.dirichlet_fusion is not None:
+            basis_state = _serialize_rks_basis_state(getattr(self.dirichlet_fusion, "basis", None))
+            if basis_state is not None:
+                out["rks_basis_state"] = basis_state
+
         # NEW: Include Walker (Track 4) work integrals and states
         if walker_work_integrals:
             out["walker_work_integrals"] = np.array(walker_work_integrals)
@@ -3381,7 +3417,8 @@ def run_multi_observer_experiment_simple(
             'walker_states', 'walker_work_integrals', 
             'spectral_evr', 'spectral_u_axis', 'spectral_antagonism', 'spectral_probe_magnitudes',
             'article_metadata', 'phantom_verdicts', 'walker_paths',
-            'T0_substrate', 'T1_embeddings', 'T1.5_spectral', 'T2_kernels', 'T3_topology'
+            'T0_substrate', 'T1_embeddings', 'T1.5_spectral', 'T2_kernels', 'T3_topology',
+            'cls_per_bot', 'cls_per_bot_contract', 'rks_basis_state'
         ]
         
         # Unpack from result or its internal 'checkpoints' dict

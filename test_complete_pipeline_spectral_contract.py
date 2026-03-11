@@ -10,8 +10,11 @@ from core.complete_pipeline import (
     _classify_track5_semantic_verdicts,
     _construct_spectral_poles,
     _map_track4_state_to_track5_verdict,
+    _serialize_rks_basis_state,
 )
+from core.dirichlet_fusion import SharedRKSBasis
 from core.metric_fusion import calculate_unified_metric
+from core.physarum_walk import compute_walker_resistance
 
 
 def test_canonical_cls_per_bot_contract_is_magnitude_preserving():
@@ -127,3 +130,74 @@ def test_track5_semantic_classifier_uses_article_delta_and_anomalies():
 
     assert verdicts.tolist() == ["HONEST", "HONEST", "PHANTOM", "TAUTOLOGY"]
     assert stats["threshold_mode"] in {"kmeans_2cluster", "median_fallback"}
+
+
+def test_serialize_rks_basis_state_preserves_replay_fields():
+    basis = SharedRKSBasis(input_dim=4, output_dim=6, seed=7, kernel_type="matern", nu=2.5, roughness=5)
+    basis.set_sigma(1.75)
+
+    state = _serialize_rks_basis_state(basis)
+
+    assert state is not None
+    assert state["input_dim"] == 4
+    assert state["output_dim"] == 6
+    assert state["seed"] == 7
+    assert state["kernel_type"] == "matern"
+    assert state["nu"] == 2.5
+    assert state["roughness"] == 5
+    assert state["sigma"] == 1.75
+    assert torch.is_tensor(state["omega"])
+    assert torch.is_tensor(state["b"])
+    assert state["omega"].shape == (4, 6)
+    assert state["b"].shape == (6,)
+
+
+def test_compute_walker_resistance_observer_cost_changes_path_metrics():
+    cls_per_bot = torch.tensor(
+        [
+            [2.0, 0.0, 0.0, 0.0],
+            [1.5, 0.2, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 1.5, 0.2, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [0.0, 0.0, 1.5, 0.2],
+            [0.0, 0.0, 0.0, 2.0],
+            [0.2, 0.0, 0.0, 1.5],
+        ],
+        dtype=torch.float32,
+    )
+    basis = SharedRKSBasis(input_dim=4, output_dim=8, seed=11, kernel_type="rbf")
+    basis.set_sigma(1.0)
+    observer_axis = torch.tensor([1.0, -0.5, 0.25, 0.0], dtype=torch.float32)
+
+    torch.manual_seed(123)
+    baseline = compute_walker_resistance(
+        cls_per_bot=cls_per_bot,
+        rks_basis=basis,
+        n_walkers=8,
+        n_steps=6,
+        observer_cost_strength=0.0,
+    )
+
+    torch.manual_seed(123)
+    conditioned = compute_walker_resistance(
+        cls_per_bot=cls_per_bot,
+        rks_basis=basis,
+        n_walkers=8,
+        n_steps=6,
+        observer_axis=observer_axis,
+        observer_cost_strength=1.5,
+    )
+
+    assert conditioned["observer_cost_strength"] == 1.5
+    assert not np.isclose(
+        float(baseline["work_integral"]),
+        float(conditioned["work_integral"]),
+        atol=1e-5,
+    )
+    base_path = np.asarray(baseline["path_xyz"], dtype=np.float32)
+    conditioned_path = np.asarray(conditioned["path_xyz"], dtype=np.float32)
+    assert base_path.shape == conditioned_path.shape
+    assert not np.allclose(base_path, conditioned_path, atol=1e-5)
+    assert "observer_penalty" in conditioned["step_diagnostics"][0]
+    assert "observer_similarity" in conditioned["step_diagnostics"][0]
