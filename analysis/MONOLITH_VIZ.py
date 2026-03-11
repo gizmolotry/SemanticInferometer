@@ -4869,6 +4869,7 @@ def create_monolith_cockpit(
 
     # Build hover texts - RICH METADATA for each article
     hover_texts = []
+    article_titles: List[str] = []
     article_uid_values: List[str] = []
     for i in range(n_articles):
         meta: Dict[str, Any] = {}
@@ -4891,6 +4892,7 @@ def create_monolith_cockpit(
         ).strip()
         bt_uid = bt_uid_raw[:16]
         article_uid_values.append(bt_uid_raw)
+        article_titles.append(title)
         evr = spectral_evr[i] if i < len(spectral_evr) else 0.5
 
         if spectral_mags_hover is not None and i < len(spectral_mags_hover):
@@ -5967,6 +5969,28 @@ def create_monolith_cockpit(
 
     fig_json = pio.to_json(fig)
     html_final = html_template.replace('{PLOT_DATA}', fig_json)
+
+    if focus_idx is not None and 0 <= int(focus_idx) < n_articles:
+        focus_uid_raw = ""
+        if focus_idx < len(article_uid_values):
+            focus_uid_raw = str(article_uid_values[focus_idx] or "").strip()
+        focus_title_raw = ""
+        if focus_idx < len(article_titles):
+            focus_title_raw = str(article_titles[focus_idx] or "").strip()
+        focus_uid = html.escape(focus_uid_raw)
+        focus_title = html.escape(focus_title_raw)
+        observer_banner = (
+            f"<div id='observer-focus-banner' "
+            f"style='position:fixed;top:10px;left:10px;z-index:9999;"
+            f"background:rgba(5,10,18,0.88);color:#FFD700;border:1px solid #FFD700;"
+            f"padding:8px 12px;font-family:monospace;font-size:12px;letter-spacing:0.04em;"
+            f"box-shadow:0 0 18px rgba(255,215,0,0.25)'>"
+            f"OBSERVER FOCUS | article:{int(focus_idx)}"
+            f"{' | uid:' + focus_uid if focus_uid else ''}"
+            f"{' | ' + focus_title if focus_title else ''}"
+            f"</div><!-- observer_focus:{int(focus_idx)}:{focus_uid_raw} -->"
+        )
+        html_final = html_final.replace("<body>", f"<body>\n{observer_banner}\n", 1)
 
     # Render contract (fail-fast): if terrain is enabled, the surface must be
     # present/visible and path traces must remain in the same scene scale.

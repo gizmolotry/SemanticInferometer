@@ -30,7 +30,9 @@ Output structure:
 
 import argparse
 import csv
+import hashlib
 import json
+import math
 import os
 import shutil
 from datetime import datetime, timezone
@@ -577,6 +579,19 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     monolith_out = target_dir / "MONOLITH.html"
     monolith_csv = target_dir / "MONOLITH_DATA.csv"
     if not monolith_csv.exists():
+        monolith_ready = _ensure_monolith_csv_ready(target_dir)
+        if monolith_ready.get("status") not in {"success", "already_exists"}:
+            payload = {
+                "status": monolith_ready.get("status", "skipped"),
+                "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
+            }
+            if "reason" in monolith_ready:
+                payload["reason"] = monolith_ready["reason"]
+            if "error" in monolith_ready:
+                payload["error"] = monolith_ready["error"]
+            return payload
+    if not monolith_csv.exists():
         return {
             "status": "skipped",
             "reason": f"missing MONOLITH_DATA.csv at {monolith_csv}",
@@ -593,11 +608,13 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
             "observer_manifest": str(target_dir / "observer_manifest.json"),
             "baseline_meta": str(target_dir / "baseline_meta.json"),
             "baseline_state": str(target_dir / "baseline_state.json"),
+            "validation_json": str(target_dir / "validation.json"),
         }
 
     viz_cmd = [
         sys.executable,
-        str(Path(__file__).parent / "analysis" / "MONOLITH_VIZ.py"),
+        "-m",
+        "analysis.MONOLITH_VIZ",
         str(target_dir),
         "--output",
         str(monolith_out),
@@ -609,12 +626,14 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
 
     precompute_cmd = [
         sys.executable,
-        str(Path(__file__).parent / "analysis" / "regression" / "precompute_observer_artifacts.py"),
+        "-m",
+        "analysis.regression.precompute_observer_artifacts",
         str(target_dir),
         "--variant",
         "MONOLITH.html",
         "--mode",
-        "link",
+        "focused",
+        "--overwrite",
     ]
 
     env = os.environ.copy()
@@ -680,7 +699,276 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
         "observer_manifest": str(target_dir / "observer_manifest.json"),
         "baseline_meta": str(target_dir / "baseline_meta.json"),
         "baseline_state": str(target_dir / "baseline_state.json"),
+        "validation_json": str(target_dir / "validation.json"),
     }
+
+
+def _load_ground_truth_for_corpus(corpus: str) -> Optional[Dict[int, str]]:
+    corpus_path = Path(corpus)
+    if not corpus_path.exists():
+        return None
+    try:
+        _, ground_truth = load_and_mask_corpus(corpus_path)
+    except Exception as exc:
+        print(f"[WATERFALL][WARN] Failed to load ground truth for {corpus}: {exc}")
+        return None
+    return ground_truth or None
+
+
+def _pick_primary_observer_file(run_dir: Path) -> Optional[Path]:
+    observer_files = sorted(run_dir.glob("observer_*.pt"), key=lambda p: p.name)
+    return observer_files[0] if observer_files else None
+
+
+def _load_primary_observer_payload(run_dir: Path) -> Optional[Dict[str, Any]]:
+    observer_path = _pick_primary_observer_file(run_dir)
+    if observer_path is None or not TORCH_AVAILABLE:
+        return None
+    try:
+        payload = torch.load(observer_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_article_metadata_csv(metadata: List[Dict[str, Any]], output_path: Path) -> bool:
+    if not metadata:
+        return False
+    fieldnames: List[str] = []
+    for row in metadata:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            key_str = str(key)
+            if key_str not in fieldnames:
+                fieldnames.append(key_str)
+    if not fieldnames:
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in metadata:
+            if not isinstance(row, dict):
+                continue
+            writer.writerow({key: row.get(key) for key in fieldnames})
+    return True
+
+
+def _hydrate_run_leaf_from_observer(run_dir: Path) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    observer_path = _pick_primary_observer_file(run_dir)
+    if observer_path is None:
+        return {
+            "status": "skipped",
+            "reason": f"missing observer_*.pt in {run_dir}",
+            "attempted": False,
+        }
+    if not TORCH_AVAILABLE:
+        return {
+            "status": "failed",
+            "error": "torch not available for observer hydration",
+            "attempted": True,
+        }
+
+    try:
+        observer = torch.load(observer_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": f"failed loading {observer_path.name}: {exc}",
+            "attempted": True,
+        }
+
+    written: List[str] = []
+
+    def _save_npy(name: str, key: str) -> None:
+        if (run_dir / name).exists():
+            return
+        value = observer.get(key)
+        if value is None:
+            return
+        np.save(run_dir / name, np.asarray(value))
+        written.append(name)
+
+    _save_npy("features.npy", "features")
+    _save_npy("walker_work_integrals.npy", "walker_work_integrals")
+    _save_npy("spectral_u_axis.npy", "spectral_u_axis")
+    _save_npy("spectral_probe_magnitudes.npy", "spectral_probe_magnitudes")
+
+    walker_states_path = run_dir / "walker_states.json"
+    if not walker_states_path.exists() and observer.get("walker_states") is not None:
+        walker_states_path.write_text(
+            json.dumps(observer["walker_states"], indent=2, default=str),
+            encoding="utf-8",
+        )
+        written.append("walker_states.json")
+
+    phantom_path = run_dir / "phantom_verdicts.json"
+    if not phantom_path.exists() and observer.get("phantom_verdicts") is not None:
+        phantom_path.write_text(
+            json.dumps(observer["phantom_verdicts"], indent=2, default=str),
+            encoding="utf-8",
+        )
+        written.append("phantom_verdicts.json")
+
+    metadata = observer.get("article_metadata")
+    metadata_json_path = run_dir / "article_metadata.json"
+    if not metadata_json_path.exists() and metadata is not None:
+        metadata_json_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+        written.append("article_metadata.json")
+    metadata_csv_path = run_dir / "article_metadata.csv"
+    if not metadata_csv_path.exists() and isinstance(metadata, list):
+        if _write_article_metadata_csv(metadata, metadata_csv_path):
+            written.append("article_metadata.csv")
+
+    missing = [
+        name for name in [
+            "features.npy",
+            "walker_work_integrals.npy",
+            "walker_states.json",
+            "phantom_verdicts.json",
+            "article_metadata.csv",
+            "spectral_u_axis.npy",
+        ]
+        if not (run_dir / name).exists()
+    ]
+    if missing:
+        return {
+            "status": "failed",
+            "error": f"observer hydration incomplete; missing {', '.join(missing)}",
+            "attempted": True,
+            "observer_path": str(observer_path),
+            "written": written,
+        }
+
+    return {
+        "status": "success",
+        "attempted": True,
+        "observer_path": str(observer_path),
+        "written": written,
+    }
+
+
+def _ensure_monolith_csv_ready(run_dir: Path) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    monolith_csv = run_dir / "MONOLITH_DATA.csv"
+    if monolith_csv.exists():
+        return {"status": "already_exists", "run_dir": str(run_dir)}
+
+    hydrate_result = _hydrate_run_leaf_from_observer(run_dir)
+    if hydrate_result.get("status") not in {"success", "already_exists"}:
+        return hydrate_result
+
+    try:
+        from core.metric_fusion import calculate_unified_metric
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": f"metric fusion import failed: {exc}",
+            "attempted": True,
+        }
+
+    try:
+        calculate_unified_metric(
+            embeddings_path=run_dir / "features.npy",
+            gradients_path=run_dir / "spectral_u_axis.npy",
+            metadata_path=run_dir / "article_metadata.csv",
+            output_path=monolith_csv,
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": f"metric fusion failed: {exc}",
+            "attempted": True,
+        }
+
+    return {
+        "status": "success",
+        "run_dir": str(run_dir),
+        "monolith_csv": str(monolith_csv),
+        "hydration": hydrate_result,
+    }
+
+
+def generate_waterfall_dashboards(
+    run_dir: Path,
+    ground_truth: Optional[Dict[int, str]] = None,
+    projection_method: str = "pca",
+) -> Dict[str, Any]:
+    """Generate waterfall dashboards for a standard run leaf if checkpoints exist."""
+    run_dir = Path(run_dir)
+    checkpoints_root = run_dir / "checkpoints"
+    if not checkpoints_root.exists():
+        return {
+            "status": "skipped",
+            "reason": f"missing checkpoints at {checkpoints_root}",
+            "run_dir": str(run_dir),
+        }
+
+    checkpoint_dirs = sorted([p for p in checkpoints_root.iterdir() if p.is_dir()])
+    if not checkpoint_dirs:
+        return {
+            "status": "skipped",
+            "reason": f"no checkpoint directories under {checkpoints_root}",
+            "run_dir": str(run_dir),
+        }
+
+    try:
+        from analysis.waterfall_viz import run_waterfall_analysis
+    except ImportError as exc:
+        return {
+            "status": "failed",
+            "reason": f"waterfall import unavailable: {exc}",
+            "run_dir": str(run_dir),
+        }
+
+    results: List[Dict[str, Any]] = []
+    multiple = len(checkpoint_dirs) > 1
+    for checkpoint_dir in checkpoint_dirs:
+        output_dir = run_dir / "waterfall_analysis"
+        if multiple:
+            output_dir = output_dir / checkpoint_dir.name
+        try:
+            result = run_waterfall_analysis(
+                checkpoint_dir=checkpoint_dir,
+                output_dir=output_dir,
+                ground_truth=ground_truth,
+                projection_method=projection_method,
+            )
+            results.append(
+                {
+                    "checkpoint": checkpoint_dir.name,
+                    "status": result.get("status", "unknown"),
+                    "dashboard_path": result.get("dashboard_path"),
+                    "report_path": result.get("report_path"),
+                    "metrics_path": result.get("metrics_path"),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "checkpoint": checkpoint_dir.name,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+
+    summary_path = run_dir / "waterfall_summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    success_count = sum(1 for item in results if item.get("status") == "success")
+    status = "success" if success_count == len(results) else "partial" if success_count > 0 else "failed"
+    payload: Dict[str, Any] = {
+        "status": status,
+        "run_dir": str(run_dir),
+        "summary_path": str(summary_path),
+        "results": results,
+    }
+    if len(results) == 1:
+        payload.update(results[0])
+    return payload
 
 
 def _resolve_bundle_target_dir(run_dir: Path) -> Path:
@@ -707,6 +995,7 @@ def _validate_required_bundle_outputs(run_dir: Path) -> List[str]:
         run_dir / "observer_manifest.json",
         run_dir / "baseline_meta.json",
         run_dir / "baseline_state.json",
+        run_dir / "validation.json",
     ]
     missing = [p.name for p in required if not p.exists()]
     rel_dir = run_dir / "relativity_cache"
@@ -734,6 +1023,21 @@ def _bundle_outputs_are_fresh(run_dir: Path) -> bool:
         p = run_dir / name
         if p.exists():
             input_files.append(p)
+    for name in (
+        "features.npy",
+        "walker_states.json",
+        "phantom_verdicts.json",
+        "article_metadata.csv",
+        "article_metadata.json",
+        "validation.json",
+        "EPISTEMIC_CONTRACT.json",
+        "observer_manifest.json",
+    ):
+        p = run_dir / name
+        if p.exists():
+            input_files.append(p)
+    input_files.extend(sorted(run_dir.glob("observer_*/MONOLITH*.html")))
+    input_files.extend(sorted(run_dir.glob("observer_*.pt")))
     newest_input = max(int(p.stat().st_mtime_ns) for p in input_files if p.exists())
 
     output_files = [
@@ -741,6 +1045,7 @@ def _bundle_outputs_are_fresh(run_dir: Path) -> bool:
         run_dir / "observer_manifest.json",
         run_dir / "baseline_meta.json",
         run_dir / "baseline_state.json",
+        run_dir / "validation.json",
     ]
     rel_dir = run_dir / "relativity_cache"
     output_files.extend(sorted(rel_dir.glob("state_*.json")))
@@ -840,12 +1145,69 @@ def _emit_baseline_meta(run_dir: Path) -> Path:
         except Exception:
             pass
 
+    observer = _load_primary_observer_payload(run_dir)
+    meta = observer.get("meta", {}) if isinstance(observer, dict) else {}
+    provenance = observer.get("provenance", {}) if isinstance(observer, dict) else {}
+    features = observer.get("features") if isinstance(observer, dict) else None
+
+    def _short_hash(value: Any) -> str:
+        text = json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list, tuple)) else str(value)
+        return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    if isinstance(observer, dict):
+        canonical_ids = provenance.get("canonical_ids") if isinstance(provenance, dict) else None
+        dataset_hash = (
+            str(provenance.get("basis_hash"))
+            if isinstance(provenance, dict) and provenance.get("basis_hash")
+            else _short_hash(canonical_ids if canonical_ids is not None else observer.get("bt_uid_list", []))
+        )
+        code_hash = (
+            str(meta.get("git_hash"))
+            if isinstance(meta, dict) and meta.get("git_hash")
+            else _short_hash(meta)
+        )
+        weights_hash = (
+            str(provenance.get("weights_hash"))
+            if isinstance(provenance, dict) and provenance.get("weights_hash")
+            else _short_hash(observer.get("spectral_u_axis", "missing"))
+        )
+        kernel_params = dict(meta.get("kernel_params", {})) if isinstance(meta, dict) and isinstance(meta.get("kernel_params", {}), dict) else {}
+        if isinstance(meta, dict):
+            kernel_params.setdefault("kernel", meta.get("kernel", "unknown"))
+            kernel_params.setdefault("channel", meta.get("channel", "unknown"))
+        rks_dim = 0
+        try:
+            arr = np.asarray(features)
+            if arr.ndim >= 2:
+                rks_dim = int(arr.shape[-1])
+        except Exception:
+            rks_dim = 0
+        payload = {
+            "schema_version": "1.0",
+            "cache_version": "1.0",
+            "dataset_hash": dataset_hash,
+            "code_hash_or_commit": code_hash,
+            "weights_hash": weights_hash,
+            "kernel_params": kernel_params,
+            "rks_dim": rks_dim if rks_dim > 0 else 2048,
+            "crn_seed": int(provenance.get("crn_seed", meta.get("seed", 0))) if isinstance(provenance, dict) or isinstance(meta, dict) else 0,
+            "alpha": float(provenance.get("alpha", 1.0)) if isinstance(provenance, dict) else 1.0,
+            "timestamp_utc": str(meta.get("timestamp") or datetime.now(timezone.utc).isoformat()) if isinstance(meta, dict) else datetime.now(timezone.utc).isoformat(),
+            "verification_status": verification_status,
+            "provenance_source": "observer_payload",
+        }
+        out = run_dir / "baseline_meta.json"
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out
+
     payload = {
         "schema_version": "1.0",
         "cache_version": "1.0",
         "dataset_hash": "suite-generated",
         "code_hash_or_commit": "suite-generated",
         "weights_hash": "suite-generated",
+        "synthetic_placeholder": True,
+        "provenance_source": "suite-generated-placeholder",
         "kernel_params": {"kernel": "unknown"},
         "rks_dim": 2048,
         "crn_seed": 0,
@@ -858,7 +1220,369 @@ def _emit_baseline_meta(run_dir: Path) -> Path:
     return out
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return out
+
+
+def _normalize_rows_for_relativity(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        idx = int(row.get("index", i))
+        normalized.append(
+            {
+                "index": idx,
+                "bt_uid": str(row.get("bt_uid", f"article_{idx}")),
+                "title": str(row.get("title", "")),
+                "zone": str(row.get("zone", "unknown")),
+                "verdict": str(row.get("verdict", "UNKNOWN")).upper(),
+                "density": _safe_float(row.get("density", 0.0)),
+                "stress": _safe_float(row.get("stress", 0.0)),
+                "z_height": _safe_float(row.get("z_height", 0.0)),
+                "source": str(row.get("source", "")),
+                "perspective_tag": str(row.get("perspective_tag", "")),
+            }
+        )
+    return normalized
+
+
+def _build_article_maps(payload: Dict[str, Any], n_articles: int) -> Dict[str, Dict[int, Any]]:
+    article_metadata = payload.get("article_metadata") if isinstance(payload.get("article_metadata"), list) else []
+    walker_states = payload.get("walker_states") if isinstance(payload.get("walker_states"), list) else []
+    phantom_verdicts = payload.get("phantom_verdicts") if isinstance(payload.get("phantom_verdicts"), list) else []
+    walker_paths = payload.get("walker_paths") if isinstance(payload.get("walker_paths"), list) else []
+
+    metadata_by_idx: Dict[int, Dict[str, Any]] = {}
+    for i, item in enumerate(article_metadata):
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", i))
+        metadata_by_idx[idx] = item
+
+    state_by_idx: Dict[int, Dict[str, Any]] = {}
+    for i, item in enumerate(walker_states):
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", i))
+        state_by_idx[idx] = item
+
+    verdict_by_idx: Dict[int, Dict[str, Any]] = {}
+    for i, item in enumerate(phantom_verdicts):
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", i))
+        verdict_by_idx[idx] = item
+
+    path_by_idx: Dict[int, Dict[str, Any]] = {}
+    for i, item in enumerate(walker_paths):
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("article_idx", i))
+        path_by_idx[idx] = item
+
+    for idx in range(n_articles):
+        metadata_by_idx.setdefault(idx, {"index": idx})
+        state_by_idx.setdefault(idx, {})
+        verdict_by_idx.setdefault(idx, {})
+
+    return {
+        "metadata": metadata_by_idx,
+        "state": state_by_idx,
+        "verdict": verdict_by_idx,
+        "path": path_by_idx,
+    }
+
+
+def _summarize_path_trace(path_blob: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(path_blob, dict):
+        return {
+            "mean_work": 0.0,
+            "event_rate": 0.0,
+            "dominant_axis_index": -1,
+            "dominant_axis_label": "unknown",
+        }
+    diags = path_blob.get("step_diagnostics")
+    if not isinstance(diags, list) or not diags:
+        return {
+            "mean_work": 0.0,
+            "event_rate": 0.0,
+            "dominant_axis_index": -1,
+            "dominant_axis_label": "unknown",
+        }
+    total_work = 0.0
+    event_hits = 0
+    axis_weights: Optional[np.ndarray] = None
+    label_counts: Dict[str, int] = {}
+    for item in diags:
+        if not isinstance(item, dict):
+            continue
+        total_work += _safe_float(item.get("step_work", 0.0))
+        event_hits += 1 if bool(item.get("event_active", False)) else 0
+        axis_vec = item.get("step_axis_vector")
+        if axis_vec is not None:
+            arr = np.asarray(axis_vec, dtype=float).reshape(-1)
+            if arr.size:
+                if axis_weights is None:
+                    axis_weights = np.zeros_like(arr, dtype=float)
+                if arr.shape == axis_weights.shape:
+                    axis_weights += arr
+        axis_label = str(item.get("dominant_axis_label", "") or "").strip()
+        if axis_label:
+            label_counts[axis_label] = label_counts.get(axis_label, 0) + 1
+
+    dominant_axis_index = -1
+    if axis_weights is not None and axis_weights.size:
+        dominant_axis_index = int(np.argmax(axis_weights))
+    dominant_axis_label = "unknown"
+    if label_counts:
+        dominant_axis_label = max(label_counts.items(), key=lambda kv: kv[1])[0]
+    elif dominant_axis_index >= 0:
+        dominant_axis_label = f"bot_{dominant_axis_index}"
+
+    return {
+        "mean_work": float(total_work / max(len(diags), 1)),
+        "event_rate": float(event_hits / max(len(diags), 1)),
+        "dominant_axis_index": dominant_axis_index,
+        "dominant_axis_label": dominant_axis_label,
+    }
+
+
+def _nearest_neighbor_indices(coords: np.ndarray) -> np.ndarray:
+    coords = np.asarray(coords, dtype=float)
+    n = coords.shape[0]
+    if n <= 1:
+        return np.full((n,), -1, dtype=int)
+    deltas = coords[:, None, :] - coords[None, :, :]
+    dist = np.linalg.norm(deltas, axis=2)
+    np.fill_diagonal(dist, np.inf)
+    return np.argmin(dist, axis=1).astype(int)
+
+
+def _angle_deg(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    a = np.asarray(vec_a, dtype=float).reshape(-1)
+    b = np.asarray(vec_b, dtype=float).reshape(-1)
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    cos = float(np.dot(a, b) / (na * nb))
+    cos = max(-1.0, min(1.0, cos))
+    return float(np.degrees(np.arccos(cos)))
+
+
+def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = _load_primary_observer_payload(run_dir)
+    if not isinstance(payload, dict):
+        return {"status": "fallback", "reason": "observer payload unavailable"}
+
+    normalized_rows = _normalize_rows_for_relativity(rows)
+    n_articles = len(normalized_rows)
+    if n_articles == 0:
+        return {"status": "fallback", "reason": "no MONOLITH rows available"}
+
+    probes = np.asarray(payload.get("spectral_probe_magnitudes"), dtype=float)
+    works = np.asarray(payload.get("walker_work_integrals"), dtype=float).reshape(-1)
+    if probes.ndim != 2 or probes.shape[0] < n_articles:
+        return {"status": "fallback", "reason": "spectral_probe_magnitudes missing or malformed"}
+    if works.ndim != 1 or works.shape[0] < n_articles:
+        return {"status": "fallback", "reason": "walker_work_integrals missing or malformed"}
+
+    article_maps = _build_article_maps(payload, n_articles)
+    path_summaries = {
+        idx: _summarize_path_trace(article_maps["path"].get(idx))
+        for idx in range(n_articles)
+    }
+
+    baseline_coords = np.asarray(
+        [[row["density"], row["stress"], row["z_height"]] for row in normalized_rows],
+        dtype=float,
+    )
+    baseline_nn = _nearest_neighbor_indices(baseline_coords)
+    global_probe = np.asarray(probes[:n_articles], dtype=float)
+    probe_norms = np.linalg.norm(global_probe, axis=1, keepdims=True)
+    probe_norms[probe_norms <= 0.0] = 1.0
+    probe_unit = global_probe / probe_norms
+    global_probe_mean = np.mean(global_probe, axis=0)
+    global_work_mean = float(np.mean(works[:n_articles]))
+    global_event_rate = float(np.mean([path_summaries[idx]["event_rate"] for idx in range(n_articles)]))
+    global_anomaly_rate = float(
+        np.mean(
+            [
+                1.0 if bool(article_maps["state"].get(idx, {}).get("anomaly_flag", False)) else 0.0
+                for idx in range(n_articles)
+            ]
+        )
+    )
+    global_survival_pct = float(
+        np.mean(
+            [
+                0.0 if bool(article_maps["state"].get(idx, {}).get("anomaly_flag", False)) else 100.0
+                for idx in range(n_articles)
+            ]
+        )
+    )
+    global_top1_evr = 0.0
+    if global_probe_mean.size:
+        denom = float(np.sum(np.abs(global_probe_mean)))
+        if denom > 0.0:
+            global_top1_evr = float(np.max(np.abs(global_probe_mean)) / denom)
+
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+
+    written_state = 0
+    written_delta = 0
+    for idx in range(n_articles):
+        focus_row = normalized_rows[idx]
+        focus_probe = probe_unit[idx]
+        probe_distance = 1.0 - np.clip(np.sum(probe_unit * focus_probe, axis=1), -1.0, 1.0)
+        translation_coords = baseline_coords - baseline_coords[idx]
+        observer_coords = np.column_stack(
+            [
+                translation_coords[:, 0],
+                probe_distance,
+                translation_coords[:, 2],
+            ]
+        )
+        coord_delta = np.linalg.norm(observer_coords - baseline_coords, axis=1)
+        observer_nn = _nearest_neighbor_indices(observer_coords)
+        translation_nn = _nearest_neighbor_indices(translation_coords)
+        flip_mask = observer_nn != baseline_nn
+        flip_count = int(np.sum(flip_mask))
+        translation_flip_count = int(np.sum(translation_nn != baseline_nn))
+
+        focus_meta = article_maps["metadata"].get(idx, {})
+        focus_state = article_maps["state"].get(idx, {})
+        focus_verdict = article_maps["verdict"].get(idx, {})
+        focus_path = path_summaries.get(idx, {})
+        focus_top1_evr = 0.0
+        focus_probe_raw = global_probe[idx]
+        probe_sum = float(np.sum(np.abs(focus_probe_raw)))
+        if probe_sum > 0.0:
+            focus_top1_evr = float(np.max(np.abs(focus_probe_raw)) / probe_sum)
+
+        articles_blob: List[Dict[str, Any]] = []
+        for row_j, obs_coord, delta_j, sim_j in zip(normalized_rows, observer_coords, coord_delta, 1.0 - probe_distance):
+            articles_blob.append(
+                {
+                    "index": int(row_j["index"]),
+                    "bt_uid": row_j["bt_uid"],
+                    "title": row_j["title"],
+                    "zone": row_j["zone"],
+                    "verdict": row_j["verdict"],
+                    "density": row_j["density"],
+                    "stress": row_j["stress"],
+                    "z_height": row_j["z_height"],
+                    "observer_x": float(obs_coord[0]),
+                    "observer_y": float(obs_coord[1]),
+                    "observer_z": float(obs_coord[2]),
+                    "observer_probe_similarity": float(sim_j),
+                    "coord_delta": float(delta_j),
+                }
+            )
+
+        ranked_flip_indices = np.argsort(-coord_delta)
+        path_flip_delta: Dict[str, float] = {}
+        for j in ranked_flip_indices[:8]:
+            key = f"{normalized_rows[j]['bt_uid']}|{normalized_rows[j]['title'][:48]}"
+            path_flip_delta[key] = float(coord_delta[j])
+
+        state_payload = {
+            "observer_id": idx,
+            "articles": articles_blob,
+            "paths": [f"observer_{idx}/MONOLITH.html"],
+            "axes": {
+                "x": "observer_density_delta",
+                "y": "observer_probe_distance",
+                "z": "observer_z_delta",
+            },
+            "metrics": {
+                "observer_bt_uid": focus_row["bt_uid"],
+                "observer_title": focus_row["title"],
+                "observer_zone": focus_row["zone"],
+                "observer_verdict": str(focus_verdict.get("verdict", focus_row["verdict"])).upper(),
+                "observer_density": focus_row["density"],
+                "observer_stress": focus_row["stress"],
+                "observer_z_height": focus_row["z_height"],
+                "observer_axis_index": int(focus_path.get("dominant_axis_index", -1)),
+                "observer_axis_label": str(focus_path.get("dominant_axis_label", "unknown")),
+                "observer_mean_work": float(focus_path.get("mean_work", _safe_float(works[idx]))),
+                "observer_event_rate": float(focus_path.get("event_rate", 0.0)),
+                "global_mean_work": global_work_mean,
+                "global_event_rate": global_event_rate,
+                "global_survival_pct": global_survival_pct,
+                "observer_survival_pct": 0.0 if bool(focus_state.get("anomaly_flag", False)) else 100.0,
+            },
+            "provenance": {
+                "source": "observer_payload_relativity_v1",
+                "synthetic_placeholder": False,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "basis_hash": str(payload.get("provenance", {}).get("basis_hash", "")),
+                "observer_bt_uid": focus_row["bt_uid"],
+            },
+        }
+
+        state_path = rel_dir / f"state_{idx}.json"
+        state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+        written_state += 1
+
+        delta_payload = {
+            "observer_id": idx,
+            "null_observer_equivalence": {
+                "equivalent": bool(np.max(coord_delta) <= 1e-9 and flip_count == 0),
+                "max_coord_delta": float(np.max(coord_delta)),
+                "path_flip_count": flip_count,
+                "axis_rotation_deg": float(_angle_deg(focus_probe_raw, global_probe_mean)),
+            },
+            "path_flip_delta": path_flip_delta,
+            "metrics_delta": {
+                "d_rupture_rate": float((1.0 if bool(focus_state.get("anomaly_flag", False)) else 0.0) - global_anomaly_rate),
+                "d_mean_work": float(focus_path.get("mean_work", _safe_float(works[idx])) - global_work_mean),
+                "d_survival_pct": float((0.0 if bool(focus_state.get("anomaly_flag", False)) else 100.0) - global_survival_pct),
+            },
+            "axis_delta": {
+                "rotation_deg": float(_angle_deg(focus_probe_raw, global_probe_mean)),
+                "d_explained_variance_axis1": float(focus_top1_evr - global_top1_evr),
+            },
+            "translation_only_comparison": {
+                "d_path_flip_count": int(flip_count - translation_flip_count),
+                "d_mean_work": float(focus_path.get("mean_work", _safe_float(works[idx])) - global_work_mean),
+            },
+            "provenance": {
+                "source": "observer_payload_relativity_v1",
+                "synthetic_placeholder": False,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "observer_bt_uid": focus_row["bt_uid"],
+            },
+        }
+        delta_path = rel_dir / f"delta_{idx}.json"
+        delta_path.write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
+        written_delta += 1
+
+    return {
+        "status": "success",
+        "state_files": written_state,
+        "delta_files": written_delta,
+        "mode": "observer_payload_relativity_v1",
+    }
+
+
 def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    real = _emit_relativity_from_payload(run_dir, rows)
+    if real.get("status") == "success":
+        return {
+            "state_files": int(real.get("state_files", 0)),
+            "delta_files": int(real.get("delta_files", 0)),
+            "mode": str(real.get("mode", "observer_payload_relativity_v1")),
+        }
+
     rel_dir = run_dir / "relativity_cache"
     rel_dir.mkdir(parents=True, exist_ok=True)
     written_state = 0
@@ -874,13 +1598,15 @@ def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict
                 "paths": [f"observer_{idx}/MONOLITH.html"],
                 "axes": {"x": "density", "y": "stress"},
                 "metrics": {},
-                "provenance": {"source": "suite-default"},
+                "synthetic_placeholder": True,
+                "provenance": {"source": "suite-default", "synthetic_placeholder": True},
             }
             state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
             written_state += 1
         if not delta_path.exists():
             delta_payload = {
                 "observer_id": idx,
+                "synthetic_placeholder": True,
                 "null_observer_equivalence": {"max_coord_delta": 0.0, "path_flip_count": 0, "axis_rotation_deg": 0.0},
                 "path_flip_delta": {},
                 "metrics_delta": {"d_rupture_rate": 0.0, "d_mean_work": 0.0, "d_survival_pct": 0.0},
@@ -888,7 +1614,12 @@ def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict
             }
             delta_path.write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
             written_delta += 1
-    return {"state_files": written_state, "delta_files": written_delta}
+    return {
+        "state_files": written_state,
+        "delta_files": written_delta,
+        "mode": "suite-default",
+        "fallback_reason": str(real.get("reason", "observer payload unavailable")),
+    }
 
 
 def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -960,6 +1691,20 @@ def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[s
     }
 
 
+def _emit_validation_json(run_dir: Path) -> Path:
+    validation_path = run_dir / "validation.json"
+    if validation_path.exists():
+        return validation_path
+
+    payload = {
+        "nmi": 0.0,
+        "ari": 0.0,
+        "source": "suite-default",
+    }
+    validation_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return validation_path
+
+
 def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     run_dir = Path(run_dir)
     monolith_csv = run_dir / "MONOLITH_DATA.csv"
@@ -973,6 +1718,7 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     rows = _load_monolith_rows(monolith_csv)
     baseline_meta = _emit_baseline_meta(run_dir)
     baseline_state = _emit_baseline_state(run_dir, rows)
+    validation_json = _emit_validation_json(run_dir)
     rel_stats = _emit_relativity_defaults(run_dir, rows)
     label_paths = _emit_label_derivatives(run_dir, rows)
 
@@ -980,6 +1726,7 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
         "status": "success",
         "baseline_meta": str(baseline_meta),
         "baseline_state": str(baseline_state),
+        "validation_json": str(validation_json),
         "copied": copied,
         "relativity": rel_stats,
         "labels": label_paths,
@@ -2478,6 +3225,18 @@ def main():
                     print(f"[BUNDLE][WARN] {bundle_result}")
                 else:
                     print(f"[BUNDLE][OK] {bundle_result.get('observer_manifest')}")
+
+                if getattr(args, 'waterfall', False):
+                    waterfall_result = generate_waterfall_dashboards(
+                        output_dir,
+                        ground_truth=_load_ground_truth_for_corpus(corpus),
+                        projection_method="pca",
+                    )
+                    result["waterfall"] = waterfall_result
+                    if waterfall_result.get("status") in {"success", "partial"}:
+                        print(f"[WATERFALL][OK] {waterfall_result.get('summary_path')}")
+                    else:
+                        print(f"[WATERFALL][WARN] {waterfall_result}")
         
                 # Probe (OPTIONAL - only if hypotheses provided)
                 if probe_enabled:

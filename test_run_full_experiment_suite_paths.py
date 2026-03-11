@@ -1,4 +1,5 @@
 import shutil
+import sys
 from datetime import datetime as real_datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,15 +29,11 @@ def test_create_experiment_directory_creates_timestamped_dir(tmp_path, monkeypat
 
     exp_dir = suite.create_experiment_directory()
 
-    assert exp_dir == Path("experiments_20260228_123456")
+    assert exp_dir == Path("outputs") / "experiments" / "runs" / "experiments_20260228_123456"
     assert exp_dir.exists()
     assert exp_dir.is_dir()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known location split: create_experiment_directory currently writes at repo root, not outputs/."
-)
 def test_create_experiment_directory_canonical_outputs_path_expected(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fixed_now = real_datetime(2026, 2, 28, 12, 34, 56)
@@ -44,7 +41,7 @@ def test_create_experiment_directory_canonical_outputs_path_expected(tmp_path, m
 
     exp_dir = suite.create_experiment_directory()
 
-    assert exp_dir == Path("outputs") / "experiments_20260228_123456"
+    assert exp_dir == Path("outputs") / "experiments" / "runs" / "experiments_20260228_123456"
 
 
 def test_run_post_thesis_sync_invokes_registry_builder_when_present(tmp_path, monkeypatch):
@@ -117,3 +114,43 @@ def test_run_post_thesis_sync_with_validation_invokes_validator_when_present(tmp
     assert validate_kwargs["text"] is True
     assert validate_kwargs["encoding"] == "utf-8"
     assert validate_kwargs["errors"] == "replace"
+
+
+def test_generate_waterfall_dashboards_uses_batch_checkpoint_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_dir = tmp_path / "outputs" / "experiments" / "runs" / "exp" / "matern" / "cls" / "sythgen" / "high_quality_articles.jsonl"
+    checkpoint_dir = run_dir / "checkpoints" / "batch"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    calls = []
+
+    def fake_run_waterfall_analysis(checkpoint_dir, output_dir=None, ground_truth=None, projection_method="pca"):
+        calls.append(
+            {
+                "checkpoint_dir": Path(checkpoint_dir),
+                "output_dir": Path(output_dir),
+                "ground_truth": ground_truth,
+                "projection_method": projection_method,
+            }
+        )
+        return {
+            "status": "success",
+            "dashboard_path": str(Path(output_dir) / "waterfall_dashboard.html"),
+            "report_path": str(Path(output_dir) / "waterfall_report.txt"),
+            "metrics_path": str(Path(output_dir) / "waterfall_metrics.json"),
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "analysis.waterfall_viz",
+        SimpleNamespace(run_waterfall_analysis=fake_run_waterfall_analysis),
+    )
+
+    result = suite.generate_waterfall_dashboards(run_dir, ground_truth={0: "a0"})
+
+    assert result["status"] == "success"
+    assert len(calls) == 1
+    assert calls[0]["checkpoint_dir"] == checkpoint_dir
+    assert calls[0]["output_dir"] == run_dir / "waterfall_analysis"
+    assert calls[0]["ground_truth"] == {0: "a0"}
+    assert calls[0]["projection_method"] == "pca"

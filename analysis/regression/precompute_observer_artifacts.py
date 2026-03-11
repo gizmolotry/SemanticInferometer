@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List
 
 
-ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_article_indices(monolith_csv: Path) -> List[int]:
@@ -59,7 +59,8 @@ def _link_or_copy(src: Path, dst: Path, overwrite: bool) -> str:
 def _render_focused(run_dir: Path, output_path: Path, observer_idx: int, strict: bool) -> None:
     cmd = [
         sys.executable,
-        str(ROOT / "analysis" / "MONOLITH_VIZ.py"),
+        "-m",
+        "analysis.MONOLITH_VIZ",
         str(run_dir),
         "--output",
         str(output_path),
@@ -68,7 +69,7 @@ def _render_focused(run_dir: Path, output_path: Path, observer_idx: int, strict:
     ]
     if strict:
         cmd.append("--strict")
-    subprocess.run(cmd, check=True, cwd=str(ROOT))
+    subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
 
 
 def main() -> None:
@@ -107,6 +108,8 @@ def main() -> None:
             if out_path.exists() and not args.overwrite:
                 action = "exists"
             else:
+                if out_path.exists():
+                    out_path.unlink()
                 _render_focused(run_dir, out_path, idx, args.strict)
                 action = "rendered"
         elif args.mode == "copy":
