@@ -5,6 +5,7 @@ import types
 import shutil
 
 import pytest
+from analysis.verification import verify_run as verify_mod
 
 
 def _install_dash_stubs() -> None:
@@ -254,3 +255,23 @@ def test_load_verification_state_malformed_summary_rows(monkeypatch, tmp_path):
     assert state["n_total"] == 1
     assert state["survival_pct"] == 0.0
     assert state["geometric_friction"] == 2.0
+
+
+def test_verify_run_leaf_resolution_supports_grouped_corpus_layout(tmp_path):
+    exp_dir = tmp_path / "outputs" / "experiments" / "runs" / "exp123"
+    leaf = exp_dir / "matern" / "cls" / "sythgen" / "high_quality_articles.jsonl"
+    leaf.mkdir(parents=True, exist_ok=True)
+    (leaf / "MONOLITH_DATA.csv").write_text("index,title\n0,A\n", encoding="utf-8")
+
+    all_layers = [
+        {
+            "layer_id": "matern/cls",
+            "layer_name": "cls",
+            "artifacts": {"high_quality_articles.jsonl": {"42": {"provenance": {}}}},
+            "layer_dir": exp_dir / "matern" / "cls" / "sythgen",
+        }
+    ]
+
+    leaves = verify_mod._leaf_output_dirs(exp_dir, all_layers)
+
+    assert leaves == [(leaf, "matern/cls")]

@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import torch
 import numpy as np
 import pandas as pd
@@ -140,8 +141,26 @@ def discover_all_layers(exp_dir: Path) -> List[Dict[str, Any]]:
         # Layout B: group/kernel_seedN -> rel_root parts: (group, kernel_seedN)
         parts = rel_root.parts
         
-        if len(parts) >= 3:
-            # Likely Layout A: kernel/channel/corpus
+        if len(parts) >= 4:
+            # Modern Layout A: kernel/channel/group/corpus
+            kernel, channel, group, corpus = parts[0], parts[1], parts[2], parts[3]
+            layer_id = f"{kernel}/{channel}"
+            layer_name = channel
+            if layer_id not in discovered:
+                discovered[layer_id] = {"name": layer_name, "corpora": {}, "dir": exp_dir / kernel / channel / group}
+            if discovered[layer_id].get("dir") is None or not Path(discovered[layer_id]["dir"]).exists():
+                discovered[layer_id]["dir"] = exp_dir / kernel / channel / group
+            if corpus not in discovered[layer_id]["corpora"]:
+                discovered[layer_id]["corpora"][corpus] = {}
+
+            for f in observer_files:
+                seed = f.split("_")[-1].replace(".pt", "")
+                data = load_pt_file(Path(root) / f)
+                if data:
+                    discovered[layer_id]["corpora"][corpus][seed] = data
+
+        elif len(parts) >= 3:
+            # Legacy Layout A: kernel/channel/corpus
             kernel, channel, corpus = parts[0], parts[1], parts[2]
             layer_id = f"{kernel}/{channel}"
             layer_name = channel
@@ -302,6 +321,16 @@ def resolve_alpha_sweep_path(layer_dir: Path, exp_dir: Path, corpus: str = "real
         for p in layer_dir.rglob("alpha_sweep_results.json"): return p
     return None
 
+def resolve_validation_path(layer_dir: Path) -> Optional[Path]:
+    """Deterministically resolve validation.json under a layer directory."""
+    if not layer_dir.exists():
+        return None
+    candidates = sorted(
+        layer_dir.rglob("validation.json"),
+        key=lambda p: p.relative_to(layer_dir).as_posix(),
+    )
+    return candidates[0] if candidates else None
+
 def check_alpha_sweep_sanity(layer_dir: Path, exp_dir: Path) -> Dict[str, Any]:
     """Check 4: Alpha sweep energy decrease (monotonic-ish)."""
     sweep_path = resolve_alpha_sweep_path(layer_dir, exp_dir)
@@ -370,14 +399,16 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
     if status == LayerStatus.VERIFIED and fail_reasons: status = LayerStatus.UNVERIFIED
         
     mi_score = None
-    for p in layer_dir.rglob("validation.json"):
+    validation_path = resolve_validation_path(layer_dir)
+    validation_found = validation_path is not None
+    if validation_path is not None:
         try:
-            with open(p) as f:
+            with open(validation_path) as f:
                 vdata = json.load(f)
                 mi_score = vdata.get("nmi", vdata.get("normalized_mutual_info"))
-                if mi_score is not None: break
-        except: pass
-    if mi_score is None:
+        except:
+            mi_score = None
+    if not validation_found and mi_score is None:
         for p in layer_dir.rglob("synthetic_validation_summary.json"):
             try:
                 with open(p) as f:
@@ -385,6 +416,21 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
                     mi_score = summary.get("nmi", summary.get("mean_nmi"))
                     if mi_score is not None: break
             except: pass
+    mi_score_valid = (
+        mi_score is not None
+        and isinstance(mi_score, (int, float))
+        and not isinstance(mi_score, bool)
+        and math.isfinite(float(mi_score))
+        and 0.0 <= float(mi_score) <= 1.0
+    )
+    if not validation_found:
+        append_unique_reason(fail_reasons, "Missing required artifact: validation.json")
+    elif not mi_score_valid:
+        append_unique_reason(fail_reasons, "Invalid or missing validation NMI in validation.json")
+    if status == LayerStatus.VERIFIED and not validation_found:
+        status = LayerStatus.MISSING_ARTIFACTS
+    elif status == LayerStatus.VERIFIED and not mi_score_valid:
+        status = LayerStatus.NON_COMPARABLE
 
     crn_pass = to_native(crn["pass"])
     seed_pass = to_native(stability["pass"])
@@ -397,7 +443,7 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
             {"name": "control_ordering", "pass": to_native(ordering["pass"]), "values": to_native(ordering["values"]), "valid": to_native(ordering["valid"])},
             {"name": "seed_stability", "pass": seed_pass, "value": to_native(stability["value"]), "valid": to_native(stability["valid"])},
             {"name": "alpha_sweep_sanity", "pass": to_native(alpha_sweep["pass"]), "value": to_native(alpha_sweep["value"]), "path": to_native(alpha_sweep["path"])},
-            {"name": "mi_score", "pass": None, "value": to_native(mi_score)}
+            {"name": "mi_score", "pass": to_native(mi_score_valid), "value": to_native(mi_score)}
         ],
         "fail_reasons": to_native(fail_reasons), "notes": []
     }
