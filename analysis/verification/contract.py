@@ -231,6 +231,13 @@ def validate_baseline_state(state: Dict[str, Any]) -> ValidationResult:
 def validate_validation_json(validation: Dict[str, Any]) -> ValidationResult:
     errors: List[str] = []
     warnings: List[str] = []
+    source = str(validation.get("source", "")).strip().lower()
+    provenance_source = str(validation.get("provenance_source", "")).strip().lower()
+    if bool(validation.get("synthetic_placeholder", False)) or source in {"suite-default", "suite-default-placeholder"}:
+        errors.append("validation contains synthetic placeholder data")
+    elif provenance_source in {"suite-default", "suite-default-placeholder"}:
+        errors.append("validation provenance_source indicates synthetic placeholder data")
+
     if "nmi" not in validation:
         errors.append("validation missing 'nmi'")
         return ValidationResult(False, errors, warnings)

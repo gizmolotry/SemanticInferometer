@@ -616,6 +616,48 @@ def test_load_contract_state_rejects_invalid_track_nmi_schema(monkeypatch, mod, 
     assert any("validation.track_metrics.T2.nmi must be numeric" in e for e in state["errors"])
 
 
+def test_load_contract_state_rejects_synthetic_placeholder_validation(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_placeholder_validation"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(
+        run_dir / "validation.json",
+        {
+            "source": "suite-default",
+            "synthetic_placeholder": True,
+            "reason": "validation.json missing during bundle emission",
+        },
+    )
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {
+                    "layer_id": "rbf/cls",
+                    "layer_name": "cls",
+                    "status": "VERIFIED",
+                    "checks": [{"name": "crn_locked", "pass": True}],
+                    "fail_reasons": [],
+                }
+            ],
+            "global_pass": True,
+        },
+    )
+    (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
+    _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "topic", "n_articles": 1}]})
+    _write_json(run_dir / "labels" / "derived" / "group_matrix.json", {"groups": ["topic"], "cost_matrix": [[0.0]]})
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_contract_state("rk", "global")
+    assert state["status"] == "INVALID_SCHEMA", state
+    assert any("validation contains synthetic placeholder data" in e for e in state["errors"]), state["errors"]
+    assert any("validation missing 'nmi'" in e for e in state["errors"]), state["errors"]
+
+
 def test_load_contract_state_invalid_schema_missing_validation_nmi(monkeypatch, mod, tmp_path):
     run_dir = tmp_path / "run_bad_validation"
     (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)

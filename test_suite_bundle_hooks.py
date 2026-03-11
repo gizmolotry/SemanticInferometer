@@ -40,11 +40,13 @@ def test_materialize_baseline_bundle_happy_path(mock_run_dir):
         patch("run_full_experiment_suite._bundle_outputs_are_fresh") as mock_fresh,
         patch("run_full_experiment_suite.emit_consumer_contract_bundle") as mock_emit,
         patch("run_full_experiment_suite._validate_required_bundle_outputs") as mock_validate,
+        patch("analysis.verification.contract.evaluate_consumer_contract") as mock_contract,
     ):
         mock_run.return_value = MagicMock(returncode=0)
         mock_fresh.return_value = False
         mock_emit.return_value = {"status": "success"}
         mock_validate.return_value = []
+        mock_contract.return_value = MagicMock(contract_ok=True, missing_required_artifacts=[], schema_errors=[])
 
         result = materialize_baseline_bundle(mock_run_dir, strict=True)
 
@@ -173,11 +175,13 @@ def test_materialize_baseline_bundle_attempts_csv_hydration_when_missing(mock_ru
         patch("run_full_experiment_suite._bundle_outputs_are_fresh") as mock_fresh,
         patch("run_full_experiment_suite.emit_consumer_contract_bundle") as mock_emit,
         patch("run_full_experiment_suite._validate_required_bundle_outputs") as mock_validate,
+        patch("analysis.verification.contract.evaluate_consumer_contract") as mock_contract,
     ):
         mock_run.return_value = MagicMock(returncode=0)
         mock_fresh.return_value = False
         mock_emit.return_value = {"status": "success"}
         mock_validate.return_value = []
+        mock_contract.return_value = MagicMock(contract_ok=True, missing_required_artifacts=[], schema_errors=[])
 
         def _fake_ensure(run_dir: Path):
             (run_dir / "MONOLITH_DATA.csv").write_text("index,title,bt_uid,density,stress,zone\n0,A,u0,0.5,0.5,Bridge\n", encoding="utf-8")
@@ -189,6 +193,26 @@ def test_materialize_baseline_bundle_attempts_csv_hydration_when_missing(mock_ru
 
         assert result["status"] == "success"
         assert mock_run.call_count == 2
+
+
+def test_materialize_baseline_bundle_rejects_fresh_but_invalid_consumer_contract(mock_run_dir):
+    with (
+        patch("run_full_experiment_suite._bundle_outputs_are_fresh") as mock_fresh,
+        patch("analysis.verification.contract.evaluate_consumer_contract") as mock_contract,
+    ):
+        mock_fresh.return_value = True
+        mock_contract.return_value = MagicMock(
+            contract_ok=False,
+            missing_required_artifacts=["verification_report.json"],
+            schema_errors=["validation contains synthetic placeholder data"],
+        )
+
+        result = materialize_baseline_bundle(mock_run_dir, strict=True)
+
+        assert result["status"] == "failed"
+        assert result["stage"] == "consumer_contract"
+        assert "verification_report.json" in result["error"]
+        assert "validation contains synthetic placeholder data" in result["error"]
 
 
 def _seed_bundle_outputs(run_dir: Path, *, input_ns: int = 1_000_000_000, output_ns: int = 2_000_000_000) -> None:
@@ -342,6 +366,11 @@ def test_emit_consumer_contract_bundle_marks_placeholder_artifacts_synthetic(tmp
     baseline_state = json.loads((run_dir / "baseline_state.json").read_text(encoding="utf-8"))
     assert baseline_state["metrics"]["source"] == "MONOLITH_DATA.csv"
     assert baseline_state["paths"] == ["observer_0/MONOLITH.html"]
+
+    validation_payload = json.loads((run_dir / "validation.json").read_text(encoding="utf-8"))
+    assert validation_payload["source"] == "suite-default"
+    assert validation_payload["synthetic_placeholder"] is True
+    assert "nmi" not in validation_payload
 
     relativity_state = json.loads((run_dir / "relativity_cache" / "state_0.json").read_text(encoding="utf-8"))
     assert relativity_state["provenance"]["source"] == "suite-default"

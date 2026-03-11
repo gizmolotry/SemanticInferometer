@@ -578,6 +578,22 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     target_dir = _resolve_bundle_target_dir(run_dir)
     monolith_out = target_dir / "MONOLITH.html"
     monolith_csv = target_dir / "MONOLITH_DATA.csv"
+
+    def _consumer_contract_failure_payload() -> Optional[Dict[str, Any]]:
+        from analysis.verification.contract import evaluate_consumer_contract
+
+        diagnostics = evaluate_consumer_contract(target_dir)
+        if diagnostics.contract_ok:
+            return None
+        reasons = diagnostics.missing_required_artifacts + diagnostics.schema_errors
+        return {
+            "status": "failed",
+            "stage": "consumer_contract",
+            "error": "; ".join(reasons) if reasons else "consumer contract invalid",
+            "run_dir": str(run_dir),
+            "target_dir": str(target_dir),
+        }
+
     if not monolith_csv.exists():
         monolith_ready = _ensure_monolith_csv_ready(target_dir)
         if monolith_ready.get("status") not in {"success", "already_exists"}:
@@ -599,6 +615,9 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
             "target_dir": str(target_dir),
         }
     if _bundle_outputs_are_fresh(target_dir):
+        contract_failure = _consumer_contract_failure_payload()
+        if contract_failure is not None:
+            return contract_failure
         return {
             "status": "skipped",
             "reason": "bundle already fresh",
@@ -682,6 +701,9 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "run_dir": str(run_dir),
                 "target_dir": str(target_dir),
             }
+        contract_failure = _consumer_contract_failure_payload()
+        if contract_failure is not None:
+            return contract_failure
     except Exception as exc:
         return {
             "status": "failed",
@@ -1697,9 +1719,9 @@ def _emit_validation_json(run_dir: Path) -> Path:
         return validation_path
 
     payload = {
-        "nmi": 0.0,
-        "ari": 0.0,
         "source": "suite-default",
+        "synthetic_placeholder": True,
+        "reason": "validation.json missing during bundle emission; canonical validation metrics unavailable",
     }
     validation_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return validation_path
