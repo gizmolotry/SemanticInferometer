@@ -431,6 +431,7 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     observer_id = _observer_id_from_value(observer_value)
     state_blob = {}
     delta_blob = {}
+    observer_non_comparable_reasons: List[str] = []
     if observer_id is not None:
         rel_dir = run_dir / "relativity_cache"
         state_path = rel_dir / f"state_{observer_id}.json"
@@ -439,16 +440,28 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
             state_blob = _safe_json(state_path, {})
             if _is_synthetic_placeholder_blob(state_blob):
                 missing_optional.append(f"relativity_cache/state_{observer_id}.json (synthetic placeholder)")
+                observer_non_comparable_reasons.append(
+                    f"observer relativity state_{observer_id}.json is synthetic placeholder data"
+                )
                 state_blob = {}
         else:
             missing_optional.append(f"relativity_cache/state_{observer_id}.json")
+            observer_non_comparable_reasons.append(
+                f"observer relativity state_{observer_id}.json is missing"
+            )
         if delta_path.exists():
             delta_blob = _safe_json(delta_path, {})
             if _is_synthetic_placeholder_blob(delta_blob):
                 missing_optional.append(f"relativity_cache/delta_{observer_id}.json (synthetic placeholder)")
+                observer_non_comparable_reasons.append(
+                    f"observer relativity delta_{observer_id}.json is synthetic placeholder data"
+                )
                 delta_blob = {}
         else:
             missing_optional.append(f"relativity_cache/delta_{observer_id}.json")
+            observer_non_comparable_reasons.append(
+                f"observer relativity delta_{observer_id}.json is missing"
+            )
 
     hidden_path = diag.paths.get("labels/hidden_groups.csv")
     hidden_rows, hidden_errors = _read_hidden_groups(hidden_path)
@@ -467,9 +480,11 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     # Optional artifacts can degrade panels but should not hard-fail gating.
     optional_schema_errors = hidden_errors + gs_errors + gm_errors
     status = "OK" if (diag.contract_ok and len(missing_required) == 0) else "INVALID_SCHEMA"
+    if status == "OK" and observer_non_comparable_reasons:
+        status = LayerStatus.NON_COMPARABLE.value
     return {
         "status": status,
-        "errors": errors + optional_schema_errors,
+        "errors": errors + observer_non_comparable_reasons + optional_schema_errors,
         "missing_required_artifacts": sorted(set(missing_required)),
         "missing_optional_artifacts": sorted(set(missing_optional)),
         "schema_errors": errors,
@@ -1894,6 +1909,8 @@ def _compute_gate_presentation(
         badge_text = "[TYPE 2 DISSONANCE]"
     elif claims_enabled:
         badge_text = "[VERIFIED]"
+    elif str(contract_status).upper() == LayerStatus.NON_COMPARABLE.value:
+        badge_text = "[NON-COMPARABLE]"
     elif str(contract_status).upper() != "OK":
         badge_text = "[INVALID SCHEMA]"
     elif str(verification_status).upper() == LayerStatus.MISSING_ARTIFACTS.value:

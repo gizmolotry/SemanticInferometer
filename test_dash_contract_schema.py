@@ -378,11 +378,15 @@ def test_load_contract_state_observer_missing_artifacts_does_not_fallback_to_glo
     monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
     state = mod.load_contract_state("rk", "article:7")
 
-    assert state["status"] == "OK", f"Expected global contract OK even when observer artifacts are missing, got: {state['status']}"
+    assert state["status"] == "NON_COMPARABLE", (
+        f"Expected observer mode to be NON_COMPARABLE when observer artifacts are missing, got: {state['status']}"
+    )
     assert state["observer_state"] == {}, f"Expected missing observer_state to stay empty, got: {state['observer_state']}"
     assert state["observer_delta"] == {}, f"Expected missing observer_delta to stay empty, got: {state['observer_delta']}"
     assert "relativity_cache/state_7.json" in state["missing_optional_artifacts"], state["missing_optional_artifacts"]
     assert "relativity_cache/delta_7.json" in state["missing_optional_artifacts"], state["missing_optional_artifacts"]
+    assert any("observer relativity state_7.json is missing" in e for e in state["errors"]), state["errors"]
+    assert any("observer relativity delta_7.json is missing" in e for e in state["errors"]), state["errors"]
     assert state["baseline_state"]["articles"] == [{"id": 1}], "Expected baseline payload to remain distinct from missing observer payload"
 
 
@@ -466,6 +470,66 @@ def test_load_contract_state_rejects_synthetic_placeholder_baseline_and_relativi
         "Synthetic placeholder baseline/relativity artifacts should be rejected instead of accepted as real observer data"
     )
     assert any("placeholder" in e.lower() or "suite-generated" in e.lower() for e in state["errors"]), state["errors"]
+
+
+def test_load_contract_state_marks_synthetic_observer_relativity_non_comparable(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_placeholder_observer_only"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+    (run_dir / "relativity_cache").mkdir(parents=True, exist_ok=True)
+
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(run_dir / "validation.json", {"nmi": 0.75})
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {
+                    "layer_id": "rbf/cls",
+                    "layer_name": "cls",
+                    "status": "VERIFIED",
+                    "checks": [{"name": "crn_locked", "pass": True}],
+                    "fail_reasons": [],
+                }
+            ],
+            "global_pass": True,
+        },
+    )
+    (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
+    _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "topic", "n_articles": 1}]})
+    _write_json(run_dir / "labels" / "derived" / "group_matrix.json", {"groups": ["topic"], "cost_matrix": [[0.0]]})
+    _write_json(
+        run_dir / "relativity_cache" / "state_7.json",
+        {
+            "observer_id": 7,
+            "articles": [],
+            "paths": [],
+            "axes": {},
+            "metrics": {},
+            "provenance": {"source": "suite-default"},
+        },
+    )
+    _write_json(
+        run_dir / "relativity_cache" / "delta_7.json",
+        {
+            "observer_id": 7,
+            "null_observer_equivalence": {"max_coord_delta": 0.0},
+            "path_flip_delta": {},
+            "metrics_delta": {},
+            "axis_delta": {},
+            "synthetic_placeholder": True,
+        },
+    )
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_contract_state("rk", "article:7")
+
+    assert state["status"] == "NON_COMPARABLE", state
+    assert "relativity_cache/state_7.json (synthetic placeholder)" in state["missing_optional_artifacts"], state["missing_optional_artifacts"]
+    assert "relativity_cache/delta_7.json (synthetic placeholder)" in state["missing_optional_artifacts"], state["missing_optional_artifacts"]
+    assert any("synthetic placeholder data" in e for e in state["errors"]), state["errors"]
 
 
 def test_load_contract_state_accepts_track_nmi_schema(monkeypatch, mod, tmp_path):
