@@ -358,43 +358,6 @@ class ExperimentData:
 # =============================================================================
 # DATA LOADING
 # =============================================================================
-def _load_observer_focus_payloads(experiment_dir: Optional[Path], observer_idx: Optional[int]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    if experiment_dir is None or observer_idx is None:
-        return None, None
-    try:
-        focus_idx = int(observer_idx)
-    except Exception:
-        return None, None
-    if focus_idx < 0:
-        return None, None
-
-    rel_dir = Path(experiment_dir) / "relativity_cache"
-    state_path = rel_dir / f"state_{focus_idx}.json"
-    delta_path = rel_dir / f"delta_{focus_idx}.json"
-
-    def _read_json(path: Path) -> Optional[Dict[str, Any]]:
-        if not path.exists():
-            return None
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                payload = json.load(f)
-            return payload if isinstance(payload, dict) else None
-        except Exception:
-            return None
-
-    return _read_json(state_path), _read_json(delta_path)
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        out = float(value)
-    except Exception:
-        return float(default)
-    if not np.isfinite(out):
-        return float(default)
-    return out
-
-
 def _find_nested_value(obj: Any, keys: List[str]) -> Optional[Any]:
     """Find first matching key in nested dict/list structures."""
     target = {k.lower() for k in keys}
@@ -4352,34 +4315,6 @@ def create_monolith_cockpit(
     focus_idx: Optional[int] = None
     if observer_idx is not None and 0 <= int(observer_idx) < n_articles:
         focus_idx = int(observer_idx)
-    focus_state_payload, focus_delta_payload = _load_observer_focus_payloads(exp.experiment_dir, focus_idx)
-    observer_coord_override: Optional[np.ndarray] = None
-    observer_probe_similarity: Optional[np.ndarray] = None
-    observer_coord_delta: Optional[np.ndarray] = None
-    if isinstance(focus_state_payload, dict):
-        articles_blob = focus_state_payload.get("articles")
-        if isinstance(articles_blob, list) and articles_blob:
-            coords = np.full((n_articles, 3), np.nan, dtype=float)
-            probe_sim = np.full(n_articles, np.nan, dtype=float)
-            coord_delta = np.full(n_articles, np.nan, dtype=float)
-            for item in articles_blob:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    idx = int(item.get("index", -1))
-                except Exception:
-                    continue
-                if idx < 0 or idx >= n_articles:
-                    continue
-                coords[idx, 0] = _safe_float(item.get("observer_x", np.nan), default=np.nan)
-                coords[idx, 1] = _safe_float(item.get("observer_y", np.nan), default=np.nan)
-                coords[idx, 2] = _safe_float(item.get("observer_z", np.nan), default=np.nan)
-                probe_sim[idx] = _safe_float(item.get("observer_probe_similarity", np.nan), default=np.nan)
-                coord_delta[idx] = _safe_float(item.get("coord_delta", np.nan), default=np.nan)
-            if np.isfinite(coords).any():
-                observer_coord_override = coords
-                observer_probe_similarity = probe_sim
-                observer_coord_delta = coord_delta
 
     # Spectral data
     spectral_evr = exp.spectral_evr if exp.spectral_evr is not None else np.ones(n_articles) * 0.5
@@ -4628,27 +4563,17 @@ def create_monolith_cockpit(
 
     # GROUND-STATE RESET: no robust scaling, no span sync, no clip/stretch.
     positions_3d = article_proj.copy()
-    observer_geometry_active = False
-    if observer_coord_override is not None and observer_coord_override.shape == positions_3d.shape:
-        finite_override = np.isfinite(observer_coord_override)
-        if finite_override.any():
-            positions_3d = positions_3d.copy()
-            positions_3d[finite_override] = observer_coord_override[finite_override]
-            observer_geometry_active = True
     positions_2d = positions_3d[:, :2]
 
     # RAW POINT Z: use persisted pure_z from MONOLITH_DATA.csv when available.
-    if not observer_geometry_active:
-        if 'monolith_df' in locals() and 'pure_z' in monolith_df.columns:
-            pure_z = monolith_df['pure_z'].to_numpy(dtype=float)
-        elif 'unified_z_height' in locals() and len(unified_z_height) == n_articles:
-            pure_z = np.asarray(unified_z_height, dtype=float)
-        else:
-            pure_z = positions_3d[:, 2].astype(float)
-        if len(pure_z) == n_articles:
-            positions_3d[:, 2] = pure_z
+    if 'monolith_df' in locals() and 'pure_z' in monolith_df.columns:
+        pure_z = monolith_df['pure_z'].to_numpy(dtype=float)
+    elif 'unified_z_height' in locals() and len(unified_z_height) == n_articles:
+        pure_z = np.asarray(unified_z_height, dtype=float)
     else:
         pure_z = positions_3d[:, 2].astype(float)
+    if len(pure_z) == n_articles:
+        positions_3d[:, 2] = pure_z
 
     # RAW PATHS: no additional normalization/clipping.
     walker_paths_pure: Dict[int, np.ndarray] = {}
@@ -5054,15 +4979,6 @@ def create_monolith_cockpit(
         # Format d and w values (handle infinity)
         d_str = f"{d_val:.2f}" if np.isfinite(d_val) else "inf"
         w_str = f"{w_val:.2f}" if np.isfinite(w_val) else "inf"
-        observer_lines = ""
-        if observer_probe_similarity is not None and i < len(observer_probe_similarity):
-            probe_sim_val = float(observer_probe_similarity[i])
-            if np.isfinite(probe_sim_val):
-                observer_lines += f'<b>Observer Probe Sim:</b> {probe_sim_val:.3f}<br>'
-        if observer_coord_delta is not None and i < len(observer_coord_delta):
-            coord_delta_val = float(observer_coord_delta[i])
-            if np.isfinite(coord_delta_val):
-                observer_lines += f'<b>Observer Coord Delta:</b> {coord_delta_val:.3f}<br>'
 
         focus_line = "<span style='color:#FFD700'>(FOCUS)</span><br>" if (focus_idx is not None and i == focus_idx) else ""
         hover_texts.append(
@@ -5080,7 +4996,6 @@ def create_monolith_cockpit(
             f'<b>T4 Walker:</b> {ws}<br>'
             f'<b>T5 Verdict:</b> <span style="color:{"#00F0FF" if pv=="HONEST" else "#FF00FF" if pv=="PHANTOM" else "#39FF14" if pv=="TAUTOLOGY" else "#888"}">{pv}</span><br>'
             f'<b>  d={d_str}, W={w_str}, Delta={delta:.2f}</b><br>'
-            f'{observer_lines}'
             f'<b>T6 HoTT:</b> {hott_status}<br>'
             f'<b>═══════════════════════</b><br>'
             f'<b>Spectral DNA:</b><br>{drivers}<br>'
@@ -6064,21 +5979,6 @@ def create_monolith_cockpit(
             focus_title_raw = str(article_titles[focus_idx] or "").strip()
         focus_uid = html.escape(focus_uid_raw)
         focus_title = html.escape(focus_title_raw)
-        focus_banner_metrics = ""
-        if isinstance(focus_delta_payload, dict):
-            eq_blob = focus_delta_payload.get("null_observer_equivalence")
-            if isinstance(eq_blob, dict):
-                max_coord_delta = _safe_float(eq_blob.get("max_coord_delta", np.nan), default=np.nan)
-                path_flip_count = int(eq_blob.get("path_flip_count", 0))
-                axis_rotation_deg = _safe_float(eq_blob.get("axis_rotation_deg", np.nan), default=np.nan)
-                metric_parts: List[str] = []
-                if np.isfinite(max_coord_delta):
-                    metric_parts.append(f"coord={max_coord_delta:.3f}")
-                metric_parts.append(f"flips={path_flip_count}")
-                if np.isfinite(axis_rotation_deg):
-                    metric_parts.append(f"axis={axis_rotation_deg:.1f}deg")
-                if metric_parts:
-                    focus_banner_metrics = " | " + " | ".join(metric_parts)
         observer_banner = (
             f"<div id='observer-focus-banner' "
             f"style='position:fixed;top:10px;left:10px;z-index:9999;"
@@ -6088,7 +5988,6 @@ def create_monolith_cockpit(
             f"OBSERVER FOCUS | article:{int(focus_idx)}"
             f"{' | uid:' + focus_uid if focus_uid else ''}"
             f"{' | ' + focus_title if focus_title else ''}"
-            f"{focus_banner_metrics}"
             f"</div><!-- observer_focus:{int(focus_idx)}:{focus_uid_raw} -->"
         )
         html_final = html_final.replace("<body>", f"<body>\n{observer_banner}\n", 1)
