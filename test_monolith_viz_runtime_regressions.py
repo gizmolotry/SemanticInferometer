@@ -928,7 +928,7 @@ def test_dash_embed_html_includes_local_observer_fallback(monkeypatch, tmp_path)
     assert "Dash server unavailable" in html_text
 
 
-def test_render_terrain_surface_masks_concave_empty_regions():
+def test_render_terrain_surface_keeps_concave_center_connected():
     _require_plotly()
     pytest.importorskip("scipy")
     positions_xy = np.array(
@@ -960,7 +960,7 @@ def test_render_terrain_surface_masks_concave_empty_regions():
 
     assert Xi is not None and Yi is not None and Zi is not None
     center_idx = np.unravel_index(np.nanargmin((Xi ** 2) + (Yi ** 2)), Xi.shape)
-    assert np.isnan(Zi[center_idx]), Zi[center_idx]
+    assert np.isfinite(Zi[center_idx]), Zi[center_idx]
 
 
 def test_render_terrain_surface_ignores_far_path_support_for_occupancy():

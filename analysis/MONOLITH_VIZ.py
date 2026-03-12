@@ -77,7 +77,7 @@ except ImportError:
 
 try:
     from scipy.interpolate import griddata, Rbf
-    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import gaussian_filter, binary_closing, binary_fill_holes, label as nd_label
     from scipy.spatial import Delaunay, cKDTree
     from scipy.spatial.distance import cdist, pdist, squareform
     from scipy.stats import gaussian_kde
@@ -1420,13 +1420,6 @@ def render_terrain_surface(
     y = positions_3d[:, 1]
     terrain_xy = np.column_stack([x, y])
     support_xy = terrain_xy
-    if terrain_support_xy is not None:
-        support_arr = np.asarray(terrain_support_xy, dtype=float)
-        if support_arr.ndim == 2 and support_arr.shape[1] >= 2:
-            support_arr = support_arr[:, :2]
-            support_arr = support_arr[np.isfinite(support_arr).all(axis=1)]
-            if support_arr.size > 0:
-                support_xy = np.vstack([support_xy, support_arr])
 
     margin = 0.15
     x_support = support_xy[:, 0]
@@ -1445,54 +1438,80 @@ def render_terrain_surface(
     xi = np.linspace(x_min, x_max, grid_resolution)
     yi = np.linspace(y_min, y_max, grid_resolution)
     Xi, Yi = np.meshgrid(xi, yi)
-    support_mask = None
     occupancy_mask = None
-    occupancy_source_xy = np.asarray(terrain_xy, dtype=float)
-    if occupancy_source_xy.ndim != 2 or occupancy_source_xy.shape[0] < 3 or occupancy_source_xy.shape[1] < 2:
-        occupancy_source_xy = np.asarray(support_xy, dtype=float)
     try:
-        xy_points = occupancy_source_xy
+        xy_points = np.asarray(terrain_xy, dtype=float)
         if xy_points.shape[0] > 0:
             _, uniq_idx = np.unique(np.round(xy_points, decimals=9), axis=0, return_index=True)
             xy_points = xy_points[np.sort(uniq_idx)]
-        if xy_points.shape[0] >= 3:
-            tri = Delaunay(xy_points)
-            grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
-            simplex = tri.find_simplex(grid_points)
-            support_mask = (simplex >= 0).reshape(Xi.shape)
-        if xy_points.shape[0] >= 4:
-            tree = cKDTree(xy_points)
-            k = min(3, xy_points.shape[0] - 1)
-            if k >= 1:
-                nn_distances, _ = tree.query(xy_points, k=k + 1)
-                local_scale = np.asarray(nn_distances[:, -1], dtype=float)
-                local_scale = local_scale[np.isfinite(local_scale)]
-                if local_scale.size > 0:
-                    local_radius = np.asarray(nn_distances[:, -1], dtype=float)
-                    local_radius = np.where(
-                        np.isfinite(local_radius),
-                        local_radius,
-                        float(np.nanmedian(local_scale)),
-                    )
-                    support_radius = float(np.percentile(local_scale, 60))
-                    support_radius = max(support_radius * 0.9, max(x_range_safe, y_range_safe) * 0.015)
-                    local_radius = np.clip(local_radius * 0.9, support_radius * 0.5, support_radius * 1.1)
-                    grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
-                    grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
-                    local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
-                    occupancy_mask = (
-                        np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
-                        <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
-                    )
     except Exception:
-        support_mask = None
         occupancy_mask = None
+        xy_points = np.empty((0, 2), dtype=float)
+    if xy_points.shape[0] >= 3:
+        grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
+        occupancy_score = None
+        if xy_points.shape[0] >= 4:
+            try:
+                kde = gaussian_kde(xy_points.T)
+                support_score = np.asarray(kde(xy_points.T), dtype=float).reshape(-1)
+                occupancy_score = np.asarray(kde(grid_points.T), dtype=float).reshape(Xi.shape)
+                max_score = float(np.nanmax(occupancy_score))
+                if np.isfinite(max_score) and max_score > 1e-12:
+                    occupancy_score = occupancy_score / max_score
+                    support_score = support_score / max_score
+                    finite_support = support_score[np.isfinite(support_score)]
+                    if finite_support.size > 0:
+                        occupancy_cutoff = max(float(np.percentile(finite_support, 15.0)) * 0.20, 0.035)
+                        occupancy_mask = occupancy_score >= occupancy_cutoff
+            except Exception:
+                occupancy_score = None
+        if occupancy_mask is None and xy_points.shape[0] >= 4:
+            try:
+                tree = cKDTree(xy_points)
+                k = min(3, xy_points.shape[0] - 1)
+                if k >= 1:
+                    nn_distances, _ = tree.query(xy_points, k=k + 1)
+                    local_scale = np.asarray(nn_distances[:, -1], dtype=float)
+                    local_scale = local_scale[np.isfinite(local_scale)]
+                    if local_scale.size > 0:
+                        local_radius = np.asarray(nn_distances[:, -1], dtype=float)
+                        local_radius = np.where(
+                            np.isfinite(local_radius),
+                            local_radius,
+                            float(np.nanmedian(local_scale)),
+                        )
+                        support_radius = float(np.percentile(local_scale, 60))
+                        support_radius = max(support_radius * 0.9, max(x_range_safe, y_range_safe) * 0.015)
+                        local_radius = np.clip(local_radius * 0.9, support_radius * 0.5, support_radius * 1.1)
+                        grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
+                        local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
+                        occupancy_mask = (
+                            np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
+                            <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
+                        )
+            except Exception:
+                occupancy_mask = None
+        if occupancy_mask is None:
+            try:
+                tri = Delaunay(xy_points)
+                simplex = tri.find_simplex(grid_points)
+                occupancy_mask = (simplex >= 0).reshape(Xi.shape)
+            except Exception:
+                occupancy_mask = None
     support_occupancy_mask = None
-    if support_mask is not None and occupancy_mask is not None:
-        support_occupancy_mask = support_mask & occupancy_mask
-    elif support_mask is not None:
-        support_occupancy_mask = support_mask
-    elif occupancy_mask is not None:
+    if occupancy_mask is not None:
+        try:
+            occupancy_mask = np.asarray(occupancy_mask, dtype=bool)
+            occupancy_mask = binary_closing(occupancy_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
+            occupancy_mask = binary_fill_holes(occupancy_mask)
+            labeled, n_components = nd_label(occupancy_mask)
+            if int(n_components) > 1:
+                component_sizes = np.bincount(labeled.ravel())
+                component_sizes[0] = 0
+                keep_label = int(np.argmax(component_sizes))
+                occupancy_mask = labeled == keep_label
+        except Exception:
+            occupancy_mask = np.asarray(occupancy_mask, dtype=bool)
         support_occupancy_mask = occupancy_mask
     tear_mask = np.zeros(Xi.shape, dtype=bool)
     if rupture_segments_2d:
@@ -5319,8 +5338,9 @@ def create_monolith_cockpit(
             terrain.meta = {'custom_mode': 'terrain'}
             fig.add_trace(terrain)
             
-            # Add contour lines overlaid on terrain
-            if grid_density is not None and grid_stress is not None:
+            # Contours are opt-in; they currently dominate the scene more than they help.
+            show_terrain_contours = os.environ.get("MONOLITH_SHOW_TERRAIN_CONTOURS", "0").strip() == "1"
+            if show_terrain_contours and grid_density is not None and grid_stress is not None:
                 print("[MONOLITH] Adding terrain contour lines...")
                 contour_traces = render_terrain_contours(
                     terrain_grid_x, terrain_grid_y, terrain_grid_z,
