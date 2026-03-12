@@ -2389,7 +2389,7 @@ def render_phantom_paths_3d(
     walker_paths = walker_paths or {}
     walker_path_diagnostics = walker_path_diagnostics or {}
     all_path_starts: List[np.ndarray] = []
-    show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "0").strip() == "1"
+    show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "1").strip() == "1"
     debug_printed = 0
     enable_raw_probe = os.environ.get("MONOLITH_RAW_MATRIX_PROBE", "0").strip() == "1"
     max_terrain_z = 1.0
@@ -2625,10 +2625,10 @@ def render_phantom_paths_3d(
 
     def _flare_color(severity: float, verdict_name: str) -> str:
         sev = float(np.clip(severity, 0.0, 1.0))
-        if verdict_name == "RUPTURE":
-            return "#FF2222" if sev < 0.6 else "#FFFF66"
         if verdict_name == "PHANTOM":
             return "#FF8C00" if sev < 0.6 else "#FF44FF"
+        if verdict_name == "TAUTOLOGY":
+            return "#A8A8A8" if sev < 0.6 else "#FFFFFF"
         return "#FFD700" if sev < 0.6 else "#FFFFFF"
 
     def _append_step_flares(
@@ -3005,31 +3005,6 @@ def render_phantom_paths_3d(
                     showlegend=legend_group not in legend_shown,
                 ))
                 legend_shown.add(legend_group)
-            elif verdict == "RUPTURE":
-                rupture_color = "#FFFFFF"
-                legend_group = "thermo-tear-rupture"
-                legend_name = "Rupture Tear"
-                traces.append(go.Scatter3d(
-                    x=scorch_x, y=scorch_y, z=scorch_z, mode='lines',
-                    line=dict(color='rgba(120,0,0,0.75)', width=12),
-                    opacity=0.85,
-                    name=legend_name,
-                    text=[hover_text] * len(scorch_x),
-                    hoverinfo='skip',
-                    legendgroup=legend_group,
-                    showlegend=False,
-                ))
-                traces.append(go.Scatter3d(
-                    x=scorch_x, y=scorch_y, z=scorch_z, mode='lines',
-                    line=dict(color=rupture_color, width=6, dash='dot'),
-                    opacity=1.0,
-                    name=legend_name,
-                    text=[hover_text] * len(scorch_x),
-                    hoverinfo='skip',
-                    legendgroup=legend_group,
-                    showlegend=legend_group not in legend_shown,
-                ))
-                legend_shown.add(legend_group)
             continue
 
         # Keep true trajectory endpoint from dynamics; only enforce finite values.
@@ -3120,29 +3095,6 @@ def render_phantom_paths_3d(
                     event_severity=step_event_severity,
                     asym=asym,
                 )
-        elif verdict == "RUPTURE":
-            rupture_color = "#FF2222" if walker_state == "broken" else "#FF00FF"
-            legend_group = 'path-rupture-broken' if walker_state == "broken" else 'path-rupture-trapped'
-            legend_name = 'Walker Broken' if walker_state == "broken" else 'Walker Trapped'
-            for seg_idx, seg in enumerate(path_segments):
-                seg_width = 4.5 if walker_state == "broken" else 2.5
-                if step_widths is not None and len(step_widths) > 0:
-                    finite_widths = np.asarray(step_widths, dtype=float)
-                    finite_widths = finite_widths[np.isfinite(finite_widths)]
-                    if finite_widths.size > 0:
-                        seg_width = float(np.clip(np.percentile(finite_widths, 75.0), 2.5, 7.0))
-                traces.append(go.Scatter3d(
-                    x=seg[:, 0],
-                    y=seg[:, 1],
-                    z=seg[:, 2],
-                    mode='lines',
-                    line=dict(color=rupture_color, width=seg_width),
-                    name=legend_name,
-                    text=[hover_text] * len(seg),
-                    hoverinfo='skip',
-                    legendgroup=legend_group,
-                    showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
-                ))
             legend_shown.add(legend_group)
             _append_step_flares(path_segments, step_event_mask, step_event_severity, hover_text, verdict)
 
@@ -3912,9 +3864,8 @@ def render_data_points_3d(
 
     Color by VERDICT (more meaningful than raw EVR):
     - HONEST: Cyan (truth)
-    - PHANTOM: Magenta (spin/lie)
-    - RUPTURE: Red (crash)
-    - TAUTOLOGY: Gray (nothing)
+    - PHANTOM: Magenta (shear / contradiction)
+    - TAUTOLOGY: Gray (null path)
 
     Size/Opacity by Annealing:
     - Crystal (survived cooling): Small, bright, solid
@@ -3938,11 +3889,10 @@ def render_data_points_3d(
 
     # Verdict to color mapping (fallback)
     verdict_colors = {
-        'HONEST': (0, 240, 255),     # Cyan
-        'PHANTOM': (204, 0, 255),    # Magenta
-        'RUPTURE': (255, 34, 34),    # Red
+        'HONEST': (0, 240, 255),       # Cyan
+        'PHANTOM': (204, 0, 255),      # Magenta
         'TAUTOLOGY': (136, 136, 136),  # Gray
-        'UNKNOWN': (255, 215, 0),    # Yellow
+        'UNKNOWN': (255, 215, 0),      # Yellow
     }
 
     for i in range(n):
@@ -3957,7 +3907,9 @@ def render_data_points_3d(
             # Fallback to existing verdict-based coloring
             verdict = "UNKNOWN"
             if phantom_verdicts and i < len(phantom_verdicts):
-                verdict = str(phantom_verdicts[i].get('verdict', 'UNKNOWN')).upper()
+                verdict = canonicalize_walker_verdict(
+                    phantom_verdicts[i].get('verdict', 'UNKNOWN')
+                )
             r, g, b = verdict_colors.get(verdict, verdict_colors['UNKNOWN'])
         
         core_opacity = 0.95 # Core point opacity, always solid
@@ -5028,7 +4980,7 @@ def create_monolith_cockpit(
                 continue
             pv = phantom_verdicts[_idx] if (_idx < len(phantom_verdicts)) else {}
             verdict = str(pv.get("verdict", "UNKNOWN")).upper()
-            if verdict != "RUPTURE":
+            if verdict != "PHANTOM":
                 continue
             if _path.ndim != 2 or _path.shape[0] < 2 or _path.shape[1] < 2:
                 continue
@@ -6016,10 +5968,10 @@ def create_monolith_cockpit(
             <span><b>Shadow View</b> active (projection)</span>
         </div>
         <div class="layer-row">
-            <label><input type="checkbox" id="toggle-failures" checked onchange="applyFailureFilter()"> Show failure cases</label>
+            <label><input type="checkbox" id="toggle-shear" checked onchange="applyFailureFilter()"> Show shear diagnostics</label>
         </div>
         <div class="layer-help">
-            Failure cases = BROKEN/TRAPPED paths and rupture overlays. If unavailable: unknown.
+            Shear diagnostics = phantom ribbons, localized flares, and shear labels.
         </div>
     </div>
     '''
@@ -6282,19 +6234,17 @@ def create_monolith_cockpit(
                 }}
             }}
 
-            // Apply failure filter policy (BROKEN/TRAPPED/RUPTURE families)
-            var showFailuresEl = document.getElementById('toggle-failures');
-            var showFailures = showFailuresEl ? showFailuresEl.checked : true;
+            // Apply public tri-state shear filter policy.
+            var showShearEl = document.getElementById('toggle-shear');
+            var showShear = showShearEl ? showShearEl.checked : true;
             for (var k = 0; k < numTraces; k++) {{
                 if (!visibility[k]) continue;
                 var tname = (figData.data[k].name || '').toUpperCase();
-                var isFailure = (
-                    tname.indexOf('BROKEN') >= 0 ||
-                    tname.indexOf('TRAPPED') >= 0 ||
-                    tname.indexOf('RUPTURE') >= 0 ||
-                    tname.indexOf('CRASH') >= 0
+                var isShearDiagnostic = (
+                    tname.indexOf('PHANTOM') >= 0 ||
+                    tname.indexOf('SHEAR') >= 0
                 );
-                if (isFailure && !showFailures) {{
+                if (isShearDiagnostic && !showShear) {{
                     visibility[k] = false;
                 }}
             }}
