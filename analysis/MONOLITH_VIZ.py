@@ -1739,17 +1739,9 @@ def render_terrain_surface(
         colorbar_config = dict(title="Height", len=0.5, x=1.02)
 
     z_finite = z_geometry[np.isfinite(z_geometry)]
-    contour_cfg = dict(
-        z=dict(
-            show=True,
-            usecolormap=False,
-            color="black",
-            width=2,
-            highlightcolor="white",
-            project_z=False,
-        )
-    )
-    if z_finite.size >= 2:
+    show_surface_contours = os.environ.get("MONOLITH_SHOW_SURFACE_CONTOURS", "0").strip() == "1"
+    contour_cfg = dict(z=dict(show=False))
+    if show_surface_contours and z_finite.size >= 2:
         z_min = float(np.min(z_finite))
         z_max = float(np.max(z_finite))
         z_span = z_max - z_min
@@ -2390,6 +2382,7 @@ def render_phantom_paths_3d(
     walker_path_diagnostics = walker_path_diagnostics or {}
     all_path_starts: List[np.ndarray] = []
     show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "1").strip() == "1"
+    show_asymmetry_lines = os.environ.get("MONOLITH_SHOW_ASYMMETRY_LINES", "0").strip() == "1"
     debug_printed = 0
     enable_raw_probe = os.environ.get("MONOLITH_RAW_MATRIX_PROBE", "0").strip() == "1"
     max_terrain_z = 1.0
@@ -2869,8 +2862,8 @@ def render_phantom_paths_3d(
 
             if step_color_spec is not None:
                 step_mode, step_values = step_color_spec
-                legend_group = "track4-axis-chroma"
-                legend_name = "Track 4 Axis Chroma"
+                legend_group = f"track4-axis-chroma-{verdict.lower()}"
+                legend_name = f"{verdict.capitalize()} Ribbon"
                 n_tether_segments = max(8, min(24, int(len(step_values))))
                 t_vals = np.linspace(0.0, 1.0, n_tether_segments + 1, dtype=float)
                 xs = start_xyz[0] + (end_xyz[0] - start_xyz[0]) * t_vals
@@ -2916,7 +2909,7 @@ def render_phantom_paths_3d(
                 legend_shown.add(legend_group)
 
             asym = _asymmetry_delta(i, end_xyz)
-            if asym is not None:
+            if show_asymmetry_lines and asym is not None:
                 asym_delta = float(asym["delta"])
                 asym_norm = float(asym["norm"])
                 if asym_norm <= 0.05:
@@ -3035,8 +3028,8 @@ def render_phantom_paths_3d(
         if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
             if step_color_spec is not None:
                 step_mode, step_values = step_color_spec
-                legend_group = "track4-axis-chroma"
-                legend_name = "Track 4 Axis Chroma"
+                legend_group = f"track4-axis-chroma-{verdict.lower()}"
+                legend_name = f"{verdict.capitalize()} Ribbon"
                 step_cursor = 0
                 for seg_idx, seg in enumerate(path_segments):
                     for j in range(max(0, seg.shape[0] - 1)):
@@ -3303,7 +3296,7 @@ def render_hysteresis_highways_3d(
         textfont=dict(size=8, color=PALETTE.cyan),
         name='Track 4: Bot Positions',
         hovertemplate='<b>%{text}</b><extra></extra>',
-        showlegend=True,
+        showlegend=False,
     ))
 
     # Render highway arcs (memory > threshold)
@@ -4407,9 +4400,11 @@ HUD_CSS = '''
 
     .epistemic-panel {
         position: fixed;
-        top: 250px;
-        left: 20px;
-        width: 360px;
+        top: 54px;
+        left: 18px;
+        width: 330px;
+        max-height: calc(100vh - 150px);
+        overflow-y: auto;
         background: rgba(8, 8, 8, 0.94);
         border: 1px solid #26474f;
         border-radius: 6px;
@@ -4427,6 +4422,91 @@ HUD_CSS = '''
     .ep-row .v { color: #e3f5ff; }
     .ep-warn { color: #FF5555; font-weight: 600; }
     .ep-good { color: #00FF41; font-weight: 600; }
+    .instrument-title {
+        color: #00F0FF;
+        font-weight: 700;
+        font-size: 12px;
+        margin-bottom: 4px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }
+    .instrument-sub {
+        color: #8eb3ba;
+        margin-bottom: 10px;
+        line-height: 1.4;
+    }
+    .instrument-section {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid #20353a;
+    }
+    .instrument-section:first-of-type {
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 0;
+    }
+    .instrument-section-title {
+        color: #e3f5ff;
+        font-weight: 600;
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+    }
+    .compass-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .compass-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 110px 36px;
+        gap: 8px;
+        align-items: center;
+    }
+    .compass-label {
+        color: #cde6ec;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .compass-bar {
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(10, 31, 36, 0.95);
+        border: 1px solid #1f4d58;
+        overflow: hidden;
+    }
+    .compass-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(0, 240, 255, 0.95), rgba(255, 140, 0, 0.92));
+    }
+    .compass-val {
+        color: #8eb3ba;
+        text-align: right;
+    }
+    .toggle-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+    }
+    .toggle-chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 30px;
+        padding: 6px 8px;
+        border: 1px solid #1f424c;
+        border-radius: 6px;
+        background: rgba(7, 14, 18, 0.86);
+        color: #cde6ec;
+    }
+    .toggle-chip input { accent-color: #00d8ff; }
+    .instrument-stats {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+    }
     .provenance-line {
         margin-top: 8px;
         padding-top: 7px;
@@ -5429,7 +5509,14 @@ def create_monolith_cockpit(
             path_ablation_mode=path_ablation_mode,
         )
         for t in path_traces:
-            t.visible = True
+            trace_name = str(getattr(t, "name", ""))
+            trace_upper = trace_name.upper()
+            if trace_name in {"Symmetric Tether", "Moderate Asymmetry", "Asymmetric Tether", "Unknown Tether"}:
+                t.visible = False
+            elif "HONEST" in trace_upper or "TAUTOLOGY" in trace_upper:
+                t.visible = False
+            else:
+                t.visible = True
             t.meta = {'custom_mode': 'synthesis'}
             fig.add_trace(t)
 
@@ -5733,50 +5820,78 @@ def create_monolith_cockpit(
         stability_text = "unstable"
 
     synthesis_nmi_valid = isinstance(exp.synthesis_nmi, (int, float, np.floating)) and np.isfinite(exp.synthesis_nmi)
-    interpretation_panel_html = f'''
+    compass_rows_html = ""
+    if spectral_mags_available and isinstance(spectral_mags, np.ndarray) and spectral_mags.ndim == 2 and spectral_mags.shape[1] >= 1:
+        try:
+            mean_probe = np.nanmean(np.abs(np.asarray(spectral_mags[:n_articles], dtype=float)), axis=0)
+            finite_probe = np.nan_to_num(mean_probe, nan=0.0, posinf=0.0, neginf=0.0)
+            top_probe_idx = np.argsort(finite_probe)[-5:][::-1]
+            probe_peak = max(float(np.max(finite_probe[top_probe_idx])) if top_probe_idx.size > 0 else 0.0, 1e-6)
+            for probe_idx in top_probe_idx:
+                if probe_idx < 0 or probe_idx >= len(PROBE_LABELS):
+                    continue
+                probe_value = float(finite_probe[probe_idx])
+                fill_pct = max(8.0, min(100.0, (probe_value / probe_peak) * 100.0))
+                compass_rows_html += (
+                    f'<div class="compass-row">'
+                    f'<div class="compass-label">{html.escape(PROBE_LABELS[probe_idx])}</div>'
+                    f'<div class="compass-bar"><div class="compass-fill" style="width: {fill_pct:.1f}%;"></div></div>'
+                    f'<div class="compass-val">{probe_value:.2f}</div>'
+                    f'</div>'
+                )
+        except Exception:
+            compass_rows_html = ""
+    if not compass_rows_html:
+        for fallback_label in PROBE_LABELS[:4]:
+            compass_rows_html += (
+                f'<div class="compass-row">'
+                f'<div class="compass-label">{html.escape(fallback_label)}</div>'
+                f'<div class="compass-bar"><div class="compass-fill" style="width: 32%;"></div></div>'
+                f'<div class="compass-val">n/a</div>'
+                f'</div>'
+            )
+
+    instrument_panel_html = f'''
     <div class="epistemic-panel">
-        <div class="ep-title">Interpretation Panel</div>
-        <div class="ep-sub">Data-driven rendering from MONOLITH_DATA.csv.</div>
-        <div class="ep-row"><span class="k">Topology:</span> <span class="v">{topology_text}</span></div>
-        <div class="ep-row"><span class="k">Geometry:</span> <span class="v">{geometry_text}</span></div>
-        <div class="ep-row"><span class="k">Stability:</span> <span class="v">{stability_text}</span></div>
-        <div class="ep-row"><span class="k">Status:</span> <span class="v">VERIFIED</span></div>
-        <div class="ep-title" style="margin-top:8px;">Instrument Readout</div>
-        <div class="ep-row"><span class="k">T4 Survival:</span> <span class="v">{survival_rate * 100.0:.1f}%</span></div>
-        <div class="ep-row"><span class="k">Anomalies:</span> <span class="v">{n_anomalies}</span></div>
-        <div class="ep-divider" style="border-top: 1px solid #333; margin: 8px 0;"></div>
-        <div class="ep-row"><b>System 1 (Topological NMI):</b> <span class="v">{'Validated' if synthesis_nmi_valid else 'Unavailable'}</span></div>
-        <div class="ep-row"><b>System 2 (Thermodynamic Cost):</b> <span class="v">{mean_action:.2f}</span></div>
+        <div class="instrument-title">Observer Compass</div>
+        <div class="instrument-sub">Synthesis defaults show only the manifold, article field, chosen ribbon families, flares, and labels.</div>
+        <div class="instrument-section">
+            <div class="instrument-section-title">Localized Stress</div>
+            <div class="compass-grid">
+                {compass_rows_html}
+            </div>
+        </div>
+        <div class="instrument-section">
+            <div class="instrument-section-title">Scene Layers</div>
+            <div class="toggle-grid">
+                <label class="toggle-chip"><input type="checkbox" id="toggle-terrain" checked onchange="applyFailureFilter()"> Terrain</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-articles" checked onchange="applyFailureFilter()"> Articles</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-phantom-ribbons" checked onchange="applyFailureFilter()"> Phantom Ribbons</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-honest-ribbons" onchange="applyFailureFilter()"> Honest Ribbons</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-tautology-ribbons" onchange="applyFailureFilter()"> Tautology Ribbons</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-shear-flares" checked onchange="applyFailureFilter()"> Shear Flares</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-shear-labels" checked onchange="applyFailureFilter()"> Shear Labels</label>
+            </div>
+        </div>
+        <div class="instrument-section">
+            <div class="instrument-section-title">Run Readout</div>
+            <div class="instrument-stats">
+                <div class="ep-row"><span class="k">Topology:</span> <span class="v">{topology_text}</span></div>
+                <div class="ep-row"><span class="k">Geometry:</span> <span class="v">{geometry_text}</span></div>
+                <div class="ep-row"><span class="k">Stability:</span> <span class="v">{stability_text}</span></div>
+                <div class="ep-row"><span class="k">Signal:</span> <span class="v">{mean_signal:.3f}</span></div>
+                <div class="ep-row"><span class="k">Track 4 Survival:</span> <span class="v">{survival_rate * 100.0:.1f}%</span></div>
+                <div class="ep-row"><span class="k">Verdicts:</span> <span class="v">{n_honest} H / {n_phantoms} P / {n_tautology} T</span></div>
+                <div class="ep-row"><span class="k">Anomalies:</span> <span class="v">{n_anomalies}</span></div>
+                <div class="ep-row"><span class="k">Synthesis NMI:</span> <span class="v">{f"{exp.synthesis_nmi:.3f}" if synthesis_nmi_valid else "unavailable"}</span></div>
+            </div>
+        </div>
     </div>
     '''
     trust_watermark_html = ""
 
     # Legend HTML - Synthesis Mode
-    legend_synthesis = f'''
-    <div class="legend-panel" id="legend-synthesis">
-        <div class="legend-title">SYNTHESIS MODE</div>
-        <div class="legend-item">
-            <div class="legend-line" style="background: #00F0FF;"></div>
-            <span>Chromatic ribbons: local prosecutor pressure along the path</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-line" style="background: linear-gradient(90deg, #00F0FF, #FF8C00, #FF00FF);"></div>
-            <span>Ribbon thickness: local thermodynamic friction / hysteresis wake</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-dot" style="background: #FFD700;"></div>
-            <span>Shear flares: localized rupture or stress spikes</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-dot" style="background: #FF5CFF;"></div>
-            <span>Shear labels: phantom-axis autopsy tags</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-dot" style="background: #FFB347;"></div>
-            <span>Orange wake: high friction / observer-history drag</span>
-        </div>
-    </div>
-    '''
+    legend_synthesis = ''
 
     # Legend HTML - Diagnostics Mode
     legend_diagnostics = f'''
@@ -5961,20 +6076,7 @@ def create_monolith_cockpit(
     </style>
     '''
 
-    layer_panel = '''
-    <div class="layer-panel" id="layer-panel">
-        <div class="layer-title">VIEW CONTRACT</div>
-        <div class="layer-row">
-            <span><b>Shadow View</b> active (projection)</span>
-        </div>
-        <div class="layer-row">
-            <label><input type="checkbox" id="toggle-shear" checked onchange="applyFailureFilter()"> Show shear diagnostics</label>
-        </div>
-        <div class="layer-help">
-            Shear diagnostics = phantom ribbons, localized flares, and shear labels.
-        </div>
-    </div>
-    '''
+    layer_panel = ''
 
     dash_run_key = str(exp.experiment_dir)
     try:
@@ -6022,7 +6124,7 @@ def create_monolith_cockpit(
     </div>
     {layer_panel}
 
-    {interpretation_panel_html}
+    {instrument_panel_html}
     {trust_watermark_html}
     {legend_synthesis}
     {legend_analysis}
@@ -6042,7 +6144,7 @@ def create_monolith_cockpit(
         var figData = {{PLOT_DATA}};
         Plotly.newPlot('cockpit', figData.data, figData.layout, {{
             responsive: true,
-            displayModeBar: true,
+            displayModeBar: 'hover',
             modeBarButtonsToRemove: ['lasso2d', 'select2d'],
         }});
 
@@ -6206,10 +6308,12 @@ def create_monolith_cockpit(
             var legSyn = document.getElementById('legend-synthesis');
             var legAna = document.getElementById('legend-analysis');
             var legDia = document.getElementById('legend-diagnostics');
+            var instrumentPanel = document.querySelector('.epistemic-panel');
             
             if (legSyn) legSyn.style.display = mode === 'synthesis' ? 'block' : 'none';
             if (legAna) legAna.style.display = mode === 'analysis' ? 'block' : 'none';
             if (legDia) legDia.style.display = mode === 'diagnostics' ? 'block' : 'none';
+            if (instrumentPanel) instrumentPanel.style.display = mode === 'synthesis' ? 'block' : 'none';
 
             // Build visibility array using metadata-driven filtering
             var visibility = [];
@@ -6234,18 +6338,58 @@ def create_monolith_cockpit(
                 }}
             }}
 
-            // Apply public tri-state shear filter policy.
-            var showShearEl = document.getElementById('toggle-shear');
-            var showShear = showShearEl ? showShearEl.checked : true;
-            for (var k = 0; k < numTraces; k++) {{
-                if (!visibility[k]) continue;
-                var tname = (figData.data[k].name || '').toUpperCase();
-                var isShearDiagnostic = (
-                    tname.indexOf('PHANTOM') >= 0 ||
-                    tname.indexOf('SHEAR') >= 0
-                );
-                if (isShearDiagnostic && !showShear) {{
-                    visibility[k] = false;
+            if (mode === 'synthesis') {{
+                var showTerrain = !(document.getElementById('toggle-terrain') && !document.getElementById('toggle-terrain').checked);
+                var showArticles = !(document.getElementById('toggle-articles') && !document.getElementById('toggle-articles').checked);
+                var showPhantom = !!(document.getElementById('toggle-phantom-ribbons') ? document.getElementById('toggle-phantom-ribbons').checked : true);
+                var showHonest = !!(document.getElementById('toggle-honest-ribbons') ? document.getElementById('toggle-honest-ribbons').checked : false);
+                var showTautology = !!(document.getElementById('toggle-tautology-ribbons') ? document.getElementById('toggle-tautology-ribbons').checked : false);
+                var showFlares = !!(document.getElementById('toggle-shear-flares') ? document.getElementById('toggle-shear-flares').checked : true);
+                var showLabels = !!(document.getElementById('toggle-shear-labels') ? document.getElementById('toggle-shear-labels').checked : true);
+                for (var k = 0; k < numTraces; k++) {{
+                    if (!visibility[k]) continue;
+                    var traceName = String(figData.data[k].name || '');
+                    var traceUpper = traceName.toUpperCase();
+                    var isArticleTrace = traceName === 'Articles' || traceName === 'glow_outer' || traceName === 'glow_mid' || traceName === 'article_hitbox';
+                    var isTerrainTrace = traceName === 'Energy Terrain';
+                    var isHonestTrace = traceUpper.indexOf('HONEST') >= 0;
+                    var isPhantomTrace = traceUpper.indexOf('PHANTOM') >= 0;
+                    var isTautologyTrace = traceUpper.indexOf('TAUTOLOGY') >= 0;
+                    var isShearFlare = traceName === 'Shear Flares';
+                    var isShearLabel = traceName === 'Ideological Shear';
+                    var isHelperLine = traceName === 'Symmetric Tether' || traceName === 'Moderate Asymmetry' || traceName === 'Asymmetric Tether' || traceName === 'Unknown Tether';
+
+                    if (isTerrainTrace && !showTerrain) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isArticleTrace && !showArticles) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isHonestTrace && !showHonest) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isPhantomTrace && !showPhantom) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isTautologyTrace && !showTautology) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isShearFlare && !showFlares) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isShearLabel && !showLabels) {{
+                        visibility[k] = false;
+                        continue;
+                    }}
+                    if (isHelperLine) {{
+                        visibility[k] = false;
+                    }}
                 }}
             }}
 
@@ -6354,7 +6498,18 @@ def create_monolith_cockpit(
             legend_group = str(getattr(_t, "legendgroup", "") or "")
             if not (
                 ("Path" in trace_name)
-                or (trace_name in {"Walker Broken", "Walker Trapped", "Track 4 Axis Chroma"})
+                or (
+                    trace_name in {
+                        "Walker Broken",
+                        "Walker Trapped",
+                        "Honest Ribbon",
+                        "Phantom Ribbon",
+                        "Tautology Ribbon",
+                        "Honest Path",
+                        "Phantom Path",
+                        "Tautology Path",
+                    }
+                )
                 or legend_group.startswith("path-")
                 or legend_group.startswith("thermo-scorch-")
                 or (legend_group == "track4-axis-chroma")

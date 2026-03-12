@@ -235,6 +235,19 @@ def test_mode_specific_camera_presets_are_applied(monkeypatch, tmp_path):
         assert f'var currentMode = "{expected_mode}";' in html_blob
 
 
+def test_synthesis_shell_uses_instrument_panel_and_layer_toggles(monkeypatch, tmp_path):
+    _, html_syn = _render_html_for_mode(tmp_path / "shell", "synthesis", None, monkeypatch)
+
+    assert "Observer Compass" in html_syn
+    assert "toggle-phantom-ribbons" in html_syn
+    assert "toggle-honest-ribbons" in html_syn
+    assert "toggle-tautology-ribbons" in html_syn
+    assert "toggle-shear-flares" in html_syn
+    assert "toggle-shear-labels" in html_syn
+    assert "VIEW CONTRACT" not in html_syn
+    assert "Show shear diagnostics" not in html_syn
+
+
 def test_path_invalid_points_are_filtered_not_origin_injected():
     _require_plotly()
     positions_3d = np.array([[10.0, 20.0, 30.0], [15.0, 25.0, 35.0]], dtype=float)
@@ -345,13 +358,13 @@ def test_track4_chroma_ribbons_emit_variable_widths_and_shear_flares():
     )
 
     names = [str(getattr(t, "name", "")) for t in traces]
-    assert "Track 4 Axis Chroma" in names
+    assert "Phantom Ribbon" in names
     assert "Shear Flares" in names
 
     chroma_widths = [
         float(getattr(getattr(t, "line", None), "width", 0.0))
         for t in traces
-        if str(getattr(t, "name", "")) == "Track 4 Axis Chroma"
+        if str(getattr(t, "name", "")) == "Phantom Ribbon"
     ]
     assert chroma_widths
     assert max(chroma_widths) > min(chroma_widths), chroma_widths
@@ -455,7 +468,7 @@ def test_cumulative_work_prevents_markovian_width_snapback():
     chroma_widths = [
         float(getattr(getattr(t, "line", None), "width", 0.0))
         for t in traces
-        if str(getattr(t, "name", "")) == "Track 4 Axis Chroma"
+        if str(getattr(t, "name", "")) == "Phantom Ribbon"
     ]
     assert chroma_widths == sorted(chroma_widths), chroma_widths
 
@@ -602,7 +615,7 @@ def test_extreme_mismatched_path_scale_is_bounded_relative_to_article_manifold(m
     article_xy_span = float(max(np.ptp(article_x), np.ptp(article_y)))
     assert np.isfinite(article_xy_span) and article_xy_span > 0.0
 
-    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Track 4 Axis Chroma"}
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Honest Ribbon", "Phantom Ribbon", "Tautology Ribbon"}
     path_traces = [
         t
         for t in fig.data
@@ -657,7 +670,7 @@ def test_terrain_footprint_expands_to_cover_rendered_paths(monkeypatch, tmp_path
     terrain_y_min = float(np.min(terrain_y_finite))
     terrain_y_max = float(np.max(terrain_y_finite))
 
-    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Track 4 Axis Chroma"}
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Honest Ribbon", "Phantom Ribbon", "Tautology Ribbon"}
     path_traces = [
         t
         for t in fig.data
@@ -704,7 +717,7 @@ def test_non_rendered_non_3d_paths_do_not_expand_terrain_footprint(monkeypatch, 
 
     terrain_traces = [t for t in fig.data if str(getattr(t, "name", "")) == "Energy Terrain"]
     article_traces = [t for t in fig.data if str(getattr(t, "name", "")) == "Articles"]
-    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Track 4 Axis Chroma"}
+    path_names = {"Honest Path", "Phantom Path", "Tautology Path", "Honest Ribbon", "Phantom Ribbon", "Tautology Ribbon"}
     path_traces = [
         t
         for t in fig.data
