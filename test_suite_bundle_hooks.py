@@ -169,6 +169,63 @@ def test_hydrate_run_leaf_from_observer_writes_required_artifacts(tmp_path):
     assert walker_states[0]["status"] == "success"
 
 
+def test_load_monolith_rows_preserves_rich_metadata_columns(tmp_path):
+    run_dir = tmp_path / "rich_rows"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    monolith_csv = run_dir / "MONOLITH_DATA.csv"
+    monolith_csv.write_text(
+        "\n".join(
+            [
+                "index,bt_uid,title,source,publication,published_at,timestamp_iso_utc,snippet,density,stress,z_height,zone,verdict",
+                "0,u0,Title 0,S0,P0,2023-03-04,2023-03-04T00:00:00Z,snip-0,0.5,0.7,0.2,Bridge,HONEST",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = suite._load_monolith_rows(monolith_csv)
+
+    assert rows[0]["publication"] == "P0"
+    assert rows[0]["published_at"] == "2023-03-04"
+    assert rows[0]["timestamp_iso_utc"] == "2023-03-04T00:00:00Z"
+    assert rows[0]["snippet"] == "snip-0"
+
+
+def test_emit_baseline_state_preserves_rich_article_metadata(tmp_path):
+    run_dir = tmp_path / "baseline_rich"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "observer_manifest.json").write_text(
+        json.dumps({"observers": [{"observer_id": 0, "relative_path": "observer_0/MONOLITH.html"}]}, indent=2),
+        encoding="utf-8",
+    )
+
+    rows = [
+        {
+            "index": 0,
+            "bt_uid": "u0",
+            "title": "Title 0",
+            "source": "S0",
+            "publication": "P0",
+            "published_at": "2023-03-04",
+            "timestamp_iso_utc": "2023-03-04T00:00:00Z",
+            "snippet": "snip-0",
+            "density": "0.5",
+            "stress": "0.7",
+            "zone": "Bridge",
+            "verdict": "HONEST",
+        }
+    ]
+
+    out = suite._emit_baseline_state(run_dir, rows)
+    payload = json.loads(out.read_text(encoding="utf-8"))
+
+    assert payload["articles"][0]["publication"] == "P0"
+    assert payload["articles"][0]["published_at"] == "2023-03-04"
+    assert payload["articles"][0]["timestamp_iso_utc"] == "2023-03-04T00:00:00Z"
+    assert payload["articles"][0]["snippet"] == "snip-0"
+
+
 def test_materialize_baseline_bundle_attempts_csv_hydration_when_missing(mock_run_dir, monkeypatch):
     with (
         patch("subprocess.run") as mock_run,
@@ -388,6 +445,10 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
             "index": 0,
             "bt_uid": "u0",
             "title": "A0",
+            "publication": "P0",
+            "published_at": "2023-03-04",
+            "timestamp_iso_utc": "2023-03-04T00:00:00Z",
+            "snippet": "snip-0",
             "zone": "Bridge",
             "verdict": "HONEST",
             "density": "0.20",
@@ -398,6 +459,10 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
             "index": 1,
             "bt_uid": "u1",
             "title": "A1",
+            "publication": "P1",
+            "published_at": "2023-03-05",
+            "timestamp_iso_utc": "2023-03-05T00:00:00Z",
+            "snippet": "snip-1",
             "zone": "Void",
             "verdict": "PHANTOM",
             "density": "0.80",
@@ -450,6 +515,10 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
     assert state["provenance"]["source"] == "observer_payload_relativity_v1"
     assert state["metrics"]["observer_bt_uid"] == "u0"
     assert state["metrics"]["observer_axis_label"] == "bot_0"
+    assert state["articles"][0]["publication"] == "P0"
+    assert state["articles"][0]["published_at"] == "2023-03-04"
+    assert state["articles"][0]["timestamp_iso_utc"] == "2023-03-04T00:00:00Z"
+    assert state["articles"][0]["snippet"] == "snip-0"
     assert delta["provenance"]["source"] == "observer_payload_relativity_v1"
     assert delta["null_observer_equivalence"]["max_coord_delta"] > 0.0
     assert delta["null_observer_equivalence"]["path_flip_count"] >= 0

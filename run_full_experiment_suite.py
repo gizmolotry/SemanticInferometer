@@ -1112,16 +1112,14 @@ def _load_monolith_rows(monolith_csv: Path) -> List[Dict[str, Any]]:
                 idx = int(ridx)
             except Exception:
                 idx = i
-            rows.append(
-                {
-                    "index": idx,
-                    "bt_uid": row.get("bt_uid", f"article_{idx}"),
-                    "title": (row.get("title", "") or "")[:200],
-                    "zone": row.get("zone", "unknown"),
-                    "density": row.get("density", "0"),
-                    "stress": row.get("stress", "0"),
-                }
-            )
+            hydrated = {str(k): v for k, v in row.items() if k is not None}
+            hydrated["index"] = idx
+            hydrated["bt_uid"] = row.get("bt_uid", f"article_{idx}")
+            hydrated["title"] = (row.get("title", "") or "")[:200]
+            hydrated["zone"] = row.get("zone", "unknown")
+            hydrated["density"] = row.get("density", "0")
+            hydrated["stress"] = row.get("stress", "0")
+            rows.append(hydrated)
     return rows
 
 
@@ -1256,7 +1254,8 @@ def _normalize_rows_for_relativity(rows: List[Dict[str, Any]]) -> List[Dict[str,
     normalized: List[Dict[str, Any]] = []
     for i, row in enumerate(rows):
         idx = int(row.get("index", i))
-        normalized.append(
+        normalized_row = dict(row)
+        normalized_row.update(
             {
                 "index": idx,
                 "bt_uid": str(row.get("bt_uid", f"article_{idx}")),
@@ -1270,6 +1269,7 @@ def _normalize_rows_for_relativity(rows: List[Dict[str, Any]]) -> List[Dict[str,
                 "perspective_tag": str(row.get("perspective_tag", "")),
             }
         )
+        normalized.append(normalized_row)
     return normalized
 
 
@@ -1492,7 +1492,8 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
 
         articles_blob: List[Dict[str, Any]] = []
         for row_j, obs_coord, delta_j, sim_j in zip(normalized_rows, observer_coords, coord_delta, 1.0 - probe_distance):
-            articles_blob.append(
+            article_row = dict(row_j)
+            article_row.update(
                 {
                     "index": int(row_j["index"]),
                     "bt_uid": row_j["bt_uid"],
@@ -1509,6 +1510,7 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
                     "coord_delta": float(delta_j),
                 }
             )
+            articles_blob.append(article_row)
 
         ranked_flip_indices = np.argsort(-coord_delta)
         path_flip_delta: Dict[str, float] = {}

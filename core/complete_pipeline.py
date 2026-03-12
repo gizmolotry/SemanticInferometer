@@ -777,6 +777,75 @@ def extract_article_timestamp(article: dict):
     return None, None, None, None, None
 
 
+def _build_article_metadata_row(
+    article: dict,
+    index: int,
+    bt_uid: Optional[str],
+    timestamp_field: Optional[str],
+    timestamp_raw: Any,
+    timestamp_epoch_s: Optional[int],
+    timestamp_iso_utc: Optional[str],
+) -> Dict[str, Any]:
+    source_val = article.get("source", None) if isinstance(article, dict) else None
+    publication_val = None
+    if isinstance(article, dict):
+        publication_val = (
+            article.get("publication")
+            or article.get("publisher")
+            or article.get("outlet")
+        )
+        source_val = source_val or publication_val
+
+    affiliation_val = article.get("affiliation", None) if isinstance(article, dict) else None
+    if isinstance(article, dict):
+        affiliation_val = affiliation_val or article.get("outlet_affiliation") or article.get("publisher_affiliation")
+
+    bias_val = article.get("bias", None) if isinstance(article, dict) else None
+    if isinstance(article, dict):
+        bias_val = bias_val or article.get("political_bias") or article.get("ideology") or article.get("lean")
+
+    summary_val = None
+    snippet_val = None
+    content_preview_val = None
+    if isinstance(article, dict):
+        summary_val = article.get("summary") or article.get("abstract")
+        snippet_val = article.get("snippet") or summary_val or article.get("content")
+        if isinstance(snippet_val, str):
+            snippet_val = snippet_val[:280]
+        content_preview_val = article.get("content") or summary_val or article.get("snippet")
+        if isinstance(content_preview_val, str):
+            content_preview_val = content_preview_val[:200]
+
+    published_at_val = None
+    if isinstance(article, dict):
+        published_at_val = article.get("published_at", None)
+    published_at_val = published_at_val if published_at_val is not None else timestamp_raw
+
+    return {
+        "index": index,
+        "bt_uid": bt_uid,
+        "published_at": published_at_val,
+        "source": source_val,
+        "publication": publication_val or source_val,
+        "author": article.get("author", None) if isinstance(article, dict) else None,
+        "url": article.get("url", article.get("link", None)) if isinstance(article, dict) else None,
+        "affiliation": affiliation_val,
+        "bias": bias_val,
+        "perspective_tag": article.get("perspective_tag", None) if isinstance(article, dict) else None,
+        "perspective_type": article.get("perspective_type", None) if isinstance(article, dict) else None,
+        "label": article.get("label", None) if isinstance(article, dict) else None,
+        "title": article.get("title", article.get("headline", None)) if isinstance(article, dict) else None,
+        "event_id": article.get("event_id", None) if isinstance(article, dict) else None,
+        "timestamp_field": timestamp_field,
+        "timestamp_raw": timestamp_raw,
+        "timestamp_epoch_s": timestamp_epoch_s,
+        "timestamp_iso_utc": timestamp_iso_utc,
+        "summary": summary_val,
+        "snippet": snippet_val,
+        "content_preview": content_preview_val,
+    }
+
+
 def stable_article_uid(article: dict, fallback_index: int, _collision_counter: dict):
     """
     Produce a stable per-article identifier.
@@ -2723,27 +2792,17 @@ class BeliefTransformerPipeline:
         # Article metadata (index-stable)
         metadata = []
         for i, art in enumerate(articles):
-            source_val = art.get("source", None) if isinstance(art, dict) else None
-            if isinstance(art, dict):
-                source_val = source_val or art.get("publisher") or art.get("publication") or art.get("outlet")
-            affiliation_val = art.get("affiliation", None) if isinstance(art, dict) else None
-            if isinstance(art, dict):
-                affiliation_val = affiliation_val or art.get("outlet_affiliation") or art.get("publisher_affiliation")
-            bias_val = art.get("bias", None) if isinstance(art, dict) else None
-            if isinstance(art, dict):
-                bias_val = bias_val or art.get("political_bias") or art.get("ideology") or art.get("lean")
-            meta = {
-                "index": i,
-                "bt_uid": bt_uids[i] if bt_uids is not None else None,
-                "published_at": art.get("published_at", None) if isinstance(art, dict) else None,
-                "source": source_val,
-                "affiliation": affiliation_val,
-                "bias": bias_val,
-                "perspective_tag": art.get("perspective_tag", None) if isinstance(art, dict) else None,
-                "label": art.get("label", None) if isinstance(art, dict) else None,
-                "title": art.get("title", None) if isinstance(art, dict) else None,
-            }
-            metadata.append(meta)
+            metadata.append(
+                _build_article_metadata_row(
+                    article=art,
+                    index=i,
+                    bt_uid=bt_uids[i] if bt_uids is not None else None,
+                    timestamp_field=ts_source_keys[i],
+                    timestamp_raw=ts_raw_values[i],
+                    timestamp_epoch_s=ts_epoch_s[i],
+                    timestamp_iso_utc=ts_iso_utc[i],
+                )
+            )
 
         out = {
             "month": month_name,
