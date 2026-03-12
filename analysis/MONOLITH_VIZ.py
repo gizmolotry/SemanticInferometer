@@ -1250,6 +1250,31 @@ def compute_smooth_terrain(
     return Xi, Yi, Zi
 
 
+def _compress_surface_height_field(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return arr
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 4:
+        return arr.copy()
+    lo = float(np.nanpercentile(finite, 2.0))
+    hi = float(np.nanpercentile(finite, 98.0))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-9:
+        return arr.copy()
+    median = float(np.nanmedian(finite))
+    iqr = float(np.nanpercentile(finite, 75.0) - np.nanpercentile(finite, 25.0))
+    scale = max(iqr, (hi - lo) / 6.0, 1e-6)
+    clipped = np.clip(arr, lo, hi)
+    transformed = np.arcsinh((clipped - median) / scale)
+    t_lo = float(np.arcsinh((lo - median) / scale))
+    t_hi = float(np.arcsinh((hi - median) / scale))
+    if not np.isfinite(t_lo) or not np.isfinite(t_hi) or abs(t_hi - t_lo) <= 1e-9:
+        return clipped
+    normalized = (transformed - t_lo) / (t_hi - t_lo)
+    remapped = lo + normalized * (hi - lo)
+    return np.asarray(remapped, dtype=float)
+
+
 def _interpolate_field_boundary_safe(
     x: np.ndarray,
     y: np.ndarray,
@@ -2364,6 +2389,7 @@ def render_phantom_paths_3d(
     walker_paths = walker_paths or {}
     walker_path_diagnostics = walker_path_diagnostics or {}
     all_path_starts: List[np.ndarray] = []
+    show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "0").strip() == "1"
     debug_printed = 0
     enable_raw_probe = os.environ.get("MONOLITH_RAW_MATRIX_PROBE", "0").strip() == "1"
     max_terrain_z = 1.0
@@ -2924,7 +2950,7 @@ def render_phantom_paths_3d(
                 ))
                 legend_shown.add('semantic-asymmetry')
 
-            if verdict == "PHANTOM":
+            if show_shear_labels and verdict == "PHANTOM":
                 _append_shear_label(
                     i,
                     [np.vstack([start_xyz, end_xyz])],
@@ -3084,7 +3110,7 @@ def render_phantom_paths_3d(
                     ))
                 legend_shown.add(legend_group)
             _append_step_flares(path_segments, step_event_mask, step_event_severity, hover_text, verdict)
-            if verdict == "PHANTOM":
+            if show_shear_labels and verdict == "PHANTOM":
                 asym = _asymmetry_delta(i, end_xyz) if end_xyz is not None else None
                 _append_shear_label(
                     i,
@@ -4506,7 +4532,7 @@ def create_monolith_cockpit(
     show_walkers: bool = True,
     show_phantom_paths: bool = True,
     show_hott: bool = True,
-    show_spectral_axis: bool = True,
+    show_spectral_axis: bool = False,
     strict_validation: bool = False,
     path_ablation_mode: str = "none",
 ) -> Any:
@@ -5038,7 +5064,7 @@ def create_monolith_cockpit(
             terrain_support_xy = np.vstack(terrain_support_parts)
 
     # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
-    energy_values_for_terrain = pure_z.copy()
+    energy_values_for_terrain = _compress_surface_height_field(pure_z.copy())
     # Contract guardrail: preserve explicit invalid-array fallback path.
     terrain_values_valid = False
     try:
@@ -5051,8 +5077,8 @@ def create_monolith_cockpit(
     except Exception:
         terrain_values_valid = False
     if not terrain_values_valid:
-        print("[MONOLITH] Falling back terrain Z to pure_z due to invalid terrain field.")
-        energy_values_for_terrain = pure_z.copy()
+        print("[MONOLITH] Falling back terrain Z to compressed pure_z due to invalid terrain field.")
+        energy_values_for_terrain = _compress_surface_height_field(pure_z.copy())
 
     # Raw variance probe (requested).
     print(f"RAW TERRAIN VARIANCE: Min={np.min(unified_stress)}, Max={np.max(unified_stress)}")

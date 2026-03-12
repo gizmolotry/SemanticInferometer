@@ -11,6 +11,7 @@ import torch
 from analysis.MONOLITH_VIZ import (
     PROBE_LABELS,
     ExperimentData,
+    _compress_surface_height_field,
     _recompute_focused_observer_track4,
     create_monolith_cockpit,
     load_experiment_data,
@@ -117,8 +118,9 @@ def _render_html_for_mode(tmp_path: Path, mode: str, spectral_probe_magnitudes: 
     return fig, output_path.read_text(encoding="utf-8")
 
 
-def test_rupture_inputs_collapse_to_phantom_render_contract():
+def test_rupture_inputs_collapse_to_phantom_render_contract(monkeypatch):
     _require_plotly()
+    monkeypatch.setenv("MONOLITH_SHOW_SHEAR_LABELS", "1")
     positions_3d = np.array([[5.0, 6.0, 7.0], [9.0, 8.0, 7.5]], dtype=float)
     walker_paths = {
         0: np.array([[4.8, 5.9, 6.9], [4.6, 5.8, 6.7]], dtype=float),
@@ -483,8 +485,9 @@ def test_honest_path_falls_back_cleanly_when_chroma_diagnostics_absent():
     assert "Honest Path" in names
 
 
-def test_phantom_path_restores_visible_shear_label_without_step_diagnostics():
+def test_phantom_path_restores_visible_shear_label_without_step_diagnostics(monkeypatch):
     _require_plotly()
+    monkeypatch.setenv("MONOLITH_SHOW_SHEAR_LABELS", "1")
     positions_3d = np.array([[0.0, 0.0, 0.1]], dtype=float)
     walker_paths = {
         0: np.array(
@@ -998,3 +1001,31 @@ def test_render_terrain_surface_ignores_far_path_support_for_occupancy():
     assert Xi is not None and Yi is not None and Zi is not None
     far_idx = np.unravel_index(np.nanargmin((Xi - 10.0) ** 2 + (Yi - 10.0) ** 2), Xi.shape)
     assert np.isnan(Zi[far_idx]), Zi[far_idx]
+
+
+def test_compress_surface_height_field_tames_single_spike():
+    values = np.array([0.05, 0.08, 0.12, 0.20, 0.35, 0.55, 1.10, 9.21], dtype=float)
+    compressed = _compress_surface_height_field(values)
+    assert compressed.shape == values.shape
+    assert float(np.max(compressed)) < float(np.max(values))
+    assert float(np.nanpercentile(compressed, 95.0)) < float(np.nanpercentile(values, 95.0))
+    assert np.all(np.diff(compressed[np.argsort(values)]) >= -1e-9)
+
+
+def test_synthesis_default_hides_spectral_axis_vectors(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    exp.spectral_probe_magnitudes = np.tile(np.linspace(-1.0, 1.0, 8, dtype=float), (exp.n_articles, 1))
+    output_path = tmp_path / "no_vectors.html"
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    fig = create_monolith_cockpit(
+        exp=exp,
+        output_path=output_path,
+        physics_mode="synthesis",
+        show_terrain=False,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+    assert not any(str(getattr(t, "name", "")).startswith("Vector: ") for t in fig.data)
