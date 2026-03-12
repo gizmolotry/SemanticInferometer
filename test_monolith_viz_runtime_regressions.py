@@ -239,6 +239,9 @@ def test_synthesis_shell_uses_instrument_panel_and_layer_toggles(monkeypatch, tm
     _, html_syn = _render_html_for_mode(tmp_path / "shell", "synthesis", None, monkeypatch)
 
     assert "Observer Compass" in html_syn
+    assert ">SYNTHESIS</button>" in html_syn
+    assert ">ANALYSIS</button>" not in html_syn
+    assert ">DIAGNOSTICS</button>" not in html_syn
     assert "toggle-phantom-ribbons" in html_syn
     assert "toggle-honest-ribbons" in html_syn
     assert "toggle-tautology-ribbons" in html_syn
@@ -246,6 +249,8 @@ def test_synthesis_shell_uses_instrument_panel_and_layer_toggles(monkeypatch, tm
     assert "toggle-shear-labels" in html_syn
     assert "VIEW CONTRACT" not in html_syn
     assert "Show shear diagnostics" not in html_syn
+    assert 'var SECONDARY_MODES_ENABLED = false;' in html_syn
+    assert "â†”" not in html_syn
 
 
 def test_path_invalid_points_are_filtered_not_origin_injected():

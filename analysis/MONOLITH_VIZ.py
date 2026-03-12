@@ -220,14 +220,14 @@ THRESHOLDS = {
 # PROBE LABELS (Track 1.5 framing pairs)
 # =============================================================================
 PROBE_LABELS = [
-    "Israeli Defense ↔ Aggression",
-    "Palestinian Resistance ↔ Terrorism",
-    "Security ↔ Occupation",
-    "Peace Process ↔ Capitulation",
-    "Self-Determination ↔ Nationalism",
-    "International Law ↔ Bias",
-    "Humanitarian ↔ Propaganda",
-    "Historical Rights ↔ Colonialism",
+    "Israeli Defense <-> Aggression",
+    "Palestinian Resistance <-> Terrorism",
+    "Security <-> Occupation",
+    "Peace Process <-> Capitulation",
+    "Self-Determination <-> Nationalism",
+    "International Law <-> Bias",
+    "Humanitarian <-> Propaganda",
+    "Historical Rights <-> Colonialism",
 ]
 
 # Canonical terrain zones (2 orthogonal axes: density x stress)
@@ -4410,8 +4410,8 @@ HUD_CSS = '''
         border-radius: 6px;
         padding: 12px;
         z-index: 1002;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 10px;
+        font-family: 'Inter', sans-serif;
+        font-size: 11px;
         line-height: 1.45;
         color: #cde6ec;
     }
@@ -4484,6 +4484,8 @@ HUD_CSS = '''
     .compass-val {
         color: #8eb3ba;
         text-align: right;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
     }
     .toggle-grid {
         display: grid;
@@ -4500,12 +4502,18 @@ HUD_CSS = '''
         border-radius: 6px;
         background: rgba(7, 14, 18, 0.86);
         color: #cde6ec;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
     }
     .toggle-chip input { accent-color: #00d8ff; }
     .instrument-stats {
         display: flex;
         flex-direction: column;
         gap: 3px;
+    }
+    .instrument-stats .ep-row .v {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
     }
     .provenance-line {
         margin-top: 8px;
@@ -5580,9 +5588,11 @@ def create_monolith_cockpit(
     # =========================================
     # DIAGNOSTICS + ANALYSIS MODE TRACES
     # =========================================
-    # Analysis and diagnostics traces must exist for mode switching to work.
-    # Opt-out only via explicit fast-path env override.
-    render_all_modes = os.environ.get("MONOLITH_FAST_SYNTHESIS_ONLY", "0").strip() != "1"
+    # Lean synthesis product by default: secondary modes are opt-in in synthesis,
+    # but still render when analysis/diagnostics is the active target mode.
+    fast_synthesis_only = os.environ.get("MONOLITH_FAST_SYNTHESIS_ONLY", "0").strip() == "1"
+    include_secondary_modes = os.environ.get("MONOLITH_INCLUDE_SECONDARY_MODES", "0").strip() == "1"
+    render_all_modes = (physics_mode != "synthesis" or include_secondary_modes) and not fast_synthesis_only
     diagnostics_trace_start = len(fig.data)
     analysis_nmi_scores = {}
 
@@ -5759,7 +5769,7 @@ def create_monolith_cockpit(
         scene=scene_layout,
         paper_bgcolor=PALETTE.void,
         plot_bgcolor=PALETTE.void,
-        margin=dict(l=0, r=0, t=40, b=0),
+        margin=dict(l=360, r=28 if render_all_modes else 28, t=40, b=0),
         uirevision='constant',
         showlegend=True,
         legend=dict(
@@ -5979,10 +5989,13 @@ def create_monolith_cockpit(
         {nmi_items}
         <div class="legend-divider" style="border-top: 1px solid #333; margin: 8px 0;"></div>
         <div style="font-size: 9px; color: #666;">
-            g_μν = (1/ρ)·δ_μν + ∇_μΦ∇_νΦ
+            g_mu_nu = (1/rho) * delta_mu_nu + grad_mu(Phi) * grad_nu(Phi)
         </div>
     </div>
     '''
+    if not render_all_modes:
+        legend_diagnostics = ''
+        legend_analysis = ''
 
     # Mode Toggle CSS
     toggle_css = '''
@@ -6102,6 +6115,17 @@ def create_monolith_cockpit(
     synthesis_active = " active" if physics_mode == "synthesis" else ""
     analysis_active = " active" if physics_mode == "analysis" else ""
     diagnostics_active = " active" if physics_mode == "diagnostics" else ""
+    mode_toggle_html = f'''
+    <div class="mode-toggle">
+        <button class="mode-btn synthesis{synthesis_active}" onclick="setMode('synthesis')">SYNTHESIS</button>
+        <button class="mode-btn analysis{analysis_active}" onclick="setMode('analysis')">ANALYSIS</button>
+        <button class="mode-btn diagnostics{diagnostics_active}" onclick="setMode('diagnostics')">DIAGNOSTICS</button>
+    </div>
+    ''' if render_all_modes else '''
+    <div class="mode-toggle">
+        <button class="mode-btn synthesis active" onclick="setMode('synthesis')">SYNTHESIS</button>
+    </div>
+    '''
 
     html_template = f'''<!DOCTYPE html>
 <html>
@@ -6117,11 +6141,7 @@ def create_monolith_cockpit(
     {hud_html}
 
     <!-- MODE TOGGLE SWITCH -->
-    <div class="mode-toggle">
-        <button class="mode-btn synthesis{synthesis_active}" onclick="setMode('synthesis')">SYNTHESIS</button>
-        <button class="mode-btn analysis{analysis_active}" onclick="setMode('analysis')">ANALYSIS</button>
-        <button class="mode-btn diagnostics{diagnostics_active}" onclick="setMode('diagnostics')">DIAGNOSTICS</button>
-    </div>
+    {mode_toggle_html}
     {layer_panel}
 
     {instrument_panel_html}
@@ -6135,6 +6155,7 @@ def create_monolith_cockpit(
     <script>
         // Trace configuration
         var currentMode = {json.dumps(physics_mode)};
+        var SECONDARY_MODES_ENABLED = {str(render_all_modes).lower()};
         var DASH_BASE_URL = 'http://127.0.0.1:8050/';
         var DASH_RUN_KEY = {json.dumps(dash_run_key)};
         var DASH_ALLOWED_ORIGINS = {{'http://127.0.0.1:8050': true, 'http://localhost:8050': true}};
@@ -6179,6 +6200,21 @@ def create_monolith_cockpit(
                 return true;
             }} catch (err) {{
                 return false;
+            }}
+        }}
+
+        async function initializeDashHint() {{
+            var hint = document.getElementById('dash-embed-hint');
+            if (!hint) return;
+            var dashReachable = await probeDashReachable(DASH_BASE_URL);
+            if (dashReachable) {{
+                hint.textContent = 'Dash live: click an article point to open the observer lab';
+                hint.style.color = '#9ff7c6';
+                hint.style.borderColor = '#20573d';
+            }} else {{
+                hint.textContent = 'Dash offline: click an article point for local observer fallback';
+                hint.style.color = '#e0c38a';
+                hint.style.borderColor = '#5d4522';
             }}
         }}
 
@@ -6295,6 +6331,9 @@ def create_monolith_cockpit(
         }};
 
         function setMode(mode) {{
+            if (!SECONDARY_MODES_ENABLED && mode !== 'synthesis') {{
+                mode = 'synthesis';
+            }}
             currentMode = mode;
 
             // Update button states
@@ -6418,6 +6457,7 @@ def create_monolith_cockpit(
         }});
 
         setMode(currentMode);
+        initializeDashHint();
 
     </script>
 </body>
