@@ -78,7 +78,7 @@ except ImportError:
 try:
     from scipy.interpolate import griddata, Rbf
     from scipy.ndimage import gaussian_filter
-    from scipy.spatial import Delaunay
+    from scipy.spatial import Delaunay, cKDTree
     from scipy.spatial.distance import cdist, pdist, squareform
     from scipy.stats import gaussian_kde
     from sklearn.neighbors import NearestNeighbors
@@ -1446,8 +1446,12 @@ def render_terrain_surface(
     yi = np.linspace(y_min, y_max, grid_resolution)
     Xi, Yi = np.meshgrid(xi, yi)
     support_mask = None
+    occupancy_mask = None
+    occupancy_source_xy = np.asarray(terrain_xy, dtype=float)
+    if occupancy_source_xy.ndim != 2 or occupancy_source_xy.shape[0] < 3 or occupancy_source_xy.shape[1] < 2:
+        occupancy_source_xy = np.asarray(support_xy, dtype=float)
     try:
-        xy_points = np.asarray(support_xy, dtype=float)
+        xy_points = occupancy_source_xy
         if xy_points.shape[0] > 0:
             _, uniq_idx = np.unique(np.round(xy_points, decimals=9), axis=0, return_index=True)
             xy_points = xy_points[np.sort(uniq_idx)]
@@ -1456,8 +1460,40 @@ def render_terrain_surface(
             grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
             simplex = tri.find_simplex(grid_points)
             support_mask = (simplex >= 0).reshape(Xi.shape)
+        if xy_points.shape[0] >= 4:
+            tree = cKDTree(xy_points)
+            k = min(3, xy_points.shape[0] - 1)
+            if k >= 1:
+                nn_distances, _ = tree.query(xy_points, k=k + 1)
+                local_scale = np.asarray(nn_distances[:, -1], dtype=float)
+                local_scale = local_scale[np.isfinite(local_scale)]
+                if local_scale.size > 0:
+                    local_radius = np.asarray(nn_distances[:, -1], dtype=float)
+                    local_radius = np.where(
+                        np.isfinite(local_radius),
+                        local_radius,
+                        float(np.nanmedian(local_scale)),
+                    )
+                    support_radius = float(np.percentile(local_scale, 60))
+                    support_radius = max(support_radius * 0.9, max(x_range_safe, y_range_safe) * 0.015)
+                    local_radius = np.clip(local_radius * 0.9, support_radius * 0.5, support_radius * 1.1)
+                    grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
+                    grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
+                    local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
+                    occupancy_mask = (
+                        np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
+                        <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
+                    )
     except Exception:
         support_mask = None
+        occupancy_mask = None
+    support_occupancy_mask = None
+    if support_mask is not None and occupancy_mask is not None:
+        support_occupancy_mask = support_mask & occupancy_mask
+    elif support_mask is not None:
+        support_occupancy_mask = support_mask
+    elif occupancy_mask is not None:
+        support_occupancy_mask = occupancy_mask
     tear_mask = np.zeros(Xi.shape, dtype=bool)
     if rupture_segments_2d:
         tear_radius = max(x_range_safe, y_range_safe) * float(max(rupture_tear_radius_scale, 1e-6))
@@ -1541,8 +1577,8 @@ def render_terrain_surface(
         )
     except Exception:
         pass
-    if support_mask is not None:
-        z_geometry = np.where(support_mask, z_geometry, np.nan)
+    if support_occupancy_mask is not None:
+        z_geometry = np.where(support_occupancy_mask, z_geometry, np.nan)
     if np.any(tear_mask):
         z_geometry = np.where(tear_mask, np.nan, z_geometry)
     # =========================================
@@ -1604,8 +1640,8 @@ def render_terrain_surface(
 
         # Clamp to [0, 1] for safety
         terrain_scalar_grid = np.clip(terrain_scalar_grid, 0.0, 1.0)
-        if support_mask is not None:
-            terrain_scalar_grid = np.where(support_mask, terrain_scalar_grid, np.nan)
+        if support_occupancy_mask is not None:
+            terrain_scalar_grid = np.where(support_occupancy_mask, terrain_scalar_grid, np.nan)
         if np.any(tear_mask):
             terrain_scalar_grid = np.where(tear_mask, np.nan, terrain_scalar_grid)
 
@@ -1631,8 +1667,8 @@ def render_terrain_surface(
             fill_value=0.5,
             clip_to_source=True,
         )
-        if support_mask is not None:
-            color_values = np.where(support_mask, color_values, np.nan)
+        if support_occupancy_mask is not None:
+            color_values = np.where(support_occupancy_mask, color_values, np.nan)
         if np.any(tear_mask):
             color_values = np.where(tear_mask, np.nan, color_values)
         colorscale = get_terrain_colorscale()
@@ -6002,6 +6038,7 @@ def create_monolith_cockpit(
         var DASH_BASE_URL = 'http://127.0.0.1:8050/';
         var DASH_RUN_KEY = {json.dumps(dash_run_key)};
         var DASH_ALLOWED_ORIGINS = {{'http://127.0.0.1:8050': true, 'http://localhost:8050': true}};
+        var DASH_PING_PATH = '_dash-layout';
 
         // Initialize plot
         var figData = {{PLOT_DATA}};
@@ -6018,7 +6055,34 @@ def create_monolith_cockpit(
             if (frame) frame.src = 'about:blank';
         }}
 
-        function openDashForArticle(articleRef) {{
+        function buildLocalObserverFallback(articleRef) {{
+            if (!articleRef || typeof articleRef !== 'object') return null;
+            if (typeof articleRef.idx !== 'number' || !isFinite(articleRef.idx)) return null;
+            return 'observer_' + String(Math.floor(articleRef.idx)) + '/MONOLITH.html';
+        }}
+
+        function setDashEmbedMessage(titleText, bodyHtml) {{
+            var panel = document.getElementById('dash-embed-panel');
+            var frame = document.getElementById('dash-embed-frame');
+            var title = document.getElementById('dash-embed-title');
+            if (title && titleText) title.textContent = titleText;
+            if (frame) {{
+                frame.srcdoc = '<html><body style=\"margin:0;background:#070912;color:#b9f7ff;font-family:JetBrains Mono, monospace;display:flex;align-items:center;justify-content:center;height:100%;padding:18px;box-sizing:border-box;text-align:left;\">' + bodyHtml + '</body></html>';
+            }}
+            if (panel) panel.style.display = 'block';
+        }}
+
+        async function probeDashReachable(originUrl) {{
+            try {{
+                var probeUrl = originUrl.replace(/\\/$/, '') + '/' + DASH_PING_PATH;
+                await fetch(probeUrl, {{method: 'GET', mode: 'no-cors', cache: 'no-store'}});
+                return true;
+            }} catch (err) {{
+                return false;
+            }}
+        }}
+
+        async function openDashForArticle(articleRef) {{
             var panel = document.getElementById('dash-embed-panel');
             var frame = document.getElementById('dash-embed-frame');
             var title = document.getElementById('dash-embed-title');
@@ -6034,6 +6098,7 @@ def create_monolith_cockpit(
                 console.warn('blocked dash embed origin', dashUrl.origin);
                 return;
             }}
+            var fallbackUrl = buildLocalObserverFallback(articleRef);
             var qs = new URLSearchParams();
             qs.set('run_key', DASH_RUN_KEY);
             qs.set('view_mode', 'observer');
@@ -6050,15 +6115,24 @@ def create_monolith_cockpit(
                 qs.set('observer', 'article:' + String(Math.floor(articleRef)));
             }}
             if (!qs.get('observer') && !qs.get('observer_uid')) return;
-            frame.src = dashUrl.origin + '/?' + qs.toString();
-            if (title) {{
-                if (qs.get('observer_uid')) {{
-                    title.textContent = 'DASH OBSERVER VIEW | uid:' + qs.get('observer_uid');
-                }} else {{
-                    title.textContent = 'DASH OBSERVER VIEW | ' + (qs.get('observer') || 'article');
-                }}
-            }}
+            var titleText = 'DASH OBSERVER VIEW | ' + (qs.get('observer_uid') ? ('uid:' + qs.get('observer_uid')) : (qs.get('observer') || 'article'));
+            if (title) title.textContent = titleText;
+            frame.srcdoc = '';
             panel.style.display = 'block';
+            var dashReachable = await probeDashReachable(dashUrl.origin);
+            if (dashReachable) {{
+                frame.src = dashUrl.origin + '/?' + qs.toString();
+                return;
+            }}
+            if (fallbackUrl) {{
+                if (title) title.textContent = 'LOCAL OBSERVER VIEW | ' + (qs.get('observer') || 'article');
+                frame.src = fallbackUrl;
+                return;
+            }}
+            setDashEmbedMessage(
+                titleText,
+                '<div><div style=\"font-size:13px;color:#ffd27a;margin-bottom:10px;\">Dash server unavailable</div><div style=\"font-size:11px;line-height:1.5;color:#b9f7ff;\">Expected service at ' + dashUrl.origin + '. Start <code>analysis/isolated_dash_prototype.py</code> to enable the observer lab.</div></div>'
+            );
         }}
 
         var cockpitEl = document.getElementById('cockpit');

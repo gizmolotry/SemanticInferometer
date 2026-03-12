@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import sys
 from urllib.parse import parse_qs
@@ -2342,8 +2343,19 @@ def _render_dashboard_impl(
 
 
 if __name__ == "__main__":
+    debug_enabled = str(os.environ.get("BT_DASH_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
+    run_kwargs = {"debug": debug_enabled, "host": "127.0.0.1", "port": 8050}
+    if not debug_enabled:
+        run_kwargs["use_reloader"] = False
     run_fn = getattr(app, "run", None)
-    if callable(run_fn):
-        run_fn(debug=True, host="127.0.0.1", port=8050)
-    else:
-        app.run_server(debug=True, host="127.0.0.1", port=8050)
+    try:
+        if callable(run_fn):
+            run_fn(**run_kwargs)
+        else:
+            app.run_server(**run_kwargs)
+    except TypeError:
+        run_kwargs.pop("use_reloader", None)
+        if callable(run_fn):
+            run_fn(**run_kwargs)
+        else:
+            app.run_server(**run_kwargs)

@@ -16,6 +16,7 @@ from analysis.MONOLITH_VIZ import (
     load_experiment_data,
     render_analysis_planes,
     render_phantom_paths_3d,
+    render_terrain_surface,
 )
 from core.complete_pipeline import _serialize_rks_basis_state
 from core.dirichlet_fusion import SharedRKSBasis
@@ -903,3 +904,97 @@ def test_focused_observer_render_falls_back_to_global_z_when_observer_z_collapse
     article_trace = next(t for t in focus_fig.data if str(getattr(t, "name", "")) == "Articles")
     article_z = np.asarray(article_trace.z, dtype=float)
     assert float(np.ptp(article_z)) > 1e-3
+
+
+def test_dash_embed_html_includes_local_observer_fallback(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    output_path = tmp_path / "dash_fallback.html"
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    create_monolith_cockpit(
+        exp=exp,
+        output_path=output_path,
+        physics_mode="synthesis",
+        show_terrain=False,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+
+    html_text = output_path.read_text(encoding="utf-8")
+    assert "probeDashReachable" in html_text
+    assert "observer_' + String(Math.floor(articleRef.idx)) + '/MONOLITH.html" in html_text
+    assert "Dash server unavailable" in html_text
+
+
+def test_render_terrain_surface_masks_concave_empty_regions():
+    _require_plotly()
+    pytest.importorskip("scipy")
+    positions_xy = np.array(
+        [
+            [-2.0, -2.0],
+            [-2.0, -1.0],
+            [-2.0, 0.0],
+            [-2.0, 1.0],
+            [-1.0, -2.0],
+            [0.0, -2.0],
+            [1.0, -2.0],
+            [2.0, -2.0],
+            [2.0, -1.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    energy = np.linspace(0.0, 1.0, len(positions_xy), dtype=float)
+    positions_3d = np.column_stack([positions_xy, energy])
+
+    _, Xi, Yi, Zi, _, _ = render_terrain_surface(
+        positions_3d=positions_3d,
+        energy_values=energy,
+        grid_resolution=80,
+        terrain_density=np.linspace(0.2, 0.9, len(positions_xy), dtype=float),
+        terrain_stress=np.linspace(0.1, 0.8, len(positions_xy), dtype=float),
+    )
+
+    assert Xi is not None and Yi is not None and Zi is not None
+    center_idx = np.unravel_index(np.nanargmin((Xi ** 2) + (Yi ** 2)), Xi.shape)
+    assert np.isnan(Zi[center_idx]), Zi[center_idx]
+
+
+def test_render_terrain_surface_ignores_far_path_support_for_occupancy():
+    _require_plotly()
+    pytest.importorskip("scipy")
+    positions_xy = np.array(
+        [
+            [-1.0, -1.0],
+            [-1.0, 1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+        ],
+        dtype=float,
+    )
+    energy = np.array([0.2, 0.4, 0.6, 0.8], dtype=float)
+    positions_3d = np.column_stack([positions_xy, energy])
+    terrain_support_xy = np.array(
+        [
+            [10.0, 10.0],
+            [10.5, 10.2],
+            [10.2, 10.7],
+        ],
+        dtype=float,
+    )
+
+    _, Xi, Yi, Zi, _, _ = render_terrain_surface(
+        positions_3d=positions_3d,
+        energy_values=energy,
+        grid_resolution=80,
+        terrain_density=np.linspace(0.2, 0.8, len(positions_xy), dtype=float),
+        terrain_stress=np.linspace(0.1, 0.7, len(positions_xy), dtype=float),
+        terrain_support_xy=terrain_support_xy,
+    )
+
+    assert Xi is not None and Yi is not None and Zi is not None
+    far_idx = np.unravel_index(np.nanargmin((Xi - 10.0) ** 2 + (Yi - 10.0) ** 2), Xi.shape)
+    assert np.isnan(Zi[far_idx]), Zi[far_idx]
