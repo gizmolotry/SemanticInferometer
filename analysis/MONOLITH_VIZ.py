@@ -2392,6 +2392,25 @@ def render_phantom_paths_3d(
         max_terrain_z = float(np.nanmax(np.abs(np.asarray(article_z_height, dtype=float))))
     max_terrain_z = max(max_terrain_z, 1e-6)
     z_cap = max_terrain_z * 2.0
+    article_x_bounds = (
+        float(np.nanmin(np.asarray(positions_3d[:, 0], dtype=float))),
+        float(np.nanmax(np.asarray(positions_3d[:, 0], dtype=float))),
+    )
+    article_y_bounds = (
+        float(np.nanmin(np.asarray(positions_3d[:, 1], dtype=float))),
+        float(np.nanmax(np.asarray(positions_3d[:, 1], dtype=float))),
+    )
+    article_span = max(article_x_bounds[1] - article_x_bounds[0], article_y_bounds[1] - article_y_bounds[0], 1.0)
+    try:
+        clip_pad_ratio = float(os.environ.get("MONOLITH_PATH_CLIP_PAD_RATIO", "0.0").strip())
+    except Exception:
+        clip_pad_ratio = 0.0
+    clip_pad_ratio = float(np.clip(clip_pad_ratio, 0.0, 0.25))
+    article_clip_pad = clip_pad_ratio * article_span
+    x_clip_min = article_x_bounds[0] - article_clip_pad
+    x_clip_max = article_x_bounds[1] + article_clip_pad
+    y_clip_min = article_y_bounds[0] - article_clip_pad
+    y_clip_max = article_y_bounds[1] + article_clip_pad
 
     mode_key = str(path_ablation_mode or "none").strip().lower()
     thermodynamic_mode = mode_key == "thermodynamic"
@@ -2438,7 +2457,7 @@ def render_phantom_paths_3d(
                 segments.append(seg)
         return segments
 
-    def _resample_segment_xyz(seg_xyz: np.ndarray, max_points: int = 18) -> np.ndarray:
+    def _resample_segment_xyz(seg_xyz: np.ndarray, max_points: int = 10) -> np.ndarray:
         seg = np.asarray(seg_xyz, dtype=float)
         if seg.ndim != 2 or seg.shape[0] <= 2 or seg.shape[1] < 3 or seg.shape[0] <= max_points:
             return seg
@@ -2454,6 +2473,14 @@ def render_phantom_paths_3d(
             np.interp(sample_arc, arc, seg[:, 2]),
         ])
         return out.astype(float)
+
+    def _clip_xy_to_support(seg_xyz: np.ndarray) -> np.ndarray:
+        seg = np.asarray(seg_xyz, dtype=float).copy()
+        if seg.ndim != 2 or seg.shape[1] < 2:
+            return seg
+        seg[:, 0] = np.clip(seg[:, 0], x_clip_min, x_clip_max)
+        seg[:, 1] = np.clip(seg[:, 1], y_clip_min, y_clip_max)
+        return seg
 
     def _dominant_probe_label(article_idx: int) -> str:
         if (
@@ -2631,6 +2658,8 @@ def render_phantom_paths_3d(
         hover_label: str,
         verdict_name: str,
     ) -> None:
+        if verdict_name != "PHANTOM":
+            return
         if event_mask is None or event_severity is None or not np.any(event_mask):
             return
         legend_group = "track4-shear-flares"
@@ -2819,6 +2848,10 @@ def render_phantom_paths_3d(
                 continue
             start_xyz = finite_path[0, :3].astype(float)
             end_xyz = finite_path[-1, :3].astype(float)
+            start_xyz[0] = float(np.clip(start_xyz[0], x_clip_min, x_clip_max))
+            start_xyz[1] = float(np.clip(start_xyz[1], y_clip_min, y_clip_max))
+            end_xyz[0] = float(np.clip(end_xyz[0], x_clip_min, x_clip_max))
+            end_xyz[1] = float(np.clip(end_xyz[1], y_clip_min, y_clip_max))
             if callable(surface_z_func):
                 try:
                     tether_z = np.asarray(
@@ -3016,11 +3049,13 @@ def render_phantom_paths_3d(
                         seg[:, 2] = terrain_z
                 except Exception:
                     pass
+                seg = _clip_xy_to_support(seg)
                 seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
                 path_segments[seg_idx] = _resample_segment_xyz(seg)
         else:
             for seg_idx in range(len(path_segments)):
                 seg = path_segments[seg_idx].copy()
+                seg = _clip_xy_to_support(seg)
                 seg[:, 2] = np.clip(seg[:, 2], -z_cap, z_cap)
                 path_segments[seg_idx] = _resample_segment_xyz(seg)
         end_xyz = path_segments[-1][-1, :3] if path_segments else None
@@ -4002,7 +4037,7 @@ def render_data_points_3d(
         customdata=custom_point_identity,
         hoverinfo='skip',
         name=name,
-        showlegend=True,  # Show in legend as "Articles"
+        showlegend=False,
     ))
 
     return traces
@@ -4725,13 +4760,31 @@ def create_monolith_cockpit(
         # Force verdicts from CSV into the visualization (authoritative source).
         if 'verdict' in monolith_df.columns:
             print(f"[MONOLITH] Wiring {len(monolith_df)} verdicts from MONOLITH_DATA.csv")
+            existing_verdicts = phantom_verdicts if isinstance(phantom_verdicts, list) else []
             phantom_verdicts = []
             for i, row in monolith_df.iterrows():
+                existing_payload = existing_verdicts[i] if i < len(existing_verdicts) and isinstance(existing_verdicts[i], dict) else {}
+                delta_val = row.get('delta', existing_payload.get('delta', 1.0))
+                d_spectral_val = row.get('d_spectral', existing_payload.get('d_spectral', existing_payload.get('d', 0.0)))
+                w_actual_val = row.get('w_actual', existing_payload.get('w_actual', existing_payload.get('w', row.get('stress', 0.5) * 5.0)))
+                try:
+                    delta_val = float(delta_val) if pd.notna(delta_val) else float(existing_payload.get('delta', 1.0))
+                except Exception:
+                    delta_val = float(existing_payload.get('delta', 1.0))
+                try:
+                    d_spectral_val = float(d_spectral_val) if pd.notna(d_spectral_val) else float(existing_payload.get('d_spectral', existing_payload.get('d', 0.0)))
+                except Exception:
+                    d_spectral_val = float(existing_payload.get('d_spectral', existing_payload.get('d', 0.0)))
+                try:
+                    w_actual_val = float(w_actual_val) if pd.notna(w_actual_val) else float(existing_payload.get('w_actual', existing_payload.get('w', row.get('stress', 0.5) * 5.0)))
+                except Exception:
+                    w_actual_val = float(existing_payload.get('w_actual', existing_payload.get('w', row.get('stress', 0.5) * 5.0)))
                 phantom_verdicts.append({
                     'article_id': row.get('article_id', f'art_{i}'),
                     'verdict': canonicalize_walker_verdict(row['verdict']),
-                    'w_actual': row.get('stress', 0.5) * 5.0, # Approximate work for HUD
-                    'delta': 1.0 # Default delta
+                    'w_actual': w_actual_val,
+                    'delta': delta_val,
+                    'd_spectral': d_spectral_val,
                 })
 
         # Ensure loaded data matches n_articles
@@ -5579,8 +5632,12 @@ def create_monolith_cockpit(
         article_uids=article_uid_values,
     )
     for t in point_traces:
-        t.visible = True
-        t.meta = {'custom_mode': 'synthesis'}
+        if getattr(t, 'name', '') in {'glow_outer', 'glow_mid'}:
+            t.visible = False
+            t.meta = {'custom_mode': 'support'}
+        else:
+            t.visible = True
+            t.meta = {'custom_mode': 'synthesis'}
         fig.add_trace(t)
 
     synthesis_trace_end = len(fig.data)
@@ -5771,15 +5828,7 @@ def create_monolith_cockpit(
         plot_bgcolor=PALETTE.void,
         margin=dict(l=360, r=28 if render_all_modes else 28, t=40, b=0),
         uirevision='constant',
-        showlegend=True,
-        legend=dict(
-            bgcolor='rgba(5,5,5,0.8)',
-            font=dict(color=PALETTE.text_primary, family='Inter, sans-serif', size=11),
-            bordercolor=PALETTE.cyan_dim,
-            borderwidth=1,
-            x=0.01,
-            y=0.99,
-        ),
+        showlegend=False,
         title=dict(
             text=f"<b>ASTER v3.2 MONOLITH [{exp.kernel.upper()}]{verification_title_stamp}</b>",
             font=dict(family='Inter, sans-serif', size=16, color=PALETTE.cyan),
@@ -6370,8 +6419,8 @@ def create_monolith_cockpit(
                     // Analysis: Show ONLY analysis traces
                     visibility.push(tMode === 'analysis');
                 }} else if (mode === 'diagnostics') {{
-                    // Diagnostics: Show diagnostics + terrain + articles
-                    visibility.push(tMode === 'diagnostics' || tMode === 'terrain' || (tMode === 'synthesis' && (trace.name === 'Articles' || (trace.name || '').includes('glow'))));
+                    // Diagnostics: Show diagnostics + terrain + clickable article anchors
+                    visibility.push(tMode === 'diagnostics' || tMode === 'terrain' || (tMode === 'synthesis' && (trace.name === 'Articles' || trace.name === 'article_hitbox')));
                 }} else {{
                     visibility.push(true);
                 }}
@@ -6389,7 +6438,7 @@ def create_monolith_cockpit(
                     if (!visibility[k]) continue;
                     var traceName = String(figData.data[k].name || '');
                     var traceUpper = traceName.toUpperCase();
-                    var isArticleTrace = traceName === 'Articles' || traceName === 'glow_outer' || traceName === 'glow_mid' || traceName === 'article_hitbox';
+                    var isArticleTrace = traceName === 'Articles' || traceName === 'article_hitbox';
                     var isTerrainTrace = traceName === 'Energy Terrain';
                     var isHonestTrace = traceUpper.indexOf('HONEST') >= 0;
                     var isPhantomTrace = traceUpper.indexOf('PHANTOM') >= 0;

@@ -186,11 +186,18 @@ def calculate_unified_metric(
         threshold_mode = "sparse_fixed_calibrated"
 
     verdicts = []
+    output_delta = []
+    output_d_spectral = []
+    output_w_actual = []
     for i in range(len(metadata_df)):
         if phantom_verdicts is not None:
-            verdict = _canonicalize_track5_verdict(phantom_verdicts[i].get("verdict"))
+            verdict_payload = phantom_verdicts[i]
+            verdict = _canonicalize_track5_verdict(verdict_payload.get("verdict"))
             if verdict != "UNKNOWN":
                 verdicts.append(verdict)
+                output_delta.append(float(verdict_payload.get("delta", w_actual[i] / (d_spectral[i] + 1e-8))))
+                output_d_spectral.append(float(verdict_payload.get("d_spectral", verdict_payload.get("d", d_spectral[i]))))
+                output_w_actual.append(float(verdict_payload.get("w_actual", verdict_payload.get("w", w_actual[i]))))
                 continue
 
         raw_state = walker_states[i] if walker_states is not None else "UNKNOWN"
@@ -199,17 +206,23 @@ def calculate_unified_metric(
         else:
             state = _canonicalize_track5_verdict(raw_state)
 
+        delta = w_actual[i] / (d_spectral[i] + 1e-8)
         if state in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
             verdicts.append(state)
+            output_delta.append(float(delta))
+            output_d_spectral.append(float(d_spectral[i]))
+            output_w_actual.append(float(w_actual[i]))
             continue
 
-        delta = w_actual[i] / (d_spectral[i] + 1e-8)
         if delta < threshold_tautology:
             verdicts.append("TAUTOLOGY")
         elif delta <= threshold_honest:
             verdicts.append("HONEST")
         else:
             verdicts.append("PHANTOM")
+        output_delta.append(float(delta))
+        output_d_spectral.append(float(d_spectral[i]))
+        output_w_actual.append(float(w_actual[i]))
 
     # 6. Save the result as 'MONOLITH_DATA.csv' with new columns:
     #    'density', 'stress', 'z_height', 'zone', 'color_code', 'verdict'.
@@ -220,6 +233,9 @@ def calculate_unified_metric(
     metadata_df['zone'] = zones
     metadata_df['color_code'] = color_codes
     metadata_df['verdict'] = verdicts
+    metadata_df['delta'] = output_delta
+    metadata_df['d_spectral'] = output_d_spectral
+    metadata_df['w_actual'] = output_w_actual
 
     metadata_df.to_csv(output_path, index=False)
     print("Unified metric calculation complete and saved.")
