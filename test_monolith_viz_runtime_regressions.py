@@ -15,6 +15,7 @@ from analysis.MONOLITH_VIZ import (
     _recompute_focused_observer_track4,
     create_monolith_cockpit,
     load_experiment_data,
+    render_data_points_3d,
     render_analysis_planes,
     render_phantom_paths_3d,
     render_terrain_surface,
@@ -253,7 +254,7 @@ def test_synthesis_shell_uses_instrument_panel_and_layer_toggles(monkeypatch, tm
     assert "â†”" not in html_syn
 
 
-def test_synthesis_product_html_includes_secondary_mode_buttons_by_default(monkeypatch, tmp_path):
+def test_synthesis_product_html_includes_analysis_button_but_not_diagnostics_button(monkeypatch, tmp_path):
     _require_plotly()
     exp = _make_experiment(tmp_path / "product_shell", spectral_probe_magnitudes=None)
     output_path = tmp_path / "product_shell" / "monolith_product.html"
@@ -271,8 +272,23 @@ def test_synthesis_product_html_includes_secondary_mode_buttons_by_default(monke
     )
     html_syn = output_path.read_text(encoding="utf-8")
     assert ">ANALYSIS</button>" in html_syn
-    assert ">DIAGNOSTICS</button>" in html_syn
+    assert ">DIAGNOSTICS</button>" not in html_syn
     assert 'var SECONDARY_MODES_ENABLED = true;' in html_syn
+
+
+def test_article_hitbox_trace_uses_large_click_target():
+    _require_plotly()
+    positions = np.array([[0.0, 0.0, 0.1], [1.0, 1.0, 0.2]], dtype=float)
+    traces = render_data_points_3d(
+        positions=positions,
+        spectral_evr=np.array([0.8, 0.7], dtype=float),
+        sizes=np.array([4.0, 6.0], dtype=float),
+        hover_texts=["a", "b"],
+        phantom_verdicts=[{"verdict": "HONEST"}, {"verdict": "PHANTOM"}],
+    )
+    hitbox = next(t for t in traces if getattr(t, "name", "") == "article_hitbox")
+    hitbox_sizes = np.asarray(hitbox.marker.size, dtype=float)
+    assert hitbox_sizes.min() >= 18.0
 
 
 def test_path_invalid_points_are_filtered_not_origin_injected():

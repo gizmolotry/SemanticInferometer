@@ -4155,7 +4155,7 @@ def render_data_points_3d(
         z=elevated_z,
         mode='markers',
         marker=dict(
-            size=np.maximum(adjusted_sizes * 2.0, 10),
+            size=np.maximum(adjusted_sizes * 3.6, 18),
             color='rgba(255,255,255,0.001)',
             line=dict(width=0),
             symbol='circle',
@@ -6346,12 +6346,10 @@ def create_monolith_cockpit(
 
     synthesis_active = " active" if physics_mode == "synthesis" else ""
     analysis_active = " active" if physics_mode == "analysis" else ""
-    diagnostics_active = " active" if physics_mode == "diagnostics" else ""
     mode_toggle_html = f'''
     <div class="mode-toggle">
         <button class="mode-btn synthesis{synthesis_active}" onclick="setMode('synthesis')">SYNTHESIS</button>
         <button class="mode-btn analysis{analysis_active}" onclick="setMode('analysis')">ANALYSIS</button>
-        <button class="mode-btn diagnostics{diagnostics_active}" onclick="setMode('diagnostics')">DIAGNOSTICS</button>
     </div>
     ''' if render_all_modes else '''
     <div class="mode-toggle">
