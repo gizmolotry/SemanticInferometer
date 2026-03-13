@@ -34,6 +34,22 @@ def _canonicalize_track5_verdict(raw_verdict: object) -> str:
     return "UNKNOWN"
 
 
+def _robust_unit_interval(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    finite = arr[np.isfinite(arr)]
+    if finite.size <= 0:
+        return np.full(arr.shape, 0.5, dtype=float)
+    lo = float(np.percentile(finite, 10.0))
+    hi = float(np.percentile(finite, 90.0))
+    if hi <= lo + 1e-12:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    if hi <= lo + 1e-12:
+        return np.full(arr.shape, 0.5, dtype=float)
+    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+
 def calculate_unified_metric(
     embeddings_path: Path,
     gradients_path: Path,
@@ -82,11 +98,30 @@ def calculate_unified_metric(
         print(f"Warning: Not enough samples ({len(embeddings)}) for KNN k={knn_k}. Assigning uniform density.")
         density = np.ones(len(embeddings)) * 0.5 # Default to mid-density
 
-    # 3. Calculate STRESS (grad_norm) as the raw L2 norm of gradient vectors.
-    # NOTE: Do not normalize/compress this value in fusion; keep raw thermodynamic scale.
-    print("Calculating stress (L2 norm of gradients)...")
-    raw_stress = np.linalg.norm(gradients, axis=1).astype(float)
-    stress = raw_stress
+    # 3. Calculate STRESS as a varying article-level scalar.
+    # `spectral_u_axis.npy` can be unit-normalized, which makes its L2 norm
+    # effectively constant and collapses the manifold skin. Prefer the existing
+    # spectral probe magnitudes when available.
+    print("Calculating stress...")
+    probe_magnitudes_path = embeddings_path.parent / "spectral_probe_magnitudes.npy"
+    raw_stress = None
+    if probe_magnitudes_path.exists():
+        try:
+            probe_magnitudes = np.load(probe_magnitudes_path)
+            if (
+                isinstance(probe_magnitudes, np.ndarray)
+                and probe_magnitudes.ndim == 2
+                and probe_magnitudes.shape[0] == len(metadata_df)
+            ):
+                raw_stress = np.linalg.norm(np.asarray(probe_magnitudes, dtype=float), axis=1).astype(float)
+                print(f"  [OK] Using spectral probe magnitudes from {probe_magnitudes_path.name} for stress.")
+        except Exception as probe_err:
+            print(f"  [WARN] Failed to load spectral probe magnitudes for stress: {probe_err}")
+            raw_stress = None
+    if raw_stress is None:
+        raw_stress = np.linalg.norm(np.asarray(gradients, dtype=float), axis=1).astype(float)
+        print("  [WARN] Falling back to gradient-vector norm for stress.")
+    stress = _robust_unit_interval(raw_stress)
 
     # 4. Calculate Z_HEIGHT from soft-floored log-density potential:
     #    Z = -log(rho + epsilon_z), preserving raw potential scale.

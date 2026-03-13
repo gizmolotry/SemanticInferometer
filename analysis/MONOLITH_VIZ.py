@@ -1445,6 +1445,16 @@ def render_terrain_surface(
     y = positions_3d[:, 1]
     terrain_xy = np.column_stack([x, y])
     support_xy = terrain_xy
+    if terrain_support_xy is not None:
+        try:
+            support_candidate = np.asarray(terrain_support_xy, dtype=float)
+            if support_candidate.ndim == 2 and support_candidate.shape[0] >= 3 and support_candidate.shape[1] >= 2:
+                finite_rows = np.isfinite(support_candidate[:, :2]).all(axis=1)
+                support_candidate = support_candidate[finite_rows, :2]
+                if support_candidate.shape[0] >= 3:
+                    support_xy = support_candidate
+        except Exception:
+            support_xy = terrain_xy
 
     margin = 0.15
     x_support = support_xy[:, 0]
@@ -1465,7 +1475,7 @@ def render_terrain_surface(
     Xi, Yi = np.meshgrid(xi, yi)
     occupancy_mask = None
     try:
-        xy_points = np.asarray(terrain_xy, dtype=float)
+        xy_points = np.asarray(support_xy, dtype=float)
         if xy_points.shape[0] > 0:
             _, uniq_idx = np.unique(np.round(xy_points, decimals=9), axis=0, return_index=True)
             xy_points = xy_points[np.sort(uniq_idx)]
@@ -2482,6 +2492,66 @@ def render_phantom_paths_3d(
         seg[:, 1] = np.clip(seg[:, 1], y_clip_min, y_clip_max)
         return seg
 
+    def _append_batched_ribbon_segments(
+        seg: np.ndarray,
+        *,
+        hover_text: str,
+        legend_group: str,
+        legend_name: str,
+        step_mode: str,
+        step_values: np.ndarray,
+        step_widths: Optional[np.ndarray],
+        start_step_idx: int,
+        allow_legend: bool,
+    ) -> int:
+        if seg.shape[0] < 2:
+            return 0
+        try:
+            batch_stride = int(os.environ.get("MONOLITH_RIBBON_BATCH_STRIDE", "3").strip())
+        except Exception:
+            batch_stride = 3
+        batch_stride = max(1, min(batch_stride, 8))
+        seg_count = max(0, seg.shape[0] - 1)
+        if seg_count <= max(3, batch_stride + 1):
+            batch_stride = 1
+        elif seg_count <= batch_stride * 2:
+            batch_stride = max(1, seg_count // 2)
+        consumed = 0
+        local_legend_used = False
+        j = 0
+        while j < seg_count:
+            end_j = min(j + batch_stride, seg_count)
+            color_indices = [min(start_step_idx + idx, len(step_values) - 1) for idx in range(j, end_j)]
+            if step_mode == "vector":
+                seg_color = _axis_rgb_from_vector(np.mean(np.asarray(step_values[color_indices], dtype=float), axis=0))
+            else:
+                axis_vals = np.asarray(step_values[color_indices], dtype=float).reshape(-1)
+                finite_axis = axis_vals[np.isfinite(axis_vals)]
+                axis_idx = int(np.rint(np.median(finite_axis))) if finite_axis.size > 0 else 0
+                seg_color = axis_index_palette[axis_idx % len(axis_index_palette)]
+            if step_widths is not None and len(step_widths) > 0:
+                width_indices = [min(start_step_idx + idx, len(step_widths) - 1) for idx in range(j, end_j)]
+                seg_width = float(np.mean(np.asarray(step_widths[width_indices], dtype=float)))
+            else:
+                seg_width = 3.5
+            traces.append(go.Scatter3d(
+                x=[seg[j, 0], seg[end_j, 0]],
+                y=[seg[j, 1], seg[end_j, 1]],
+                z=[seg[j, 2], seg[end_j, 2]],
+                mode='lines',
+                line=dict(color=seg_color, width=seg_width),
+                opacity=0.82,
+                name=legend_name,
+                text=[hover_text, hover_text],
+                hoverinfo='skip',
+                legendgroup=legend_group,
+                showlegend=allow_legend and (not local_legend_used),
+            ))
+            local_legend_used = True
+            consumed += max(1, end_j - j)
+            j = end_j
+        return consumed
+
     def _dominant_probe_label(article_idx: int) -> str:
         if (
             spectral_probe_magnitudes is None
@@ -3067,32 +3137,18 @@ def render_phantom_paths_3d(
                 legend_name = f"{verdict.capitalize()} Ribbon"
                 step_cursor = 0
                 for seg_idx, seg in enumerate(path_segments):
-                    for j in range(max(0, seg.shape[0] - 1)):
-                        color_idx = min(step_cursor + j, len(step_values) - 1)
-                        if step_mode == "vector":
-                            seg_color = _axis_rgb_from_vector(step_values[color_idx])
-                        else:
-                            axis_idx = int(step_values[color_idx]) if np.isfinite(step_values[color_idx]) else 0
-                            seg_color = axis_index_palette[axis_idx % len(axis_index_palette)]
-                        seg_width = (
-                            float(step_widths[min(color_idx, len(step_widths) - 1)])
-                            if step_widths is not None and len(step_widths) > 0
-                            else 3.5
-                        )
-                        traces.append(go.Scatter3d(
-                            x=[seg[j, 0], seg[j + 1, 0]],
-                            y=[seg[j, 1], seg[j + 1, 1]],
-                            z=[seg[j, 2], seg[j + 1, 2]],
-                            mode='lines',
-                            line=dict(color=seg_color, width=seg_width),
-                            opacity=0.82,
-                            name=legend_name,
-                            text=[hover_text, hover_text],
-                            hoverinfo='skip',
-                            legendgroup=legend_group,
-                            showlegend=(legend_group not in legend_shown) and (seg_idx == 0) and (j == 0),
-                        ))
-                    step_cursor += max(1, seg.shape[0] - 1)
+                    consumed = _append_batched_ribbon_segments(
+                        seg,
+                        hover_text=hover_text,
+                        legend_group=legend_group,
+                        legend_name=legend_name,
+                        step_mode=step_mode,
+                        step_values=step_values,
+                        step_widths=step_widths,
+                        start_step_idx=step_cursor,
+                        allow_legend=(legend_group not in legend_shown) and (seg_idx == 0),
+                    )
+                    step_cursor += consumed
                 legend_shown.add(legend_group)
             else:
                 fallback_color, fallback_width, fallback_opacity, fallback_name = _fallback_path_style(verdict)
