@@ -100,6 +100,22 @@ def get_umap_module():
     return None
 
 
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    return str(value)
+
+
 # =============================================================================
 # FIGHTER JET COLOR PALETTE
 # =============================================================================
@@ -6827,6 +6843,73 @@ def create_monolith_cockpit(
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html_final)
+
+    monolith_state_rows: List[Dict[str, Any]] = []
+    if monolith_df is not None and len(monolith_df) == n_articles:
+        for idx, row in monolith_df.iterrows():
+            entry = {
+                "idx": int(idx),
+                "bt_uid": row.get("bt_uid"),
+                "title": row.get("title"),
+                "zone": row.get("zone"),
+                "verdict": row.get("verdict"),
+                "density": row.get("density"),
+                "stress": row.get("stress"),
+                "z_height": row.get("z_height"),
+                "delta": row.get("delta"),
+                "d_spectral": row.get("d_spectral"),
+                "w_actual": row.get("w_actual"),
+                "x": float(positions_3d[idx, 0]) if idx < len(positions_3d) else None,
+                "y": float(positions_3d[idx, 1]) if idx < len(positions_3d) else None,
+                "z": float(positions_3d[idx, 2]) if idx < len(positions_3d) else None,
+            }
+            monolith_state_rows.append(_json_safe_value(entry))
+    else:
+        for idx in range(n_articles):
+            monolith_state_rows.append(
+                {
+                    "idx": int(idx),
+                    "bt_uid": article_uids[idx] if idx < len(article_uids) else None,
+                    "title": article_titles[idx] if idx < len(article_titles) else None,
+                    "zone": unified_zones[idx] if idx < len(unified_zones) else None,
+                    "verdict": phantom_verdicts[idx].get("verdict") if idx < len(phantom_verdicts) else None,
+                    "x": float(positions_3d[idx, 0]) if idx < len(positions_3d) else None,
+                    "y": float(positions_3d[idx, 1]) if idx < len(positions_3d) else None,
+                    "z": float(positions_3d[idx, 2]) if idx < len(positions_3d) else None,
+                }
+            )
+
+    artifact_state_payload = {
+        "schema_version": 1,
+        "artifact": {
+            "html": str(output_path.name),
+            "physics_mode": physics_mode,
+            "kernel": exp.kernel,
+            "run_key": dash_run_key,
+        },
+        "metrics": {
+            "synthesis_nmi": effective_synthesis_nmi,
+            "spectral_signal": mean_signal,
+            "dirichlet_bonds": n_bonds,
+            "dirichlet_cracks": n_cracks,
+            "walker_mean_action": mean_action,
+            "walker_survival_rate": survival_rate,
+            "honest_count": n_honest,
+            "phantom_count": n_phantoms,
+            "tautology_count": n_tautology,
+            "anomaly_count": n_anomalies,
+        },
+        "observer_focus": {
+            "idx": int(focus_idx) if focus_idx is not None else None,
+            "uid": focus_uid_raw if focus_idx is not None else None,
+        },
+        "articles": monolith_state_rows,
+    }
+    artifact_state_path = output_path.with_suffix(".view_state.json")
+    artifact_state_path.write_text(
+        json.dumps(_json_safe_value(artifact_state_payload), indent=2),
+        encoding="utf-8",
+    )
 
     print(f"[MONOLITH] Saved to: {output_path}")
     print(f"  Articles: {n_articles}")

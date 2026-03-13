@@ -139,6 +139,19 @@ def _safe_read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def _load_artifact_view_state(path: Optional[Path]) -> dict:
+    if not path:
+        return {}
+    candidate = path.with_suffix(".view_state.json")
+    if not candidate.exists():
+        return {}
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def _safe_json(path: Path, default):
     try:
         return json.loads(_safe_read_text(path))
@@ -2188,7 +2201,18 @@ def _render_dashboard_impl(
         container = single_view
         path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 
+    artifact_state = _load_artifact_view_state(single_view_path if not compare_enabled else p_b)
+    artifact_metrics = artifact_state.get("metrics", {}) if isinstance(artifact_state, dict) else {}
+
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
+    if artifact_metrics:
+        run_score = (
+            f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} "
+            f"NMI={artifact_metrics.get('synthesis_nmi', run.get('nmi', 'n/a'))} "
+            f"| Signal={artifact_metrics.get('spectral_signal', 'n/a')} "
+            f"| T3 bonds/cracks={artifact_metrics.get('dirichlet_bonds', 'n/a')}/{artifact_metrics.get('dirichlet_cracks', 'n/a')} "
+            f"| T4 action={artifact_metrics.get('walker_mean_action', 'n/a')} surv={artifact_metrics.get('walker_survival_rate', 'n/a')}"
+        )
     if effective_observer.startswith("article:"):
         observer_state_metrics = contract.get("observer_state", {}).get("metrics", {}) if isinstance(contract.get("observer_state", {}), dict) else {}
         obs_nmi = observer_state_metrics.get("observer_conditioned_nmi")
@@ -2201,6 +2225,11 @@ def _render_dashboard_impl(
         try:
             idx = int(effective_observer.split(":", 1)[1])
             row = INDEX["article_rows_by_run"].get(run_key, {}).get(idx, {})
+            if not row and artifact_state:
+                for item in (artifact_state.get("articles", []) or []):
+                    if isinstance(item, dict) and int(item.get("idx", -1)) == idx:
+                        row = item
+                        break
             if row:
                 article_metric_text = (
                     f"Article #{idx} | uid={row.get('bt_uid', 'n/a')} | zone={row.get('zone', 'n/a')} "
