@@ -1586,23 +1586,25 @@ def reindex_runs(n_clicks: Optional[int], current_run: Optional[str]):
     State("observer-dropdown", "value"),
 )
 def refresh_variants(run_key: str, search: Optional[str], current_a: str, current_b: str, current_observer: str):
-    run = INDEX["runs"].get(run_key, {})
+    try:
+        qs = parse_qs((search or "").lstrip("?"))
+    except Exception:
+        qs = {}
+    requested_run = str((qs.get("run_key") or [run_key])[0] or run_key)
+    effective_run_key = requested_run if requested_run in INDEX.get("runs", {}) else run_key
+    run = INDEX["runs"].get(effective_run_key, {})
     variants = run.get("variants", ["MONOLITH.html"])
     if not variants:
         variants = ["MONOLITH.html"]
     opts = [{"label": v, "value": v} for v in variants]
     a = current_a if current_a in variants else variants[0]
     b = current_b if current_b in variants else (variants[1] if len(variants) > 1 else variants[0])
-    obs_opts = INDEX["observers_by_run"].get(run_key, [{"label": "Global Mean", "value": "global"}])
+    obs_opts = INDEX["observers_by_run"].get(effective_run_key, [{"label": "Global Mean", "value": "global"}])
     obs_values = [o["value"] for o in obs_opts]
     observer = current_observer if current_observer in obs_values else "global"
-    try:
-        qs = parse_qs((search or "").lstrip("?"))
-    except Exception:
-        qs = {}
     requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
     requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
-    observer_from_uid = _observer_value_from_uid(run_key, requested_uid)
+    observer_from_uid = _observer_value_from_uid(effective_run_key, requested_uid)
     if observer_from_uid and observer_from_uid in obs_values:
         observer = observer_from_uid
     elif requested_observer in obs_values:

@@ -6334,7 +6334,10 @@ def create_monolith_cockpit(
     <div id="dash-embed-panel" style="position: fixed; left: 18px; bottom: 18px; width: 46vw; height: 42vh; min-width: 420px; min-height: 280px; background: rgba(3,5,10,0.95); border: 1px solid #1e5062; border-radius: 8px; z-index: 1100; display: none; box-shadow: 0 8px 30px rgba(0,0,0,0.45); overflow: hidden;">
         <div style="height: 34px; display:flex; align-items:center; justify-content:space-between; padding: 0 10px; background: rgba(0,240,255,0.08); border-bottom: 1px solid #1e5062; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #b9f7ff;">
             <span id="dash-embed-title">DASH OBSERVER VIEW</span>
-            <button onclick="closeDashEmbed()" style="background: transparent; color: #9adce8; border: 1px solid #2f7688; border-radius: 4px; font-size: 10px; cursor: pointer; padding: 2px 8px;">CLOSE</button>
+            <div style="display:flex; gap:8px; align-items:center;">
+                <a id="dash-embed-open" href="http://127.0.0.1:8050/" target="_blank" rel="noopener noreferrer" style="color:#9adce8; text-decoration:none; border:1px solid #2f7688; border-radius:4px; font-size:10px; padding:2px 8px;">OPEN</a>
+                <button onclick="closeDashEmbed()" style="background: transparent; color: #9adce8; border: 1px solid #2f7688; border-radius: 4px; font-size: 10px; cursor: pointer; padding: 2px 8px;">CLOSE</button>
+            </div>
         </div>
         <iframe id="dash-embed-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="no-referrer" style="width: 100%; height: calc(100% - 34px); border: 0; background: #070912;"></iframe>
     </div>
@@ -6452,6 +6455,7 @@ def create_monolith_cockpit(
             var panel = document.getElementById('dash-embed-panel');
             var frame = document.getElementById('dash-embed-frame');
             var title = document.getElementById('dash-embed-title');
+            var openLink = document.getElementById('dash-embed-open');
             if (!panel || !frame) return;
             var dashUrl = null;
             try {{
@@ -6483,6 +6487,7 @@ def create_monolith_cockpit(
             if (!qs.get('observer') && !qs.get('observer_uid')) return;
             var titleText = 'DASH OBSERVER VIEW | ' + (qs.get('observer_uid') ? ('uid:' + qs.get('observer_uid')) : (qs.get('observer') || 'article'));
             if (title) title.textContent = titleText;
+            if (openLink) openLink.href = dashUrl.origin + '/?' + qs.toString();
             frame.srcdoc = '';
             panel.style.display = 'block';
             frame.src = dashUrl.origin + '/?' + qs.toString();
