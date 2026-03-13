@@ -965,7 +965,7 @@ def test_focused_observer_render_falls_back_to_global_z_when_observer_z_collapse
     assert float(np.ptp(article_z)) > 1e-3
 
 
-def test_dash_embed_html_includes_local_observer_fallback(monkeypatch, tmp_path):
+def test_dash_embed_html_prefers_live_dash_and_keeps_local_observer_fallback_hint(monkeypatch, tmp_path):
     _require_plotly()
     exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
     output_path = tmp_path / "dash_fallback.html"
@@ -984,7 +984,7 @@ def test_dash_embed_html_includes_local_observer_fallback(monkeypatch, tmp_path)
     html_text = output_path.read_text(encoding="utf-8")
     assert "probeDashReachable" in html_text
     assert "observer_' + String(Math.floor(articleRef.idx)) + '/MONOLITH.html" in html_text
-    assert "Dash server unavailable" in html_text
+    assert "frame.src = dashUrl.origin + '/?' + qs.toString();" in html_text
 
 
 def test_render_terrain_surface_keeps_concave_center_connected():

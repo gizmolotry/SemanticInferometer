@@ -6442,7 +6442,7 @@ def create_monolith_cockpit(
                 hint.style.color = '#9ff7c6';
                 hint.style.borderColor = '#20573d';
             }} else {{
-                hint.textContent = 'Dash offline: click an article point for local observer fallback';
+                hint.textContent = 'Dash probe uncertain: click an article point to try live observer lab';
                 hint.style.color = '#e0c38a';
                 hint.style.borderColor = '#5d4522';
             }}
@@ -6485,20 +6485,7 @@ def create_monolith_cockpit(
             if (title) title.textContent = titleText;
             frame.srcdoc = '';
             panel.style.display = 'block';
-            var dashReachable = await probeDashReachable(dashUrl.origin);
-            if (dashReachable) {{
-                frame.src = dashUrl.origin + '/?' + qs.toString();
-                return;
-            }}
-            if (fallbackUrl) {{
-                if (title) title.textContent = 'LOCAL OBSERVER VIEW | ' + (qs.get('observer') || 'article');
-                frame.src = fallbackUrl;
-                return;
-            }}
-            setDashEmbedMessage(
-                titleText,
-                '<div><div style=\"font-size:13px;color:#ffd27a;margin-bottom:10px;\">Dash server unavailable</div><div style=\"font-size:11px;line-height:1.5;color:#b9f7ff;\">Expected service at ' + dashUrl.origin + '. Start <code>analysis/isolated_dash_prototype.py</code> to enable the observer lab.</div></div>'
-            );
+            frame.src = dashUrl.origin + '/?' + qs.toString();
         }}
 
         var cockpitEl = document.getElementById('cockpit');
