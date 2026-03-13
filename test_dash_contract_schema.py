@@ -843,3 +843,30 @@ def test_refresh_variants_honors_url_variant_selection_and_prefers_monolith(monk
 
     assert out[1] == "MONOLITH.html"
     assert out[3] == "MONOLITH.html"
+
+
+def test_resolve_artifact_does_not_force_manifest_observer_when_variant_differs(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run"
+    observer_dir = run_dir / "observer_7"
+    observer_dir.mkdir(parents=True, exist_ok=True)
+    (observer_dir / "MONOLITH.html").write_text("<html>observer</html>", encoding="utf-8")
+    (run_dir / "ALT.html").write_text("<html>alt</html>", encoding="utf-8")
+
+    monkeypatch.setattr(
+        mod,
+        "INDEX",
+        {
+            "runs": {
+                "rk": {
+                    "run_dir": run_dir,
+                    "variants": ["MONOLITH.html", "ALT.html"],
+                    "observer_manifest": {"variant": "MONOLITH.html"},
+                    "observer_artifacts": {"article:7": observer_dir / "MONOLITH.html"},
+                }
+            }
+        },
+    )
+
+    resolved = mod.resolve_artifact("rk", "ALT.html", "article:7")
+
+    assert resolved == run_dir / "ALT.html"

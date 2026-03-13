@@ -124,6 +124,9 @@ def main() -> None:
                 "idx": idx,
                 "value": f"article:{idx}",
                 "relative_path": str(out_path.relative_to(run_dir)).replace("\\", "/"),
+                "view_state_relative_path": str(out_path.with_suffix(".view_state.json").relative_to(run_dir)).replace("\\", "/")
+                if out_path.with_suffix(".view_state.json").exists()
+                else None,
                 "exists": out_path.exists(),
                 "action": action,
             }

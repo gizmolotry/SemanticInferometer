@@ -1308,8 +1308,14 @@ def resolve_artifact(run_key: str, variant_name: str, observer_value: str) -> Op
     # Observer-specific naming support (future-compatible) should take priority
     # for article viewpoints, then fallback to chosen global variant.
     if observer_value.startswith("article:"):
+        manifest = run.get("observer_manifest") or {}
+        manifest_variant = str(manifest.get("variant", "")).strip()
         manifest_hit = run.get("observer_artifacts", {}).get(observer_value)
-        if manifest_hit and manifest_hit.exists():
+        if (
+            manifest_hit
+            and manifest_hit.exists()
+            and (not manifest_variant or manifest_variant == selected_variant)
+        ):
             return manifest_hit
 
         idx = observer_value.split(":", 1)[1]
@@ -1317,13 +1323,19 @@ def resolve_artifact(run_key: str, variant_name: str, observer_value: str) -> Op
         observer_candidates = [
             run_dir / f"observer_{idx}" / selected_variant,
             run_dir / f"article_{idx}" / selected_variant,
-            run_dir / f"observer_{idx}" / "MONOLITH.html",
-            run_dir / f"article_{idx}" / "MONOLITH.html",
             run_dir / f"{stem}_article_{idx}.html",
             run_dir / f"{stem}_observer_{idx}.html",
-            run_dir / f"MONOLITH_article_{idx}.html",
-            run_dir / f"MONOLITH_observer_{idx}.html",
         ]
+        monolith_named = str(selected_variant).strip().upper() == "MONOLITH.HTML"
+        if monolith_named:
+            observer_candidates.extend(
+                [
+                    run_dir / f"observer_{idx}" / "MONOLITH.html",
+                    run_dir / f"article_{idx}" / "MONOLITH.html",
+                    run_dir / f"MONOLITH_article_{idx}.html",
+                    run_dir / f"MONOLITH_observer_{idx}.html",
+                ]
+            )
         for p in observer_candidates:
             if p.exists():
                 return p
