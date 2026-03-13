@@ -985,6 +985,8 @@ def test_dash_embed_html_prefers_live_dash_and_keeps_local_observer_fallback_hin
     assert "probeDashReachable" in html_text
     assert "observer_' + String(Math.floor(articleRef.idx)) + '/MONOLITH.html" in html_text
     assert "frame.src = dashUrl.origin + '/?' + qs.toString();" in html_text
+    assert "qs.set('variant_a', DASH_VARIANT_NAME);" in html_text
+    assert "qs.set('variant_b', DASH_VARIANT_NAME);" in html_text
 
 
 def test_render_terrain_surface_keeps_concave_center_connected():

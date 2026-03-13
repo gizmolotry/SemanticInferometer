@@ -6407,6 +6407,7 @@ def create_monolith_cockpit(
         var SECONDARY_MODES_ENABLED = {str(render_all_modes).lower()};
         var DASH_BASE_URL = 'http://127.0.0.1:8050/';
         var DASH_RUN_KEY = {json.dumps(dash_run_key)};
+        var DASH_VARIANT_NAME = {json.dumps(output_path.name)};
         var DASH_ALLOWED_ORIGINS = {{'http://127.0.0.1:8050': true, 'http://localhost:8050': true}};
         var DASH_PING_PATH = '_dash-layout';
 
@@ -6487,6 +6488,8 @@ def create_monolith_cockpit(
             var fallbackUrl = buildLocalObserverFallback(articleRef);
             var qs = new URLSearchParams();
             qs.set('run_key', DASH_RUN_KEY);
+            qs.set('variant_a', DASH_VARIANT_NAME);
+            qs.set('variant_b', DASH_VARIANT_NAME);
             qs.set('view_mode', 'observer');
             qs.set('compare', '0');
             qs.set('embedded', '1');
@@ -6910,6 +6913,37 @@ def create_monolith_cockpit(
         json.dumps(_json_safe_value(artifact_state_payload), indent=2),
         encoding="utf-8",
     )
+
+    if exp.experiment_dir is not None:
+        html_files = sorted(
+            [p for p in Path(exp.experiment_dir).glob("*.html") if p.is_file()],
+            key=lambda p: (
+                0 if p.name.upper() == "MONOLITH.HTML" else (1 if p.name.upper().startswith("MONOLITH") else 2),
+                p.name.lower(),
+            ),
+        )
+        manifest_artifacts: List[Dict[str, Any]] = []
+        for html_path in html_files:
+            view_state_path = html_path.with_suffix(".view_state.json")
+            manifest_artifacts.append(
+                {
+                    "html": html_path.name,
+                    "view_state": view_state_path.name if view_state_path.exists() else None,
+                }
+            )
+        run_manifest_payload = {
+            "schema_version": 1,
+            "run_key": dash_run_key,
+            "primary_artifact": output_path.name,
+            "primary_view_state": artifact_state_path.name,
+            "primary_metrics": artifact_state_payload.get("metrics", {}),
+            "observer_manifest": "observer_manifest.json" if (Path(exp.experiment_dir) / "observer_manifest.json").exists() else None,
+            "artifacts": manifest_artifacts,
+        }
+        (Path(exp.experiment_dir) / "MONOLITH.run_manifest.json").write_text(
+            json.dumps(_json_safe_value(run_manifest_payload), indent=2),
+            encoding="utf-8",
+        )
 
     print(f"[MONOLITH] Saved to: {output_path}")
     print(f"  Articles: {n_articles}")

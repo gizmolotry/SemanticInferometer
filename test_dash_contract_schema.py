@@ -735,6 +735,38 @@ def test_build_artifact_index_discovers_modern_run_layouts(monkeypatch, mod, tmp
     assert index["runs"][modern_key]["ari"] == 0.19
 
 
+def test_build_artifact_index_prefers_monolith_run_manifest_for_variants_and_metrics(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "outputs" / "experiments" / "runs" / "exp_x" / "matern" / "cls" / "sythgen" / "high_quality_articles.jsonl"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "MONOLITH.html").write_text("<html>main</html>", encoding="utf-8")
+    (run_dir / "_probe_current.html").write_text("<html>probe</html>", encoding="utf-8")
+    (run_dir / "MONOLITH_DATA.csv").write_text("index,title,bt_uid\n0,Main,uid-0\n", encoding="utf-8")
+    _write_json(
+        run_dir / "MONOLITH.run_manifest.json",
+        {
+            "schema_version": 1,
+            "run_key": "outputs/experiments/runs/exp_x/matern/cls/sythgen/high_quality_articles.jsonl",
+            "primary_artifact": "MONOLITH.html",
+            "primary_metrics": {"synthesis_nmi": 0.77},
+            "artifacts": [
+                {"html": "MONOLITH.html", "view_state": "MONOLITH.view_state.json"},
+                {"html": "_probe_current.html", "view_state": None},
+            ],
+        },
+    )
+
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    roots = mod._discover_artifact_roots()
+    monkeypatch.setattr(mod, "ARTIFACT_ROOTS", roots)
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", roots[0] if roots else None)
+    index = mod.build_artifact_index()
+
+    run_key = "outputs/experiments/runs/exp_x/matern/cls/sythgen/high_quality_articles.jsonl"
+    assert index["runs"][run_key]["variants"] == ["MONOLITH.html", "_probe_current.html"]
+    assert index["runs"][run_key]["primary_variant"] == "MONOLITH.html"
+    assert index["runs"][run_key]["nmi"] == 0.77
+
+
 def test_apply_url_state_observer_uid_overrides_query_observer(monkeypatch, mod):
     monkeypatch.setattr(mod, "_observer_value_from_uid", lambda run_key, uid: "article:7" if uid == "uid-7" else None)
     run_options = [{"label": "rk", "value": "rk"}]
@@ -788,3 +820,26 @@ def test_refresh_variants_hydrates_observer_from_uid(monkeypatch, mod):
     assert out[1] == "MONOLITH.html"
     assert out[3] == "ALT.html"
     assert out[5] == "article:7"
+
+
+def test_refresh_variants_honors_url_variant_selection_and_prefers_monolith(monkeypatch, mod):
+    monkeypatch.setattr(
+        mod,
+        "INDEX",
+        {
+            "runs": {"rk": {"variants": ["MONOLITH.html", "_probe_current.html", "ALT.html"]}},
+            "observers_by_run": {"rk": [{"label": "Global Mean", "value": "global"}]},
+            "article_rows_by_run": {"rk": {}},
+        },
+    )
+
+    out = mod.refresh_variants(
+        "rk",
+        "?run_key=rk&variant_a=MONOLITH.html&variant_b=MONOLITH.html",
+        "_probe_current.html",
+        "_probe_current.html",
+        "global",
+    )
+
+    assert out[1] == "MONOLITH.html"
+    assert out[3] == "MONOLITH.html"

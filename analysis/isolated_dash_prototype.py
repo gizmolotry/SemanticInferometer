@@ -152,6 +152,17 @@ def _load_artifact_view_state(path: Optional[Path]) -> dict:
         return {}
 
 
+def _load_run_manifest(run_dir: Path) -> dict:
+    candidate = run_dir / "MONOLITH.run_manifest.json"
+    if not candidate.exists():
+        return {}
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def _safe_json(path: Path, default):
     try:
         return json.loads(_safe_read_text(path))
@@ -700,6 +711,15 @@ def _collect_variant_names(run_dir: Path) -> List[str]:
     return [p.name for p in html_files]
 
 
+def _preferred_variant(variants: List[str]) -> str:
+    if not variants:
+        return "MONOLITH.html"
+    for name in variants:
+        if str(name).upper() == "MONOLITH.HTML":
+            return name
+    return variants[0]
+
+
 def _infer_run_metrics(run_dir: Path, summary_item: dict) -> dict:
     item = dict(summary_item or {})
     validation = _safe_json(run_dir / "validation.json", {}) if (run_dir / "validation.json").exists() else {}
@@ -1196,7 +1216,14 @@ def build_artifact_index() -> dict:
             continue
         root_key = str(run_dir.parent)
         item = _infer_run_metrics(run_dir, metrics_by_root.get(root_key, {}).get(run_dir.name, {}))
-        variants = _collect_variant_names(run_dir)
+        run_manifest = _load_run_manifest(run_dir)
+        manifest_artifacts = run_manifest.get("artifacts", []) if isinstance(run_manifest, dict) else []
+        variants = [str(a.get("html", "")).strip() for a in manifest_artifacts if isinstance(a, dict) and str(a.get("html", "")).strip()]
+        if not variants:
+            variants = _collect_variant_names(run_dir)
+        primary_metrics = run_manifest.get("primary_metrics", {}) if isinstance(run_manifest, dict) else {}
+        if item.get("nmi") is None and _is_number(primary_metrics.get("synthesis_nmi")):
+            item["nmi"] = float(primary_metrics.get("synthesis_nmi"))
         run = {
             "run_key": run_key,
             "kernel": str(item.get("kernel", "unknown")),
@@ -1206,11 +1233,13 @@ def build_artifact_index() -> dict:
             "run_dir": run_dir,
             "artifact_root": run_dir.parent,
             "variants": variants,
+            "primary_variant": str(run_manifest.get("primary_artifact") or _preferred_variant(variants)),
             "article_meta_path": run_dir / "article_metadata.json",
             "monolith_data_path": run_dir / "MONOLITH_DATA.csv",
             "observer_manifest_path": run_dir / "observer_manifest.json",
             "observer_manifest": {},
             "observer_artifacts": {},
+            "run_manifest": run_manifest if isinstance(run_manifest, dict) else {},
         }
         manifest_path = run["observer_manifest_path"]
         if manifest_path.exists():
@@ -1390,6 +1419,7 @@ app = Dash(__name__, external_stylesheets=[dbc.themes.CYBORG], title="MONOLITH A
 RUN_OPTIONS = _run_options_from_index(INDEX)
 DEFAULT_RUN = INDEX["default_run"]
 DEFAULT_VARIANTS = INDEX["runs"].get(DEFAULT_RUN, {}).get("variants", ["MONOLITH.html"])
+DEFAULT_PRIMARY_VARIANT = _preferred_variant(DEFAULT_VARIANTS)
 
 app.layout = dbc.Container(
     fluid=True,
@@ -1483,7 +1513,7 @@ app.layout = dbc.Container(
                             className="g-1",
                             children=[
                                 dbc.Col([html.Label("Variant A", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}), dcc.Dropdown(id="variant-a-dropdown", options=[{"label": v, "value": v} for v in DEFAULT_VARIANTS], value=DEFAULT_VARIANTS[0] if DEFAULT_VARIANTS else "MONOLITH.html", clearable=False, style={"color": "#111"})], width=6),
-                                dbc.Col([html.Label("Variant B", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}), dcc.Dropdown(id="variant-b-dropdown", options=[{"label": v, "value": v} for v in DEFAULT_VARIANTS], value=(DEFAULT_VARIANTS[1] if len(DEFAULT_VARIANTS) > 1 else DEFAULT_VARIANTS[0]) if DEFAULT_VARIANTS else "MONOLITH.html", clearable=False, style={"color": "#111"})], width=6),
+                                dbc.Col([html.Label("Variant B", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.82rem"}), dcc.Dropdown(id="variant-b-dropdown", options=[{"label": v, "value": v} for v in DEFAULT_VARIANTS], value=DEFAULT_PRIMARY_VARIANT if DEFAULT_VARIANTS else "MONOLITH.html", clearable=False, style={"color": "#111"})], width=6),
                             ],
                             style={"marginBottom": "8px"},
                         ),
@@ -1566,13 +1596,14 @@ app.layout = dbc.Container(
     State("run-dropdown", "value"),
 )
 def reindex_runs(n_clicks: Optional[int], current_run: Optional[str]):
-    global ARTIFACT_ROOTS, PRIMARY_ARTIFACT_ROOT, INDEX, RUN_OPTIONS, DEFAULT_RUN, DEFAULT_VARIANTS
+    global ARTIFACT_ROOTS, PRIMARY_ARTIFACT_ROOT, INDEX, RUN_OPTIONS, DEFAULT_RUN, DEFAULT_VARIANTS, DEFAULT_PRIMARY_VARIANT
     ARTIFACT_ROOTS = _discover_artifact_roots()
     PRIMARY_ARTIFACT_ROOT = ARTIFACT_ROOTS[0] if ARTIFACT_ROOTS else None
     INDEX = build_artifact_index()
     RUN_OPTIONS = _run_options_from_index(INDEX)
     DEFAULT_RUN = INDEX.get("default_run", "")
     DEFAULT_VARIANTS = INDEX.get("runs", {}).get(DEFAULT_RUN, {}).get("variants", ["MONOLITH.html"])
+    DEFAULT_PRIMARY_VARIANT = _preferred_variant(DEFAULT_VARIANTS)
 
     option_values = [opt["value"] for opt in RUN_OPTIONS]
     if current_run in option_values:
@@ -1610,8 +1641,15 @@ def refresh_variants(run_key: str, search: Optional[str], current_a: str, curren
     if not variants:
         variants = ["MONOLITH.html"]
     opts = [{"label": v, "value": v} for v in variants]
-    a = current_a if current_a in variants else variants[0]
-    b = current_b if current_b in variants else (variants[1] if len(variants) > 1 else variants[0])
+    preferred_variant = _preferred_variant(variants)
+    requested_variant_a = str((qs.get("variant_a") or [""])[0] or "").strip()
+    requested_variant_b = str((qs.get("variant_b") or [""])[0] or "").strip()
+    a = current_a if current_a in variants else preferred_variant
+    b = current_b if current_b in variants else preferred_variant
+    if requested_variant_a in variants:
+        a = requested_variant_a
+    if requested_variant_b in variants:
+        b = requested_variant_b
     obs_opts = INDEX["observers_by_run"].get(effective_run_key, [{"label": "Global Mean", "value": "global"}])
     obs_values = [o["value"] for o in obs_opts]
     observer = current_observer if current_observer in obs_values else "global"
