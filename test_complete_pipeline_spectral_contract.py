@@ -132,6 +132,25 @@ def test_track5_semantic_classifier_uses_article_delta_and_anomalies():
     assert stats["threshold_mode"] in {"kmeans_2cluster", "median_fallback"}
 
 
+def test_track5_semantic_classifier_emits_lower_tail_tautologies_when_supported():
+    delta = np.array(
+        [0.030, 0.032, 0.034, 0.036, 0.038, 0.040, 0.043, 0.046, 0.050, 0.054,
+         0.058, 0.062, 0.070, 0.078, 0.086, 0.094, 0.110, 0.128, 0.160, 0.220],
+        dtype=np.float32,
+    )
+    work = delta.copy()
+    disp = np.ones_like(delta, dtype=np.float32)
+    records = [{"label": "phantom", "anomaly_kind": "none"} for _ in range(len(delta))]
+
+    verdicts, stats = _classify_track5_semantic_verdicts(work, disp, records)
+
+    assert "TAUTOLOGY" in verdicts.tolist()
+    assert "HONEST" in verdicts.tolist()
+    assert "PHANTOM" in verdicts.tolist()
+    assert stats["tautology_cutoff"] is not None
+    assert stats["tautology_cutoff"] < stats["honest_cutoff"]
+
+
 def test_serialize_rks_basis_state_preserves_replay_fields():
     basis = SharedRKSBasis(input_dim=4, output_dim=6, seed=7, kernel_type="matern", nu=2.5, roughness=5)
     basis.set_sigma(1.75)

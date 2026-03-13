@@ -1426,6 +1426,26 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
         [[row["density"], row["stress"], row["z_height"]] for row in normalized_rows],
         dtype=float,
     )
+    try:
+        from core.complete_pipeline import _compute_alignment_metrics, _extract_validation_label_info
+    except Exception:
+        _compute_alignment_metrics = None
+        _extract_validation_label_info = None
+
+    label_info = None
+    baseline_alignment = None
+    if callable(_extract_validation_label_info) and callable(_compute_alignment_metrics):
+        try:
+            label_info = _extract_validation_label_info(
+                articles_for_labels=normalized_rows,
+                metadata_for_labels=normalized_rows,
+                allow_source_fallback=True,
+            )
+            if label_info is not None:
+                baseline_alignment = _compute_alignment_metrics(baseline_coords, label_info)
+        except Exception:
+            label_info = None
+            baseline_alignment = None
     baseline_nn = _nearest_neighbor_indices(baseline_coords)
     global_probe = np.asarray(probes[:n_articles], dtype=float)
     probe_norms = np.linalg.norm(global_probe, axis=1, keepdims=True)
@@ -1479,6 +1499,12 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
         flip_mask = observer_nn != baseline_nn
         flip_count = int(np.sum(flip_mask))
         translation_flip_count = int(np.sum(translation_nn != baseline_nn))
+        observer_alignment = None
+        if label_info is not None and callable(_compute_alignment_metrics):
+            try:
+                observer_alignment = _compute_alignment_metrics(observer_coords, label_info)
+            except Exception:
+                observer_alignment = None
 
         focus_meta = article_maps["metadata"].get(idx, {})
         focus_state = article_maps["state"].get(idx, {})
@@ -1543,6 +1569,11 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
                 "global_event_rate": global_event_rate,
                 "global_survival_pct": global_survival_pct,
                 "observer_survival_pct": 0.0 if bool(focus_state.get("anomaly_flag", False)) else 100.0,
+                "global_nmi": float(baseline_alignment.get("nmi")) if isinstance(baseline_alignment, dict) and isinstance(baseline_alignment.get("nmi"), (int, float)) else None,
+                "global_ari": float(baseline_alignment.get("ari")) if isinstance(baseline_alignment, dict) and isinstance(baseline_alignment.get("ari"), (int, float)) else None,
+                "observer_conditioned_nmi": float(observer_alignment.get("nmi")) if isinstance(observer_alignment, dict) and isinstance(observer_alignment.get("nmi"), (int, float)) else None,
+                "observer_conditioned_ari": float(observer_alignment.get("ari")) if isinstance(observer_alignment, dict) and isinstance(observer_alignment.get("ari"), (int, float)) else None,
+                "observer_track_nmi": {"SYN": float(observer_alignment.get("nmi"))} if isinstance(observer_alignment, dict) and isinstance(observer_alignment.get("nmi"), (int, float)) else {},
             },
             "provenance": {
                 "source": "observer_payload_relativity_v1",
@@ -1570,6 +1601,22 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
                 "d_rupture_rate": float((1.0 if bool(focus_state.get("anomaly_flag", False)) else 0.0) - global_anomaly_rate),
                 "d_mean_work": float(focus_path.get("mean_work", _safe_float(works[idx])) - global_work_mean),
                 "d_survival_pct": float((0.0 if bool(focus_state.get("anomaly_flag", False)) else 100.0) - global_survival_pct),
+                "d_nmi": (
+                    float(observer_alignment.get("nmi") - baseline_alignment.get("nmi"))
+                    if isinstance(observer_alignment, dict)
+                    and isinstance(baseline_alignment, dict)
+                    and isinstance(observer_alignment.get("nmi"), (int, float))
+                    and isinstance(baseline_alignment.get("nmi"), (int, float))
+                    else None
+                ),
+                "d_ari": (
+                    float(observer_alignment.get("ari") - baseline_alignment.get("ari"))
+                    if isinstance(observer_alignment, dict)
+                    and isinstance(baseline_alignment, dict)
+                    and isinstance(observer_alignment.get("ari"), (int, float))
+                    and isinstance(baseline_alignment.get("ari"), (int, float))
+                    else None
+                ),
             },
             "axis_delta": {
                 "rotation_deg": float(_angle_deg(focus_probe_raw, global_probe_mean)),

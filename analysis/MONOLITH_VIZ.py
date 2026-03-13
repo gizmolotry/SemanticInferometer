@@ -1613,6 +1613,44 @@ def render_terrain_surface(
     z_geometry = np.asarray(grid_stress, dtype=float).copy()
     try:
         pts_z = np.asarray(positions_3d[:, 2], dtype=float)
+        base_geometry = np.asarray(energy_values if energy_values is not None else pts_z, dtype=float).reshape(-1)
+        stress_geometry = np.asarray(stress_values, dtype=float).reshape(-1)
+        blend_ratio = float(os.environ.get("MONOLITH_TERRAIN_STRESS_BLEND", "0.35").strip())
+        blend_ratio = float(np.clip(blend_ratio, 0.0, 1.0))
+
+        def _robust_norm(arr: np.ndarray) -> np.ndarray:
+            arr = np.asarray(arr, dtype=float)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            finite = arr[np.isfinite(arr)]
+            if finite.size <= 0:
+                return np.full(arr.shape, 0.5, dtype=float)
+            lo = float(np.percentile(finite, 5.0))
+            hi = float(np.percentile(finite, 95.0))
+            if hi <= lo + 1e-12:
+                lo = float(np.nanmin(finite))
+                hi = float(np.nanmax(finite))
+            if hi <= lo + 1e-12:
+                return np.full(arr.shape, 0.5, dtype=float)
+            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+        base_norm = _robust_norm(base_geometry)
+        stress_norm = _robust_norm(stress_geometry)
+        if np.nanstd(stress_norm) > 1e-6:
+            geom_source = ((1.0 - blend_ratio) * base_norm) + (blend_ratio * stress_norm)
+        else:
+            geom_source = base_norm
+        grid_geom = _interpolate_field_boundary_safe(
+            x=x,
+            y=y,
+            values=geom_source,
+            Xi=Xi,
+            Yi=Yi,
+            fill_value=float(np.nanmean(np.asarray(geom_source, dtype=float))),
+            clip_to_source=True,
+        )
+        grid_geom = gaussian_filter(grid_geom, sigma=1.1)
+        z_geometry = np.asarray(grid_geom, dtype=float).copy()
+
         pts_min = float(np.nanmin(pts_z))
         pts_max = float(np.nanmax(pts_z))
         g_min = float(np.nanmin(z_geometry))
@@ -2362,6 +2400,7 @@ def render_phantom_paths_3d(
     article_z_height: Optional[np.ndarray] = None,
     terrain_z_values: Optional[np.ndarray] = None,
     surface_z_func=None,
+    surface_xy_projector=None,
     article_metadata: Optional[List[Dict]] = None,
     spectral_evr: Optional[np.ndarray] = None,
     spectral_probe_magnitudes: Optional[np.ndarray] = None,
@@ -2426,6 +2465,10 @@ def render_phantom_paths_3d(
     thermodynamic_mode = mode_key == "thermodynamic"
     semantic_tether_mode = mode_key == "semantic_tether"
     drape_paths = os.environ.get("MONOLITH_DRAPE_PATHS", "1").strip() == "1"
+    try:
+        path_surface_offset = float(os.environ.get("MONOLITH_PATH_SURFACE_OFFSET", "0.0").strip())
+    except Exception:
+        path_surface_offset = 0.0
 
     def _resample_polyline_xy(path_xy: np.ndarray, n_steps: int = 120) -> Tuple[np.ndarray, np.ndarray]:
         pts = np.asarray(path_xy, dtype=float)
@@ -2488,6 +2531,17 @@ def render_phantom_paths_3d(
         seg = np.asarray(seg_xyz, dtype=float).copy()
         if seg.ndim != 2 or seg.shape[1] < 2:
             return seg
+        if callable(surface_xy_projector):
+            try:
+                proj_x, proj_y = surface_xy_projector(seg[:, 0], seg[:, 1])
+                proj_x = np.asarray(proj_x, dtype=float).reshape(-1)
+                proj_y = np.asarray(proj_y, dtype=float).reshape(-1)
+                if proj_x.shape[0] == seg.shape[0] and proj_y.shape[0] == seg.shape[0]:
+                    finite_proj = np.isfinite(proj_x) & np.isfinite(proj_y)
+                    seg[finite_proj, 0] = proj_x[finite_proj]
+                    seg[finite_proj, 1] = proj_y[finite_proj]
+            except Exception:
+                pass
         seg[:, 0] = np.clip(seg[:, 0], x_clip_min, x_clip_max)
         seg[:, 1] = np.clip(seg[:, 1], y_clip_min, y_clip_max)
         return seg
@@ -2774,7 +2828,13 @@ def render_phantom_paths_3d(
         shear_axis = _dominant_probe_label(article_idx)
         asym_note = ""
         if asym is not None and "delta" in asym:
-            asym_note = f" | Δ={float(asym['delta']):.3f}"
+            raw_delta = float(asym["delta"])
+            if abs(raw_delta) < 1e-3:
+                asym_note = f" | Δ={raw_delta:.2e}"
+            else:
+                asym_note = f" | Δ={raw_delta:.3f}"
+            if "norm" in asym:
+                asym_note += f" | Δn={float(asym['norm']):.3f}"
         return f"[SHEAR: {shear_axis}{asym_note}]"
 
     def _select_shear_anchor_xyz(
@@ -2922,19 +2982,37 @@ def render_phantom_paths_3d(
             start_xyz[1] = float(np.clip(start_xyz[1], y_clip_min, y_clip_max))
             end_xyz[0] = float(np.clip(end_xyz[0], x_clip_min, x_clip_max))
             end_xyz[1] = float(np.clip(end_xyz[1], y_clip_min, y_clip_max))
+            if callable(surface_xy_projector):
+                try:
+                    proj_x, proj_y = surface_xy_projector(
+                        np.array([start_xyz[0], end_xyz[0]], dtype=float),
+                        np.array([start_xyz[1], end_xyz[1]], dtype=float),
+                    )
+                    proj_x = np.asarray(proj_x, dtype=float).reshape(-1)
+                    proj_y = np.asarray(proj_y, dtype=float).reshape(-1)
+                    if proj_x.shape[0] == 2 and proj_y.shape[0] == 2:
+                        start_xyz[0], end_xyz[0] = float(proj_x[0]), float(proj_x[1])
+                        start_xyz[1], end_xyz[1] = float(proj_y[0]), float(proj_y[1])
+                except Exception:
+                    pass
             if callable(surface_z_func):
                 try:
                     tether_z = np.asarray(
                         surface_z_func(
                             np.array([start_xyz[0], end_xyz[0]], dtype=float),
                             np.array([start_xyz[1], end_xyz[1]], dtype=float),
-                            offset=0.05,
+                            offset=path_surface_offset,
                             preserve_nan=False,
                         ),
                         dtype=float,
                     )
                     if tether_z.shape[0] == 2:
-                        tether_z = np.nan_to_num(tether_z, nan=source_z + 0.05, posinf=source_z + 0.05, neginf=source_z + 0.05)
+                        tether_z = np.nan_to_num(
+                            tether_z,
+                            nan=source_z + path_surface_offset,
+                            posinf=source_z + path_surface_offset,
+                            neginf=source_z + path_surface_offset,
+                        )
                         start_xyz[2] = float(np.clip(tether_z[0], -z_cap, z_cap))
                         end_xyz[2] = float(np.clip(tether_z[1], -z_cap, z_cap))
                 except Exception:
@@ -3060,21 +3138,28 @@ def render_phantom_paths_3d(
             scorch_x, scorch_y = _resample_polyline_xy(rendered_path[:, :2], n_steps=120)
             if scorch_x.size < 2:
                 continue
+            if callable(surface_xy_projector):
+                try:
+                    scorch_x, scorch_y = surface_xy_projector(scorch_x, scorch_y)
+                    scorch_x = np.asarray(scorch_x, dtype=float).reshape(-1)
+                    scorch_y = np.asarray(scorch_y, dtype=float).reshape(-1)
+                except Exception:
+                    pass
             if callable(surface_z_func):
                 try:
                     scorch_z = np.asarray(
                         surface_z_func(
                             scorch_x,
                             scorch_y,
-                            offset=0.05,
+                            offset=path_surface_offset,
                             preserve_nan=True,
                         ),
                         dtype=float,
                     )
                 except Exception:
-                    scorch_z = np.full_like(scorch_x, source_z + 0.05, dtype=float)
+                    scorch_z = np.full_like(scorch_x, source_z + path_surface_offset, dtype=float)
             else:
-                scorch_z = np.full_like(scorch_x, source_z + 0.05, dtype=float)
+                scorch_z = np.full_like(scorch_x, source_z + path_surface_offset, dtype=float)
 
             if verdict in {"HONEST", "PHANTOM", "TAUTOLOGY"}:
                 path_color = ("#00FFFF" if verdict == "HONEST" else "#FF2DFF" if verdict == "PHANTOM" else "#39FF14")
@@ -3112,7 +3197,7 @@ def render_phantom_paths_3d(
                 seg = path_segments[seg_idx].copy()
                 try:
                     terrain_z = np.asarray(
-                        surface_z_func(seg[:, 0], seg[:, 1], offset=0.05),
+                        surface_z_func(seg[:, 0], seg[:, 1], offset=path_surface_offset),
                         dtype=float
                     )
                     if terrain_z.shape == seg[:, 2].shape and np.isfinite(terrain_z).any():
@@ -4119,6 +4204,7 @@ def render_analysis_planes(
     exp: 'ExperimentData',
     plane_spacing: float = 3.0,
     plane_size: float = 10.0,
+    nmi_override: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Any], Dict[str, float]]:
     """
     Render stacked horizontal planes showing each track in isolation.
@@ -4226,8 +4312,9 @@ def render_analysis_planes(
             continue
 
         persisted_nmi = None
-        if isinstance(exp.track_nmi, dict):
-            candidate = exp.track_nmi.get(cp_label)
+        effective_track_nmi = nmi_override if isinstance(nmi_override, dict) else exp.track_nmi
+        if isinstance(effective_track_nmi, dict):
+            candidate = effective_track_nmi.get(cp_label)
             if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)):
                 persisted_nmi = float(candidate)
         if persisted_nmi is None and cp_label == "SYN" and isinstance(exp.synthesis_nmi, (int, float)):
@@ -4701,8 +4788,20 @@ def create_monolith_cockpit(
     observer_coord_override: Optional[np.ndarray] = None
     observer_probe_similarity: Optional[np.ndarray] = None
     observer_coord_delta: Optional[np.ndarray] = None
+    effective_synthesis_nmi = exp.synthesis_nmi
+    effective_track_nmi = dict(exp.track_nmi) if isinstance(exp.track_nmi, dict) else {}
     if isinstance(focus_state_payload, dict):
         articles_blob = focus_state_payload.get("articles")
+        metrics_blob = focus_state_payload.get("metrics", {}) if isinstance(focus_state_payload.get("metrics"), dict) else {}
+        obs_nmi = metrics_blob.get("observer_conditioned_nmi")
+        if isinstance(obs_nmi, (int, float)) and np.isfinite(float(obs_nmi)):
+            effective_synthesis_nmi = float(obs_nmi)
+            effective_track_nmi["SYN"] = float(obs_nmi)
+        obs_track_nmi = metrics_blob.get("observer_track_nmi")
+        if isinstance(obs_track_nmi, dict):
+            for k, v in obs_track_nmi.items():
+                if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                    effective_track_nmi[str(k)] = float(v)
         if isinstance(articles_blob, list) and articles_blob:
             coords = np.full((n_articles, 3), np.nan, dtype=float)
             probe_sim = np.full(n_articles, np.nan, dtype=float)
@@ -5196,21 +5295,7 @@ def create_monolith_cockpit(
 
     terrain_support_xy = None
     if walker_paths_pure:
-        terrain_support_parts = []
-        for _path in walker_paths_pure.values():
-            path_arr = np.asarray(_path, dtype=float)
-            if path_arr.ndim != 2 or path_arr.shape[0] < 2 or path_arr.shape[1] < 2:
-                continue
-            xy = np.asarray(path_arr[:, :2], dtype=float)
-            xy = xy[np.isfinite(xy).all(axis=1)]
-            if xy.shape[0] < 2:
-                continue
-            xy_sample = xy[::4]
-            if xy_sample.shape[0] == 0 or not np.allclose(xy_sample[-1], xy[-1]):
-                xy_sample = np.vstack([xy_sample, xy[-1:]])
-            terrain_support_parts.append(xy_sample)
-        if terrain_support_parts:
-            terrain_support_xy = np.vstack(terrain_support_parts)
+        terrain_support_xy = np.asarray(positions_3d[:, :2], dtype=float)
 
     # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
     energy_values_for_terrain = _compress_surface_height_field(pure_z.copy())
@@ -5486,6 +5571,11 @@ def create_monolith_cockpit(
     # SYNTHESIS MODE TRACES (Default: visible)
     # =========================================
     synthesis_trace_start = len(fig.data)
+    terrain_grid_x = None
+    terrain_grid_y = None
+    terrain_grid_z = None
+    grid_density = None
+    grid_stress = None
 
     # Dumb-renderer mode: keep terrain fully visible, no verification ghosting.
     surface_opacity = 0.9
@@ -5549,22 +5639,46 @@ def create_monolith_cockpit(
     # Terrain interpolator remains available for overlays that intentionally drape to surface.
     energy_values_for_points = positions_3d[:, 2]
 
-    def _nearest_article_surface_z(x_coords, y_coords) -> np.ndarray:
-        xq = np.atleast_1d(x_coords).astype(float)
-        yq = np.atleast_1d(y_coords).astype(float)
-        if article_xy.shape[0] <= 0:
-            return np.full_like(xq, positions_3d[:, 2].mean() if len(positions_3d) > 0 else 0.0, dtype=float)
-        q = np.column_stack((xq, yq))
-        d = cdist(q, article_xy)
-        idx = np.argmin(d, axis=1)
-        return np.asarray(energy_values_for_points, dtype=float)[idx]
+    surface_support_projector = None
+    if terrain_grid_x is not None and terrain_grid_y is not None and terrain_grid_z is not None:
+        try:
+            finite_surface = np.isfinite(np.asarray(terrain_grid_z, dtype=float))
+            if np.any(finite_surface):
+                surface_support_xy = np.column_stack(
+                    [
+                        np.asarray(terrain_grid_x, dtype=float)[finite_surface],
+                        np.asarray(terrain_grid_y, dtype=float)[finite_surface],
+                    ]
+                )
+                if surface_support_xy.shape[0] >= 1:
+                    support_tree = cKDTree(surface_support_xy)
+
+                    def surface_support_projector(x_coords, y_coords):
+                        xq = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
+                        yq = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
+                        q = np.column_stack((xq, yq))
+                        _, idx = support_tree.query(q, k=1)
+                        idx = np.asarray(idx, dtype=int).reshape(-1)
+                        proj = surface_support_xy[idx]
+                        if np.isscalar(x_coords) or np.ndim(np.asarray(x_coords)) == 0:
+                            return float(proj[0, 0]), float(proj[0, 1])
+                        return proj[:, 0], proj[:, 1]
+        except Exception:
+            surface_support_projector = None
 
     # Helper function to get surface Z from interpolator
     def get_surface_z(x_coords, y_coords, offset=0.0, preserve_nan=False):
         if interp_terrain_z is not None:
             # Ensure x_coord and y_coord are numpy arrays for interpolation
-            x_coord_np = np.atleast_1d(x_coords)
-            y_coord_np = np.atleast_1d(y_coords)
+            x_coord_np = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
+            y_coord_np = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
+            if callable(surface_support_projector):
+                try:
+                    x_coord_np, y_coord_np = surface_support_projector(x_coord_np, y_coord_np)
+                    x_coord_np = np.asarray(x_coord_np, dtype=float).reshape(-1)
+                    y_coord_np = np.asarray(y_coord_np, dtype=float).reshape(-1)
+                except Exception:
+                    pass
             if terrain_grid_x is not None and terrain_grid_y is not None:
                 x_min_grid = float(np.nanmin(terrain_grid_x[0, :]))
                 x_max_grid = float(np.nanmax(terrain_grid_x[0, :]))
@@ -5579,10 +5693,12 @@ def create_monolith_cockpit(
             interp_z = np.asarray(interp_terrain_z(points_for_interp), dtype=float)
             invalid = ~np.isfinite(interp_z)
             if np.any(invalid) and not preserve_nan:
-                interp_z[invalid] = _nearest_article_surface_z(
-                    x_coord_np[invalid],
-                    y_coord_np[invalid],
+                fill_value = (
+                    float(np.nanmean(np.asarray(terrain_grid_z, dtype=float)))
+                    if terrain_grid_z is not None and np.isfinite(np.asarray(terrain_grid_z, dtype=float)).any()
+                    else float(np.nanmean(np.asarray(energy_values_for_points, dtype=float)))
                 )
+                interp_z[invalid] = fill_value
             
             # If input was scalar, return scalar. If array, return array.
             if isinstance(x_coords, (int, float, np.floating)):
@@ -5619,6 +5735,7 @@ def create_monolith_cockpit(
             article_z_height=article_marker_z,
             terrain_z_values=energy_values_for_terrain,
             surface_z_func=get_surface_z,
+            surface_xy_projector=surface_support_projector,
             article_metadata=metadata,
             spectral_evr=spectral_evr,
             spectral_probe_magnitudes=spectral_mags,
@@ -5802,7 +5919,7 @@ def create_monolith_cockpit(
         # ANALYSIS mode traces
         analysis_trace_start = len(fig.data)
         print("[MONOLITH] Rendering ANALYSIS mode traces (stacked track planes)...")
-        analysis_traces, analysis_nmi_scores = render_analysis_planes(exp)
+        analysis_traces, analysis_nmi_scores = render_analysis_planes(exp, nmi_override=effective_track_nmi)
         for t in analysis_traces:
             t.visible = False
             t.meta = {'custom_mode': 'analysis'}
@@ -5913,7 +6030,7 @@ def create_monolith_cockpit(
         n_bonds=n_bonds,
         mean_action=mean_action,
         survival_rate=survival_rate,
-        synthesis_nmi=exp.synthesis_nmi,
+        synthesis_nmi=effective_synthesis_nmi,
     )
 
     # ==========================================================================
@@ -5934,7 +6051,7 @@ def create_monolith_cockpit(
     else:
         stability_text = "unstable"
 
-    synthesis_nmi_valid = isinstance(exp.synthesis_nmi, (int, float, np.floating)) and np.isfinite(exp.synthesis_nmi)
+    synthesis_nmi_valid = isinstance(effective_synthesis_nmi, (int, float, np.floating)) and np.isfinite(effective_synthesis_nmi)
     compass_rows_html = ""
     if spectral_mags_available and isinstance(spectral_mags, np.ndarray) and spectral_mags.ndim == 2 and spectral_mags.shape[1] >= 1:
         try:
@@ -5998,7 +6115,7 @@ def create_monolith_cockpit(
                 <div class="ep-row"><span class="k">Track 4 Survival:</span> <span class="v">{survival_rate * 100.0:.1f}%</span></div>
                 <div class="ep-row"><span class="k">Verdicts:</span> <span class="v">{n_honest} H / {n_phantoms} P / {n_tautology} T</span></div>
                 <div class="ep-row"><span class="k">Anomalies:</span> <span class="v">{n_anomalies}</span></div>
-                <div class="ep-row"><span class="k">Synthesis NMI:</span> <span class="v">{f"{exp.synthesis_nmi:.3f}" if synthesis_nmi_valid else "unavailable"}</span></div>
+                <div class="ep-row"><span class="k">Synthesis NMI:</span> <span class="v">{f"{effective_synthesis_nmi:.3f}" if synthesis_nmi_valid else "unavailable"}</span></div>
             </div>
         </div>
     </div>
@@ -6694,11 +6811,11 @@ def create_monolith_cockpit(
         validation_errors.append(f"Non-canonical zones detected: {invalid_zones}")
     if "Fault" in html_final:
         validation_errors.append("Found legacy 'Fault' label in output HTML.")
-    if exp.synthesis_nmi is not None:
-        expected_nmi = f"{exp.synthesis_nmi:.3f}"
+    if effective_synthesis_nmi is not None:
+        expected_nmi = f"{effective_synthesis_nmi:.3f}"
         if ("| NMI: <span" not in html_final) or (expected_nmi not in html_final):
             validation_errors.append(
-                f"Synthesis NMI mismatch: expected HUD value {expected_nmi} from validation.json."
+                f"Synthesis NMI mismatch: expected HUD value {expected_nmi} from active observer/global metrics."
             )
     if validation_errors:
         message = "[MONOLITH][VALIDATION] " + " | ".join(validation_errors)

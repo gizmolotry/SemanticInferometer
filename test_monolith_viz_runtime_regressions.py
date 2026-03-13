@@ -563,7 +563,7 @@ def test_paths_are_draped_to_surface_height_with_positive_offset():
     assert honest_traces, "Expected draped honest path trace"
     for trace in honest_traces:
         zs = np.asarray(trace.z, dtype=float)
-        assert np.allclose(zs, 1.05), zs
+        assert np.allclose(zs, 1.0), zs
 
 
 def test_axis_labels_are_data_driven_when_spectral_present(monkeypatch, tmp_path):

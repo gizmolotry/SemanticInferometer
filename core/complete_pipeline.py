@@ -556,7 +556,17 @@ def _classify_track5_semantic_verdicts(
         "HONEST",
         "PHANTOM",
     )
+    tautology_cutoff = None
+    if candidate_delta.size >= 12 and np.unique(np.round(candidate_delta, 8)).size >= 4:
+        lower_tail_cutoff = float(np.percentile(candidate_delta, 20.0))
+        tautology_cutoff = min(lower_tail_cutoff, honest_cutoff * 0.8)
+        if np.isfinite(tautology_cutoff):
+            candidate_indices = np.flatnonzero(candidate_mask)
+            low_tail_mask = candidate_delta <= tautology_cutoff
+            if np.any(low_tail_mask):
+                verdicts[candidate_indices[low_tail_mask]] = "TAUTOLOGY"
     return verdicts, {
+        "tautology_cutoff": float(tautology_cutoff) if tautology_cutoff is not None else None,
         "honest_cutoff": honest_cutoff,
         "threshold_mode": threshold_mode,
         "delta_min": float(delta_arr.min()) if delta_arr.size else 0.0,

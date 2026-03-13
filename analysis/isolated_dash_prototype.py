@@ -2036,6 +2036,7 @@ def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str
         return html.Div("Global baseline selected. Choose an article observer to view Type-2 deltas.", style={"color": PALETTE["dim"]})
 
     delta = contract.get("observer_delta", {}) or {}
+    observer_state = contract.get("observer_state", {}) or {}
     if not delta:
         return html.Div("Observer delta artifact missing.", style={"color": PALETTE["amber"]})
 
@@ -2054,6 +2055,12 @@ def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str
         f"Axis Delta -> rotation_deg={axis_delta.get('rotation_deg', 'n/a')} | d_explained_variance_axis1={axis_delta.get('d_explained_variance_axis1', 'n/a')}",
         "Path Flip Delta (top):",
     ]
+    state_metrics = observer_state.get("metrics", {}) if isinstance(observer_state.get("metrics"), dict) else {}
+    if state_metrics:
+        lines.insert(
+            2,
+            f"Observer NMI -> global={state_metrics.get('global_nmi', 'n/a')} | observer={state_metrics.get('observer_conditioned_nmi', 'n/a')} | d_nmi={metrics_delta.get('d_nmi', 'n/a')}",
+        )
     flip_items = sorted(flips.items(), key=lambda kv: -float(kv[1]) if _is_number(kv[1]) else 0.0)
     for k, v in flip_items[:8]:
         lines.append(f"  - {k}: {v}")
@@ -2180,6 +2187,12 @@ def _render_dashboard_impl(
         path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
+    if effective_observer.startswith("article:"):
+        observer_state_metrics = contract.get("observer_state", {}).get("metrics", {}) if isinstance(contract.get("observer_state", {}), dict) else {}
+        obs_nmi = observer_state_metrics.get("observer_conditioned_nmi")
+        obs_ari = observer_state_metrics.get("observer_conditioned_ari")
+        if _is_number(obs_nmi) or _is_number(obs_ari):
+            run_score += f" | Observer NMI={obs_nmi if _is_number(obs_nmi) else 'n/a'} ARI={obs_ari if _is_number(obs_ari) else 'n/a'}"
 
     article_metric_text = "Article Metrics: n/a"
     if effective_observer.startswith("article:"):
