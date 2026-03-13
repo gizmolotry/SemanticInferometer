@@ -2431,6 +2431,11 @@ def render_phantom_paths_3d(
     walker_path_diagnostics = walker_path_diagnostics or {}
     all_path_starts: List[np.ndarray] = []
     show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "1").strip() == "1"
+    try:
+        max_shear_labels = int(os.environ.get("MONOLITH_MAX_SHEAR_LABELS", "8").strip())
+    except Exception:
+        max_shear_labels = 8
+    max_shear_labels = max(0, max_shear_labels)
     show_asymmetry_lines = os.environ.get("MONOLITH_SHOW_ASYMMETRY_LINES", "0").strip() == "1"
     debug_printed = 0
     enable_raw_probe = os.environ.get("MONOLITH_RAW_MATRIX_PROBE", "0").strip() == "1"
@@ -2561,9 +2566,9 @@ def render_phantom_paths_3d(
         if seg.shape[0] < 2:
             return 0
         try:
-            batch_stride = int(os.environ.get("MONOLITH_RIBBON_BATCH_STRIDE", "3").strip())
+            batch_stride = int(os.environ.get("MONOLITH_RIBBON_BATCH_STRIDE", "6").strip())
         except Exception:
-            batch_stride = 3
+            batch_stride = 6
         batch_stride = max(1, min(batch_stride, 8))
         seg_count = max(0, seg.shape[0] - 1)
         if seg_count <= max(3, batch_stride + 1):
@@ -2874,6 +2879,11 @@ def render_phantom_paths_3d(
         asym: Optional[Dict[str, float]] = None,
     ) -> None:
         if not path_segments:
+            return
+        if max_shear_labels == 0:
+            return
+        existing_labels = sum(1 for t in traces if str(getattr(t, "name", "")) == "Ideological Shear")
+        if existing_labels >= max_shear_labels:
             return
         anchor_xyz = _select_shear_anchor_xyz(path_segments, event_mask, event_severity)
         if anchor_xyz is None or not np.isfinite(anchor_xyz).all():
@@ -5175,9 +5185,9 @@ def create_monolith_cockpit(
     if not np.isfinite(global_norm_span) or global_norm_span <= 1e-12:
         global_norm_span = float(np.max(target_xy_span))
     min_norm_span = max(1e-3, global_norm_span * 0.02)
-    max_segment_norm_len = max(1e-3, global_norm_span * 0.20)
-    max_total_path_norm_span = max(1e-3, global_norm_span * 0.90)
-    max_target_path_norm_span = max(1e-3, global_norm_span * 0.60)
+    max_segment_norm_len = max(1e-3, global_norm_span * 0.35)
+    max_total_path_norm_span = max(1e-3, global_norm_span * 1.10)
+    max_target_path_norm_span = max(1e-3, global_norm_span * 0.85)
 
     # Normalize path XY via local span mapping and anchor each path to source article XY.
     compatible_paths: Dict[int, np.ndarray] = {}
