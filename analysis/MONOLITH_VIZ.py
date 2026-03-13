@@ -5831,7 +5831,7 @@ def create_monolith_cockpit(
     # Lean synthesis product by default: secondary modes are opt-in in synthesis,
     # but still render when analysis/diagnostics is the active target mode.
     fast_synthesis_only = os.environ.get("MONOLITH_FAST_SYNTHESIS_ONLY", "0").strip() == "1"
-    include_secondary_modes = os.environ.get("MONOLITH_INCLUDE_SECONDARY_MODES", "0").strip() == "1"
+    include_secondary_modes = os.environ.get("MONOLITH_INCLUDE_SECONDARY_MODES", "1").strip() == "1"
     render_all_modes = (physics_mode != "synthesis" or include_secondary_modes) and not fast_synthesis_only
     diagnostics_trace_start = len(fig.data)
     analysis_nmi_scores = {}

@@ -253,6 +253,28 @@ def test_synthesis_shell_uses_instrument_panel_and_layer_toggles(monkeypatch, tm
     assert "â†”" not in html_syn
 
 
+def test_synthesis_product_html_includes_secondary_mode_buttons_by_default(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path / "product_shell", spectral_probe_magnitudes=None)
+    output_path = tmp_path / "product_shell" / "monolith_product.html"
+    monkeypatch.delenv("MONOLITH_FAST_SYNTHESIS_ONLY", raising=False)
+    monkeypatch.delenv("MONOLITH_INCLUDE_SECONDARY_MODES", raising=False)
+    create_monolith_cockpit(
+        exp=exp,
+        output_path=output_path,
+        physics_mode="synthesis",
+        show_terrain=False,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=False,
+        show_hott=False,
+    )
+    html_syn = output_path.read_text(encoding="utf-8")
+    assert ">ANALYSIS</button>" in html_syn
+    assert ">DIAGNOSTICS</button>" in html_syn
+    assert 'var SECONDARY_MODES_ENABLED = true;' in html_syn
+
+
 def test_path_invalid_points_are_filtered_not_origin_injected():
     _require_plotly()
     positions_3d = np.array([[10.0, 20.0, 30.0], [15.0, 25.0, 35.0]], dtype=float)
