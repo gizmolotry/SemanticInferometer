@@ -5089,12 +5089,20 @@ def create_monolith_cockpit(
             path_samples = []
             for _p in walker_paths_raw.values():
                 _arr = np.asarray(_p, dtype=float)
-                if _arr.ndim == 2 and _arr.shape[1] == features.shape[1] and _arr.shape[0] >= 2:
-                    # Sample every 12th step + last point to keep memory bounded.
-                    _sample = _arr[::12]
-                    if _sample.shape[0] == 0 or not np.array_equal(_sample[-1], _arr[-1]):
-                        _sample = np.vstack([_sample, _arr[-1:]])
-                    path_samples.append(_sample)
+                if _arr.ndim == 2 and _arr.shape[0] >= 2:
+                    # ASTER v3.2 Dimensionality Bridge:
+                    # If path dimension < feature dimension, pad with zeros to match PCA basis.
+                    if _arr.shape[1] < features.shape[1]:
+                        _padded = np.zeros((_arr.shape[0], features.shape[1]), dtype=float)
+                        _padded[:, :_arr.shape[1]] = _arr
+                        _arr = _padded
+                    
+                    if _arr.shape[1] == features.shape[1]:
+                        # Sample every 12th step + last point to keep memory bounded.
+                        _sample = _arr[::12]
+                        if _sample.shape[0] == 0 or not np.array_equal(_sample[-1], _arr[-1]):
+                            _sample = np.vstack([_sample, _arr[-1:]])
+                        path_samples.append(_sample)
             if path_samples:
                 path_fit = np.vstack(path_samples)
                 projection_fit_matrix = np.vstack([features, path_fit])
@@ -5120,6 +5128,13 @@ def create_monolith_cockpit(
             path_arr = np.asarray(raw_path, dtype=float)
             if path_arr.ndim != 2 or path_arr.shape[0] < 2:
                 continue
+            
+            # ASTER v3.2 Dimensionality Bridge during projection
+            if path_arr.shape[1] < features.shape[1]:
+                _padded = np.zeros((path_arr.shape[0], features.shape[1]), dtype=float)
+                _padded[:, :path_arr.shape[1]] = path_arr
+                path_arr = _padded
+
             if path_arr.shape[1] == features.shape[1]:
                 path_proj = pca_3d.transform(path_arr)
             elif path_arr.shape[1] == 3:
@@ -5163,9 +5178,9 @@ def create_monolith_cockpit(
             positions_3d[:, 2] = pure_z
 
     # RAW PATHS: no additional normalization/clipping.
-    walker_paths_pure: Dict[int, np.ndarray] = {}
+    walker_paths_projected_raw: Dict[int, np.ndarray] = {}
     for article_idx, path_proj in walker_paths_projected.items():
-        walker_paths_pure[int(article_idx)] = np.asarray(path_proj[:, :3], dtype=float)
+        walker_paths_projected_raw[int(article_idx)] = np.asarray(path_proj[:, :3], dtype=float)
 
     # Deterministic XY normalization (no runtime source fallback):
     # keep relative geometry, center XY, and scale into a stable display range.
@@ -5210,7 +5225,7 @@ def create_monolith_cockpit(
     skipped_invalid_paths = 0
     clipped_segment_count = 0
     clipped_path_span_count = 0
-    for _idx, _path in walker_paths_pure.items():
+    for _idx, _path in walker_paths_projected_raw.items():
         idx = int(_idx)
         if idx < 0 or idx >= n_pts:
             skipped_invalid_paths += 1

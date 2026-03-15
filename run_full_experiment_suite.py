@@ -671,17 +671,6 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "target_dir": str(target_dir),
             }
 
-        print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
-        pre_res = subprocess.run(precompute_cmd, env=env)
-        if pre_res.returncode != 0:
-            return {
-                "status": "failed",
-                "stage": "observer_manifest",
-                "returncode": pre_res.returncode,
-                "run_dir": str(run_dir),
-                "target_dir": str(target_dir),
-            }
-
         print(f"[BUNDLE] Emitting consumer contract bundle for {target_dir}...")
         contract_res = emit_consumer_contract_bundle(target_dir)
         if contract_res.get("status") != "success":
@@ -689,6 +678,17 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "status": "failed",
                 "stage": "contract_bundle",
                 "error": contract_res.get("error", "unknown contract bundle error"),
+                "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
+            }
+
+        print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
+        pre_res = subprocess.run(precompute_cmd, env=env)
+        if pre_res.returncode != 0:
+            return {
+                "status": "failed",
+                "stage": "observer_manifest",
+                "returncode": pre_res.returncode,
                 "run_dir": str(run_dir),
                 "target_dir": str(target_dir),
             }
@@ -1210,9 +1210,9 @@ def _emit_baseline_meta(run_dir: Path) -> Path:
             "weights_hash": weights_hash,
             "kernel_params": kernel_params,
             "rks_dim": rks_dim if rks_dim > 0 else 2048,
-            "crn_seed": int(provenance.get("crn_seed", meta.get("seed", 0))) if isinstance(provenance, dict) or isinstance(meta, dict) else 0,
+            "crn_seed": int(provenance.get("crn_seed", meta.get("seed", 0) if isinstance(meta, dict) else 0)) if isinstance(provenance, dict) else 0,
             "alpha": float(provenance.get("alpha", 1.0)) if isinstance(provenance, dict) else 1.0,
-            "timestamp_utc": str(meta.get("timestamp") or datetime.now(timezone.utc).isoformat()) if isinstance(meta, dict) else datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": str(meta.get("timestamp") if isinstance(meta, dict) else datetime.now(timezone.utc).isoformat()),
             "verification_status": verification_status,
             "provenance_source": "observer_payload",
         }
@@ -1426,6 +1426,30 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
         [[row["density"], row["stress"], row["z_height"]] for row in normalized_rows],
         dtype=float,
     )
+
+    # ASTER v3.2 RICH RELATIVITY: 
+    # Use 2D PCA to preserve the manifold layout instead of correlated pancake axes.
+    # We'll use PCA for XY and keep relativistic Z-height for the 'mountains'.
+    pca_xy = None
+    try:
+        from sklearn.decomposition import PCA
+        embeddings = payload.get("embeddings")
+        if embeddings is None:
+            embeddings = payload.get("features")
+        if embeddings is not None:
+            if torch.is_tensor(embeddings):
+                embeddings = embeddings.detach().cpu().numpy()
+            embeddings = np.asarray(embeddings, dtype=float)
+            if embeddings.ndim == 2 and embeddings.shape[0] >= n_articles:
+                # Use only the active articles for the local manifold fit.
+                fit_data = embeddings[:n_articles]
+                pca_2d = PCA(n_components=2, random_state=42)
+                pca_xy = pca_2d.fit_transform(fit_data)
+                print(f"  [RELATIVITY] Generated rich XY manifold (EVR: {float(np.sum(pca_2d.explained_variance_ratio_)):.2%})")
+    except Exception as pca_err:
+        print(f"  [WARN] Relativity PCA failed: {pca_err}. Falling back to pancake mode.")
+        pca_xy = None
+
     try:
         from core.complete_pipeline import _compute_alignment_metrics, _extract_validation_label_info
     except Exception:
@@ -1484,18 +1508,60 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
     for idx in range(n_articles):
         focus_row = normalized_rows[idx]
         focus_probe = probe_unit[idx]
+        
+        # Spectral axis: 1.0 - cosine similarity
         probe_distance = 1.0 - np.clip(np.sum(probe_unit * focus_probe, axis=1), -1.0, 1.0)
-        translation_coords = baseline_coords - baseline_coords[idx]
-        observer_coords = np.column_stack(
-            [
-                translation_coords[:, 0],
-                probe_distance,
-                translation_coords[:, 2],
-            ]
-        )
-        coord_delta = np.linalg.norm(observer_coords - baseline_coords, axis=1)
+        
+        # Baseline reference centered on focus for delta calculation
+        centered_baseline = baseline_coords - baseline_coords[idx]
+
+        if pca_xy is not None:
+            # RELATIVISTIC MANIFOLD: Center the rich PCA projection on the focused article.
+            # We'll use a local PCA fit to capture the perspective of this specific article.
+            try:
+                # Find local neighborhood (top 50% articles by spectral distance)
+                # to make the PCA fit 'local' to this observer's regime.
+                n_local = max(min(n_articles, 50), n_articles // 2)
+                local_indices = np.argsort(probe_distance)[:n_local]
+                local_fit_data = embeddings[local_indices]
+                
+                local_pca_2d = PCA(n_components=2, random_state=seed)
+                local_pca_2d.fit(local_fit_data)
+                local_pca_coords = local_pca_2d.transform(embeddings[:n_articles])
+                
+                centered_pca = local_pca_coords - local_pca_coords[idx]
+                observer_coords = np.column_stack(
+                    [
+                        centered_pca[:, 0],
+                        centered_pca[:, 1],
+                        centered_baseline[:, 2], # Rich log-density delta
+                    ]
+                )
+                print(f"    [PERSPECTIVE] {idx} fit on {n_local} neighbors (EVR: {float(np.sum(local_pca_2d.explained_variance_ratio_)):.2%})")
+            except Exception as e:
+                # Fallback to global PCA if local fit fails
+                centered_pca = pca_xy - pca_xy[idx]
+                observer_coords = np.column_stack(
+                    [
+                        centered_pca[:, 0],
+                        centered_pca[:, 1],
+                        centered_baseline[:, 2],
+                    ]
+                )
+        else:
+            # Fallback: Center the density/stress space.
+            observer_coords = np.column_stack(
+                [
+                    centered_baseline[:, 0], # density delta
+                    probe_distance,           # spectral distance (independent of density)
+                    centered_baseline[:, 2], # z_height delta
+                ]
+            )
+        
+        # Delta is the distance between relativistic projection and centered global baseline.
+        coord_delta = np.linalg.norm(observer_coords - centered_baseline, axis=1)
         observer_nn = _nearest_neighbor_indices(observer_coords)
-        translation_nn = _nearest_neighbor_indices(translation_coords)
+        translation_nn = _nearest_neighbor_indices(centered_baseline)
         flip_mask = observer_nn != baseline_nn
         flip_count = int(np.sum(flip_mask))
         translation_flip_count = int(np.sum(translation_nn != baseline_nn))
@@ -1579,7 +1645,7 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
                 "source": "observer_payload_relativity_v1",
                 "synthetic_placeholder": False,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "basis_hash": str(payload.get("provenance", {}).get("basis_hash", "")),
+                "basis_hash": str(payload.get("provenance", {}).get("basis_hash", "")) if isinstance(payload.get("provenance"), dict) else "",
                 "observer_bt_uid": focus_row["bt_uid"],
             },
         }
@@ -2139,7 +2205,8 @@ def run_synthetic_experiment_suite(
                 if 'article_metadata' in result:
                     with open(run_dir / "article_metadata.json", 'w') as mf:
                         json.dump(result['article_metadata'], mf, indent=2)
-                    print(f"    Saved article_metadata.json ({len(result['article_metadata'])} articles)")
+                    _write_article_metadata_csv(result['article_metadata'], run_dir / "article_metadata.csv")
+                    print(f"    Saved article_metadata.json and .csv ({len(result['article_metadata'])} articles)")
 
                 # Petal glyph visualization (Track 1.5)
                 if 'spectral_probe_magnitudes' in result and 'spectral_evr' in result:
@@ -2194,6 +2261,7 @@ def run_synthetic_experiment_suite(
 
                 all_results.append({
                     "run_key": run_key,
+                    "run_dir": str(run_dir),
                     "kernel": kernel,
                     "seed": seed,
                     "nmi": nmi,
@@ -3029,6 +3097,22 @@ def main():
             n_clusters=getattr(args, 'synthetic_clusters', 4),
             enable_checkpoints=enable_checkpoints,
         )
+
+        # Emit thesis-facing baseline artifacts for each synthetic run
+        if synthetic_result.get("status") == "success":
+            print(f"\n{'='*80}")
+            print("MATERIALIZING SYNTHETIC BASELINE BUNDLES")
+            print(f"{'='*80}")
+            for res in synthetic_result.get("results", []):
+                if res.get("status") == "success" and res.get("run_dir"):
+                    run_dir = Path(res["run_dir"])
+                    print(f"\n  Processing: {res['run_key']}")
+                    bundle_res = materialize_baseline_bundle(run_dir, strict=True)
+                    res["baseline_bundle"] = bundle_res
+                    if bundle_res.get("status") == "success":
+                        print(f"    [BUNDLE][OK] {bundle_res.get('observer_manifest')}")
+                    else:
+                        print(f"    [BUNDLE][WARN] {bundle_res.get('error', 'Unknown error')}")
 
         # Generate Waterfall Visualization for each run (if checkpoints enabled)
         if enable_checkpoints and synthetic_result.get("status") == "success":

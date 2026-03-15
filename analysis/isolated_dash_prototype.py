@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 import sys
 from urllib.parse import parse_qs
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -64,6 +65,8 @@ ROOT = REPO_ROOT
 
 def _is_run_directory(path: Path) -> bool:
     if not path.is_dir():
+        return False
+    if path.name.startswith("observer_"):
         return False
     if list(path.glob("MONOLITH*.html")):
         return True
@@ -132,6 +135,7 @@ TRACK_MARKERS = {
     "T5": ["track 5", "phantom", "tautology", "honest"],
     "T6": ["track 6", "hott", "proof"],
 }
+TRACK_ORDER = ["T1", "T1.5", "T2", "T3", "T4", "T5", "T6"]
 VERIFICATION_STATUSES = {s.value for s in LayerStatus}
 
 
@@ -1074,6 +1078,199 @@ def _artifact_track_state(path: Optional[Path]) -> Dict[str, str]:
     return out
 
 
+def _safe_json_list(path: Optional[Path], default: Optional[List[Any]] = None) -> List[Any]:
+    default = default or []
+    if not path or not path.exists():
+        return list(default)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        return payload if isinstance(payload, list) else list(default)
+    except Exception:
+        return list(default)
+
+
+def _fmt_metric(value: Any, digits: int = 3) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if _is_number(value):
+        num = float(value)
+        if math.isfinite(num):
+            return f"{num:.{digits}f}"
+    return "n/a"
+
+
+def _load_validation_payload(run_key: Optional[str]) -> dict:
+    run_dir = _resolve_run_dir(run_key)
+    if not run_dir:
+        return {}
+    return _safe_json(run_dir / "validation.json", {})
+
+
+def _load_hott_summary(run_key: Optional[str]) -> dict:
+    run_dir = _resolve_run_dir(run_key)
+    if not run_dir:
+        return {}
+    return _safe_json(run_dir / "hott_summary.json", {})
+
+
+def _compute_track_snapshot(
+    run_key: Optional[str],
+    artifact_state: Optional[dict],
+    contract: Optional[dict],
+    observer_value: str = "global",
+) -> Dict[str, Dict[str, Any]]:
+    run_dir = _resolve_run_dir(run_key)
+    validation = _load_validation_payload(run_key)
+    track_metrics = validation.get("track_metrics", {}) if isinstance(validation.get("track_metrics"), dict) else {}
+    artifact_metrics = artifact_state.get("metrics", {}) if isinstance(artifact_state, dict) and isinstance(artifact_state.get("metrics"), dict) else {}
+    observer_metrics = {}
+    if isinstance(contract, dict):
+        observer_state = contract.get("observer_state", {}) or {}
+        if isinstance(observer_state, dict) and isinstance(observer_state.get("metrics"), dict):
+            observer_metrics = observer_state.get("metrics", {}) or {}
+    observer_track_nmi = observer_metrics.get("observer_track_nmi", {}) if isinstance(observer_metrics.get("observer_track_nmi"), dict) else {}
+    snapshot: Dict[str, Dict[str, Any]] = {}
+
+    def _base_track(track_key: str) -> Dict[str, Any]:
+        metrics = track_metrics.get(track_key, {}) if isinstance(track_metrics.get(track_key), dict) else {}
+        item = {
+            "status": "online" if metrics else "missing",
+            "source": f"validation.track_metrics.{track_key}" if metrics else "missing",
+            "nmi": float(metrics.get("nmi")) if _is_number(metrics.get("nmi")) else None,
+            "ari": float(metrics.get("ari")) if _is_number(metrics.get("ari")) else None,
+        }
+        obs_nmi = observer_track_nmi.get(track_key)
+        if observer_value.startswith("article:") and _is_number(obs_nmi):
+            item["nmi"] = float(obs_nmi)
+            item["source"] = f"observer_state.metrics.observer_track_nmi.{track_key}"
+        return item
+
+    snapshot["T1"] = _base_track("T1")
+    snapshot["T1.5"] = _base_track("T1.5")
+    if _is_number(artifact_metrics.get("spectral_signal")):
+        snapshot["T1.5"]["signal"] = float(artifact_metrics.get("spectral_signal"))
+    snapshot["T2"] = _base_track("T2")
+    snapshot["T3"] = _base_track("T3")
+    if _is_number(artifact_metrics.get("dirichlet_bonds")):
+        snapshot["T3"]["bonds"] = int(float(artifact_metrics.get("dirichlet_bonds")))
+    if _is_number(artifact_metrics.get("dirichlet_cracks")):
+        snapshot["T3"]["cracks"] = int(float(artifact_metrics.get("dirichlet_cracks")))
+
+    t4_online = bool(run_dir and (run_dir / "walker_paths.npz").exists()) or _is_number(artifact_metrics.get("walker_mean_action"))
+    snapshot["T4"] = {
+        "status": "online" if t4_online else "missing",
+        "source": "artifact.metrics.walker_*" if t4_online else "missing",
+        "action": float(artifact_metrics.get("walker_mean_action")) if _is_number(artifact_metrics.get("walker_mean_action")) else None,
+        "survival": float(artifact_metrics.get("walker_survival_rate")) if _is_number(artifact_metrics.get("walker_survival_rate")) else None,
+    }
+
+    t5_online = bool(run_dir and (run_dir / "phantom_verdicts.json").exists()) or any(
+        _is_number(artifact_metrics.get(k))
+        for k in ("honest_count", "phantom_count", "tautology_count", "anomaly_count")
+    )
+    snapshot["T5"] = {
+        "status": "online" if t5_online else "missing",
+        "source": "artifact.metrics.*_count" if t5_online else "missing",
+        "honest": int(float(artifact_metrics.get("honest_count"))) if _is_number(artifact_metrics.get("honest_count")) else None,
+        "phantom": int(float(artifact_metrics.get("phantom_count"))) if _is_number(artifact_metrics.get("phantom_count")) else None,
+        "tautology": int(float(artifact_metrics.get("tautology_count"))) if _is_number(artifact_metrics.get("tautology_count")) else None,
+        "anomaly": int(float(artifact_metrics.get("anomaly_count"))) if _is_number(artifact_metrics.get("anomaly_count")) else None,
+    }
+
+    hott_summary = _load_hott_summary(run_key)
+    t6_online = bool(run_dir and ((run_dir / "hott_summary.json").exists() or (run_dir / "hott_proofs.json").exists()))
+    snapshot["T6"] = {
+        "status": "online" if t6_online else "missing",
+        "source": "hott_summary.json" if t6_online else "missing",
+        "n_proofs": int(float(hott_summary.get("n_proofs"))) if _is_number(hott_summary.get("n_proofs")) else None,
+        "equivalence_rate": float(hott_summary.get("equivalence_rate")) if _is_number(hott_summary.get("equivalence_rate")) else None,
+        "mean_confidence": float(hott_summary.get("mean_confidence")) if _is_number(hott_summary.get("mean_confidence")) else None,
+    }
+
+    syn_metrics = track_metrics.get("SYN", {}) if isinstance(track_metrics.get("SYN"), dict) else {}
+    syn_nmi = artifact_metrics.get("synthesis_nmi")
+    if not _is_number(syn_nmi):
+        syn_nmi = observer_metrics.get("observer_conditioned_nmi") if observer_value.startswith("article:") else syn_metrics.get("nmi")
+    snapshot["SYN"] = {
+        "status": "online" if (_is_number(syn_nmi) or syn_metrics) else "missing",
+        "source": "artifact.metrics.synthesis_nmi" if _is_number(artifact_metrics.get("synthesis_nmi")) else ("observer_state.metrics.observer_conditioned_nmi" if observer_value.startswith("article:") and _is_number(observer_metrics.get("observer_conditioned_nmi")) else "validation.track_metrics.SYN"),
+        "nmi": float(syn_nmi) if _is_number(syn_nmi) else None,
+        "ari": float(syn_metrics.get("ari")) if _is_number(syn_metrics.get("ari")) else (float(observer_metrics.get("observer_conditioned_ari")) if observer_value.startswith("article:") and _is_number(observer_metrics.get("observer_conditioned_ari")) else None),
+    }
+    return snapshot
+
+
+def _compute_track_delta_summary(
+    snapshot_a: Dict[str, Dict[str, Any]],
+    snapshot_b: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    for track in TRACK_ORDER + ["SYN"]:
+        a = snapshot_a.get(track, {})
+        b = snapshot_b.get(track, {})
+        status_a = a.get("status", "missing")
+        status_b = b.get("status", "missing")
+        entry: Dict[str, Any] = {
+            "status_a": status_a,
+            "status_b": status_b,
+            "same_status": status_a == status_b,
+            "delta": False,
+            "summary": "",
+        }
+        if track in {"T1", "T1.5", "T2", "T3", "SYN"}:
+            a_nmi = a.get("nmi")
+            b_nmi = b.get("nmi")
+            if _is_number(a_nmi) and _is_number(b_nmi):
+                delta_nmi = float(b_nmi) - float(a_nmi)
+                entry["delta_nmi"] = delta_nmi
+                entry["delta"] = abs(delta_nmi) > 1e-9
+                entry["summary"] = f"NMI A={_fmt_metric(a_nmi)} B={_fmt_metric(b_nmi)} d={delta_nmi:+.3f}"
+            elif status_a != status_b:
+                entry["delta"] = True
+                entry["summary"] = f"status A={status_a.upper()} B={status_b.upper()}"
+        elif track == "T4":
+            a_action = a.get("action")
+            b_action = b.get("action")
+            a_surv = a.get("survival")
+            b_surv = b.get("survival")
+            parts: List[str] = []
+            if _is_number(a_action) and _is_number(b_action):
+                delta_action = float(b_action) - float(a_action)
+                entry["delta_action"] = delta_action
+                entry["delta"] = entry["delta"] or abs(delta_action) > 1e-9
+                parts.append(f"action A={_fmt_metric(a_action)} B={_fmt_metric(b_action)} d={delta_action:+.3f}")
+            if _is_number(a_surv) and _is_number(b_surv):
+                delta_surv = float(b_surv) - float(a_surv)
+                entry["delta_survival"] = delta_surv
+                entry["delta"] = entry["delta"] or abs(delta_surv) > 1e-9
+                parts.append(f"surv A={_fmt_metric(a_surv)} B={_fmt_metric(b_surv)} d={delta_surv:+.3f}")
+            entry["summary"] = " | ".join(parts) if parts else f"status A={status_a.upper()} B={status_b.upper()}"
+        elif track == "T5":
+            keys = ["honest", "phantom", "tautology", "anomaly"]
+            parts = []
+            for key in keys:
+                av = a.get(key)
+                bv = b.get(key)
+                if _is_number(av) and _is_number(bv):
+                    delta_v = int(float(bv) - float(av))
+                    if delta_v != 0:
+                        entry["delta"] = True
+                    parts.append(f"{key[0].upper()} d={delta_v:+d}")
+            entry["summary"] = " | ".join(parts) if parts else f"status A={status_a.upper()} B={status_b.upper()}"
+        elif track == "T6":
+            a_eq = a.get("equivalence_rate")
+            b_eq = b.get("equivalence_rate")
+            if _is_number(a_eq) and _is_number(b_eq):
+                delta_eq = float(b_eq) - float(a_eq)
+                entry["delta_equivalence"] = delta_eq
+                entry["delta"] = abs(delta_eq) > 1e-9
+                entry["summary"] = f"equiv A={_fmt_metric(a_eq)} B={_fmt_metric(b_eq)} d={delta_eq:+.3f}"
+            else:
+                entry["summary"] = f"status A={status_a.upper()} B={status_b.upper()}"
+        summary[track] = entry
+    return summary
+
+
 def _artifact_coverage(run_key: str, variant_name: str) -> Tuple[int, int]:
     run = INDEX["runs"].get(run_key, {})
     manifest = run.get("observer_manifest") or {}
@@ -1103,8 +1300,10 @@ def _artifact_coverage(run_key: str, variant_name: str) -> Tuple[int, int]:
 
 def _track_status_component(track_state: Dict[str, str]):
     chips = []
-    for track in ["T1", "T1.5", "T2", "T3", "T4", "T5", "T6"]:
-        st = track_state.get(track, "unknown")
+    detail_lines: List[str] = []
+    for track in TRACK_ORDER:
+        payload = track_state.get(track, {}) if isinstance(track_state.get(track), dict) else {"status": track_state.get(track, "unknown")}
+        st = payload.get("status", "unknown")
         color = PALETTE["green"] if st == "online" else (PALETTE["red"] if st == "missing" else PALETTE["amber"])
         chips.append(
             html.Span(
@@ -1122,21 +1321,39 @@ def _track_status_component(track_state: Dict[str, str]):
                 },
             )
         )
-    return html.Div(chips)
+        if track in {"T1", "T1.5", "T2", "T3"}:
+            line = f"{track}: NMI={_fmt_metric(payload.get('nmi'))}"
+            if _is_number(payload.get("ari")):
+                line += f" | ARI={_fmt_metric(payload.get('ari'))}"
+            if track == "T1.5" and _is_number(payload.get("signal")):
+                line += f" | Signal={_fmt_metric(payload.get('signal'))}"
+            if track == "T3" and (_is_number(payload.get("bonds")) or _is_number(payload.get("cracks"))):
+                line += f" | bonds/cracks={payload.get('bonds', 'n/a')}/{payload.get('cracks', 'n/a')}"
+        elif track == "T4":
+            line = f"T4: action={_fmt_metric(payload.get('action'))} | surv={_fmt_metric(payload.get('survival'))}"
+        elif track == "T5":
+            line = f"T5: H={payload.get('honest', 'n/a')} P={payload.get('phantom', 'n/a')} T={payload.get('tautology', 'n/a')} A={payload.get('anomaly', 'n/a')}"
+        else:
+            line = f"T6: proofs={payload.get('n_proofs', 'n/a')} | equiv={_fmt_metric(payload.get('equivalence_rate'))} | conf={_fmt_metric(payload.get('mean_confidence'))}"
+        detail_lines.append(line)
+    return html.Div([html.Div(chips), html.Pre("\n".join(detail_lines), style={"margin": "6px 0 0 0", "color": PALETTE["dim"], "fontSize": "0.74rem", "whiteSpace": "pre-wrap"})])
 
 
 def _track_delta_component(track_a: Dict[str, str], track_b: Dict[str, str]):
     chips = []
-    for track in ["T1", "T1.5", "T2", "T3", "T4", "T5", "T6"]:
-        a = track_a.get(track, "unknown")
-        b = track_b.get(track, "unknown")
-        same = a == b
+    detail_lines: List[str] = []
+    summary = _compute_track_delta_summary(track_a, track_b)
+    for track in TRACK_ORDER:
+        payload = summary.get(track, {})
+        a = payload.get("status_a", "unknown")
+        b = payload.get("status_b", "unknown")
+        same = bool(payload.get("same_status", False)) and not bool(payload.get("delta", False))
         if same:
             color = PALETTE["green"] if a == "online" else PALETTE["amber"]
             text = f"{track}:A={a.upper()} B={b.upper()}"
         else:
-            color = PALETTE["red"]
-            text = f"{track}:A={a.upper()} B={b.upper()} DELTA"
+            color = PALETTE["red"] if payload.get("delta") or a != b else PALETTE["amber"]
+            text = f"{track}:A={a.upper()} B={b.upper()}" + (" DELTA" if (payload.get("delta") or a != b) else "")
         chips.append(
             html.Span(
                 text,
@@ -1153,7 +1370,11 @@ def _track_delta_component(track_a: Dict[str, str], track_b: Dict[str, str]):
                 },
             )
         )
-    return html.Div(chips)
+        detail_lines.append(f"{track}: {payload.get('summary', 'n/a')}")
+    syn_payload = summary.get("SYN", {})
+    if syn_payload:
+        detail_lines.insert(0, f"SYN: {syn_payload.get('summary', 'n/a')}")
+    return html.Div([html.Div(chips), html.Pre("\n".join(detail_lines), style={"margin": "6px 0 0 0", "color": PALETTE["dim"], "fontSize": "0.74rem", "whiteSpace": "pre-wrap"})])
 
 
 def _build_run_observers_and_rows(run: dict) -> Tuple[List[dict], Dict[int, dict]]:
@@ -2251,8 +2472,11 @@ def _render_dashboard_impl(
         container = single_view
         path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 
+    artifact_state_a = _load_artifact_view_state(p_a)
+    artifact_state_b = _load_artifact_view_state(p_b)
     artifact_state = _load_artifact_view_state(single_view_path if not compare_enabled else p_b)
     artifact_metrics = artifact_state.get("metrics", {}) if isinstance(artifact_state, dict) else {}
+    contract_global = load_contract_state(run_key, "global") if (run_key and view_mode == "observer" and observer_value.startswith("article:")) else contract
 
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
     if artifact_metrics:
@@ -2288,13 +2512,20 @@ def _render_dashboard_impl(
         except Exception:
             pass
 
-    track_state_a = _artifact_track_state(p_a)
-    track_state_b = _artifact_track_state(p_b)
+    snapshot_a = _compute_track_snapshot(run_key, artifact_state_a, contract_global, "global" if view_mode == "observer" and observer_value.startswith("article:") else effective_observer)
+    snapshot_b = _compute_track_snapshot(run_key, artifact_state_b, contract, effective_observer)
     main_path = p_a if (p_a and p_a.exists()) else p_b
-    track_readout = _track_status_component(track_state_a if main_path == p_a else track_state_b)
-    track_compare_readout = _track_delta_component(track_state_a, track_state_b)
-    found, total = _artifact_coverage(run_key, variant_a) if run_key else (0, 0)
-    coverage_text = f"Observer Artifact Coverage (Variant A): {found}/{total}" if total > 0 else "Observer Artifact Coverage: n/a"
+    track_readout = _track_status_component(snapshot_a if main_path == p_a else snapshot_b)
+    track_compare_readout = _track_delta_component(snapshot_a, snapshot_b)
+    found_a, total_a = _artifact_coverage(run_key, variant_a) if run_key else (0, 0)
+    found_b, total_b = _artifact_coverage(run_key, variant_b) if run_key else (0, 0)
+    if compare_enabled:
+        coverage_text = (
+            f"Observer Artifact Coverage | A={found_a}/{total_a if total_a > 0 else 'n/a'}"
+            f" | B={found_b}/{total_b if total_b > 0 else 'n/a'}"
+        )
+    else:
+        coverage_text = f"Observer Artifact Coverage (Variant A): {found_a}/{total_a}" if total_a > 0 else "Observer Artifact Coverage: n/a"
 
     state = load_verification_state(run_key, verification_source)
     verification_status = str(state.get("verification_status", "UNVERIFIED")).upper()
