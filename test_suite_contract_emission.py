@@ -92,7 +92,10 @@ def test_emit_consumer_contract_bundle_happy_path():
     required = [
         run_dir / "baseline_meta.json",
         run_dir / "baseline_state.json",
-        run_dir / "verification_report.json",
+        run_dir / "validation.json",
+        run_dir / "ablation_summary.json",
+        run_dir / "control_metrics.json",
+        run_dir / "relativity_deltas.json",
         run_dir / "relativity_cache" / "state_0.json",
         run_dir / "relativity_cache" / "delta_0.json",
         run_dir / "labels" / "hidden_groups.csv",
@@ -120,6 +123,7 @@ def test_emit_consumer_contract_bundle_deterministic_observer_file_count():
 
     res = suite.emit_consumer_contract_bundle(run_dir)
     assert res["status"] == "success"
+    assert (run_dir / "validation.json").exists()
     rel = res["relativity"]
     assert rel["state_files"] == 2
     assert rel["delta_files"] == 2

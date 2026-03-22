@@ -50,6 +50,52 @@ def _robust_unit_interval(values: np.ndarray) -> np.ndarray:
     return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
 
 
+def _compute_density_field(
+    embeddings: np.ndarray,
+    *,
+    knn_k: int,
+    epsilon: float,
+) -> np.ndarray:
+    arr = np.asarray(embeddings, dtype=float)
+    n = int(arr.shape[0])
+    if n <= 1:
+        raise ValueError("Need at least 2 samples to compute a density field.")
+
+    effective_k = int(max(1, min(int(knn_k), n - 1)))
+    print(f"Calculating density with KNN (requested_k={knn_k}, effective_k={effective_k})...")
+
+    nn = NearestNeighbors(n_neighbors=effective_k + 1, metric="euclidean")
+    nn.fit(arr)
+    distances, _ = nn.kneighbors(arr)
+
+    neighbor_distances = np.asarray(distances[:, 1 : effective_k + 1], dtype=float)
+    neighbor_distances = np.nan_to_num(neighbor_distances, nan=np.inf, posinf=np.inf, neginf=0.0)
+    mean_neighbor_distance = np.mean(neighbor_distances, axis=1)
+    density = 1.0 / (mean_neighbor_distance + epsilon)
+    density = _robust_unit_interval(density)
+
+    # Never silently flatten the manifold on small/degenerate runs. If the local
+    # KNN estimate collapses, fall back to inverse mean distance over the full
+    # point cloud before giving up.
+    if n >= 3 and float(np.ptp(density)) <= 1e-9:
+        pairwise = np.linalg.norm(arr[:, None, :] - arr[None, :, :], axis=2)
+        finite_mask = np.isfinite(pairwise)
+        diag_mask = np.eye(n, dtype=bool)
+        pairwise = np.where(diag_mask, np.nan, pairwise)
+        pairwise = np.where(finite_mask, pairwise, np.nan)
+        mean_pairwise_distance = np.nanmean(pairwise, axis=1)
+        if np.isfinite(mean_pairwise_distance).any():
+            fallback_density = 1.0 / (np.nan_to_num(mean_pairwise_distance, nan=np.nanmax(mean_pairwise_distance)) + epsilon)
+            density = _robust_unit_interval(fallback_density)
+            print("  [WARN] Local KNN density collapsed; using inverse mean pairwise distance fallback.")
+
+    if n >= 3 and float(np.ptp(density)) <= 1e-9:
+        raise ValueError(
+            "Density field collapsed after adaptive KNN and pairwise-distance fallback; refusing to emit flat manifold metrics."
+        )
+    return density.astype(float)
+
+
 def calculate_unified_metric(
     embeddings_path: Path,
     gradients_path: Path,
@@ -71,7 +117,10 @@ def calculate_unified_metric(
     # 1. Load 'embeddings.npy', 'gradients.npy', and 'articles.csv'
     embeddings = np.load(embeddings_path)
     gradients = np.load(gradients_path)
-    metadata_df = pd.read_csv(metadata_path)
+    if Path(metadata_path).suffix == ".json":
+        metadata_df = pd.read_json(metadata_path)
+    else:
+        metadata_df = pd.read_csv(metadata_path)
 
     # Ensure embeddings and gradients match metadata length
     if len(embeddings) != len(metadata_df) or len(gradients) != len(metadata_df):
@@ -80,23 +129,13 @@ def calculate_unified_metric(
             f"Embeddings: {len(embeddings)}, Gradients: {len(gradients)}, Metadata: {len(metadata_df)}"
         )
 
-    # 2. Calculate DENSITY (rho) using KNN (k=20). Normalize 0-1.
-    print(f"Calculating density with KNN (k={knn_k})...")
-    if len(embeddings) > knn_k:
-        nn = NearestNeighbors(n_neighbors=knn_k + 1, metric='euclidean')
-        nn.fit(embeddings)
-        distances, _ = nn.kneighbors(embeddings)
-        # Density is inversely proportional to average distance to k-th neighbor
-        # We take the distance to the k-th neighbor (knn_k index, as 0th is self)
-        k_distances = distances[:, knn_k]
-        density = 1.0 / (k_distances + thermo_config.density_clamp_min)  # Add epsilon to prevent division by zero
-        density = (
-            (density - density.min()) /
-            (density.max() - density.min() + thermo_config.density_clamp_min)
-        )  # Normalize 0-1
-    else:
-        print(f"Warning: Not enough samples ({len(embeddings)}) for KNN k={knn_k}. Assigning uniform density.")
-        density = np.ones(len(embeddings)) * 0.5 # Default to mid-density
+    # 2. Calculate DENSITY (rho) using adaptive KNN. Never silently replace the
+    # manifold with a uniform density field just because the corpus is small.
+    density = _compute_density_field(
+        embeddings,
+        knn_k=knn_k,
+        epsilon=float(thermo_config.density_clamp_min),
+    )
 
     # 3. Calculate STRESS as a varying article-level scalar.
     # `spectral_u_axis.npy` can be unit-normalized, which makes its L2 norm
@@ -129,6 +168,8 @@ def calculate_unified_metric(
     epsilon_z = thermo_config.epsilon_z
     z_potential = -np.log(density + epsilon_z)
     z_height = z_potential
+    if len(z_height) >= 3 and float(np.ptp(z_height)) <= 1e-9:
+        raise ValueError("Z-height collapsed after density computation; refusing to emit flat manifold metrics.")
 
     # 5. Calculate ZONES (Bridge/Swamp/Tightrope/Void) using ABSOLUTE THRESHOLDS
     print("Classifying zones (Bridge/Swamp/Tightrope/Void)...")

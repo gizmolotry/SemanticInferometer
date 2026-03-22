@@ -694,6 +694,122 @@ def test_load_contract_state_invalid_schema_missing_validation_nmi(monkeypatch, 
     )
 
 
+def test_load_control_state_accepts_control_metrics_json(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_control_metrics"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "control_metrics.json",
+        {
+            "status": "OK",
+            "message": "loaded",
+            "metrics": {
+                "procrustes_ratio": 1.8,
+                "distance_corr_ratio": 1.2,
+                "separates_count": 3,
+                "consensus_pct": 74.0,
+                "residual_pct": 26.0,
+            },
+        },
+    )
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_control_state("rk")
+
+    assert state["status"] == "OK"
+    assert state["procrustes_ratio"] == 1.8
+    assert state["distance_corr_ratio"] == 1.2
+    assert state["separates_count"] == 3
+    assert state["consensus_pct"] == 74.0
+    assert state["residual_pct"] == 26.0
+
+
+def test_load_ablation_state_accepts_normalized_ablation_summary(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_ablation_metrics"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "ablation_summary.json",
+        {
+            "status": "OK",
+            "metrics": {
+                "stage_1_nmi": 0.91,
+                "stage_2_nmi": 0.61,
+                "stage_3_nmi": 0.42,
+                "delta_nmi": -0.49,
+                "retained_pct": 63.0,
+            },
+        },
+    )
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_ablation_state("rk")
+
+    assert state["status"] == "OK"
+    assert state["stage_1_nmi"] == 0.91
+    assert state["stage_2_nmi"] == 0.61
+    assert state["stage_3_nmi"] == 0.42
+    assert state["delta_nmi"] == -0.49
+    assert state["retained_pct"] == 63.0
+
+
+def test_load_contract_state_accepts_relativity_deltas_bundle(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_relativity_bundle"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+    (run_dir / "relativity_cache").mkdir(parents=True, exist_ok=True)
+
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(run_dir / "validation.json", {"nmi": 0.75})
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {
+                    "layer_id": "rbf/cls",
+                    "layer_name": "cls",
+                    "status": "VERIFIED",
+                    "checks": [{"name": "crn_locked", "pass": True}],
+                    "fail_reasons": [],
+                }
+            ],
+            "global_pass": True,
+        },
+    )
+    _write_json(run_dir / "control_metrics.json", {"status": "NO_DATA", "metrics": {}, "synthetic_placeholder": True})
+    (run_dir / "labels" / "hidden_groups.csv").write_text("article_id,group_topic\n1,topic\n", encoding="utf-8")
+    _write_json(run_dir / "labels" / "derived" / "group_summaries.json", {"groups": [{"group_name": "topic", "n_articles": 1}]})
+    _write_json(run_dir / "labels" / "derived" / "group_matrix.json", {"groups": ["topic"], "cost_matrix": [[0.0]]})
+    _write_json(
+        run_dir / "relativity_cache" / "state_7.json",
+        {"observer_id": 7, "articles": [], "paths": [], "axes": {}, "metrics": {}, "provenance": {}},
+    )
+    _write_json(
+        run_dir / "relativity_deltas.json",
+        {
+            "status": "OK",
+            "observer_count": 1,
+            "observers": [
+                {
+                    "observer_id": 7,
+                    "null_observer_equivalence": {"max_coord_delta": 0.3, "path_flip_count": 1, "axis_rotation_deg": 9.0},
+                    "path_flip_delta": {"u0|A0": 0.3},
+                    "metrics_delta": {"d_nmi": 0.2},
+                    "axis_delta": {"rotation_deg": 9.0, "d_explained_variance_axis1": 0.1},
+                    "translation_only_comparison": {"d_path_flip_count": 1},
+                }
+            ],
+        },
+    )
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_contract_state("rk", "article:7")
+
+    assert state["status"] == "OK", state
+    assert state["observer_delta"]["metrics_delta"]["d_nmi"] == 0.2
+    assert state["observer_delta"]["axis_delta"]["rotation_deg"] == 9.0
+
+
 def test_build_artifact_index_discovers_modern_run_layouts(monkeypatch, mod, tmp_path):
     honest_run = tmp_path / "outputs" / "honest_matern"
     honest_run.mkdir(parents=True, exist_ok=True)
@@ -870,3 +986,93 @@ def test_resolve_artifact_does_not_force_manifest_observer_when_variant_differs(
     resolved = mod.resolve_artifact("rk", "ALT.html", "article:7")
 
     assert resolved == run_dir / "ALT.html"
+
+
+def test_compute_track_snapshot_uses_validation_and_artifact_metrics(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_snapshot"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "validation.json",
+        {
+            "nmi": 0.62,
+            "track_metrics": {
+                "T1": {"nmi": 0.88, "ari": 0.31},
+                "T1.5": {"nmi": 0.77, "ari": 0.22},
+                "T2": {"nmi": 0.24, "ari": 0.10},
+                "T3": {"nmi": 0.24, "ari": 0.10},
+                "SYN": {"nmi": 0.52, "ari": 0.30},
+            },
+        },
+    )
+    (run_dir / "walker_paths.npz").write_bytes(b"npz")
+    (run_dir / "phantom_verdicts.json").write_text("[]", encoding="utf-8")
+    _write_json(
+        run_dir / "hott_summary.json",
+        {"n_proofs": 10, "equivalence_rate": 0.7, "mean_confidence": 0.8},
+    )
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+
+    artifact_state = {
+        "metrics": {
+            "synthesis_nmi": 0.52,
+            "spectral_signal": 0.80,
+            "dirichlet_bonds": 76,
+            "dirichlet_cracks": 4,
+            "walker_mean_action": 61.7,
+            "walker_survival_rate": 1.0,
+            "honest_count": 48,
+            "phantom_count": 16,
+            "tautology_count": 16,
+            "anomaly_count": 0,
+        }
+    }
+    contract = {
+        "observer_state": {
+            "metrics": {
+                "observer_conditioned_nmi": 0.46,
+                "observer_track_nmi": {"SYN": 0.46},
+            }
+        }
+    }
+
+    snapshot = mod._compute_track_snapshot("rk", artifact_state, contract, "article:7")
+
+    assert snapshot["T1"]["status"] == "online"
+    assert snapshot["T1"]["nmi"] == 0.88
+    assert snapshot["T1.5"]["signal"] == 0.80
+    assert snapshot["T3"]["bonds"] == 76
+    assert snapshot["T4"]["action"] == 61.7
+    assert snapshot["T5"]["phantom"] == 16
+    assert snapshot["T6"]["n_proofs"] == 10
+    assert snapshot["SYN"]["nmi"] == 0.52
+
+
+def test_compute_track_delta_summary_reports_real_metric_deltas(mod):
+    snapshot_a = {
+        "T1": {"status": "online", "nmi": 0.88, "ari": 0.31},
+        "T1.5": {"status": "online", "nmi": 0.77, "signal": 0.80},
+        "T2": {"status": "online", "nmi": 0.24},
+        "T3": {"status": "online", "nmi": 0.24, "bonds": 76, "cracks": 4},
+        "T4": {"status": "online", "action": 61.7, "survival": 1.0},
+        "T5": {"status": "online", "honest": 48, "phantom": 16, "tautology": 16, "anomaly": 0},
+        "T6": {"status": "missing"},
+        "SYN": {"status": "online", "nmi": 0.52},
+    }
+    snapshot_b = {
+        "T1": {"status": "online", "nmi": 0.88, "ari": 0.31},
+        "T1.5": {"status": "online", "nmi": 0.77, "signal": 0.80},
+        "T2": {"status": "online", "nmi": 0.24},
+        "T3": {"status": "online", "nmi": 0.24, "bonds": 76, "cracks": 4},
+        "T4": {"status": "online", "action": 61.9, "survival": 0.95},
+        "T5": {"status": "online", "honest": 46, "phantom": 18, "tautology": 16, "anomaly": 0},
+        "T6": {"status": "missing"},
+        "SYN": {"status": "online", "nmi": 0.46},
+    }
+
+    delta = mod._compute_track_delta_summary(snapshot_a, snapshot_b)
+
+    assert delta["SYN"]["delta"] is True
+    assert abs(delta["SYN"]["delta_nmi"] + 0.06) < 1e-9
+    assert delta["T4"]["delta"] is True
+    assert abs(delta["T4"]["delta_action"] - 0.2) < 1e-9
+    assert "H d=-2" in delta["T5"]["summary"]

@@ -139,6 +139,12 @@ def _make_valid_run_dir(root: Path) -> Path:
             "metrics": {},
         },
     )
+    _write_json(
+        run_dir / "validation.json",
+        {
+            "nmi": 0.5,
+        },
+    )
     return run_dir
 
 

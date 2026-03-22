@@ -1,6 +1,8 @@
 # core/provenance_tracker.py
 
 from dataclasses import dataclass, asdict
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -86,6 +88,24 @@ class ProvenanceTracker:
             "entries": [asdict(e) for e in self.entries],
             "pipeline_entries": [e.to_dict() for e in self.pipeline_entries],
         }
+
+    def save(self, provenance_dir: Union[str, Path], filename: Optional[str] = None) -> Path:
+        """
+        Persist current provenance payload to a JSON file.
+
+        Args:
+            provenance_dir: Directory where the provenance file should be written.
+            filename: Optional filename. Defaults to "provenance.json".
+
+        Returns:
+            Path to the saved JSON file.
+        """
+        out_dir = Path(provenance_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / (filename or "provenance.json")
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        return out_path
 
     def __len__(self):
         return len(self.entries) + len(self.pipeline_entries)

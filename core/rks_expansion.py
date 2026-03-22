@@ -346,14 +346,14 @@ def estimate_rbf_sigma(
     # Check for degenerate data (ROBUST FIX)
     if len(distances) == 0:
         print("  ⚠ No distances computed - using fallback sigma=1.0")
-        return 1.0
+        return 0.1
     
     max_dist = distances.max()
     if max_dist < 1e-8:
         print("  [WARN] DEGENERATE DATA: All distances ~ 0")
         print("    (All articles identical - constant control)")
         print("    Using fallback sigma = 1.0")
-        return 1.0
+        return 0.1
     
     # Use percentile (median by default)
     sigma = np.percentile(distances, percentile)
@@ -361,7 +361,7 @@ def estimate_rbf_sigma(
     # Safety check
     if sigma < 1e-6:
         print(f"  ⚠ Sigma too small ({sigma:.2e}), using fallback 1.0")
-        return 1.0
+        return 0.1
     
     return float(sigma)
 

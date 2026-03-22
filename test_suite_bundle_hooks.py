@@ -440,6 +440,8 @@ def test_emit_consumer_contract_bundle_marks_placeholder_artifacts_synthetic(tmp
 def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path):
     run_dir = tmp_path / "real_relativity_bundle"
     run_dir.mkdir(parents=True, exist_ok=True)
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
     rows = [
         {
             "index": 0,
@@ -471,6 +473,7 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
         },
     ]
     observer_payload = {
+        "features": np.array([[0.0, 0.0], [1.0, 1.0]], dtype=float),
         "spectral_probe_magnitudes": np.array([[0.9, 0.1], [0.2, 0.8]], dtype=float),
         "walker_work_integrals": np.array([1.5, 5.0], dtype=float),
         "article_metadata": [
@@ -504,13 +507,19 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
         "provenance": {"basis_hash": "basis-xyz"},
     }
     torch.save(observer_payload, run_dir / "observer_42.pt")
+    observer_payload_0 = dict(observer_payload)
+    observer_payload_0["features"] = np.array([[0.5, 0.0], [1.5, 1.0]], dtype=float)
+    observer_payload_1 = dict(observer_payload)
+    observer_payload_1["features"] = np.array([[0.0, -0.5], [1.0, 0.5]], dtype=float)
+    torch.save(observer_payload_0, rel_dir / "observer_0.pt")
+    torch.save(observer_payload_1, rel_dir / "observer_1.pt")
 
     result = suite._emit_relativity_defaults(run_dir, rows)
 
     assert result["mode"] == "observer_payload_relativity_v1"
 
-    state = json.loads((run_dir / "relativity_cache" / "state_0.json").read_text(encoding="utf-8"))
-    delta = json.loads((run_dir / "relativity_cache" / "delta_0.json").read_text(encoding="utf-8"))
+    state = json.loads((rel_dir / "state_0.json").read_text(encoding="utf-8"))
+    delta = json.loads((rel_dir / "delta_0.json").read_text(encoding="utf-8"))
 
     assert state["provenance"]["source"] == "observer_payload_relativity_v1"
     assert state["metrics"]["observer_bt_uid"] == "u0"
@@ -519,7 +528,316 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
     assert state["articles"][0]["published_at"] == "2023-03-04"
     assert state["articles"][0]["timestamp_iso_utc"] == "2023-03-04T00:00:00Z"
     assert state["articles"][0]["snippet"] == "snip-0"
+    assert "baseline_x" in state["articles"][0]
+    assert "delta_x" in state["articles"][0]
     assert delta["provenance"]["source"] == "observer_payload_relativity_v1"
     assert delta["null_observer_equivalence"]["max_coord_delta"] > 0.0
     assert delta["null_observer_equivalence"]["path_flip_count"] >= 0
     assert delta["axis_delta"]["rotation_deg"] > 0.0
+
+
+def test_emit_relativity_defaults_uses_observer_feature_matrix_for_nmi(tmp_path):
+    run_dir = tmp_path / "observer_metric_bundle"
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "index": 0,
+            "bt_uid": "u0",
+            "title": "A0",
+            "publication": "P0",
+            "published_at": "2023-03-04",
+            "timestamp_iso_utc": "2023-03-04T00:00:00Z",
+            "snippet": "snip-0",
+            "zone": "Bridge",
+            "verdict": "HONEST",
+            "density": "0.20",
+            "stress": "0.30",
+            "z_height": "0.10",
+        },
+        {
+            "index": 1,
+            "bt_uid": "u1",
+            "title": "A1",
+            "publication": "P1",
+            "published_at": "2023-03-05",
+            "timestamp_iso_utc": "2023-03-05T00:00:00Z",
+            "snippet": "snip-1",
+            "zone": "Void",
+            "verdict": "PHANTOM",
+            "density": "0.80",
+            "stress": "0.90",
+            "z_height": "0.60",
+        },
+        {
+            "index": 2,
+            "bt_uid": "u2",
+            "title": "A2",
+            "publication": "P2",
+            "published_at": "2023-03-06",
+            "timestamp_iso_utc": "2023-03-06T00:00:00Z",
+            "snippet": "snip-2",
+            "zone": "Plateau",
+            "verdict": "HONEST",
+            "density": "0.40",
+            "stress": "0.55",
+            "z_height": "0.20",
+        },
+    ]
+    root_payload = {
+        "features": np.zeros((3, 2), dtype=float),
+        "spectral_probe_magnitudes": np.array([[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]], dtype=float),
+        "walker_work_integrals": np.array([1.0, 2.0, 3.0], dtype=float),
+        "article_metadata": [{"index": i, "bt_uid": f"u{i}", "title": f"A{i}"} for i in range(3)],
+        "walker_states": [{"index": i, "anomaly_flag": False} for i in range(3)],
+        "phantom_verdicts": [{"index": i, "verdict": "HONEST"} for i in range(3)],
+        "walker_paths": [{"article_idx": i, "step_diagnostics": []} for i in range(3)],
+        "provenance": {"basis_hash": "basis-root"},
+    }
+    torch.save(root_payload, run_dir / "observer_42.pt")
+
+    observer_feature_means = [10.0, 20.0, 30.0]
+    for i, mean_val in enumerate(observer_feature_means):
+        observer_payload = dict(root_payload)
+        observer_payload["features"] = np.full((3, 2), mean_val, dtype=float)
+        torch.save(observer_payload, rel_dir / f"observer_{i}.pt")
+
+    def fake_extract_validation_label_info(*args, **kwargs):
+        return {
+            "labels": ["a", "b", "a"],
+            "label_cardinality": 2,
+            "label_source": "test",
+        }
+
+    def fake_compute_alignment_metrics(features_np, label_info):
+        arr = np.asarray(features_np, dtype=float)
+        return {
+            "nmi": float(arr.mean()),
+            "ari": 0.0,
+            "n_clusters": 2,
+            "label_cardinality": 2,
+            "label_source": "test",
+        }
+
+    with (
+        patch("core.complete_pipeline._extract_validation_label_info", side_effect=fake_extract_validation_label_info),
+        patch("core.complete_pipeline._compute_alignment_metrics", side_effect=fake_compute_alignment_metrics),
+    ):
+        result = suite._emit_relativity_defaults(run_dir, rows)
+
+    assert result["mode"] == "observer_payload_relativity_v1"
+    state0 = json.loads((rel_dir / "state_0.json").read_text(encoding="utf-8"))
+    state1 = json.loads((rel_dir / "state_1.json").read_text(encoding="utf-8"))
+    state2 = json.loads((rel_dir / "state_2.json").read_text(encoding="utf-8"))
+
+    assert state0["metrics"]["global_nmi"] == 0.0
+    assert state0["metrics"]["observer_conditioned_nmi"] == 10.0
+    assert state1["metrics"]["observer_conditioned_nmi"] == 20.0
+    assert state2["metrics"]["observer_conditioned_nmi"] == 30.0
+
+
+def test_collect_track_metrics_restores_t1_from_t1_embeddings():
+    label_info = {"labels": ["a", "b"], "label_cardinality": 2, "label_source": "test"}
+    result = {
+        "features": np.array([[10.0, 10.0], [10.0, 10.0]], dtype=float),
+        "checkpoints": {
+            "T1_embeddings": np.array([[1.0, 1.0], [1.0, 1.0]], dtype=float),
+            "T0_substrate": np.zeros((2, 8, 3), dtype=float),
+            "T2_kernels": np.array([[2.0, 2.0], [2.0, 2.0]], dtype=float),
+        },
+    }
+
+    def fake_compute_alignment_metrics(features_np, _label_info):
+        arr = np.asarray(features_np, dtype=float)
+        return {"nmi": float(arr.mean())}
+
+    metrics = suite._collect_track_metrics_from_result(result, label_info, fake_compute_alignment_metrics)
+
+    assert metrics["SYN"]["nmi"] == pytest.approx(10.0)
+    assert metrics["T1"]["nmi"] == pytest.approx(1.0)
+    assert metrics["T2"]["nmi"] == pytest.approx(2.0)
+
+
+def test_normalize_observer_payloads_for_verification_rewrites_provenance(tmp_path):
+    run_dir = tmp_path / "verification_leaf"
+    run_dir.mkdir()
+    payload = {
+        "features": np.ones((2, 3), dtype=float),
+        "bt_uid_list": ["u0", "u1"],
+        "provenance": [],
+        "rks_basis_state": {"hash": "basis-abc", "kernel_type": "rbf", "sigma": 1.5, "seed": 42},
+        "meta": {"kernel": "rbf", "channel": "cls", "seed": 42, "git_hash": "deadbeef"},
+    }
+    torch.save(payload, run_dir / "observer_global.pt")
+
+    suite._normalize_observer_payloads_for_verification(run_dir)
+
+    hydrated = torch.load(run_dir / "observer_global.pt", map_location="cpu", weights_only=False)
+    provenance = hydrated["provenance"]
+
+    assert isinstance(provenance, dict)
+    assert provenance["basis_hash"] == "basis-abc"
+    assert provenance["crn_seed"] == 42
+    assert provenance["alpha"] == pytest.approx(1.0)
+    assert isinstance(provenance["weights_hash"], str)
+    assert len(provenance["weights_hash"]) > 0
+
+
+def test_pick_primary_observer_file_prefers_observer_global(tmp_path):
+    run_dir = tmp_path / "primary_observer"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "observer_42.pt").write_text("legacy", encoding="utf-8")
+    (run_dir / "observer_global.pt").write_text("global", encoding="utf-8")
+
+    picked = suite._pick_primary_observer_file(run_dir)
+
+    assert picked == run_dir / "observer_global.pt"
+
+
+def test_emit_relativity_deltas_json_aggregates_vector_fields(tmp_path):
+    run_dir = tmp_path / "relativity_delta_bundle"
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    state_payload = {
+        "observer_id": 7,
+        "articles": [
+            {
+                "index": 0,
+                "bt_uid": "u0",
+                "title": "A0",
+                "baseline_x": 0.4,
+                "baseline_y": 0.5,
+                "baseline_z": 0.3,
+                "observer_x": 0.5,
+                "observer_y": 0.1,
+                "observer_z": -0.2,
+                "delta_x": 0.1,
+                "delta_y": -0.4,
+                "delta_z": -0.5,
+                "coord_delta": 0.9,
+            }
+        ],
+        "metrics": {
+            "observer_bt_uid": "u7",
+            "observer_title": "Obs",
+            "observer_density": 0.2,
+            "observer_stress": 0.3,
+            "observer_z_height": 0.1,
+            "observer_conditioned_nmi": 0.55,
+            "global_nmi": 0.44,
+        },
+        "provenance": {},
+    }
+    delta_payload = {
+        "observer_id": 7,
+        "null_observer_equivalence": {"max_coord_delta": 0.9},
+        "path_flip_delta": {"u0|A0": 0.9},
+        "metrics_delta": {"d_nmi": 0.11},
+        "axis_delta": {"rotation_deg": 12.0},
+        "translation_only_comparison": {"d_path_flip_count": 1},
+    }
+    (rel_dir / "state_7.json").write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+    (rel_dir / "delta_7.json").write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
+
+    out = suite._emit_relativity_deltas_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert blob["status"] == "OK"
+    assert blob["observer_count"] == 1
+    vector = blob["observers"][0]["vectors"][0]
+    assert vector["baseline"]["x"] == pytest.approx(0.4)
+    assert vector["baseline"]["y"] == pytest.approx(0.5)
+    assert vector["baseline"]["z"] == pytest.approx(0.3)
+    assert vector["delta"]["x"] == pytest.approx(0.10000000000000003)
+    assert vector["delta"]["y"] == pytest.approx(-0.4)
+    assert vector["delta"]["z"] == pytest.approx(-0.5)
+
+
+def test_emit_control_metrics_json_prefers_direct_control_results_blob(tmp_path, monkeypatch):
+    run_dir = tmp_path / "control_metrics_direct"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "comprehensive_results.json").write_text(json.dumps({"status": "stale"}), encoding="utf-8")
+
+    direct_blob = {
+        "direct_source": str(run_dir.parent),
+        "interpretation": {
+            "metrics": {
+                "procrustes": {"ratio": 1.9, "separates": True},
+                "distance_corr": {"ratio": 1.3, "separates": True},
+                "knn_overlap": {"ratio": 0.7, "separates": True},
+            },
+            "consensus_residual": {"real": {"consensus_pct": 72.0, "residual_pct": 28.0}},
+        },
+        "results": {"Real": {"procrustes": {"mean": 0.2}}},
+    }
+    monkeypatch.setattr(suite, "_build_direct_control_results_blob", lambda _run_dir: direct_blob)
+
+    out = suite._emit_control_metrics_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert blob["status"] == "OK"
+    assert blob["message"] == "loaded from direct control observer payloads"
+    assert blob["metrics"]["procrustes_ratio"] == pytest.approx(1.9)
+    assert blob["metrics"]["distance_corr_ratio"] == pytest.approx(1.3)
+    assert blob["metrics"]["separates_count"] == 3
+    assert blob["metrics"]["consensus_pct"] == pytest.approx(72.0)
+    assert blob["metrics"]["residual_pct"] == pytest.approx(28.0)
+
+
+def test_emit_ablation_summary_json_normalizes_legacy_metrics(tmp_path):
+    run_dir = tmp_path / "ablation_bundle"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "ablation_results.json").write_text(
+        json.dumps(
+            {
+                "stage_1_nmi": 0.81,
+                "stage_2_nmi": 0.52,
+                "stage_3_nmi": 0.44,
+                "delta_nmi": -0.37,
+                "retained_percentage": 68.0,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    out = suite._emit_ablation_summary_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert blob["status"] == "OK"
+    assert blob["metrics"]["stage_1_nmi"] == pytest.approx(0.81)
+    assert blob["metrics"]["stage_3_nmi"] == pytest.approx(0.44)
+    assert blob["metrics"]["retained_pct"] == pytest.approx(68.0)
+
+
+def test_emit_ablation_summary_json_translates_lab_diagnostics(tmp_path):
+    run_dir = tmp_path / "ablation_lab_bundle"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "lab_diagnostics.json").write_text(
+        json.dumps(
+            {
+                "procrustes": {
+                    "mean_distance_before": 1.0,
+                    "mean_distance_after": 0.25,
+                    "consensus_fraction": 0.62,
+                    "residual_fraction": 0.38,
+                },
+                "structural_invariants": {
+                    "mean_survival_rate": 0.8,
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    out = suite._emit_ablation_summary_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert blob["status"] == "OK"
+    assert blob["message"] == "translated from lab_diagnostics.json"
+    assert blob["metrics"]["stage_1_nmi"] == pytest.approx(0.5)
+    assert blob["metrics"]["stage_2_nmi"] == pytest.approx(0.8)
+    assert blob["metrics"]["stage_3_nmi"] == pytest.approx(0.8)
+    assert blob["metrics"]["delta_nmi"] == pytest.approx(0.3)
+    assert blob["metrics"]["retained_pct"] == pytest.approx(80.0)

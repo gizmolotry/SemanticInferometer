@@ -183,6 +183,7 @@ def compute_matern_distance(
 
     # Scaled distance (for angular, sigma is in angular units)
     effective_sigma = sigma if not use_angular else sigma * 0.5  # Scale for [0,1] range
+    effective_sigma = max(effective_sigma, 1e-4)
     r_scaled = r / effective_sigma
 
     # Matern kernel evaluation
@@ -480,6 +481,7 @@ def compute_matern_density(
         r = torch.cdist(embeddings, embeddings)
         effective_sigma = sigma
 
+    effective_sigma = max(effective_sigma, 1e-4)
     r_scaled = r / effective_sigma
 
     # Matern kernel evaluation
@@ -538,7 +540,7 @@ def metropolis_step(
     # Acceptance ratio: π(proposed) / π(current)
     current_density = density[current_idx]
     proposal_density = density[proposal_idx]
-    ratio = (proposal_density / (current_density + 1e-10)).clamp(max=100)
+    ratio = (proposal_density / (current_density + 1e-10)).clamp(max=10000)
 
     # Metropolis criterion with temperature
     acceptance_prob = torch.min(torch.ones_like(ratio), ratio ** (1.0 / temperature))
@@ -998,14 +1000,15 @@ class SemanticWorkIntegrator:
         work_matrix = torch.zeros(N, N, device=points.device)
 
         for i in range(N):
-            for j in range(i + 1, N):
+            for j in range(N):
+                if i == j:
+                    continue
                 result = self.compute_work(
                     points[i:i+1],
                     points[j:j+1],
                     ideology_idx,
                 )
                 work_matrix[i, j] = result['work'].item()
-                work_matrix[j, i] = work_matrix[i, j]  # Symmetric
 
         return work_matrix
 

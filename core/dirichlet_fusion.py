@@ -74,23 +74,29 @@ class DirichletFusionConfig:
     # Sigma policy
     sigma: Optional[float] = None  # If None, estimate from data
     sigma_policy: str = 'median'   # 'median', 'mean', 'fixed'
+    nu: float = 1.5                # Matérn smoothness / Student-t df control
+    roughness: int = 3             # IMQ Student-t degrees of freedom
     
     # Mode B support (map-then-mix)
     mix_in_rkhs: bool = False  # If True, project to RKHS before mixing
     
     # Sequential Cooling / Atmospheric Annealing settings
-    use_sequential_cooling: bool = False  # If True, use iterative Sequential Cooling algorithm
+    # Production guardrail: keep legacy variance-reinforcement cooling disabled.
+    use_sequential_cooling: bool = False
     cooling_iterations: int = 10
     cooling_decay: float = 0.1  # Path decay rate
     cooling_reinforce: float = 1.5  # Reinforcement factor
 
     # ASTER v3.2: Sequential Annealing (replaces parallel snapshots)
-    # Instead of independent alpha samples, we anneal from hot (consensus) to cold (partisan)
+    # Hot stages stay close to the prior barycenter; cold stages release that constraint
+    # and allow structured observer separation to emerge.
     use_annealing: bool = True  # If True, use sequential annealing instead of parallel
     annealing_schedule: List[float] = field(default_factory=lambda: [10.0, 5.0, 2.0, 1.0, 0.5, 0.1])
     annealing_kl_weight: float = 0.5  # How strongly to penalize deviation from prior state
 
     # Consensus removal
+    # Production guardrail: keep observer-consensus residualization disabled unless
+    # explicitly requested for diagnostic experiments.
     remove_consensus: bool = False
     n_consensus_components: int = 1  # How many PCs to remove
     
@@ -425,6 +431,11 @@ class DirichletFusion(nn.Module):
             'n_observers': config.n_observers,
             'use_sequential_cooling': config.use_sequential_cooling,
             'remove_consensus': config.remove_consensus,
+            'thermodynamic_objective': {
+                'hot_stage': 'strong prior regularization, weak separation pressure',
+                'cold_stage': 'weak prior regularization, strong separation pressure',
+                'prior_reference': 'simplex weights',
+            },
         }
         
         # Initialize multiple RKS bases (M-observers)
@@ -437,6 +448,8 @@ class DirichletFusion(nn.Module):
                 output_dim=config.rks_dim,
                 seed=config.basis_seed,
                 kernel_type=kernel_type,
+                nu=config.nu,
+                roughness=config.roughness,
             )
             self.bases[kernel_type] = basis
             self._sigma_estimated[kernel_type] = False
@@ -465,6 +478,8 @@ class DirichletFusion(nn.Module):
                 output_dim=config.rks_dim,
                 seed=config.basis_seed,
                 kernel_type=config.kernel_type,
+                nu=config.nu,
+                roughness=config.roughness,
             )
             print(f"[DirichletFusion] Created basis with seed {config.basis_seed}")
         
@@ -613,10 +628,10 @@ class DirichletFusion(nn.Module):
         samples_per_kernel = {k: torch.cat(v, dim=0) for k, v in samples_per_kernel.items()}
         
         # =====================================================================
-        # STEP 4: Optional consensus removal (inverse PCA)
+        # STEP 4: Optional consensus residualization (diagnostic only; disabled in production)
         # =====================================================================
         if self.config.remove_consensus:
-            print(f"[DirichletFusion] Removing {self.config.n_consensus_components} consensus components...")
+            print("[DirichletFusion] Diagnostic consensus residualization enabled (robust median field)...")
             phi_per_kernel = self._remove_consensus(phi_per_kernel)
             # Re-fuse after consensus removal
             for k_name in samples_per_kernel.keys():
@@ -624,7 +639,7 @@ class DirichletFusion(nn.Module):
                 samples_per_kernel[k_name] = torch.einsum('nbd,kb->nkd', phi, weights).cpu()
         
         # =====================================================================
-        # STEP 5: Optional sequential cooling adaptive weighting
+        # STEP 5: Optional sequential cooling adaptive weighting (legacy diagnostic path)
         # =====================================================================
         if self.config.use_sequential_cooling:
             print(f"[DirichletFusion] Running Sequential Cooling ({self.config.cooling_iterations} iterations)...")
@@ -731,55 +746,15 @@ class DirichletFusion(nn.Module):
     
     def _remove_consensus(self, phi_per_kernel: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Remove consensus components across V-observers (bots) using inverse PCA.
-        
-        For each article, identifies what all bots agree on (consensus)
-        and removes it, leaving only observer-specific residuals.
-        
-        Args:
-            phi_per_kernel: {kernel_name: [N, B, D]} RKHS projections
-            
-        Returns:
-            residuals: {kernel_name: [N, B, D]} with consensus removed
+        Diagnostic-only consensus residualization using a robust shared field.
+
+        The production path keeps this disabled. When explicitly enabled for audits,
+        it subtracts a geometric-median shared field rather than a PCA disagreement axis.
         """
-        from sklearn.decomposition import PCA
-        
-        n_components = self.config.n_consensus_components
-        residuals = {}
-        
-        for k_name, phi in phi_per_kernel.items():
-            N, B, D = phi.shape
-            phi_np = phi.numpy()
-            
-            phi_residual = np.zeros_like(phi_np)
-            
-            for i in range(N):
-                # Stack bots for this article: [B, D]
-                bots_i = phi_np[i]
-                
-                # Center bots
-                bots_centered = bots_i - bots_i.mean(axis=0, keepdims=True)
-                
-                # PCA to find consensus directions
-                pca = PCA(n_components=min(n_components, B - 1))
-                pca.fit(bots_centered)
-                
-                # Project onto consensus and remove
-                consensus_proj = pca.transform(bots_centered)
-                consensus = pca.inverse_transform(consensus_proj)
-                
-                # Residual = what's unique to each bot
-                phi_residual[i] = bots_centered - consensus
-            
-            residuals[k_name] = torch.from_numpy(phi_residual).float()
-            
-            # Log how much variance was removed
-            total_var = np.var(phi_np)
-            residual_var = np.var(phi_residual)
-            removed_frac = 1 - (residual_var / total_var) if total_var > 0 else 0
-            print(f"  [{k_name}] Consensus removed: {removed_frac:.1%} of variance")
-        
-        return residuals
+        return self._remove_consensus_pca(
+            phi_per_kernel,
+            n_components=self.config.n_consensus_components,
+        )
     
     def _sequential_cooling(
         self, 
@@ -1208,6 +1183,8 @@ class DirichletFusion(nn.Module):
         # Get annealing schedule (sorted high to low = hot to cold)
         schedule = sorted(self.config.annealing_schedule, reverse=True)
         print(f"\n[Track 3] Sequential Annealing: {schedule[0]:.1f} -> {schedule[-1]:.1f}")
+        print("  Hot stages: strong prior lock, weak separation pressure")
+        print("  Cold stages: weak prior lock, strong separation pressure")
 
         # Project through kernel (use first/primary kernel)
         kernel_name = list(self.bases.keys())[0]
@@ -1222,7 +1199,7 @@ class DirichletFusion(nn.Module):
         D = phi_flat.shape[-1]
         phi = phi_flat.reshape(N, B, D)  # [N, B, D]
 
-        # Initialize: Uniform weights (raw democracy)
+        # Initialize: uniform barycenter prior
         current_weights = torch.ones(N, B, device=device) / B  # [N, B]
 
         # Tracking
@@ -1233,7 +1210,7 @@ class DirichletFusion(nn.Module):
 
         # Annealing loop: Hot → Cold
         for stage_idx, alpha in enumerate(schedule):
-            # Optimize weights at this temperature, using prior as starting point
+            # Hot stages remain close to the prior barycenter; cold stages relax it.
             new_weights, stage_work = self._anneal_step(
                 phi=phi,
                 alpha=alpha,
@@ -1253,7 +1230,7 @@ class DirichletFusion(nn.Module):
             stage_emb = torch.einsum('nbd,nb->nd', phi, current_weights)
             stage_embeddings.append(stage_emb)
 
-            # Capture consensus (first/hot stage)
+            # Capture the hot-stage barycenter before the system is released.
             if stage_idx == 0:
                 consensus_weights = current_weights.clone()
 
@@ -1264,8 +1241,9 @@ class DirichletFusion(nn.Module):
         fused_cold = stage_embeddings[-1]
         fused_hot = stage_embeddings[0]
 
-        # Compute stability: cosine similarity between hot and cold weights
-        # High similarity = bond held = Crystal, Low similarity = collapsed = Fog
+        # Compute stability: cosine similarity between hot-stage barycenter and cold-state weights.
+        # High similarity means the observer mixture stayed near the hot prior;
+        # low similarity means colder stages separated meaningfully.
         stability_mask = F.cosine_similarity(consensus_weights, final_weights, dim=1)
         stability_mask = torch.clamp(stability_mask, 0.0, 1.0)
 
@@ -1285,6 +1263,11 @@ class DirichletFusion(nn.Module):
                 'method': 'sequential_annealing',
                 'schedule': schedule,
                 'n_stages': len(schedule),
+                'thermodynamic_objective': {
+                    'hot_stage': 'strong prior regularization, weak separation pressure',
+                    'cold_stage': 'weak prior regularization, strong separation pressure',
+                    'prior_reference': 'previous-stage simplex weights',
+                },
             },
         }
 
@@ -1315,62 +1298,87 @@ class DirichletFusion(nn.Module):
         """
         Single annealing step: optimize weights at given temperature.
 
-        Loss = Variance(fused) + (1/alpha) * KL(weights || prior)
+        Hot stage:
+            - strong prior regularization
+            - weak separation pressure
+        Cold stage:
+            - weak prior regularization
+            - strong separation pressure
 
-        High alpha (hot): KL term weak → weights free to find consensus
-        Low alpha (cold): KL term strong → weights must stay near prior
+        The prior_weights input is already a simplex distribution, so KL is
+        computed directly against that prior rather than softmaxing it again.
 
         Returns:
             new_weights: [N, B] optimized weights
             work: scalar work done (distance from prior)
         """
         N, B, D = phi.shape
-        device = phi.device
 
-        # Initialize from prior
-        weights = prior_weights.clone().requires_grad_(True)
+        eps = 1e-8
+        prior_prob = prior_weights.detach().clamp_min(eps)
+        prior_prob = prior_prob / prior_prob.sum(dim=-1, keepdim=True).clamp_min(eps)
 
-        optimizer = torch.optim.Adam([weights], lr=0.1)
+        # Optimize logits, but anchor them to the true simplex prior.
+        logits = prior_prob.log().clone().requires_grad_(True)
+        optimizer = torch.optim.Adam([logits], lr=0.1)
+
+        separation_scale = 1.0 / max(float(alpha), eps)
+        prior_scale = float(kl_weight) * float(alpha)
 
         for _ in range(n_iter):
             optimizer.zero_grad()
 
             # Softmax to ensure simplex
-            w_soft = F.softmax(weights, dim=-1)
+            w_soft = F.softmax(logits, dim=-1)
 
             # Fused embedding: [N, D]
             fused = torch.einsum('nbd,nb->nd', phi, w_soft)
 
-            # Variance loss: we want high variance (disagreement is signal)
-            # But for consensus, we want LOW variance at high alpha
-            var_loss = -fused.var(dim=0).mean()  # Negative = maximize variance
+            # Structured separation should emerge gradually as the temperature cools.
+            separation_gain = fused.var(dim=0).mean()
 
-            # KL divergence from prior (encourages staying near memory)
-            # At high alpha (hot), this is weak; at low alpha (cold), this is strong
-            prior_soft = F.softmax(prior_weights, dim=-1).detach()
-            kl_div = F.kl_div(
-                w_soft.log(),
-                prior_soft,
-                reduction='batchmean'
-            )
+            # KL divergence from the previous stage's simplex weights.
+            kl_div = F.kl_div(w_soft.log(), prior_prob, reduction='batchmean')
 
-            # Total loss: balance variance and memory
-            loss = var_loss + (kl_weight / alpha) * kl_div
+            # Hot alpha enforces conformity; cold alpha releases the constraint.
+            loss = -(separation_scale * separation_gain) + prior_scale * kl_div
 
             loss.backward()
             optimizer.step()
 
         # Final weights
-        final_weights = F.softmax(weights.detach(), dim=-1)
+        final_weights = F.softmax(logits.detach(), dim=-1)
         work = torch.norm(final_weights - prior_weights, p=2).item()
 
         return final_weights, work
 
     def _entropy(self, weights: torch.Tensor) -> torch.Tensor:
-        """Compute entropy of weight distribution per sample."""
-        w = F.softmax(weights, dim=-1)
+        """Compute entropy of a simplex weight distribution per sample."""
+        w = weights
+        if (w < 0).any() or not torch.allclose(
+            w.sum(dim=-1),
+            torch.ones_like(w.sum(dim=-1)),
+            atol=1e-4,
+            rtol=1e-4,
+        ):
+            w = F.softmax(weights, dim=-1)
         log_w = torch.log(w + 1e-9)
         return -(w * log_w).sum(dim=-1)
+
+    def _geometric_median(self, points: torch.Tensor, max_iter: int = 32, tol: float = 1e-5) -> torch.Tensor:
+        """Weiszfeld geometric median for a small set of observer vectors."""
+        guess = points.mean(dim=0)
+        eps = 1e-8
+        for _ in range(max_iter):
+            distances = torch.norm(points - guess, dim=1).clamp_min(eps)
+            if torch.any(distances <= tol):
+                return points[torch.argmin(distances)]
+            inv_dist = 1.0 / distances
+            next_guess = (points * inv_dist.unsqueeze(1)).sum(dim=0) / inv_dist.sum()
+            if torch.norm(next_guess - guess).item() <= tol:
+                return next_guess
+            guess = next_guess
+        return guess
 
     def _remove_consensus_pca(
         self,
@@ -1378,45 +1386,31 @@ class DirichletFusion(nn.Module):
         n_components: int = 1,
     ) -> Dict[str, torch.Tensor]:
         """
-        Remove consensus across observers using PCA.
-        
-        For each article, stack all observer views and remove
-        the top PCs (what observers agree on).
-        
+        Diagnostic-only consensus residualization using a robust geometric median.
+
+        This intentionally avoids PCA: the leading PCA direction across observers is
+        a disagreement axis, not a principled consensus field.
+
         Args:
             phi_per_kernel: dict of {kernel_name: [N, B, D]}
-            n_components: number of consensus components to remove
-            
+            n_components: unused, retained for API compatibility
+
         Returns:
-            residuals: dict of {kernel_name: [N, B, D]} with consensus removed
+            residuals: dict of {kernel_name: [N, B, D]} with robust shared field removed
         """
-        from sklearn.decomposition import PCA
-        
         residuals = {}
-        
+
         for k_name, phi in phi_per_kernel.items():
             N, B, D = phi.shape
-            device = phi.device
-            phi_np = phi.cpu().numpy()
-            
-            # For each article, remove consensus across bots
-            phi_residual = np.zeros_like(phi_np)
-            
+            phi_residual = torch.zeros_like(phi)
+
             for i in range(N):
-                # Stack bots: [B, D]
-                bots_i = phi_np[i]
-                
-                # PCA across bots
-                n_comp = min(n_components, B - 1)
-                pca = PCA(n_components=n_comp)
-                pca.fit(bots_i)
-                
-                # Project and remove consensus
-                consensus = pca.inverse_transform(pca.transform(bots_i))
-                phi_residual[i] = bots_i - consensus
-            
-            residuals[k_name] = torch.from_numpy(phi_residual).to(device)
-        
+                bots_i = phi[i]
+                shared_field = self._geometric_median(bots_i)
+                phi_residual[i] = bots_i - shared_field.unsqueeze(0)
+
+            residuals[k_name] = phi_residual
+
         return residuals
 
     def _decompose_vmo_variance_legacy(

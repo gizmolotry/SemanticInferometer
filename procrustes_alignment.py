@@ -22,6 +22,7 @@ from pathlib import Path
 import json
 import argparse
 from typing import List, Dict
+import pandas as pd
 
 # Import from core module
 from core.procrustes import (
@@ -191,7 +192,7 @@ def save_alignment_results(results: Dict, output_dir: Path):
     with open(output_dir / 'alignment_stats.json', 'w') as f:
         json.dump(stats, f, indent=2)
     
-    print(f"\n✅ Saved alignment results to {output_dir}")
+    print(f"\n[OK] Saved alignment results to {output_dir}")
 
 
 def compare_corpora(
@@ -243,7 +244,7 @@ def compare_corpora(
                     break
         
         if len(observer_files) < 2:
-            print(f"⚠️  Skipping {corpus_name}: found only {len(observer_files)} observers")
+            print(f"[WARN] Skipping {corpus_name}: found only {len(observer_files)} observers")
             continue
         
         # Run alignment with CORRECTED variance
@@ -282,7 +283,7 @@ def compare_corpora(
         with open(output_dir / 'corpus_comparison.json', 'w') as f:
             json.dump(comparison, f, indent=2)
         
-        print(f"\n✅ Saved comparison to {output_dir / 'corpus_comparison.json'}")
+        print(f"\n[OK] Saved comparison to {output_dir / 'corpus_comparison.json'}")
     
     return comparison
 
@@ -341,11 +342,11 @@ if __name__ == "__main__":
         observer_files = find_observer_files(data_dir)
     
     if not observer_files:
-        print(f"❌ No files found in {data_dir}")
+        print(f"[FAIL] No files found in {data_dir}")
         print("   Tried patterns: observer_*.pt, seed_*.pt, *_observer_*.pt")
         exit(1)
     
-    print(f"✅ Found {len(observer_files)} observer files")
+    print(f"[OK] Found {len(observer_files)} observer files")
     
     # Run alignment with CORRECTED variance
     results = load_and_align_observers(observer_files, args.reference_idx)
@@ -364,8 +365,23 @@ if __name__ == "__main__":
 
     # 1. Extract and save downstream artifacts from reference observer
     artifact_count = 0
+    bt_uid_list = ref_data.get('bt_uid_list') or ref_data.get('ids') or ref_data.get('canonical_ids')
+    if bt_uid_list is not None:
+        with open(output_dir / "bt_uid_list.json", "w", encoding="utf-8") as f:
+            json.dump(list(bt_uid_list), f, indent=2, ensure_ascii=False)
+        artifact_count += 1
+        print("  [OK] Extracted bt_uid_list.json")
+
+    # Expected row count for strict alignment with features.npy
+    n_rows = None
+    if 'features' in ref_data:
+        ref_features = ref_data['features']
+        n_rows = int(ref_features.shape[0]) if hasattr(ref_features, "shape") else len(ref_features)
+    elif bt_uid_list is not None:
+        n_rows = len(bt_uid_list)
 
     # NEW: Reconstruct article metadata if missing (crucial for synthetic runs)
+    metadata_df = None
     if not ref_data.get('article_metadata'):
         print("  [INFO] article_metadata missing or empty in observer. Attempting reconstruction from corpus...")
         try:
@@ -393,17 +409,93 @@ if __name__ == "__main__":
                             'perspective_type': item.get('perspective_type', 'unknown')
                         })
 
-                import pandas as pd
-                pd.DataFrame(metadata).to_csv(output_dir / "article_metadata.csv", index=False)
-                print(f"  [OK] Reconstructed article_metadata.csv from {corpus_path.name}")
+                metadata_df = pd.DataFrame(metadata)
+                print(f"  [OK] Reconstructed metadata from {corpus_path.name}")
         except Exception as e:
             print(f"  [WARN] Metadata reconstruction failed: {e}")
     else:
         # Check if we need to convert metadata list to CSV for metric_fusion
         metadata = ref_data['article_metadata']
-        import pandas as pd
-        pd.DataFrame(metadata).to_csv(output_dir / "article_metadata.csv", index=False)
-        print("  [OK] Extracted article_metadata.csv")
+        metadata_df = pd.DataFrame(metadata)
+        print("  [OK] Extracted metadata from artifact")
+
+    # Preserve and align bt_uid explicitly with features rows.
+    if metadata_df is None:
+        metadata_df = pd.DataFrame(index=range(n_rows or 0))
+    if bt_uid_list is not None:
+        bt_uid_list = list(bt_uid_list)
+        if n_rows is None:
+            n_rows = len(bt_uid_list)
+        aligned_n = min(n_rows, len(metadata_df), len(bt_uid_list)) if len(metadata_df) > 0 else min(n_rows, len(bt_uid_list))
+        if len(metadata_df) == 0:
+            metadata_df = pd.DataFrame(index=range(aligned_n))
+        else:
+            metadata_df = metadata_df.iloc[:aligned_n].copy()
+        metadata_df['bt_uid'] = bt_uid_list[:aligned_n]
+        n_rows = aligned_n
+    elif n_rows is not None and len(metadata_df) > n_rows:
+        metadata_df = metadata_df.iloc[:n_rows].copy()
+
+    # Enrich synthetic metadata with perspective fields when bias/affiliation are missing.
+    try:
+        needs_enrichment = (
+            ('bias' not in metadata_df.columns) or metadata_df.get('bias', pd.Series(dtype=object)).isna().all()
+        ) and ('title' in metadata_df.columns)
+        if needs_enrichment:
+            synth_path = Path("sythgen/high_quality_articles.jsonl")
+            if synth_path.exists():
+                synth_rows = []
+                with open(synth_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        synth_rows.append(json.loads(line))
+                if len(synth_rows) >= len(metadata_df):
+                    synth_df = pd.DataFrame(synth_rows)
+                    # Fast path: aligned synthetic corpus by row index.
+                    if 'title' in synth_df.columns and metadata_df['title'].astype(str).equals(
+                        synth_df['title'].astype(str).iloc[:len(metadata_df)].reset_index(drop=True)
+                    ):
+                        aligned = synth_df.iloc[:len(metadata_df)].reset_index(drop=True)
+                    else:
+                        # Fallback: title+source key join.
+                        lhs = metadata_df.copy()
+                        lhs['_key'] = (
+                            lhs.get('title', pd.Series('', index=lhs.index)).astype(str).str.strip().str.lower() + '||' +
+                            lhs.get('source', pd.Series('', index=lhs.index)).astype(str).str.strip().str.lower()
+                        )
+                        rhs = synth_df.copy()
+                        rhs['_key'] = (
+                            rhs.get('title', pd.Series('', index=rhs.index)).astype(str).str.strip().str.lower() + '||' +
+                            rhs.get('publication', pd.Series('', index=rhs.index)).astype(str).str.strip().str.lower()
+                        )
+                        aligned = lhs.merge(
+                            rhs[['_key', 'perspective_tag', 'perspective_type', 'publication']],
+                            on='_key',
+                            how='left'
+                        )
+                    if 'perspective_tag' in aligned.columns:
+                        metadata_df['perspective_tag'] = aligned['perspective_tag'].values
+                    if 'perspective_type' in aligned.columns:
+                        metadata_df['perspective_type'] = aligned['perspective_type'].values
+                    if 'bias' not in metadata_df.columns:
+                        metadata_df['bias'] = aligned.get('perspective_tag', pd.Series(index=metadata_df.index)).values
+                    else:
+                        metadata_df['bias'] = metadata_df['bias'].fillna(
+                            aligned.get('perspective_tag', pd.Series(index=metadata_df.index))
+                        )
+                    if 'affiliation' not in metadata_df.columns:
+                        metadata_df['affiliation'] = aligned.get('perspective_type', pd.Series(index=metadata_df.index)).values
+                    else:
+                        metadata_df['affiliation'] = metadata_df['affiliation'].fillna(
+                            aligned.get('perspective_type', pd.Series(index=metadata_df.index))
+                        )
+                    if 'source' in metadata_df.columns and 'publication' in aligned.columns:
+                        metadata_df['source'] = metadata_df['source'].fillna(aligned['publication'])
+                    print("  [OK] Enriched metadata with perspective_tag/perspective_type from synthetic corpus")
+    except Exception as e:
+        print(f"  [WARN] Synthetic metadata enrichment failed: {e}")
+
+    metadata_df.to_csv(output_dir / "article_metadata.csv", index=False)
+    print("  [OK] Saved article_metadata.csv with bt_uid alignment")
     # Extract spectral_evr
     if 'spectral_evr' in ref_data:
         np.save(output_dir / "spectral_evr.npy", ref_data['spectral_evr'])
@@ -432,6 +524,23 @@ if __name__ == "__main__":
         np.save(output_dir / "spectral_u_axis.npy", u_axis)
         artifact_count += 1
         print("  [OK] Derived spectral_u_axis.npy from features PCA")
+
+    # Extract spectral_probe_magnitudes (required for MONOLITH Spectral DNA hover)
+    if 'spectral_probe_magnitudes' in ref_data:
+        probe_mags = ref_data['spectral_probe_magnitudes']
+        if torch.is_tensor(probe_mags):
+            probe_mags = probe_mags.detach().cpu().numpy()
+        np.save(output_dir / "spectral_probe_magnitudes.npy", probe_mags)
+        artifact_count += 1
+        print("  [OK] Extracted spectral_probe_magnitudes.npy")
+    elif 'T1.5_spectral' in ref_data and isinstance(ref_data['T1.5_spectral'], dict):
+        probe_mags = ref_data['T1.5_spectral'].get('probe_magnitudes')
+        if probe_mags is not None:
+            if torch.is_tensor(probe_mags):
+                probe_mags = probe_mags.detach().cpu().numpy()
+            np.save(output_dir / "spectral_probe_magnitudes.npy", probe_mags)
+            artifact_count += 1
+            print("  [OK] Extracted spectral_probe_magnitudes.npy from T1.5_spectral")
 
     # Extract walker data
     if 'walker_states' in ref_data:
@@ -496,7 +605,7 @@ if __name__ == "__main__":
             np.save(ckpt_out_dir / "T3_topology.npz", topo)
         print("  [OK] Unpacked T3_topology.npz")
 
-    print(f"✅ Bridge: Saved {artifact_count} physics artifacts.")
+    print(f"[OK] Bridge: Saved {artifact_count} physics artifacts.")
 
     # 2. Trigger Metric Fusion if possible
     embeddings_path = output_dir / "features.npy"
@@ -515,16 +624,16 @@ if __name__ == "__main__":
                 metadata_path=metadata_path,
                 output_path=fusion_output
             )
-            print("✅ Bridge: Generated MONOLITH_DATA.csv")
+            print("[OK] Bridge: Generated MONOLITH_DATA.csv")
         except Exception as e:
-            print(f"❌ Bridge: Metric fusion failed: {e}")
+            print(f"[FAIL] Bridge: Metric fusion failed: {e}")
     else:
         missing = []
         if not embeddings_path.exists(): missing.append("features.npy")
         if not gradients_path.exists(): missing.append("spectral_u_axis.npy")
         if not metadata_path.exists(): missing.append("article_metadata.csv")
-        print(f"⚠️  Bridge: Skipping metric fusion, missing: {', '.join(missing)}")
+        print(f"[WARN] Bridge: Skipping metric fusion, missing: {', '.join(missing)}")
 
     print("\n" + "="*70)
-    print("✅ ALIGNMENT & PHYSICS COMPLETE")
+    print("[OK] ALIGNMENT & PHYSICS COMPLETE")
     print("="*70)

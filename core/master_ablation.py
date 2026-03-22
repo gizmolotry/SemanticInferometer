@@ -199,6 +199,20 @@ class AblationConfig:
                 'max_articles': self.max_articles,
                 'corpora': self.corpora,
             },
+            'evaluation_contract': {
+                'primary_metrics': [
+                    'pairwise_procrustes_residual',
+                    'consensus_fraction',
+                    'residual_fraction',
+                    'structural_invariant_survival_rate',
+                ],
+                'forbidden_judges': [
+                    'analysis/ablation.py',
+                    'tribe_label_nmi',
+                    'red_blue_gray_static_labels',
+                ],
+                'notes': 'Heavy-tailed geometry sweeps are judged downstream by observer alignment and invariant survival, not exogenous label clustering.',
+            },
         }
 
 
@@ -369,7 +383,7 @@ class AblationRunner:
 
         Returns dict with run metadata and paths to outputs.
         """
-        from .complete_pipeline import initialize_full_pipeline, BeliefTransformerPipeline
+        from .complete_pipeline import run_multi_observer_experiment_simple
 
         run_dir = Path(config.output_dir) / (config.run_name or config.config_hash)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -381,48 +395,71 @@ class AblationRunner:
             json.dump(manifest, f, indent=2, default=str)
         print(f"[ABLATION] Manifest saved: {manifest_path}")
 
-        # Map ablation config to pipeline parameters
-        pipeline_kwargs = self._config_to_pipeline_kwargs(config)
-
         results = {}
         t_start = time.time()
 
-        for seed in config.observer_seeds:
-            print(f"\n[ABLATION] Observer seed={seed}, kernel={config.kernel_type}, "
-                  f"agg={config.aggregation}, backdrop={config.backdrop_mode}")
+        for corpus_name in config.corpora:
+            corpus_path = self._resolve_corpus_path(corpus_name, config)
+            if corpus_path is None:
+                print(f"[ABLATION] Skipping {corpus_name}: path not found")
+                continue
 
-            pipeline_kwargs['random_seed'] = seed
-            components = initialize_full_pipeline(**pipeline_kwargs)
-            pipeline = BeliefTransformerPipeline(
-                components=components,
-                random_seed=seed,
-                enable_provenance=True,
-                provenance_dir=str(run_dir),
+            articles = self._load_articles(corpus_path, max_articles=config.max_articles)
+            corpus_dir = run_dir / corpus_name
+            corpus_dir.mkdir(parents=True, exist_ok=True)
+
+            print(
+                f"\n[ABLATION] Corpus={corpus_name} | kernel={config.kernel_type} "
+                f"| observers={len(config.observer_seeds)} | articles={len(articles)}"
             )
 
-            seed_results = {}
-            for corpus_name in config.corpora:
-                corpus_path = self._resolve_corpus_path(corpus_name, config)
-                if corpus_path is None:
-                    print(f"  Skipping {corpus_name}: path not found")
-                    continue
+            run_multi_observer_experiment_simple(
+                articles=articles,
+                seeds=config.observer_seeds,
+                use_contrastive=True,
+                use_pca_removal=False,
+                use_cls_tokens=True,
+                shared_pca=False,
+                kernel_type=config.kernel_type,
+                kernel_params=self._kernel_params_for_run(config),
+                use_gru=False,
+                use_multi_framing_rks=True,
+                use_attention=False,
+                use_dirichlet_fusion=True,
+                normalize_features=True,
+                device=config.device,
+                track_variance=True,
+                output_dir=corpus_dir,
+                rks_sigma=config.sigma,
+                corpus_name=corpus_name,
+                emit_label_validation=False,
+                enable_checkpoints=True,
+                dirichlet_alpha=config.dirichlet_alpha,
+                dirichlet_n_observers=config.n_observers,
+                dirichlet_rks_dim=config.rks_dim,
+                dirichlet_basis_seed=config.basis_seed,
+                dirichlet_crn_seed=config.crn_seed,
+                kernel_nu=config.kernel_nu,
+                kernel_roughness=config.kernel_roughness,
+            )
 
-                print(f"  Processing: {corpus_name}")
-                # The actual processing is delegated to the pipeline
-                # Results are saved per-seed per-corpus
-                out_dir = run_dir / config.kernel_type / corpus_name
-                out_dir.mkdir(parents=True, exist_ok=True)
+            observer_payloads = self._load_observer_payloads(corpus_dir, config.observer_seeds)
+            diagnostics = self._compute_lab_diagnostics(observer_payloads)
+            diagnostics_path = corpus_dir / "lab_diagnostics.json"
+            with open(diagnostics_path, "w", encoding="utf-8") as f:
+                json.dump(diagnostics, f, indent=2, default=str)
 
-                seed_results[corpus_name] = {
-                    'output_dir': str(out_dir),
-                    'corpus_path': corpus_path,
-                }
-
-            results[seed] = seed_results
+            results[corpus_name] = {
+                'output_dir': str(corpus_dir),
+                'corpus_path': corpus_path,
+                'n_articles': len(articles),
+                'observer_files': [str(corpus_dir / f"observer_{seed}.pt") for seed in config.observer_seeds],
+                'diagnostics_path': str(diagnostics_path),
+            }
 
         elapsed = time.time() - t_start
         manifest['elapsed_seconds'] = elapsed
-        manifest['results'] = {str(k): v for k, v in results.items()}
+        manifest['results'] = results
 
         # Update manifest with timing
         with open(manifest_path, 'w') as f:
@@ -489,8 +526,110 @@ class AblationRunner:
             'dirichlet_rks_dim': config.rks_dim,
             'dirichlet_basis_seed': config.basis_seed,
             'dirichlet_crn_seed': config.crn_seed,
+            'kernel_nu': config.kernel_nu,
+            'kernel_roughness': config.kernel_roughness,
             'normalize_features': True,
         }
+
+    def _kernel_params_for_run(self, config: AblationConfig) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if config.kernel_type == 'matern':
+            params['nu'] = float(config.kernel_nu)
+        if config.kernel_type == 'imq':
+            params['roughness'] = int(config.kernel_roughness)
+        return params
+
+    def _load_articles(self, corpus_path: str, max_articles: int) -> List[Dict[str, Any]]:
+        from .canonical_ids import assign_canonical_uids
+
+        articles: List[Dict[str, Any]] = []
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                articles.append(json.loads(line))
+                if max_articles and len(articles) >= max_articles:
+                    break
+
+        articles, _ = assign_canonical_uids(articles)
+        return articles
+
+    def _load_observer_payloads(self, corpus_dir: Path, seeds: List[int]) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for seed in seeds:
+            observer_path = corpus_dir / f"observer_{seed}.pt"
+            if observer_path.exists():
+                payloads.append(torch.load(observer_path, map_location='cpu', weights_only=False))
+        return payloads
+
+    def _compute_lab_diagnostics(self, observer_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        from .procrustes import compute_consensus_and_residuals, procrustes_align
+
+        diagnostics: Dict[str, Any] = {
+            'evaluation_policy': {
+                'label_nmi_used': False,
+                'analysis_ablation_used': False,
+                'primary_metrics': [
+                    'pairwise_procrustes_residual',
+                    'consensus_fraction',
+                    'residual_fraction',
+                    'structural_invariant_survival_rate',
+                ],
+            },
+            'n_observers_loaded': len(observer_payloads),
+        }
+
+        feature_mats: List[torch.Tensor] = []
+        for payload in observer_payloads:
+            features = payload.get('features')
+            if features is None:
+                features = payload.get('embeddings')
+            if features is None:
+                continue
+            feature_mats.append(torch.as_tensor(features, dtype=torch.float32))
+
+        if len(feature_mats) >= 2:
+            align = procrustes_align(feature_mats, reference_idx=0)
+            _consensus, _residuals, variance = compute_consensus_and_residuals(align['aligned'])
+            diagnostics['procrustes'] = {
+                'reference_idx': 0,
+                'mean_distance_before': float(np.mean(align['distances_before'])),
+                'mean_distance_after': float(np.mean(align['distances_after'])),
+                'consensus_fraction': float(variance['consensus_fraction']),
+                'residual_fraction': float(variance['residual_fraction']),
+                'mean_per_observer_residual_energy': float(np.mean(variance['per_observer_residual_energy'])),
+            }
+
+        invariant_fields = [
+            'T1_embeddings',
+            'T1.5_spectral',
+            'T2_kernels',
+            'T3_topology',
+            'walker_states',
+            'walker_work_integrals',
+            'phantom_verdicts',
+        ]
+        per_field = {}
+        for field_name in invariant_fields:
+            alive = 0
+            for payload in observer_payloads:
+                value = payload.get(field_name)
+                if value is None:
+                    continue
+                if hasattr(value, '__len__') and not isinstance(value, (str, bytes)) and len(value) == 0:
+                    continue
+                alive += 1
+            per_field[field_name] = {
+                'alive_observers': int(alive),
+                'survival_rate': float(alive / len(observer_payloads)) if observer_payloads else 0.0,
+            }
+
+        diagnostics['structural_invariants'] = {
+            'per_field': per_field,
+            'mean_survival_rate': float(np.mean([v['survival_rate'] for v in per_field.values()])) if per_field else 0.0,
+        }
+        return diagnostics
 
     def _resolve_corpus_path(self, corpus_name: str, config: AblationConfig) -> Optional[str]:
         """Resolve corpus name to file path."""

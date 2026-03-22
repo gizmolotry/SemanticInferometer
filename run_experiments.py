@@ -736,7 +736,6 @@ def run_rq_sweep_experiment(articles, mode_config, corpus_name='real'):
         print(f"[OK] Saved alpha={alpha} observer to {output_path.name}")
 
 
-
 def run_dirichlet_fusion_experiment(articles, mode_config, seeds, corpus_name='real', *, output_root: str = None):
     """
     Run Dirichlet observer fusion experiment.
@@ -1144,6 +1143,18 @@ def main():
         type=str,
         default=None,
         help='Path to NLI embedding cache file (for reuse across kernel runs)'
+    )
+    parser.add_argument(
+        '--nu',
+        type=float,
+        default=None,
+        help='Smoothness parameter for Matern kernel (v)'
+    )
+    parser.add_argument(
+        '--roughness',
+        type=float,
+        default=None,
+        help='Roughness parameter for IMQ kernel (df)'
     )
     parser.add_argument(
         '--freeze-good-run',

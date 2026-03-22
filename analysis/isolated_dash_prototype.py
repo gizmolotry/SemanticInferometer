@@ -25,9 +25,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import numpy as np
 import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, callback_context, dcc, html, no_update
 import plotly.graph_objects as go
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception:
+    torch = None
+    TORCH_AVAILABLE = False
 try:
     from analysis.verification.contract import (
         LayerStatus,
@@ -172,6 +179,27 @@ def _safe_json(path: Path, default):
         return json.loads(_safe_read_text(path))
     except Exception:
         return default
+
+
+@lru_cache(maxsize=128)
+def _cached_payload(path_str: str, mtime_ns: int, size: int) -> dict:
+    if not TORCH_AVAILABLE:
+        return {}
+    try:
+        payload = torch.load(path_str, map_location="cpu", weights_only=False)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _safe_payload(path: Optional[Path]) -> dict:
+    if not path or not path.exists():
+        return {}
+    try:
+        stat = path.stat()
+    except Exception:
+        return {}
+    return _cached_payload(str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def _is_number(val) -> bool:
@@ -505,7 +533,27 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
             observer_non_comparable_reasons.append(
                 f"observer relativity state_{observer_id}.json is missing"
             )
-        if delta_path.exists():
+        bundled_delta = _load_relativity_delta_bundle(run_dir, observer_id)
+        if isinstance(bundled_delta, dict) and bundled_delta:
+            delta_blob = {
+                "observer_id": bundled_delta.get("observer_id", observer_id),
+                "null_observer_equivalence": bundled_delta.get("null_observer_equivalence", {}),
+                "path_flip_delta": bundled_delta.get("path_flip_delta", {}),
+                "metrics_delta": bundled_delta.get("metrics_delta", {}),
+                "axis_delta": bundled_delta.get("axis_delta", {}),
+                "translation_only_comparison": bundled_delta.get("translation_only_comparison", {}),
+                "provenance": {
+                    "source": str(run_dir / "relativity_deltas.json"),
+                    "synthetic_placeholder": bool(bundled_delta.get("synthetic_placeholder", False)),
+                },
+            }
+            if _is_synthetic_placeholder_blob(delta_blob):
+                missing_optional.append(f"relativity_deltas.json observer {observer_id} (synthetic placeholder)")
+                observer_non_comparable_reasons.append(
+                    f"observer relativity deltas for observer {observer_id} are synthetic placeholder data"
+                )
+                delta_blob = {}
+        elif delta_path.exists():
             delta_blob = _safe_json(delta_path, {})
             if _is_synthetic_placeholder_blob(delta_blob):
                 missing_optional.append(f"relativity_cache/delta_{observer_id}.json (synthetic placeholder)")
@@ -901,16 +949,22 @@ def _control_results_candidates(run_key: Optional[str]) -> List[Path]:
     if run_dir and run_dir.exists():
         candidates.extend(
             [
+                run_dir / "control_metrics.json",
                 run_dir / "comprehensive_results.json",
+                run_dir.parent / "control_metrics.json",
                 run_dir.parent / "comprehensive_results.json",
             ]
         )
         for cls_dir in _candidate_cls_dirs(run_key):
             if cls_dir.exists():
+                candidates.extend(sorted(cls_dir.glob("comprehensive_analysis*/control_metrics.json"), key=lambda p: p.stat().st_mtime, reverse=True))
                 candidates.extend(sorted(cls_dir.glob("comprehensive_analysis*/comprehensive_results.json"), key=lambda p: p.stat().st_mtime, reverse=True))
-    fallback = ROOT / "outputs" / "comprehensive_analysis" / "comprehensive_results.json"
-    if fallback.exists():
-        candidates.append(fallback)
+    for fallback in (
+        ROOT / "outputs" / "comprehensive_analysis" / "control_metrics.json",
+        ROOT / "outputs" / "comprehensive_analysis" / "comprehensive_results.json",
+    ):
+        if fallback.exists():
+            candidates.append(fallback)
     seen = set()
     out: List[Path] = []
     for p in candidates:
@@ -924,6 +978,30 @@ def _control_results_candidates(run_key: Optional[str]) -> List[Path]:
 def load_control_state(run_key: Optional[str]) -> dict:
     for path in _control_results_candidates(run_key):
         data = _safe_json(path, {})
+        if isinstance(data, dict) and isinstance(data.get("metrics"), dict):
+            metrics = data.get("metrics", {})
+            status = str(data.get("status", "")).strip().upper()
+            if status in {"NO_DATA", "UNAVAILABLE"} or bool(data.get("synthetic_placeholder", False)):
+                return {
+                    "status": "UNAVAILABLE",
+                    "source": str(path),
+                    "message": str(data.get("message", "control analysis unavailable")),
+                    "procrustes_ratio": None,
+                    "distance_corr_ratio": None,
+                    "separates_count": 0,
+                    "consensus_pct": None,
+                    "residual_pct": None,
+                }
+            return {
+                "status": "OK",
+                "source": str(path),
+                "message": str(data.get("message", "loaded")),
+                "procrustes_ratio": metrics.get("procrustes_ratio"),
+                "distance_corr_ratio": metrics.get("distance_corr_ratio"),
+                "separates_count": int(metrics.get("separates_count", 0) or 0),
+                "consensus_pct": metrics.get("consensus_pct"),
+                "residual_pct": metrics.get("residual_pct"),
+            }
         interp = data.get("interpretation", {}) if isinstance(data, dict) else {}
         if not isinstance(interp, dict):
             continue
@@ -967,6 +1045,28 @@ def load_control_state(run_key: Optional[str]) -> dict:
     }
 
 
+def _load_relativity_delta_bundle(run_dir: Path, observer_id: int) -> dict:
+    bundle_path = run_dir / "relativity_deltas.json"
+    if not bundle_path.exists():
+        return {}
+    bundle = _safe_json(bundle_path, {})
+    if not isinstance(bundle, dict):
+        return {}
+    observers = bundle.get("observers", [])
+    if not isinstance(observers, list):
+        return {}
+    for observer in observers:
+        if not isinstance(observer, dict):
+            continue
+        try:
+            if int(observer.get("observer_id")) != int(observer_id):
+                continue
+        except Exception:
+            continue
+        return observer
+    return {}
+
+
 def _ablation_candidates(run_key: Optional[str]) -> List[Path]:
     candidates: List[Path] = []
     run_dir = _resolve_run_dir(run_key)
@@ -1000,11 +1100,26 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
             blob = _safe_json(path, {})
             if not isinstance(blob, dict):
                 continue
-            s1 = blob.get("stage_1_nmi")
-            s2 = blob.get("stage_2_nmi")
-            s3 = blob.get("stage_3_nmi")
-            delta = blob.get("delta_nmi")
-            retained = blob.get("retained_percentage")
+            status_marker = str(blob.get("status", "")).strip().upper()
+            if status_marker in {"NO_DATA", "UNAVAILABLE"} or bool(blob.get("synthetic_placeholder", False)):
+                return {
+                    "status": "UNAVAILABLE",
+                    "source": str(path),
+                    "stage_1_nmi": None,
+                    "stage_2_nmi": None,
+                    "stage_3_nmi": None,
+                    "delta_nmi": None,
+                    "retained_pct": None,
+                    "legacy_mean_variance": None,
+                }
+            metrics = blob.get("metrics", {})
+            metrics = metrics if isinstance(metrics, dict) else {}
+            s1 = blob.get("stage_1_nmi", metrics.get("stage_1_nmi"))
+            s2 = blob.get("stage_2_nmi", metrics.get("stage_2_nmi"))
+            s3 = blob.get("stage_3_nmi", metrics.get("stage_3_nmi"))
+            delta = blob.get("delta_nmi", metrics.get("delta_nmi"))
+            retained = blob.get("retained_percentage", metrics.get("retained_pct"))
+            legacy_mean_variance = blob.get("legacy_mean_variance", metrics.get("legacy_mean_variance"))
             if any(v is not None for v in (s1, s2, s3, delta, retained)):
                 return {
                     "status": "OK",
@@ -1014,7 +1129,7 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                     "stage_3_nmi": s3,
                     "delta_nmi": delta,
                     "retained_pct": retained,
-                    "legacy_mean_variance": None,
+                    "legacy_mean_variance": legacy_mean_variance,
                 }
         if path.suffix.lower() == ".csv":
             try:
@@ -1454,7 +1569,7 @@ def build_artifact_index() -> dict:
             "run_dir": run_dir,
             "artifact_root": run_dir.parent,
             "variants": variants,
-            "primary_variant": str(run_manifest.get("primary_artifact") or _preferred_variant(variants)),
+            "primary_variant": _preferred_variant(variants),
             "article_meta_path": run_dir / "article_metadata.json",
             "monolith_data_path": run_dir / "MONOLITH_DATA.csv",
             "observer_manifest_path": run_dir / "observer_manifest.json",
@@ -2427,9 +2542,8 @@ def _render_dashboard_impl(
     missing_required = contract.get("missing_required_artifacts", [])
     missing_optional = contract.get("missing_optional_artifacts", [])
     baseline_meta = contract.get("baseline_meta", {}) or {}
+    contract_global = load_contract_state(run_key, "global") if (run_key and view_mode == "observer" and observer_value.startswith("article:")) else contract
 
-    # VALIDATION TYPE 2: Perspective Sensitivity (Global vs Subjective)
-    # If in observer mode, Variant A shows Global perspective for comparison.
     if view_mode == "observer" and observer_value.startswith("article:"):
         p_a = resolve_artifact(run_key, variant_a, "global") if run_key else None
         p_b = resolve_artifact(run_key, variant_b, observer_value) if run_key else None
@@ -2472,11 +2586,12 @@ def _render_dashboard_impl(
         container = single_view
         path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 
-    artifact_state_a = _load_artifact_view_state(p_a)
-    artifact_state_b = _load_artifact_view_state(p_b)
-    artifact_state = _load_artifact_view_state(single_view_path if not compare_enabled else p_b)
+    graph_observer_a = "global" if (view_mode == "observer" and observer_value.startswith("article:")) else effective_observer
+    graph_observer_b = effective_observer
+    artifact_state_a = contract_global.get("baseline_state", {}) if graph_observer_a == "global" else contract_global.get("observer_state", {})
+    artifact_state_b = contract.get("baseline_state", {}) if graph_observer_b == "global" else contract.get("observer_state", {})
+    artifact_state = artifact_state_b if (view_mode == "observer" and observer_value.startswith("article:")) else artifact_state_a
     artifact_metrics = artifact_state.get("metrics", {}) if isinstance(artifact_state, dict) else {}
-    contract_global = load_contract_state(run_key, "global") if (run_key and view_mode == "observer" and observer_value.startswith("article:")) else contract
 
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
     if artifact_metrics:
@@ -2514,8 +2629,8 @@ def _render_dashboard_impl(
 
     snapshot_a = _compute_track_snapshot(run_key, artifact_state_a, contract_global, "global" if view_mode == "observer" and observer_value.startswith("article:") else effective_observer)
     snapshot_b = _compute_track_snapshot(run_key, artifact_state_b, contract, effective_observer)
-    main_path = p_a if (p_a and p_a.exists()) else p_b
-    track_readout = _track_status_component(snapshot_a if main_path == p_a else snapshot_b)
+    primary_snapshot = snapshot_b if (view_mode == "observer" and observer_value.startswith("article:")) else snapshot_a
+    track_readout = _track_status_component(primary_snapshot)
     track_compare_readout = _track_delta_component(snapshot_a, snapshot_b)
     found_a, total_a = _artifact_coverage(run_key, variant_a) if run_key else (0, 0)
     found_b, total_b = _artifact_coverage(run_key, variant_b) if run_key else (0, 0)
@@ -2533,12 +2648,11 @@ def _render_dashboard_impl(
 
     # VALIDATION TYPE 2: Perspective Sensitivity (Divergence Check)
     type2_dissonance = False
-    if compare_enabled and text_a and text_b:
-        surv_a = _extract_survival_rate(text_a)
-        surv_b = _extract_survival_rate(text_b)
-        if surv_a is not None and surv_b is not None:
-            if abs(surv_a - surv_b) > 0.20:
-                type2_dissonance = True
+    if compare_enabled:
+        surv_a = snapshot_a.get("T4", {}).get("survival")
+        surv_b = snapshot_b.get("T4", {}).get("survival")
+        if _is_number(surv_a) and _is_number(surv_b) and abs(float(surv_a) - float(surv_b)) > 0.20:
+            type2_dissonance = True
 
     gate = _compute_gate_presentation(contract_status, verification_status, global_pass, type2_dissonance)
     claims_enabled = gate["claims_enabled"]
@@ -2669,7 +2783,7 @@ def _render_dashboard_impl(
 
 if __name__ == "__main__":
     debug_enabled = str(os.environ.get("BT_DASH_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
-    run_kwargs = {"debug": debug_enabled, "host": "127.0.0.1", "port": 8050}
+    run_kwargs = {"debug": debug_enabled, "host": "0.0.0.0", "port": 8050}
     if not debug_enabled:
         run_kwargs["use_reloader"] = False
     run_fn = getattr(app, "run", None)

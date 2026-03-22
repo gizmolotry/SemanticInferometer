@@ -948,30 +948,54 @@ def _compute_kernel_matrix(
     kernel_type: str = "rbf",
     gamma: float = 1.0,
     sigma: Optional[float] = None,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
 ) -> torch.Tensor:
     """
     Compute an NxN kernel matrix K for features X.
-
-    Supported kernels:
-      - rbf: exp(-||x-y||^2 / (2*sigma^2))  (sigma via median heuristic if None)
-      - laplacian: exp(-||x-y||_1 / sigma)  (sigma via median heuristic on L1 if None)
-      - rq (rational quadratic): (1 + ||x-y||^2 / (2*alpha*sigma^2))^{-alpha} where alpha=gamma
-      - imq (inverse multiquadric): (1 + ||x-y||^2 / sigma^2)^{-1/2}
+    
+    If observer_axis is provided, warps the distance matrix by the observer's
+    phenomenological penalty (Track 1.5 Relativity).
     """
     kt = (kernel_type or "rbf").lower().strip()
-
+    
+    # 1. Compute Base Distances
     if kt == "laplacian":
-        d1 = _pairwise_l1_dists(X)
+        d_base = _pairwise_l1_dists(X)
+    else:
+        d_base_sq = _pairwise_sq_dists(X)
+        d_base = torch.sqrt(d_base_sq.clamp(min=1e-12))
+
+    # 2. Apply Observer Warp (Track 1.5 ROOT RELATIVITY)
+    if observer_axis is not None and observer_cost_strength > 0.0:
+        # Calculate similarity of each article to the observer's worldview
+        # X: [N, D], observer_axis: [D]
+        norm_x = torch.norm(X, p=2, dim=-1).clamp(min=1e-12)
+        norm_obs = torch.norm(observer_axis, p=2).clamp(min=1e-12)
+        similarity = (X * observer_axis).sum(dim=-1) / (norm_x * norm_obs)
+        similarity = torch.clamp(similarity, min=-1.0, max=1.0)
+        
+        # Penalty increases as articles diverge from observer's perspective
+        penalty = 1.0 + observer_cost_strength * torch.clamp(1.0 - similarity, min=0.0)
+        
+        # Conformal warp: D_rel(i, j) = D_base(i, j) * sqrt(P(i) * P(j))
+        # This preserves symmetry while stretching the space where the observer feels 'stress'.
+        penalty_matrix = torch.sqrt(torch.outer(penalty, penalty))
+        d_rel = d_base * penalty_matrix
+    else:
+        d_rel = d_base
+
+    # 3. Compute Kernel from Relativistic Distances
+    if kt == "laplacian":
         if sigma is None:
-            # median heuristic on L1
-            n = d1.shape[0]
-            tri = d1[torch.triu(torch.ones_like(d1, dtype=torch.bool), diagonal=1)]
+            n = d_rel.shape[0]
+            tri = d_rel[torch.triu(torch.ones_like(d_rel, dtype=torch.bool), diagonal=1)]
             med = torch.median(tri).item() if tri.numel() else 1.0
             sigma = float(max(1e-6, med))
-        K = torch.exp(-d1 / float(sigma))
+        K = torch.exp(-d_rel / float(sigma))
         return K
 
-    d2 = _pairwise_sq_dists(X)
+    d2 = d_rel ** 2
 
     if kt == "rbf":
         if sigma is None:
@@ -980,7 +1004,6 @@ def _compute_kernel_matrix(
         return K
 
     if kt == "rq":
-        # gamma here plays role of alpha (shape). sigma controls scale.
         alpha = float(max(1e-6, gamma))
         if sigma is None:
             sigma = _median_heuristic_sigma_from_d2(d2)
@@ -1037,9 +1060,18 @@ def kernel_pca_embed(
     sigma: Optional[float] = None,
     n_components: int = 128,
     center: bool = True,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
 ) -> torch.Tensor:
     """Convenience: compute K then (optionally) center then kernel PCA."""
-    K = _compute_kernel_matrix(X, kernel_type=kernel_type, gamma=gamma, sigma=sigma)
+    K = _compute_kernel_matrix(
+        X, 
+        kernel_type=kernel_type, 
+        gamma=gamma, 
+        sigma=sigma,
+        observer_axis=observer_axis,
+        observer_cost_strength=observer_cost_strength
+    )
     if center:
         K = _center_kernel(K)
     return _kernel_pca_from_kernel(K, n_components=n_components)
@@ -1054,6 +1086,8 @@ def nystrom_kernel_pca_embed(
     m_landmarks: int = 256,
     center: bool = True,
     seed: int = 0,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
 ) -> torch.Tensor:
     """
     Nystrm approximation for kernel PCA.
@@ -1193,6 +1227,8 @@ def initialize_full_pipeline(
     kernel_ctx: Optional[Any] = None,  # KernelContext instance
     kernel_type: str = DEFAULT_PIPELINE_RUNTIME_CONFIG.kernel_type,          # Fallback if no kernel_ctx
     kernel_bandwidth: Optional[float] = None,  # Fallback sigma
+    kernel_nu: float = 1.5,
+    kernel_roughness: int = 3,
     mix_in_rkhs: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs,         # Mode B for Dirichlet fusion
 ):
     """
@@ -1397,6 +1433,8 @@ def initialize_full_pipeline(
             n_observers=dirichlet_n_observers,
             alpha=dirichlet_alpha,
             kernel_type=kernel_type,
+            nu=float(kernel_nu),
+            roughness=int(kernel_roughness),
             basis_seed=dirichlet_basis_seed,
             basis_path=dirichlet_basis_path,
             crn_enabled=True,
@@ -1404,13 +1442,20 @@ def initialize_full_pipeline(
             crn_seed=dirichlet_crn_seed,
             mix_in_rkhs=mix_in_rkhs,  # NEW: Mode A vs Mode B
             kernel_ctx=built_kernel_ctx,  # NEW: Pass kernel context
-            # ASTER v3.2: Sequential Annealing (HotCold hysteresis)
+            # Track 3 thermodynamics: hot stages stay close to the prior barycenter;
+            # cold stages progressively release that constraint and expose separation.
             use_annealing=True,
             annealing_schedule=[10.0, 5.0, 2.0, 1.0, 0.5, 0.1],
+            use_sequential_cooling=False,
+            remove_consensus=False,
         )
         dirichlet_fusion = DirichletFusion(dirichlet_config)
         mode_str = "Mode B (map-then-mix)" if mix_in_rkhs else "Mode A (mix-then-map)"
-        print(f"[PIPELINE] Dirichlet fusion initialized: {mode_str}, alpha={dirichlet_alpha}, K={dirichlet_n_observers}, annealing=ENABLED")
+        print(
+            f"[PIPELINE] Dirichlet fusion initialized: {mode_str}, alpha={dirichlet_alpha}, "
+            f"K={dirichlet_n_observers}, annealing=ENABLED, consensus_removal=OFF, "
+            f"sequential_cooling=OFF"
+        )
     elif use_dirichlet_fusion and not HAS_DIRICHLET_FUSION:
         print("WARNING: Dirichlet fusion requested but dirichlet_fusion.py not found. Skipping.")
 
@@ -1462,6 +1507,8 @@ def initialize_full_pipeline(
         "force_logits_raw": force_logits_raw,
         # NEW: KernelContext for provenance
         "kernel_ctx": built_kernel_ctx,
+        "kernel_nu": float(kernel_nu),
+        "kernel_roughness": int(kernel_roughness),
         "mix_in_rkhs": mix_in_rkhs,
     }
 
@@ -1606,33 +1653,22 @@ class BeliefTransformerPipeline:
 
         return sorted_indices, inverse_indices
 
-    def process_month(self, articles: List[Dict], month_name: str = "unknown", config: Optional[Dict] = None) -> Dict:
+    def process_month(
+        self, 
+        articles: List[Dict], 
+        month_name: str = "unknown", 
+        config: Optional[Dict] = None,
+        observer_idx: Optional[int] = None,
+    ) -> Dict:
         """
         Process a month of articles through the full pipeline.
 
         Args:
             articles: List of article dictionaries
             month_name: Name identifier for this processing run
-            config: Optional configuration dict with:
-                - enable_checkpoints: bool - Enable waterfall checkpoint saving
-                - checkpoint_dir: str - Directory to save checkpoints
-                - run_social_texture: bool - Run expensive social texture analysis
-
-        Steps:
-          1) NLI extraction -> base embeddings (and optional multi-framing)
-          2) Temporal GRU over timestamp-sorted sequence (optional)
-          3) Random Kitchen Sinks feature map (optional)
-          4) Cross-article attention aggregation (optional)
-          5) PCA removal (optional)
-          6) Return final features + diagnostics + metadata
-
-        Returns a dict with:
-          - features: final tensor/ndarray (N x D)
-          - diagnostics: coverage, timing, variance, and ordering stats
-          - provenance: optional provenance entries
-          - article_metadata: per-article payload for dashboards
-          - timeline: timestamp-normalized join table
-          - bt_uid_list: stable IDs aligned to returned arrays
+            config: Optional configuration dict
+            observer_idx: Optional index of the article acting as the active observer.
+                         If set, the entire DAG (Tracks 1.5-4) is warped by this observer's worldview.
         """
 
         # ------------------------------------------------------------------
@@ -1703,6 +1739,7 @@ class BeliefTransformerPipeline:
             provenance_metadata = {
                 "month": month_name,
                 "n_articles": len(articles),
+                "observer_idx": observer_idx,
                 "articles": {
                     i: {
                         "bt_uid": bt_uids[i],
@@ -1743,6 +1780,7 @@ class BeliefTransformerPipeline:
         diagnostics = {
             "month": month_name,
             "n_articles": len(articles),
+            "observer_idx": observer_idx,
             "use_gru": self.gru_model is not None,
             "use_rks": self.rks_map is not None,
             "use_attention": self.attention_model is not None,
@@ -1770,8 +1808,6 @@ class BeliefTransformerPipeline:
         diagnostics["timing"]["nli_extraction"] = time.time() - step_start
 
         # Convert to tensor(s)
-        # Option B: if compare_logits_vs_cli=True, we run identical downstream processing on BOTH
-        # (a) raw logits-derived features and (b) CLI-derived features, then return both for plotting.
         base_by_channel: Dict[str, torch.Tensor] = {}
 
         if self.compare_logits_vs_cli:
@@ -1825,6 +1861,20 @@ class BeliefTransformerPipeline:
             diagnostics["temporal_sort_indices"] = sorted_indices
 
         # ------------------------------------------------------------------
+        # Observer Extraction (ASTER v3.2 ROOT RELATIVITY)
+        # ------------------------------------------------------------------
+        observer_axis = None
+        observer_cost = float((config or {}).get("observer_cost_strength", 1.0))
+        
+        # We need the base embeddings to find the observer's vector
+        if base_by_channel:
+            first_X = next(iter(base_by_channel.values()))
+            if observer_idx is not None and 0 <= observer_idx < first_X.shape[0]:
+                observer_axis = first_X[observer_idx].detach().clone()
+                diagnostics["active_observer_idx"] = observer_idx
+                diagnostics["observer_cost_strength"] = observer_cost
+
+        # ------------------------------------------------------------------
         # Shared downstream runner (GRU -> geometry -> attention -> (optional) PCA)
         # ------------------------------------------------------------------
         def _run_channel(channel_name: str, X_in: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -1855,8 +1905,7 @@ class BeliefTransformerPipeline:
                 if sorted_tensor.dim() != 2:
                     sorted_tensor = sorted_tensor.reshape(sorted_tensor.shape[0], -1)
 
-                # IMPORTANT: do NOT add a batch dimension here. TemporalGRU.forward() already
-                # unsqueezes to [N, 1, D] for torch.nn.GRU. Adding another unsqueeze would create 4D.
+                # TemporalGRU.forward() already unsqueezes to [N, 1, D]
                 temporal_out = self.gru_model(sorted_tensor)  # (N, D)
 
                 # Defensive: if an older TemporalGRU returns a leading batch axis, remove it.
@@ -1870,54 +1919,82 @@ class BeliefTransformerPipeline:
                 ch_diag["timing_temporal_gru"] = time.time() - t_gru
                 ch_diag["temporal_variance"] = float(X.var().item())
 
-            # Step 3: Geometry stage
+            # Step 3: Geometry stage (ASTER v3.2: ROOT RELATIVITY)
             t_geom = time.time()
             Z = X
             
+            # NEW: Divisibility check for MultiheadAttention (heads=8)
+            def _ensure_8_divisible(n: int, max_val: int) -> int:
+                # MultiheadAttention REQUIRES embed_dim divisible by num_heads (8)
+                if n % 8 != 0:
+                    # Try rounding UP first
+                    candidate = int(((n + 7) // 8) * 8)
+                    if candidate > max_val:
+                        # Round DOWN if UP exceeds rank
+                        candidate = int((n // 8) * 8)
+                    return max(8, candidate)
+                return max(1, n)
+
+            # Extract observer axis if index provided
+            observer_axis = None
+            observer_cost = float((config or {}).get("observer_cost_strength", 1.0))
+            if observer_idx is not None and 0 <= observer_idx < X.shape[0]:
+                observer_axis = X[observer_idx].detach().clone()
+                ch_diag["active_observer_idx"] = observer_idx
+                ch_diag["observer_cost_strength"] = observer_cost
+
             # NEW: Constitutional contract check before RKS
             rks_allowed = _check_operation_allowed(channel_rep_kind, 'rks', warn_only=True)
             
             if self.geometry_mode == "rks" and self.rks_map is not None and rks_allowed:
-                # Channel-safe RKS: one feature map per (channel, input_dim, kernel, seed)
-                if not hasattr(self, "_rks_map_cache"):
-                    self._rks_map_cache = {}
-                in_dim = int(X.shape[-1])
-                kernel_name = getattr(self.rks_map, "kernel_type", "rbf")
-                tmpl_cfg = getattr(self.rks_map, "cfg", None)
-                try:
-                    seed = int(getattr(tmpl_cfg, "random_seed", 0) if tmpl_cfg is not None else 0)
-                except Exception:
-                    seed = 0
-                key = (channel_name, in_dim, kernel_name, seed)
-                if key not in self._rks_map_cache:
-                    n_f = int(getattr(tmpl_cfg, "n_framings", 8) if tmpl_cfg is not None else 8)
-                    base_out = int(getattr(tmpl_cfg, "output_dim", getattr(self, "final_dim", 512)) if tmpl_cfg is not None else getattr(self, "final_dim", 512))
-                    # Default policy: logits stay lightweight; CLS/other channels get the full budget
-                    if channel_name.lower() == "logits":
-                        out_dim = int(getattr(self, "rks_output_dim_logits", min(base_out, 512)))
-                    else:
-                        out_dim = int(getattr(self, "rks_output_dim_cls", base_out))
-                    if out_dim % n_f != 0:
-                        out_dim = max(n_f, (out_dim // n_f) * n_f)
-                    device_str = str(X.device)
-                    self._rks_map_cache[key] = RKSFeatureMap(
-                        input_dim=in_dim,
-                        output_dim=out_dim,
-                        kernel_type=kernel_name,
-                        gamma=getattr(tmpl_cfg, "gamma", None) if tmpl_cfg is not None else None,
-                        sigma=getattr(tmpl_cfg, "sigma", None) if tmpl_cfg is not None else None,
-                        n_framings=n_f,
-                        random_seed=int(getattr(tmpl_cfg, "random_seed", 42) if tmpl_cfg is not None else 42),
-                        device=device_str,
-                        kernel_params=getattr(tmpl_cfg, "kernel_params", None) if tmpl_cfg is not None else None,
-                        auto_sigma=bool(getattr(tmpl_cfg, "auto_sigma", False) if tmpl_cfg is not None else False),
-                        verbose=bool(getattr(tmpl_cfg, "verbose", False) if tmpl_cfg is not None else False),
-                    )
-                Z = self._rks_map_cache[key].transform(X)
-                diagnostics["steps"].append(f"rks_feature_map:{channel_name}")
-            elif self.geometry_mode == "kernel_pca" and _check_operation_allowed(channel_rep_kind, 'kernel_pca', warn_only=True):
-                # Exact kernel trick (O(N^2) memory/time)
-                n_components = int(self.final_dim or X.shape[0] - 1 or 1)
+                # IMPORTANT: RKS assumes kernel stationarity. Root warping requires 
+                # explicit kernel matrix computation (Adult Mode).
+                if observer_axis is not None:
+                    print(f"WARNING: geometry_mode='rks' detected with active observer. "
+                          f"Falling back to 'kernel_pca' to enable non-stationary root warping.")
+                    self.geometry_mode = "kernel_pca"
+                else:
+                    # Standard RKS path (Global Mean)
+                    if not hasattr(self, "_rks_map_cache"):
+                        self._rks_map_cache = {}
+                    in_dim = int(X.shape[-1])
+                    kernel_name = getattr(self.rks_map, "kernel_type", "rbf")
+                    tmpl_cfg = getattr(self.rks_map, "cfg", None)
+                    try:
+                        seed = int(getattr(tmpl_cfg, "random_seed", 0) if tmpl_cfg is not None else 0)
+                    except Exception:
+                        seed = 0
+                    key = (channel_name, in_dim, kernel_name, seed)
+                    if key not in self._rks_map_cache:
+                        n_f = int(getattr(tmpl_cfg, "n_framings", 8) if tmpl_cfg is not None else 8)
+                        base_out = int(getattr(tmpl_cfg, "output_dim", getattr(self, "final_dim", 512)) if tmpl_cfg is not None else getattr(self, "final_dim", 512))
+                        if channel_name.lower() == "logits":
+                            out_dim = int(getattr(self, "rks_output_dim_logits", min(base_out, 512)))
+                        else:
+                            out_dim = int(getattr(self, "rks_output_dim_cls", base_out))
+                        # RKS is an expansion, max_val is just a safety cap (e.g. 8192)
+                        out_dim = _ensure_8_divisible(out_dim, 8192)
+                        device_str = str(X.device)
+                        self._rks_map_cache[key] = RKSFeatureMap(
+                            input_dim=in_dim,
+                            output_dim=out_dim,
+                            kernel_type=kernel_name,
+                            gamma=getattr(tmpl_cfg, "gamma", None) if tmpl_cfg is not None else None,
+                            sigma=getattr(tmpl_cfg, "sigma", None) if tmpl_cfg is not None else None,
+                            n_framings=n_f,
+                            random_seed=int(getattr(tmpl_cfg, "random_seed", 42) if tmpl_cfg is not None else 42),
+                            device=device_str,
+                            kernel_params=getattr(tmpl_cfg, "kernel_params", None) if tmpl_cfg is not None else None,
+                            auto_sigma=bool(getattr(tmpl_cfg, "auto_sigma", False) if tmpl_cfg is not None else False),
+                            verbose=bool(getattr(tmpl_cfg, "verbose", False) if tmpl_cfg is not None else False),
+                        )
+                    Z = self._rks_map_cache[key].transform(X)
+                    diagnostics["steps"].append(f"rks_feature_map:{channel_name}")
+
+            # Re-check mode (it may have been switched above)
+            if self.geometry_mode == "kernel_pca" and _check_operation_allowed(channel_rep_kind, 'kernel_pca', warn_only=True):
+                # Exact kernel trick (O(N^2) memory/time) - supports non-stationary warping
+                n_components = _ensure_8_divisible(int(self.final_dim or X.shape[0] - 1 or 1), X.shape[0] - 1)
                 Z = kernel_pca_embed(
                     X,
                     kernel_type=self.adult_kernel,
@@ -1925,11 +2002,13 @@ class BeliefTransformerPipeline:
                     sigma=self.adult_sigma,
                     n_components=n_components,
                     center=self.adult_center,
+                    observer_axis=observer_axis,
+                    observer_cost_strength=observer_cost if observer_axis is not None else 0.0,
                 )
                 diagnostics["steps"].append(f"kernel_pca:{channel_name}")
             elif self.geometry_mode == "nystrom" and _check_operation_allowed(channel_rep_kind, 'nystrom', warn_only=True):
                 # Nystrom approximation (sub-quadratic in N for large N)
-                n_components = int(self.final_dim or min(256, X.shape[0] - 1) or 1)
+                n_components = _ensure_8_divisible(int(self.final_dim or min(256, X.shape[0] - 1) or 1), X.shape[0] - 1)
                 Z = nystrom_kernel_pca_embed(
                     X,
                     kernel_type=self.adult_kernel,
@@ -1939,10 +2018,11 @@ class BeliefTransformerPipeline:
                     m_landmarks=self.adult_nystrom_m,
                     center=self.adult_center,
                     seed=self.random_seed,
+                    observer_axis=observer_axis,
+                    observer_cost_strength=observer_cost if observer_axis is not None else 0.0,
                 )
                 diagnostics["steps"].append(f"nystrom_kernel_pca:{channel_name}")
             elif self.geometry_mode == "none":
-                # No kernel mapping - pass through (used for logits_raw contract)
                 Z = X
                 diagnostics["steps"].append(f"geometry_none:{channel_name}")
                 ch_diag["contract_note"] = "geometry_mode=none, no kernel mapping applied"
@@ -1959,33 +2039,50 @@ class BeliefTransformerPipeline:
             A = Z
             if self.attention_model is not None:
                 t_attn = time.time()
-
-                # If adult mode yields a runtime-capped dimension, rebuild attention to match.
-                # [FIX] Use local variable to avoid overwriting global state in multi-channel runs
                 current_attn = self.attention_model
+                attn_num_heads = int(getattr(current_attn, "num_heads", 8) or 8)
                 
                 if A.dim() == 2:
                     cur_d = int(A.shape[1])
-                    # Try to detect mismatch without relying on internal attribute names.
+                    if cur_d <= 0 or cur_d < attn_num_heads:
+                        diagnostics["steps"].append(f"attention_skipped_small_dim:{channel_name}")
+                        ch_diag["attention_skipped_reason"] = f"feature_dim={cur_d} < num_heads={attn_num_heads}"
+                        ch_diag["timing_attention"] = time.time() - t_attn
+                        ch_diag["attention_variance"] = float(A.var().item()) if A.numel() > 0 else 0.0
+                        return A, channel_extras
+                    # ASTER v3.2: Rebuild attention if dim changed (common in N-Universe warping)
                     need_rebuild = False
-                    for attr in ("feature_dim", "d_model", "dim"):
-                        if hasattr(current_attn, attr):
-                            if int(getattr(current_attn, attr)) != cur_d:
-                                need_rebuild = True
-                            break
+                    if hasattr(current_attn, "feature_dim"):
+                        if int(current_attn.feature_dim) != cur_d:
+                            need_rebuild = True
+                    
                     if need_rebuild:
+                        # MultiheadAttention REQUIRES divisibility by num_heads (8)
+                        safe_cur_d = _ensure_8_divisible(cur_d, cur_d)
+                        print(f"      [DAG] Rebuilding attention for warped dim={cur_d} -> safe_dim={safe_cur_d} (heads=8)")
                         current_attn = CrossArticleAttention(
-                            feature_dim=cur_d,
-                            num_heads=8,
+                            feature_dim=safe_cur_d,
+                            num_heads=attn_num_heads,
                         ).to(A.device)
 
+                # Final contract check: MultiheadAttention REQUIRES divisibility by num_heads
+                if int(A.shape[1]) % attn_num_heads != 0:
+                    print(f"      [DAG] WARNING: Attn feature_dim={A.shape[1]} not divisible by {attn_num_heads}. Truncating to nearest multiple.")
+                    safe_d = (int(A.shape[1]) // attn_num_heads) * attn_num_heads
+                    if safe_d < attn_num_heads:
+                        diagnostics["steps"].append(f"attention_skipped_nondivisible_small_dim:{channel_name}")
+                        ch_diag["attention_skipped_reason"] = f"truncated_feature_dim={safe_d} < num_heads={attn_num_heads}"
+                        ch_diag["timing_attention"] = time.time() - t_attn
+                        ch_diag["attention_variance"] = float(A.var().item()) if A.numel() > 0 else 0.0
+                        return A, channel_extras
+                    A = A[:, :safe_d]
+                    # Need to rebuild again for this truncated A
+                    current_attn = CrossArticleAttention(
+                        feature_dim=safe_d,
+                        num_heads=attn_num_heads,
+                    ).to(A.device)
+                
                 attn_res = current_attn(A)
-
-                # Support multiple attention module return conventions:
-                # - (attn_out, attn_weights)
-                # - (attn_out, attn_weights, *extras)
-                # - attn_weights only (NxN), in which case attn_out = attn_weights @ A
-                # - attn_out only (NxD), in which case weights are unavailable
                 attn_out = None
                 attn_weights = None
 
@@ -1994,13 +2091,8 @@ class BeliefTransformerPipeline:
                         attn_out, attn_weights = attn_res[0], attn_res[1]
                     elif len(attn_res) == 1:
                         attn_weights = attn_res[0]
-                    else:
-                        attn_out = None
-                        attn_weights = None
                 else:
-                    # single tensor result
                     if torch.is_tensor(attn_res):
-                        # Heuristic: square matrix -> weights
                         if attn_res.dim() == 2 and attn_res.shape[0] == A.shape[0] and attn_res.shape[1] == A.shape[0]:
                             attn_weights = attn_res
                         else:
@@ -2010,9 +2102,7 @@ class BeliefTransformerPipeline:
 
                 if attn_out is None:
                     if attn_weights is None:
-                        raise ValueError(
-                            f"Attention module returned unsupported value: {type(attn_res)}"
-                        )
+                        raise ValueError(f"Attention module returned unsupported value: {type(attn_res)}")
                     attn_out = attn_weights @ A
 
                 if attn_weights is not None:
@@ -2027,12 +2117,7 @@ class BeliefTransformerPipeline:
                 ch_diag["attention_variance"] = float(A.var().item())
 
             # Step 5: Optional PCA removal
-            # IMPORTANT RULE:
-            # - If compare_logits_vs_cli=True, we skip pipeline PCA entirely so the comparison is fair.
-            # - If CLS channel is enabled, PCA is handled inside the extractor (CLS only), not here.
             F_out = A
-            
-            # NEW: Contract check for PCA removal
             pca_allowed = _check_operation_allowed(channel_rep_kind, 'pca_removal', warn_only=True)
             
             if self.compare_logits_vs_cli:
@@ -2058,8 +2143,6 @@ class BeliefTransformerPipeline:
                 ch_diag["final_variance"] = float(F_out.var().item())
 
             ch_diag["timing_total_channel"] = time.time() - t0
-            
-            # NEW: Update channel_extras with final provenance
             channel_extras["provenance"]["rep_kind"] = channel_rep_kind.value
             channel_extras["provenance"]["geometry_mode"] = self.geometry_mode
             channel_extras["provenance"]["final_dim"] = int(F_out.shape[-1]) if F_out is not None else 0
@@ -2478,10 +2561,22 @@ class BeliefTransformerPipeline:
                             bot_embs = cls_stacked[i]  # [8, hidden]
                             u_axis_i = u_axes[i] if u_axes is not None else None
 
+                            # ASTER v3.2: Observer conditioning for walkers
+                            # If an observer is active, walkers experience the warped terrain friction.
+                            obs_axis_t4 = observer_axis
+                            obs_cost_t4 = observer_cost
+                            
+                            # Fix dimension mismatch: observer_axis may be [12288] (stacked bots) but walkers need [1536]
+                            if obs_axis_t4 is not None and obs_axis_t4.shape[0] != bot_embs.shape[1]:
+                                # Slice to the first bot's dimension (canonical worldview)
+                                obs_axis_t4 = obs_axis_t4[:bot_embs.shape[1]]
+
                             result_t4 = compute_walker_resistance(
                                 cls_per_bot=bot_embs,
                                 rks_basis=self.dirichlet_fusion.basis,
                                 u_axis=u_axis_i,
+                                observer_axis=obs_axis_t4,
+                                observer_cost_strength=obs_cost_t4,
                                 temperature=0.5,
                                 n_walkers=20,
                                 n_steps=walker_n_steps,
@@ -3301,6 +3396,7 @@ def run_multi_observer_experiment_simple(
     rks_sigma = None,
     corpus_name: str = 'unknown',
     nli_cache_path: str = None,
+    emit_label_validation: bool = True,
     **kwargs
 ):
     """
@@ -3339,6 +3435,9 @@ def run_multi_observer_experiment_simple(
     
     results = {}
     validation_records = []
+    kernel_params = dict(kernel_params or {})
+    kernel_nu = float(kernel_params.get("nu", kwargs.get("kernel_nu", 1.5)))
+    kernel_roughness = int(kernel_params.get("roughness", kwargs.get("kernel_roughness", 3)))
     
     for seed in seeds:
         print(f"\n{'='*70}")
@@ -3380,6 +3479,8 @@ def run_multi_observer_experiment_simple(
             adult_sigma=kwargs.get("adult_sigma", rks_sigma),
             adult_center=bool(kwargs.get("adult_center", True)),
             adult_nystrom_m=int(kwargs.get("adult_nystrom_m", 256)),
+            kernel_nu=kernel_nu,
+            kernel_roughness=kernel_roughness,
             embedding_dim=24 if not use_cls_tokens else 8192,
         )
         
@@ -3462,6 +3563,8 @@ def run_multi_observer_experiment_simple(
                 'shared_pca': shared_pca,
                 'rks_sigma': rks_sigma,
                 'kernel_params': kernel_params or {},
+                'kernel_nu': kernel_nu,
+                'kernel_roughness': kernel_roughness,
                 # NEW: Reproducibility info
                 'git_hash': git_hash,
                 'git_dirty': git_dirty,
@@ -3508,48 +3611,49 @@ def run_multi_observer_experiment_simple(
         output_file = output_dir / f"observer_{seed}.pt"
         torch.save(output_artifact, output_file)
 
-        label_info = _extract_validation_label_info(
-            articles_for_labels=articles,
-            metadata_for_labels=output_artifact.get("article_metadata"),
-        )
-        metrics = _compute_alignment_metrics(
-            output_artifact.get("features"),
-            label_info,
-        )
-        track_metrics = _compute_track_validation_metrics(
-            output_dir,
-            label_info,
-            synthesis_features=output_artifact.get("features"),
-        )
-        validation_payload = {
-            "schema_version": "1.0",
-            "seed": int(seed),
-            "kernel": str(kernel_type),
-            "channel": str(channel),
-            "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
-            "nmi": metrics.get("nmi") if metrics else None,
-            "ari": metrics.get("ari") if metrics else None,
-            "metric_source": "kmeans_on_final_features" if metrics else "unavailable",
-            "label_source": metrics.get("label_source") if metrics else "unavailable",
-            "label_cardinality": metrics.get("label_cardinality") if metrics else None,
-            "n_clusters": metrics.get("n_clusters") if metrics else None,
-            "track_nmi": {
-                k: float(v["nmi"])
-                for k, v in track_metrics.items()
-                if isinstance(v.get("nmi"), (int, float))
-            },
-            "track_metrics": track_metrics,
-            "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
-        }
-        with open(output_dir / f"validation_seed{seed}.json", "w", encoding="utf-8") as f:
-            json.dump(validation_payload, f, indent=2)
-        validation_records.append(validation_payload)
+        if emit_label_validation:
+            label_info = _extract_validation_label_info(
+                articles_for_labels=articles,
+                metadata_for_labels=output_artifact.get("article_metadata"),
+            )
+            metrics = _compute_alignment_metrics(
+                output_artifact.get("features"),
+                label_info,
+            )
+            track_metrics = _compute_track_validation_metrics(
+                output_dir,
+                label_info,
+                synthesis_features=output_artifact.get("features"),
+            )
+            validation_payload = {
+                "schema_version": "1.0",
+                "seed": int(seed),
+                "kernel": str(kernel_type),
+                "channel": str(channel),
+                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                "nmi": metrics.get("nmi") if metrics else None,
+                "ari": metrics.get("ari") if metrics else None,
+                "metric_source": "kmeans_on_final_features" if metrics else "unavailable",
+                "label_source": metrics.get("label_source") if metrics else "unavailable",
+                "label_cardinality": metrics.get("label_cardinality") if metrics else None,
+                "n_clusters": metrics.get("n_clusters") if metrics else None,
+                "track_nmi": {
+                    k: float(v["nmi"])
+                    for k, v in track_metrics.items()
+                    if isinstance(v.get("nmi"), (int, float))
+                },
+                "track_metrics": track_metrics,
+                "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
+            }
+            with open(output_dir / f"validation_seed{seed}.json", "w", encoding="utf-8") as f:
+                json.dump(validation_payload, f, indent=2)
+            validation_records.append(validation_payload)
         
         print(f"[OK] Saved: {output_file}")
         print(f"  -> {len(result.get('bt_uid_list', []))} articles with stable IDs")
         results[seed] = result
 
-    if validation_records:
+    if emit_label_validation and validation_records:
         available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
         available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
         track_nmi_summary, track_metrics_summary = _summarize_track_validation_records(validation_records)

@@ -55,8 +55,8 @@ class SpectralPolarityConfig:
     dynamic_k_threshold_ratio: float = 0.1
     # Explicit spectral weighting mode:
     # - "sigma": legacy sigma * delta^2
-    # - "sigma_squared": sigma^2 * delta^2
-    weighted_sigma_mode: str = "sigma"
+    # - "sigma_squared": sigma^2 * delta^2 (default)
+    weighted_sigma_mode: str = "sigma_squared"
     # Explicit whitened weighting mode:
     # - "sigma": legacy (delta / sigma)^2
     # - "sigma_squared": (delta / sigma^2)^2

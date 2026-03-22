@@ -14,7 +14,8 @@ class ArtifactContract:
             "walker_states.json",
             "walker_work_integrals.npy",
             "phantom_verdicts.json",
-            "article_metadata.csv"
+            "article_metadata.csv",
+            "validation.json",
         ]
         self.require_spectral_dna = bool(require_spectral_dna)
         self.spectral_files = [

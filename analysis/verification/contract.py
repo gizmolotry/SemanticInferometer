@@ -14,6 +14,9 @@ CONTRACT_VERSION = "1.0"
 REQUIRED_CONSUMER_ARTIFACTS = ("baseline_meta.json", "baseline_state.json", "verification_report.json", "validation.json")
 OPTIONAL_CONSUMER_ARTIFACTS = (
     "verification_summary.csv",
+    "ablation_summary.json",
+    "control_metrics.json",
+    "relativity_deltas.json",
     "labels/hidden_groups.csv",
     "labels/derived/group_summaries.json",
     "labels/derived/group_matrix.json",
@@ -294,6 +297,9 @@ def _artifact_map(run_dir: Path) -> Dict[str, Optional[Path]]:
         "verification_report.json": run_dir / "verification_report.json",
         "validation.json": run_dir / "validation.json",
         "verification_summary.csv": run_dir / "verification_summary.csv",
+        "ablation_summary.json": run_dir / "ablation_summary.json",
+        "control_metrics.json": run_dir / "control_metrics.json",
+        "relativity_deltas.json": run_dir / "relativity_deltas.json",
         "labels/hidden_groups.csv": run_dir / "labels" / "hidden_groups.csv",
         "labels/derived/group_summaries.json": run_dir / "labels" / "derived" / "group_summaries.json",
         "labels/derived/group_matrix.json": run_dir / "labels" / "derived" / "group_matrix.json",

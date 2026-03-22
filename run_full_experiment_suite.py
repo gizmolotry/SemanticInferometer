@@ -37,7 +37,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import subprocess
 import sys
 
@@ -660,17 +660,6 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     env["PYTHONUNBUFFERED"] = "1"
 
     try:
-        print(f"[BUNDLE] Rendering MONOLITH baseline for {target_dir}...")
-        viz_res = subprocess.run(viz_cmd, env=env)
-        if viz_res.returncode != 0:
-            return {
-                "status": "failed",
-                "stage": "monolith_render",
-                "returncode": viz_res.returncode,
-                "run_dir": str(run_dir),
-                "target_dir": str(target_dir),
-            }
-
         print(f"[BUNDLE] Emitting consumer contract bundle for {target_dir}...")
         contract_res = emit_consumer_contract_bundle(target_dir)
         if contract_res.get("status") != "success":
@@ -680,6 +669,18 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "error": contract_res.get("error", "unknown contract bundle error"),
                 "run_dir": str(run_dir),
                 "target_dir": str(target_dir),
+            }
+
+        print(f"[BUNDLE] Rendering MONOLITH baseline for {target_dir}...")
+        viz_res = subprocess.run(viz_cmd, env=env)
+        if viz_res.returncode != 0:
+            return {
+                "status": "failed",
+                "stage": "monolith_render",
+                "returncode": viz_res.returncode,
+                "run_dir": str(run_dir),
+                "target_dir": str(target_dir),
+                "contract_bundle": contract_res,
             }
 
         print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
@@ -738,6 +739,9 @@ def _load_ground_truth_for_corpus(corpus: str) -> Optional[Dict[int, str]]:
 
 
 def _pick_primary_observer_file(run_dir: Path) -> Optional[Path]:
+    global_payload = run_dir / "observer_global.pt"
+    if global_payload.exists():
+        return global_payload
     observer_files = sorted(run_dir.glob("observer_*.pt"), key=lambda p: p.name)
     return observer_files[0] if observer_files else None
 
@@ -751,6 +755,760 @@ def _load_primary_observer_payload(run_dir: Path) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _json_ready(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
+    except Exception:
+        return value
+
+
+def _resolve_control_family_root(run_dir: Path) -> Optional[Path]:
+    run_dir = Path(run_dir)
+    corpus_markers = ("real", "control_constant", "control_shuffled", "control_random")
+    if any((run_dir / name).exists() for name in corpus_markers):
+        return run_dir
+    if any((run_dir.parent / name).exists() for name in corpus_markers):
+        return run_dir.parent
+    return None
+
+
+def _center_rows(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return arr
+    return arr - np.mean(arr, axis=0, keepdims=True)
+
+
+def _normalize_frobenius(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float64)
+    norm = float(np.linalg.norm(arr))
+    if norm <= eps:
+        return arr.copy()
+    return arr / norm
+
+
+def _orthogonal_procrustes_rotation(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    m = a.T @ b
+    u, _, vt = np.linalg.svd(m, full_matrices=False)
+    return u @ vt
+
+
+def _procrustes_residual(a: np.ndarray, b: np.ndarray) -> float:
+    a_norm = _normalize_frobenius(_center_rows(a))
+    b_norm = _normalize_frobenius(_center_rows(b))
+    rotation = _orthogonal_procrustes_rotation(a_norm, b_norm)
+    aligned = a_norm @ rotation
+    return float(np.linalg.norm(aligned - b_norm))
+
+
+def _pairwise_distance_vector(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] < 2:
+        return np.zeros((0,), dtype=np.float64)
+    deltas = arr[:, None, :] - arr[None, :, :]
+    dist = np.linalg.norm(deltas, axis=2)
+    iu = np.triu_indices(arr.shape[0], k=1)
+    return dist[iu]
+
+
+def _rankdata_average(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return values
+    sorter = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    sorted_vals = values[sorter]
+    i = 0
+    while i < values.size:
+        j = i + 1
+        while j < values.size and sorted_vals[j] == sorted_vals[i]:
+            j += 1
+        avg_rank = (i + j - 1) / 2.0 + 1.0
+        ranks[sorter[i:j]] = avg_rank
+        i = j
+    return ranks
+
+
+def _distance_correlation_residual(a: np.ndarray, b: np.ndarray) -> float:
+    da = _pairwise_distance_vector(a)
+    db = _pairwise_distance_vector(b)
+    if da.size == 0 or db.size == 0 or da.size != db.size:
+        return 1.0
+    ra = _rankdata_average(da)
+    rb = _rankdata_average(db)
+    ra -= np.mean(ra)
+    rb -= np.mean(rb)
+    denom = float(np.linalg.norm(ra) * np.linalg.norm(rb))
+    if denom <= 1e-12:
+        return 1.0
+    rho = float(np.dot(ra, rb) / denom)
+    rho = max(-1.0, min(1.0, rho))
+    return float(1.0 - rho)
+
+
+def _consensus_residual_summary(feature_mats: List[np.ndarray]) -> Dict[str, float]:
+    if not feature_mats:
+        return {"consensus_pct": 0.0, "residual_pct": 0.0}
+    stacked = np.stack(feature_mats, axis=0)
+    consensus = stacked.mean(axis=0)
+    residuals = stacked - consensus[None, :, :]
+    total_var = float(np.var(stacked))
+    if total_var <= 1e-12:
+        return {"consensus_pct": 0.0, "residual_pct": 0.0}
+    consensus_pct = float(np.var(consensus) / total_var * 100.0)
+    residual_pct = float(np.var(residuals) / total_var * 100.0)
+    return {
+        "consensus_pct": consensus_pct,
+        "residual_pct": residual_pct,
+    }
+
+
+def _load_control_observers(corpus_dir: Path) -> Dict[int, Dict[str, Any]]:
+    observers: Dict[int, Dict[str, Any]] = {}
+    if not TORCH_AVAILABLE or not corpus_dir.exists():
+        return observers
+    for fpath in sorted(corpus_dir.glob("observer_*.pt")):
+        seed_txt = fpath.stem.replace("observer_", "", 1)
+        if not seed_txt.isdigit():
+            continue
+        try:
+            payload = torch.load(fpath, map_location="cpu", weights_only=False)
+        except Exception:
+            continue
+        matrix = payload.get("features") if isinstance(payload, dict) else payload
+        if matrix is None and isinstance(payload, dict):
+            matrix = payload.get("embeddings")
+        if matrix is None:
+            continue
+        if TORCH_AVAILABLE and torch.is_tensor(matrix):
+            matrix = matrix.detach().cpu().numpy()
+        try:
+            arr = np.asarray(matrix, dtype=np.float64)
+        except Exception:
+            continue
+        if arr.ndim != 2:
+            continue
+        observers[int(seed_txt)] = {
+            "features": arr,
+            "shape": arr.shape,
+            "file": fpath.name,
+        }
+    return observers
+
+
+def _reconcile_control_shapes(observers: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    if not observers:
+        return {}
+    shapes = [tuple(obs.get("shape", ())) for obs in observers.values()]
+    if len(set(shapes)) <= 1:
+        return observers
+    shape_counts: Dict[Tuple[int, ...], int] = {}
+    for shape in shapes:
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+    dominant_shape = max(shape_counts.items(), key=lambda kv: kv[1])[0]
+    return {seed: obs for seed, obs in observers.items() if tuple(obs.get("shape", ())) == dominant_shape}
+
+
+def _compute_direct_control_metrics(observers: Dict[int, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    seeds = sorted(observers.keys())
+    if len(seeds) < 2:
+        return None
+    procrustes_vals: List[float] = []
+    distance_vals: List[float] = []
+    feature_mats: List[np.ndarray] = [np.asarray(observers[s]["features"], dtype=np.float64) for s in seeds]
+    for i, seed_a in enumerate(seeds):
+        for seed_b in seeds[i + 1:]:
+            obs_a = np.asarray(observers[seed_a]["features"], dtype=np.float64)
+            obs_b = np.asarray(observers[seed_b]["features"], dtype=np.float64)
+            procrustes_vals.append(_procrustes_residual(obs_a, obs_b))
+            distance_vals.append(_distance_correlation_residual(obs_a, obs_b))
+    if not procrustes_vals or not distance_vals:
+        return None
+    return {
+        "procrustes": {
+            "mean": float(np.mean(procrustes_vals)),
+            "std": float(np.std(procrustes_vals)),
+            "values": [float(v) for v in procrustes_vals],
+        },
+        "distance_corr": {
+            "mean": float(np.mean(distance_vals)),
+            "std": float(np.std(distance_vals)),
+            "values": [float(v) for v in distance_vals],
+        },
+        "consensus_residual": _consensus_residual_summary(feature_mats),
+        "n_observers": len(seeds),
+        "seeds": seeds,
+    }
+
+
+def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]]:
+    family_root = _resolve_control_family_root(run_dir)
+    if family_root is None:
+        return None
+
+    corpus_dirs = {
+        "Real": family_root / "real",
+        "Constant": family_root / "control_constant",
+        "Shuffled": family_root / "control_shuffled",
+        "Random": family_root / "control_random",
+    }
+
+    results_dict: Dict[str, Dict[str, Any]] = {}
+    for display_name, corpus_dir in corpus_dirs.items():
+        observers = _reconcile_control_shapes(_load_control_observers(corpus_dir))
+        results = _compute_direct_control_metrics(observers)
+        if isinstance(results, dict):
+            results_dict[display_name] = _json_ready(results)
+
+    if "Real" not in results_dict or len(results_dict) < 2:
+        # Single-seed suite runs still produce one observer payload per corpus.
+        # Build direct real-vs-control comparisons from that family instead of
+        # silently collapsing to NO_DATA.
+        primary_family: Dict[str, Dict[str, Any]] = {}
+        for display_name, corpus_dir in corpus_dirs.items():
+            observers = _load_control_observers(corpus_dir)
+            if not observers:
+                continue
+            primary_seed = sorted(observers.keys())[0]
+            primary_family[display_name] = dict(observers[primary_seed])
+            primary_family[display_name]["seed"] = primary_seed
+
+        if "Real" not in primary_family or len(primary_family) < 2:
+            return None
+
+        shared_rows = min(
+            int(np.asarray(obs["features"]).shape[0])
+            for obs in primary_family.values()
+            if np.asarray(obs["features"]).ndim == 2
+        )
+        shared_dim = min(
+            int(np.asarray(obs["features"]).shape[1])
+            for obs in primary_family.values()
+            if np.asarray(obs["features"]).ndim == 2
+        )
+        if shared_rows < 2 or shared_dim < 1:
+            return None
+
+        aligned_family: Dict[str, np.ndarray] = {}
+        for display_name, obs in primary_family.items():
+            arr = np.asarray(obs["features"], dtype=np.float64)
+            if arr.ndim != 2:
+                continue
+            aligned_family[display_name] = arr[:shared_rows, :shared_dim]
+        if "Real" not in aligned_family or len(aligned_family) < 2:
+            return None
+
+        real_arr = aligned_family["Real"]
+        control_names = [name for name in aligned_family.keys() if name != "Real"]
+        control_pair_procrustes: List[float] = []
+        control_pair_distcorr: List[float] = []
+        if len(control_names) >= 2:
+            for i, name_a in enumerate(control_names):
+                for name_b in control_names[i + 1:]:
+                    arr_a = aligned_family[name_a]
+                    arr_b = aligned_family[name_b]
+                    control_pair_procrustes.append(_procrustes_residual(arr_a, arr_b))
+                    control_pair_distcorr.append(_distance_correlation_residual(arr_a, arr_b))
+
+        real_vs_control_procrustes: List[float] = []
+        real_vs_control_distcorr: List[float] = []
+        fallback_results: Dict[str, Dict[str, Any]] = {}
+        for control_name in control_names:
+            ctrl_arr = aligned_family[control_name]
+            p_val = _procrustes_residual(real_arr, ctrl_arr)
+            d_val = _distance_correlation_residual(real_arr, ctrl_arr)
+            real_vs_control_procrustes.append(p_val)
+            real_vs_control_distcorr.append(d_val)
+            fallback_results[control_name] = {
+                "comparison_to_real": {
+                    "procrustes": float(p_val),
+                    "distance_corr": float(d_val),
+                },
+                "n_observers": 1,
+                "seeds": [int(primary_family[control_name]["seed"])],
+                "single_observer_mode": True,
+            }
+
+        if not real_vs_control_procrustes or not real_vs_control_distcorr:
+            return None
+
+        procrustes_control_avg = (
+            float(np.mean(control_pair_procrustes))
+            if control_pair_procrustes
+            else 1.0
+        )
+        distcorr_control_avg = (
+            float(np.mean(control_pair_distcorr))
+            if control_pair_distcorr
+            else 1.0
+        )
+        procrustes_real_value = float(np.mean(real_vs_control_procrustes))
+        distcorr_real_value = float(np.mean(real_vs_control_distcorr))
+
+        interpretation = {
+            "has_real": True,
+            "has_controls": True,
+            "single_observer_mode": True,
+            "metrics": {
+                "procrustes": {
+                    "real_value": procrustes_real_value,
+                    "control_avg": procrustes_control_avg,
+                    "ratio": (
+                        float(procrustes_real_value / procrustes_control_avg)
+                        if abs(procrustes_control_avg) > 1e-12
+                        else None
+                    ),
+                    "separates": bool(
+                        abs(procrustes_real_value - procrustes_control_avg) > 1e-9
+                        and (
+                            abs(procrustes_real_value / procrustes_control_avg - 1.0) > 0.2
+                            if abs(procrustes_control_avg) > 1e-12
+                            else True
+                        )
+                    ),
+                },
+                "distance_corr": {
+                    "real_value": distcorr_real_value,
+                    "control_avg": distcorr_control_avg,
+                    "ratio": (
+                        float(distcorr_real_value / distcorr_control_avg)
+                        if abs(distcorr_control_avg) > 1e-12
+                        else None
+                    ),
+                    "separates": bool(
+                        abs(distcorr_real_value - distcorr_control_avg) > 1e-9
+                        and (
+                            abs(distcorr_real_value / distcorr_control_avg - 1.0) > 0.2
+                            if abs(distcorr_control_avg) > 1e-12
+                            else True
+                        )
+                    ),
+                },
+            },
+            "consensus_residual": {
+                "real": {
+                    "consensus_pct": None,
+                    "residual_pct": None,
+                }
+            },
+        }
+        fallback_results["Real"] = {
+            "n_observers": 1,
+            "seeds": [int(primary_family["Real"]["seed"])],
+            "single_observer_mode": True,
+            "consensus_residual": {"consensus_pct": None, "residual_pct": None},
+        }
+        return {
+            "results": _json_ready(fallback_results),
+            "interpretation": _json_ready(interpretation),
+            "direct_source": str(family_root),
+        }
+
+    interpretation: Dict[str, Any] = {
+        "has_real": True,
+        "has_controls": True,
+        "metrics": {},
+        "consensus_residual": {
+            "real": results_dict["Real"].get("consensus_residual", {}),
+        },
+    }
+    for metric_name in ("procrustes", "distance_corr"):
+        if metric_name not in results_dict["Real"]:
+            continue
+        real_val = float(results_dict["Real"][metric_name]["mean"])
+        control_vals = [
+            float(corpus_metrics[metric_name]["mean"])
+            for corpus_name, corpus_metrics in results_dict.items()
+            if corpus_name != "Real" and metric_name in corpus_metrics
+        ]
+        if not control_vals:
+            continue
+        control_avg = float(np.mean(control_vals))
+        ratio = float(real_val / control_avg) if abs(control_avg) > 1e-12 else None
+        interpretation["metrics"][metric_name] = {
+            "real_value": real_val,
+            "control_avg": control_avg,
+            "ratio": ratio,
+            "separates": bool(ratio is not None and abs(ratio - 1.0) > 0.2),
+        }
+
+    return {
+        "results": results_dict,
+        "interpretation": _json_ready(interpretation),
+        "direct_source": str(family_root),
+    }
+
+
+def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": "NO_DATA",
+        "source": str(source_path) if source_path else "NOT FOUND",
+        "synthetic_placeholder": True,
+        "message": "control analysis not run for this leaf",
+        "metrics": {
+            "procrustes_ratio": None,
+            "distance_corr_ratio": None,
+            "separates_count": 0,
+            "consensus_pct": None,
+            "residual_pct": None,
+        },
+        "controls": {},
+    }
+    if not isinstance(results_blob, dict) or not results_blob:
+        return payload
+
+    interpretation = results_blob.get("interpretation", {})
+    if not isinstance(interpretation, dict):
+        return payload
+
+    if interpretation.get("error"):
+        payload["status"] = "UNAVAILABLE"
+        payload["message"] = str(interpretation.get("error"))
+        return payload
+
+    metrics = interpretation.get("metrics", {})
+    metrics = metrics if isinstance(metrics, dict) else {}
+    procrustes_ratio = _safe_float((metrics.get("procrustes", {}) or {}).get("ratio"), default=float("nan"))
+    distance_corr_ratio = _safe_float((metrics.get("distance_corr", {}) or {}).get("ratio"), default=float("nan"))
+    separates_count = sum(1 for m in metrics.values() if isinstance(m, dict) and bool(m.get("separates")))
+    consensus_residual = ((interpretation.get("consensus_residual", {}) or {}).get("real", {}) or {})
+    controls = results_blob.get("results", {})
+    controls = controls if isinstance(controls, dict) else {}
+
+    payload.update(
+        {
+            "status": "OK",
+            "synthetic_placeholder": bool(results_blob.get("synthetic_placeholder", False)),
+            "message": "loaded",
+            "metrics": {
+                "procrustes_ratio": None if str(procrustes_ratio) == "nan" else procrustes_ratio,
+                "distance_corr_ratio": None if str(distance_corr_ratio) == "nan" else distance_corr_ratio,
+                "separates_count": int(separates_count),
+                "consensus_pct": _safe_float(consensus_residual.get("consensus_pct"), default=None),
+                "residual_pct": _safe_float(consensus_residual.get("residual_pct"), default=None),
+            },
+            "controls": controls,
+        }
+    )
+    return payload
+
+
+def _emit_control_metrics_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "control_metrics.json"
+    direct_blob = _build_direct_control_results_blob(run_dir)
+    if isinstance(direct_blob, dict) and direct_blob:
+        source_path = Path(str(direct_blob.get("direct_source", run_dir)))
+        payload = _build_control_metrics_payload(direct_blob, source_path)
+        payload["message"] = "loaded from direct control observer payloads"
+        payload["synthetic_placeholder"] = False
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out
+
+    source_path = run_dir / "comprehensive_results.json"
+    if source_path.exists():
+        try:
+            results_blob = json.loads(source_path.read_text(encoding="utf-8"))
+        except Exception:
+            results_blob = {}
+    else:
+        results_blob = {}
+    payload = _build_control_metrics_payload(results_blob, source_path if source_path.exists() else None)
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": "NO_DATA",
+        "source": str(source_path) if source_path else "NOT FOUND",
+        "synthetic_placeholder": True,
+        "reason": "ablation flow not executed for this run",
+        "stage_1_nmi": None,
+        "stage_2_nmi": None,
+        "stage_3_nmi": None,
+        "delta_nmi": None,
+        "retained_percentage": None,
+        "retained_pct": None,
+        "legacy_mean_variance": None,
+        "mean_variance": None,
+        "metrics": {
+            "stage_1_nmi": None,
+            "stage_2_nmi": None,
+            "stage_3_nmi": None,
+            "delta_nmi": None,
+            "retained_pct": None,
+            "legacy_mean_variance": None,
+        },
+    }
+    if not isinstance(summary_blob, dict) or not summary_blob:
+        return payload
+
+    status_marker = str(summary_blob.get("status", "")).strip().upper()
+    if status_marker in {"NO_DATA", "UNAVAILABLE"} or bool(summary_blob.get("synthetic_placeholder", False)):
+        payload["status"] = status_marker or "NO_DATA"
+        payload["reason"] = str(summary_blob.get("reason", payload["reason"]))
+        return payload
+
+    metrics = summary_blob.get("metrics", {})
+    metrics = metrics if isinstance(metrics, dict) else {}
+
+    def _pick(name: str, metric_name: Optional[str] = None):
+        metric_key = metric_name or name
+        val = summary_blob.get(name)
+        if val is None:
+            val = metrics.get(metric_key)
+        return val
+
+    stage_1_nmi = _pick("stage_1_nmi")
+    stage_2_nmi = _pick("stage_2_nmi")
+    stage_3_nmi = _pick("stage_3_nmi")
+    delta_nmi = _pick("delta_nmi")
+    retained_pct = _pick("retained_percentage", "retained_pct")
+    legacy_mean_variance = _pick("legacy_mean_variance")
+
+    payload.update(
+        {
+            "status": "OK",
+            "synthetic_placeholder": False,
+            "reason": None,
+            "stage_1_nmi": stage_1_nmi,
+            "stage_2_nmi": stage_2_nmi,
+            "stage_3_nmi": stage_3_nmi,
+            "delta_nmi": delta_nmi,
+            "retained_percentage": retained_pct,
+            "retained_pct": retained_pct,
+            "legacy_mean_variance": legacy_mean_variance,
+            "mean_variance": legacy_mean_variance,
+            "metrics": {
+                "stage_1_nmi": stage_1_nmi,
+                "stage_2_nmi": stage_2_nmi,
+                "stage_3_nmi": stage_3_nmi,
+                "delta_nmi": delta_nmi,
+                "retained_pct": retained_pct,
+                "legacy_mean_variance": legacy_mean_variance,
+            },
+        }
+    )
+    return payload
+
+
+def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
+    payload = _build_ablation_summary_payload({}, source_path)
+    if not isinstance(lab_blob, dict) or not lab_blob:
+        return payload
+
+    procrustes = lab_blob.get("procrustes", {})
+    invariants = lab_blob.get("structural_invariants", {})
+    if not isinstance(procrustes, dict):
+        procrustes = {}
+    if not isinstance(invariants, dict):
+        invariants = {}
+
+    mean_before = _safe_float(procrustes.get("mean_distance_before"), default=None)
+    mean_after = _safe_float(procrustes.get("mean_distance_after"), default=None)
+    survival_rate = _safe_float(invariants.get("mean_survival_rate"), default=None)
+
+    def _distance_similarity(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(1.0 / (1.0 + max(float(value), 0.0)))
+        except Exception:
+            return None
+
+    stage_1 = _distance_similarity(mean_before)
+    stage_2 = _distance_similarity(mean_after)
+    stage_3 = survival_rate
+    delta_nmi = None
+    if stage_1 is not None and stage_2 is not None:
+        delta_nmi = float(stage_2 - stage_1)
+    retained_pct = float(survival_rate * 100.0) if survival_rate is not None else None
+
+    payload.update(
+        {
+            "status": "OK",
+            "synthetic_placeholder": False,
+            "reason": None,
+            "source": str(source_path) if source_path else "lab_diagnostics.json",
+            "message": "translated from lab_diagnostics.json",
+            "stage_1_nmi": stage_1,
+            "stage_2_nmi": stage_2,
+            "stage_3_nmi": stage_3,
+            "delta_nmi": delta_nmi,
+            "retained_percentage": retained_pct,
+            "retained_pct": retained_pct,
+            "legacy_mean_variance": None,
+            "mean_variance": None,
+            "metrics": {
+                "stage_1_nmi": stage_1,
+                "stage_2_nmi": stage_2,
+                "stage_3_nmi": stage_3,
+                "delta_nmi": delta_nmi,
+                "retained_pct": retained_pct,
+                "legacy_mean_variance": None,
+            },
+            "translation": {
+                "source_type": "lab_diagnostics",
+                "lab_metrics": {
+                    "mean_distance_before": mean_before,
+                    "mean_distance_after": mean_after,
+                    "mean_survival_rate": survival_rate,
+                    "consensus_fraction": _safe_float(procrustes.get("consensus_fraction"), default=None),
+                    "residual_fraction": _safe_float(procrustes.get("residual_fraction"), default=None),
+                },
+            },
+        }
+    )
+    return payload
+
+
+def _emit_ablation_results_json(run_dir: Path, payload: Dict[str, Any]) -> Path:
+    out = Path(run_dir) / "ablation_results.json"
+    legacy_blob = dict(payload)
+    legacy_blob.setdefault("retained_pct", payload.get("retained_percentage"))
+    legacy_blob.setdefault("mean_variance", payload.get("legacy_mean_variance"))
+    out.write_text(json.dumps(legacy_blob, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_ablation_summary_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "ablation_summary.json"
+    source_path: Optional[Path] = None
+    summary_blob: Dict[str, Any] = {}
+
+    if out.exists():
+        source_path = out
+        try:
+            summary_blob = json.loads(out.read_text(encoding="utf-8"))
+        except Exception:
+            summary_blob = {}
+    elif (run_dir / "ablation_results.json").exists():
+        source_path = run_dir / "ablation_results.json"
+        try:
+            summary_blob = json.loads(source_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary_blob = {}
+    elif (run_dir / "critical_ablation_summary.csv").exists():
+        source_path = run_dir / "critical_ablation_summary.csv"
+        try:
+            with source_path.open("r", encoding="utf-8", errors="replace") as f:
+                reader = csv.DictReader(f)
+                summary_blob = dict(next(reader, {}) or {})
+        except Exception:
+            summary_blob = {}
+    elif (run_dir / "lab_diagnostics.json").exists():
+        source_path = run_dir / "lab_diagnostics.json"
+        try:
+            summary_blob = json.loads(source_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary_blob = {}
+        payload = _translate_lab_diagnostics_to_ablation_summary(summary_blob, source_path)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _emit_ablation_results_json(run_dir, payload)
+        return out
+
+    payload = _build_ablation_summary_payload(summary_blob, source_path)
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _emit_ablation_results_json(run_dir, payload)
+    return out
+
+
+def _emit_relativity_deltas_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    rel_dir = run_dir / "relativity_cache"
+    out = run_dir / "relativity_deltas.json"
+    state_paths = sorted(rel_dir.glob("state_*.json"), key=lambda p: p.name)
+    delta_paths = {
+        p.stem.replace("delta_", "", 1): p
+        for p in sorted(rel_dir.glob("delta_*.json"), key=lambda p: p.name)
+    }
+    observers: List[Dict[str, Any]] = []
+    for state_path in state_paths:
+        observer_key = state_path.stem.replace("state_", "", 1)
+        try:
+            state_blob = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state_blob = {}
+        if observer_key in delta_paths:
+            try:
+                delta_blob = json.loads(delta_paths[observer_key].read_text(encoding="utf-8"))
+            except Exception:
+                delta_blob = {}
+        else:
+            delta_blob = {}
+        if not isinstance(state_blob, dict):
+            continue
+        metrics = state_blob.get("metrics", {})
+        metrics = metrics if isinstance(metrics, dict) else {}
+        articles = state_blob.get("articles", [])
+        articles = articles if isinstance(articles, list) else []
+        observer_density = _safe_float(metrics.get("observer_density"), default=0.0)
+        observer_stress = _safe_float(metrics.get("observer_stress"), default=0.0)
+        observer_z_height = _safe_float(metrics.get("observer_z_height"), default=0.0)
+        vectors: List[Dict[str, Any]] = []
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            baseline_x = article.get("baseline_x")
+            baseline_y = article.get("baseline_y")
+            baseline_z = article.get("baseline_z")
+            if baseline_x is None or baseline_y is None or baseline_z is None:
+                baseline_x = _safe_float(article.get("density"), default=0.0) - observer_density
+                baseline_y = _safe_float(article.get("stress"), default=0.0) - observer_stress
+                baseline_z = _safe_float(article.get("z_height"), default=0.0) - observer_z_height
+            else:
+                baseline_x = _safe_float(baseline_x, default=0.0)
+                baseline_y = _safe_float(baseline_y, default=0.0)
+                baseline_z = _safe_float(baseline_z, default=0.0)
+            observer_x = _safe_float(article.get("observer_x"), default=0.0)
+            observer_y = _safe_float(article.get("observer_y"), default=0.0)
+            observer_z = _safe_float(article.get("observer_z"), default=0.0)
+            delta_x = _safe_float(article.get("delta_x"), default=observer_x - baseline_x)
+            delta_y = _safe_float(article.get("delta_y"), default=observer_y - baseline_y)
+            delta_z = _safe_float(article.get("delta_z"), default=observer_z - baseline_z)
+            coord_delta = _safe_float(
+                article.get("coord_delta"),
+                default=float(np.linalg.norm([delta_x, delta_y, delta_z])),
+            )
+            vectors.append(
+                {
+                    "index": int(article.get("index", len(vectors))),
+                    "bt_uid": str(article.get("bt_uid", "")),
+                    "title": str(article.get("title", "")),
+                    "baseline": {"x": baseline_x, "y": baseline_y, "z": baseline_z},
+                    "observer": {"x": observer_x, "y": observer_y, "z": observer_z},
+                    "delta": {"x": delta_x, "y": delta_y, "z": delta_z},
+                    "coord_delta": coord_delta,
+                }
+            )
+        observers.append(
+            {
+                "observer_id": int(state_blob.get("observer_id", observer_key)),
+                "observer_bt_uid": str(metrics.get("observer_bt_uid", "")),
+                "observer_title": str(metrics.get("observer_title", "")),
+                "observer_conditioned_nmi": metrics.get("observer_conditioned_nmi"),
+                "global_nmi": metrics.get("global_nmi"),
+                "null_observer_equivalence": delta_blob.get("null_observer_equivalence", {}),
+                "path_flip_delta": delta_blob.get("path_flip_delta", {}),
+                "metrics_delta": delta_blob.get("metrics_delta", {}),
+                "axis_delta": delta_blob.get("axis_delta", {}),
+                "translation_only_comparison": delta_blob.get("translation_only_comparison", {}),
+                "vectors": vectors,
+            }
+        )
+
+    payload = {
+        "status": "OK" if observers else "NO_DATA",
+        "source": str(rel_dir),
+        "observer_count": len(observers),
+        "observers": observers,
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
 
 
 def _write_article_metadata_csv(metadata: List[Dict[str, Any]], output_path: Path) -> bool:
@@ -1150,6 +1908,124 @@ def _emit_baseline_state(run_dir: Path, rows: List[Dict[str, Any]]) -> Path:
     return out
 
 
+def _stable_short_hash(value: Any) -> str:
+    try:
+        text = json.dumps(value, sort_keys=True, default=str)
+    except Exception:
+        text = str(value)
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _normalize_run_provenance(payload: Optional[Dict[str, Any]], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+
+    existing = payload.get("provenance")
+    provenance: Dict[str, Any] = {}
+    if isinstance(existing, dict):
+        provenance.update(existing)
+    elif isinstance(existing, list):
+        for entry in existing:
+            if isinstance(entry, dict):
+                metadata = entry.get("metadata", {})
+                if isinstance(metadata, dict):
+                    provenance.update(metadata)
+                for key in ("basis_hash", "weights_hash", "crn_seed", "alpha", "canonical_ids"):
+                    if entry.get(key) is not None:
+                        provenance[key] = entry.get(key)
+
+    meta_provenance = meta.get("provenance")
+    if isinstance(meta_provenance, dict):
+        provenance.update(meta_provenance)
+
+    dirichlet_provenance = payload.get("dirichlet_provenance")
+    if isinstance(dirichlet_provenance, dict):
+        for key in ("basis_hash", "weights_hash", "crn_seed", "alpha"):
+            if dirichlet_provenance.get(key) is not None and key not in provenance:
+                provenance[key] = dirichlet_provenance.get(key)
+
+    rks_basis_state = payload.get("rks_basis_state")
+    if isinstance(rks_basis_state, dict):
+        if rks_basis_state.get("hash"):
+            provenance.setdefault("basis_hash", rks_basis_state.get("hash"))
+        if rks_basis_state.get("seed") is not None:
+            provenance.setdefault("basis_seed", rks_basis_state.get("seed"))
+        if rks_basis_state.get("kernel_type"):
+            provenance.setdefault("kernel_type", rks_basis_state.get("kernel_type"))
+        if rks_basis_state.get("sigma") is not None:
+            provenance.setdefault("kernel_sigma", rks_basis_state.get("sigma"))
+
+    canonical_ids = payload.get("bt_uid_list")
+    if canonical_ids is not None:
+        provenance.setdefault("canonical_ids", canonical_ids)
+
+    if not provenance.get("basis_hash"):
+        provenance["basis_hash"] = _stable_short_hash(
+            canonical_ids if canonical_ids is not None else payload.get("article_metadata", [])
+        )
+
+    if not provenance.get("weights_hash"):
+        weight_source = "missing"
+        for candidate in (
+            payload.get("cls_per_bot_contract"),
+            payload.get("spectral_u_axis"),
+            payload.get("features"),
+            payload.get("embeddings"),
+            canonical_ids,
+        ):
+            if candidate is not None:
+                weight_source = candidate
+                break
+        provenance["weights_hash"] = _stable_short_hash(weight_source)
+
+    if provenance.get("crn_seed") is None:
+        provenance["crn_seed"] = meta.get("seed", payload.get("seed", 0))
+
+    if provenance.get("alpha") is None:
+        kernel_params = meta.get("kernel_params", {}) if isinstance(meta.get("kernel_params"), dict) else {}
+        provenance["alpha"] = kernel_params.get("alpha", 1.0)
+
+    return provenance
+
+
+def _build_leaf_provenance_summary(run_dir: Path, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    payload = payload if isinstance(payload, dict) else {}
+    meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+    provenance = _normalize_run_provenance(payload, meta)
+
+    kernel_params = dict(meta.get("kernel_params", {})) if isinstance(meta.get("kernel_params"), dict) else {}
+    if "kernel" in meta:
+        kernel_params.setdefault("kernel", str(meta["kernel"]))
+    if "channel" in meta:
+        kernel_params.setdefault("channel", str(meta["channel"]))
+    kernel_params.setdefault("kernel", "unknown")
+    kernel_params.setdefault("channel", "main")
+
+    rks_dim = 0
+    try:
+        arr = np.asarray(payload.get("features"))
+        if arr.ndim >= 2:
+            rks_dim = int(arr.shape[-1])
+    except Exception:
+        rks_dim = 0
+
+    return {
+        "schema_version": "1.0",
+        "cache_version": "1.0",
+        "dataset_hash": str(provenance.get("basis_hash") or _stable_short_hash(run_dir.name)),
+        "code_hash_or_commit": str(meta.get("git_hash") or _stable_short_hash(meta)),
+        "weights_hash": str(provenance.get("weights_hash") or _stable_short_hash("missing")),
+        "kernel_params": kernel_params,
+        "rks_dim": rks_dim if rks_dim > 0 else 2048,
+        "crn_seed": int(provenance.get("crn_seed", meta.get("seed", 0) or 0)),
+        "alpha": float(provenance.get("alpha", 1.0)),
+        "timestamp_utc": str(meta.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+        "verification_status": "UNVERIFIED",
+        "provenance_source": "observer_payload",
+    }
+
+
 def _emit_baseline_meta(run_dir: Path) -> Path:
     report_path = run_dir / "verification_report.json"
     verification_status = "UNVERIFIED"
@@ -1166,56 +2042,10 @@ def _emit_baseline_meta(run_dir: Path) -> Path:
             pass
 
     observer = _load_primary_observer_payload(run_dir)
-    meta = observer.get("meta", {}) if isinstance(observer, dict) else {}
-    provenance = observer.get("provenance", {}) if isinstance(observer, dict) else {}
-    features = observer.get("features") if isinstance(observer, dict) else None
-
-    def _short_hash(value: Any) -> str:
-        text = json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list, tuple)) else str(value)
-        return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
     if isinstance(observer, dict):
-        canonical_ids = provenance.get("canonical_ids") if isinstance(provenance, dict) else None
-        dataset_hash = (
-            str(provenance.get("basis_hash"))
-            if isinstance(provenance, dict) and provenance.get("basis_hash")
-            else _short_hash(canonical_ids if canonical_ids is not None else observer.get("bt_uid_list", []))
-        )
-        code_hash = (
-            str(meta.get("git_hash"))
-            if isinstance(meta, dict) and meta.get("git_hash")
-            else _short_hash(meta)
-        )
-        weights_hash = (
-            str(provenance.get("weights_hash"))
-            if isinstance(provenance, dict) and provenance.get("weights_hash")
-            else _short_hash(observer.get("spectral_u_axis", "missing"))
-        )
-        kernel_params = dict(meta.get("kernel_params", {})) if isinstance(meta, dict) and isinstance(meta.get("kernel_params", {}), dict) else {}
-        if isinstance(meta, dict):
-            kernel_params.setdefault("kernel", meta.get("kernel", "unknown"))
-            kernel_params.setdefault("channel", meta.get("channel", "unknown"))
-        rks_dim = 0
-        try:
-            arr = np.asarray(features)
-            if arr.ndim >= 2:
-                rks_dim = int(arr.shape[-1])
-        except Exception:
-            rks_dim = 0
-        payload = {
-            "schema_version": "1.0",
-            "cache_version": "1.0",
-            "dataset_hash": dataset_hash,
-            "code_hash_or_commit": code_hash,
-            "weights_hash": weights_hash,
-            "kernel_params": kernel_params,
-            "rks_dim": rks_dim if rks_dim > 0 else 2048,
-            "crn_seed": int(provenance.get("crn_seed", meta.get("seed", 0) if isinstance(meta, dict) else 0)) if isinstance(provenance, dict) else 0,
-            "alpha": float(provenance.get("alpha", 1.0)) if isinstance(provenance, dict) else 1.0,
-            "timestamp_utc": str(meta.get("timestamp") if isinstance(meta, dict) else datetime.now(timezone.utc).isoformat()),
-            "verification_status": verification_status,
-            "provenance_source": "observer_payload",
-        }
+        payload = _build_leaf_provenance_summary(run_dir, observer)
+        payload["verification_status"] = verification_status
         out = run_dir / "baseline_meta.json"
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return out
@@ -1240,12 +2070,60 @@ def _emit_baseline_meta(run_dir: Path) -> Path:
     return out
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _ensure_verification_report(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    report_path = run_dir / "verification_report.json"
+    if report_path.exists():
+        try:
+            existing = json.loads(report_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                required = {"run_id", "timestamp", "layers", "global_pass"}
+                if required.issubset(existing.keys()):
+                    return report_path
+        except Exception:
+            pass
+
+    observer_payload = _load_primary_observer_payload(run_dir)
+    provenance_summary = _build_leaf_provenance_summary(run_dir, observer_payload)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    placeholder = {
+        "schema_version": "1.0",
+        "contract_version": "1.0",
+        "run_id": run_dir.name,
+        "timestamp": now_iso,
+        "global_pass": False,
+        "layers": [
+            {
+                "layer_id": run_dir.name,
+                "layer_name": run_dir.name,
+                "status": "UNVERIFIED",
+                "checks": [],
+                "fail_reasons": ["verification layer not materialized during bundle emission"],
+            }
+        ],
+        "dataset_hash": provenance_summary["dataset_hash"],
+        "code_hash_or_commit": provenance_summary["code_hash_or_commit"],
+        "weights_hash": provenance_summary["weights_hash"],
+        "kernel_params": provenance_summary["kernel_params"],
+        "rks_dim": provenance_summary["rks_dim"],
+        "crn_seed": provenance_summary["crn_seed"],
+        "alpha": provenance_summary["alpha"],
+        "verification_status": "UNVERIFIED",
+    }
+    report_path.write_text(json.dumps(placeholder, indent=2), encoding="utf-8")
+    return report_path
+
+
+def _safe_float(value: Any, default: Any = 0.0) -> Optional[float]:
     try:
         out = float(value)
     except Exception:
+        if default is None:
+            return None
         return float(default)
     if not math.isfinite(out):
+        if default is None:
+            return None
         return float(default)
     return out
 
@@ -1409,6 +2287,65 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
     if n_articles == 0:
         return {"status": "fallback", "reason": "no MONOLITH rows available"}
 
+    ordered_uids = [str(row.get("bt_uid", "")) for row in normalized_rows]
+
+    def _ordered_metric_matrix_from_payload(candidate_payload: Dict[str, Any]) -> Optional[np.ndarray]:
+        if not isinstance(candidate_payload, dict):
+            return None
+        matrix = candidate_payload.get("features")
+        if matrix is None:
+            matrix = candidate_payload.get("embeddings")
+        if matrix is None:
+            return None
+        if TORCH_AVAILABLE and torch.is_tensor(matrix):
+            matrix = matrix.detach().cpu().numpy()
+        try:
+            arr = np.asarray(matrix, dtype=np.float64)
+        except Exception:
+            return None
+        if arr.ndim != 2:
+            return None
+        ids = candidate_payload.get("bt_uid_list")
+        if not isinstance(ids, (list, tuple)):
+            metadata = candidate_payload.get("article_metadata", [])
+            if isinstance(metadata, list):
+                ids = [str((row or {}).get("bt_uid", "")) for row in metadata if isinstance(row, dict)]
+        if isinstance(ids, (list, tuple)) and len(ids) >= n_articles:
+            id_to_idx = {str(uid): i for i, uid in enumerate(ids)}
+            if all(uid in id_to_idx for uid in ordered_uids):
+                return np.asarray([arr[id_to_idx[uid]] for uid in ordered_uids], dtype=np.float64)
+        if arr.shape[0] < n_articles:
+            return None
+        return arr[:n_articles]
+
+    def _project_shared_basis(global_matrix: np.ndarray, observer_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        g = np.asarray(global_matrix, dtype=np.float64)
+        o = np.asarray(observer_matrix, dtype=np.float64)
+        if g.ndim != 2 or o.ndim != 2:
+            raise ValueError("shared-basis projection requires 2D matrices")
+        d = min(g.shape[1], o.shape[1])
+        if d <= 0:
+            raise ValueError("shared-basis projection requires non-empty feature dims")
+        g = g[:, :d]
+        o = o[:, :d]
+        mean_vec = np.mean(g, axis=0, keepdims=True)
+        g_centered = g - mean_vec
+        o_centered = o - mean_vec
+        if g_centered.shape[0] < 2 or d == 1:
+            g_proj = g_centered[:, :1]
+            o_proj = o_centered[:, :1]
+        else:
+            _, _, vt = np.linalg.svd(g_centered, full_matrices=False)
+            n_comp = max(1, min(3, vt.shape[0], d))
+            basis = vt[:n_comp].T
+            g_proj = g_centered @ basis
+            o_proj = o_centered @ basis
+        if g_proj.shape[1] < 3:
+            pad = 3 - g_proj.shape[1]
+            g_proj = np.pad(g_proj, ((0, 0), (0, pad)), constant_values=0.0)
+            o_proj = np.pad(o_proj, ((0, 0), (0, pad)), constant_values=0.0)
+        return g_proj[:, :3], o_proj[:, :3]
+
     probes = np.asarray(payload.get("spectral_probe_magnitudes"), dtype=float)
     works = np.asarray(payload.get("walker_work_integrals"), dtype=float).reshape(-1)
     if probes.ndim != 2 or probes.shape[0] < n_articles:
@@ -1422,33 +2359,13 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
         for idx in range(n_articles)
     }
 
-    baseline_coords = np.asarray(
-        [[row["density"], row["stress"], row["z_height"]] for row in normalized_rows],
-        dtype=float,
-    )
-
-    # ASTER v3.2 RICH RELATIVITY: 
-    # Use 2D PCA to preserve the manifold layout instead of correlated pancake axes.
-    # We'll use PCA for XY and keep relativistic Z-height for the 'mountains'.
-    pca_xy = None
+    baseline_metric_matrix = _ordered_metric_matrix_from_payload(payload)
+    if baseline_metric_matrix is None:
+        return {"status": "fallback", "reason": "root feature matrix unavailable"}
     try:
-        from sklearn.decomposition import PCA
-        embeddings = payload.get("embeddings")
-        if embeddings is None:
-            embeddings = payload.get("features")
-        if embeddings is not None:
-            if torch.is_tensor(embeddings):
-                embeddings = embeddings.detach().cpu().numpy()
-            embeddings = np.asarray(embeddings, dtype=float)
-            if embeddings.ndim == 2 and embeddings.shape[0] >= n_articles:
-                # Use only the active articles for the local manifold fit.
-                fit_data = embeddings[:n_articles]
-                pca_2d = PCA(n_components=2, random_state=42)
-                pca_xy = pca_2d.fit_transform(fit_data)
-                print(f"  [RELATIVITY] Generated rich XY manifold (EVR: {float(np.sum(pca_2d.explained_variance_ratio_)):.2%})")
-    except Exception as pca_err:
-        print(f"  [WARN] Relativity PCA failed: {pca_err}. Falling back to pancake mode.")
-        pca_xy = None
+        baseline_coords, _ = _project_shared_basis(baseline_metric_matrix, baseline_metric_matrix)
+    except Exception as proj_err:
+        return {"status": "fallback", "reason": f"shared-basis projection failed: {proj_err}"}
 
     try:
         from core.complete_pipeline import _compute_alignment_metrics, _extract_validation_label_info
@@ -1466,7 +2383,10 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
                 allow_source_fallback=True,
             )
             if label_info is not None:
-                baseline_alignment = _compute_alignment_metrics(baseline_coords, label_info)
+                baseline_alignment = _compute_alignment_metrics(
+                    baseline_metric_matrix if baseline_metric_matrix is not None else baseline_coords,
+                    label_info,
+                )
         except Exception:
             label_info = None
             baseline_alignment = None
@@ -1506,84 +2426,81 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
     written_state = 0
     written_delta = 0
     for idx in range(n_articles):
-        focus_row = normalized_rows[idx]
-        focus_probe = probe_unit[idx]
-        
-        # Spectral axis: 1.0 - cosine similarity
-        probe_distance = 1.0 - np.clip(np.sum(probe_unit * focus_probe, axis=1), -1.0, 1.0)
-        
-        # Baseline reference centered on focus for delta calculation
-        centered_baseline = baseline_coords - baseline_coords[idx]
-
-        if pca_xy is not None:
-            # RELATIVISTIC MANIFOLD: Center the rich PCA projection on the focused article.
-            # We'll use a local PCA fit to capture the perspective of this specific article.
+        # NUCLEAR DAG: Load the physically distinct universe for this observer
+        obs_pt_path = rel_dir / f"observer_{idx}.pt"
+        current_obs_payload = payload  # Default to global
+        if obs_pt_path.exists() and TORCH_AVAILABLE:
             try:
-                # Find local neighborhood (top 50% articles by spectral distance)
-                # to make the PCA fit 'local' to this observer's regime.
-                n_local = max(min(n_articles, 50), n_articles // 2)
-                local_indices = np.argsort(probe_distance)[:n_local]
-                local_fit_data = embeddings[local_indices]
-                
-                local_pca_2d = PCA(n_components=2, random_state=seed)
-                local_pca_2d.fit(local_fit_data)
-                local_pca_coords = local_pca_2d.transform(embeddings[:n_articles])
-                
-                centered_pca = local_pca_coords - local_pca_coords[idx]
-                observer_coords = np.column_stack(
-                    [
-                        centered_pca[:, 0],
-                        centered_pca[:, 1],
-                        centered_baseline[:, 2], # Rich log-density delta
-                    ]
-                )
-                print(f"    [PERSPECTIVE] {idx} fit on {n_local} neighbors (EVR: {float(np.sum(local_pca_2d.explained_variance_ratio_)):.2%})")
-            except Exception as e:
-                # Fallback to global PCA if local fit fails
-                centered_pca = pca_xy - pca_xy[idx]
-                observer_coords = np.column_stack(
-                    [
-                        centered_pca[:, 0],
-                        centered_pca[:, 1],
-                        centered_baseline[:, 2],
-                    ]
-                )
-        else:
-            # Fallback: Center the density/stress space.
-            observer_coords = np.column_stack(
-                [
-                    centered_baseline[:, 0], # density delta
-                    probe_distance,           # spectral distance (independent of density)
-                    centered_baseline[:, 2], # z_height delta
-                ]
-            )
+                current_obs_payload = torch.load(obs_pt_path, map_location="cpu", weights_only=False)
+            except Exception:
+                pass
         
-        # Delta is the distance between relativistic projection and centered global baseline.
-        coord_delta = np.linalg.norm(observer_coords - centered_baseline, axis=1)
+        # Build map for CURRENT observer's results
+        obs_article_maps = _build_article_maps(current_obs_payload, n_articles)
+        obs_path_summaries = {
+            j: _summarize_path_trace(obs_article_maps["path"].get(j))
+            for j in range(n_articles)
+        }
+        observer_metric_matrix = _ordered_metric_matrix_from_payload(current_obs_payload)
+        if observer_metric_matrix is None:
+            observer_metric_matrix = baseline_metric_matrix
+
+        focus_row = normalized_rows[idx]
+        
+        # Spectral axis from observer's own universe
+        obs_probes = np.asarray(current_obs_payload.get("spectral_probe_magnitudes", probes), dtype=float)
+        obs_focus_probe = obs_probes[idx]
+        obs_probe_norms = np.linalg.norm(obs_probes, axis=1, keepdims=True)
+        obs_probe_norms[obs_probe_norms <= 0.0] = 1.0
+        obs_probe_unit = obs_probes / obs_probe_norms
+        
+        # Similarity in the warped space
+        probe_distance = 1.0 - np.clip(np.sum(obs_probe_unit * (obs_focus_probe / np.linalg.norm(obs_focus_probe).clip(min=1e-9)), axis=1), -1.0, 1.0)
+
+        try:
+            centered_baseline, observer_coords = _project_shared_basis(baseline_metric_matrix, observer_metric_matrix)
+        except Exception:
+            centered_baseline = baseline_coords
+            observer_coords = baseline_coords.copy()
+
+        # Strict Einsteinian displacement in the shared Minkowski projection space.
+        delta_vectors = observer_coords - centered_baseline
+        coord_delta = np.linalg.norm(delta_vectors, axis=1)
         observer_nn = _nearest_neighbor_indices(observer_coords)
         translation_nn = _nearest_neighbor_indices(centered_baseline)
         flip_mask = observer_nn != baseline_nn
         flip_count = int(np.sum(flip_mask))
         translation_flip_count = int(np.sum(translation_nn != baseline_nn))
+        
         observer_alignment = None
         if label_info is not None and callable(_compute_alignment_metrics):
             try:
-                observer_alignment = _compute_alignment_metrics(observer_coords, label_info)
+                observer_alignment = _compute_alignment_metrics(
+                    observer_metric_matrix if observer_metric_matrix is not None else observer_coords,
+                    label_info,
+                )
             except Exception:
                 observer_alignment = None
 
-        focus_meta = article_maps["metadata"].get(idx, {})
-        focus_state = article_maps["state"].get(idx, {})
-        focus_verdict = article_maps["verdict"].get(idx, {})
-        focus_path = path_summaries.get(idx, {})
-        focus_top1_evr = 0.0
-        focus_probe_raw = global_probe[idx]
+        focus_meta = obs_article_maps["metadata"].get(idx, {})
+        focus_state = obs_article_maps["state"].get(idx, {})
+        focus_verdict = obs_article_maps["verdict"].get(idx, {})
+        focus_path = obs_path_summaries.get(idx, {})
+        focus_probe_raw = obs_probes[idx]
         probe_sum = float(np.sum(np.abs(focus_probe_raw)))
+        focus_top1_evr = 0.0
         if probe_sum > 0.0:
             focus_top1_evr = float(np.max(np.abs(focus_probe_raw)) / probe_sum)
 
         articles_blob: List[Dict[str, Any]] = []
-        for row_j, obs_coord, delta_j, sim_j in zip(normalized_rows, observer_coords, coord_delta, 1.0 - probe_distance):
+        for row_j, base_coord, obs_coord, delta_vec, delta_j, sim_j in zip(
+            normalized_rows,
+            centered_baseline,
+            observer_coords,
+            delta_vectors,
+            coord_delta,
+            1.0 - probe_distance,
+        ):
             article_row = dict(row_j)
             article_row.update(
                 {
@@ -1595,9 +2512,15 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
                     "density": row_j["density"],
                     "stress": row_j["stress"],
                     "z_height": row_j["z_height"],
+                    "baseline_x": float(base_coord[0]),
+                    "baseline_y": float(base_coord[1]),
+                    "baseline_z": float(base_coord[2]),
                     "observer_x": float(obs_coord[0]),
                     "observer_y": float(obs_coord[1]),
                     "observer_z": float(obs_coord[2]),
+                    "delta_x": float(delta_vec[0]),
+                    "delta_y": float(delta_vec[1]),
+                    "delta_z": float(delta_vec[2]),
                     "observer_probe_similarity": float(sim_j),
                     "coord_delta": float(delta_j),
                 }
@@ -1615,9 +2538,9 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
             "articles": articles_blob,
             "paths": [f"observer_{idx}/MONOLITH.html"],
             "axes": {
-                "x": "observer_density_delta",
-                "y": "observer_probe_distance",
-                "z": "observer_z_delta",
+                "x": "shared_basis_axis_1",
+                "y": "shared_basis_axis_2",
+                "z": "shared_basis_axis_3",
             },
             "metrics": {
                 "observer_bt_uid": focus_row["bt_uid"],
@@ -1830,16 +2753,451 @@ def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[s
 
 def _emit_validation_json(run_dir: Path) -> Path:
     validation_path = run_dir / "validation.json"
+    existing: Dict[str, Any] = {}
     if validation_path.exists():
+        try:
+            loaded = json.loads(validation_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+
+    current_nmi = existing.get("nmi")
+    if isinstance(current_nmi, (int, float)) and not isinstance(current_nmi, bool) and math.isfinite(float(current_nmi)) and 0.0 <= float(current_nmi) <= 1.0:
         return validation_path
 
-    payload = {
-        "source": "suite-default",
-        "synthetic_placeholder": True,
-        "reason": "validation.json missing during bundle emission; canonical validation metrics unavailable",
-    }
-    validation_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    observer_payload = _load_primary_observer_payload(run_dir)
+    rows = _load_monolith_rows(run_dir / "MONOLITH_DATA.csv")
+    validation_payload = dict(existing) if isinstance(existing, dict) else {}
+
+    try:
+        from core.complete_pipeline import _compute_alignment_metrics, _extract_validation_label_info
+    except Exception:
+        _compute_alignment_metrics = None
+        _extract_validation_label_info = None
+
+    alignment_metrics = None
+    track_metrics: Dict[str, Dict[str, Any]] = {}
+
+    def _as_metric_array_local(value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        if TORCH_AVAILABLE:
+            try:
+                import torch as torch_lib
+                if torch_lib.is_tensor(value):
+                    value = value.detach().cpu().numpy()
+            except Exception:
+                pass
+        try:
+            arr = np.asarray(value, dtype=np.float64)
+        except Exception:
+            return None
+        if arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        if arr.ndim != 2:
+            return None
+        return arr
+
+    def _simple_zone_alignment_metrics(matrix: Any) -> Optional[Dict[str, Any]]:
+        arr = _as_metric_array_local(matrix)
+        if arr is None or arr.shape[0] < 2:
+            return None
+        zone_labels = [str(row.get("zone", "")).strip() for row in rows if str(row.get("zone", "")).strip()]
+        if len(zone_labels) < 2:
+            return None
+        n = min(arr.shape[0], len(zone_labels))
+        arr = arr[:n]
+        zone_labels = zone_labels[:n]
+        unique_labels = sorted(set(zone_labels))
+        if len(unique_labels) < 2:
+            return None
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+        except Exception:
+            return None
+        label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+        truth = np.asarray([label_to_idx[label] for label in zone_labels], dtype=int)
+        try:
+            pred = KMeans(n_clusters=len(unique_labels), n_init=10, random_state=42).fit_predict(arr)
+        except Exception:
+            return None
+        return {
+            "nmi": float(normalized_mutual_info_score(truth, pred)),
+            "ari": float(adjusted_rand_score(truth, pred)),
+            "n_clusters": int(len(unique_labels)),
+            "label_cardinality": int(len(unique_labels)),
+            "label_source": "zone_fallback",
+            "metric_source": "kmeans_on_final_features",
+        }
+
+    if isinstance(observer_payload, dict) and callable(_compute_alignment_metrics) and callable(_extract_validation_label_info):
+        label_rows = rows or (observer_payload.get("article_metadata") if isinstance(observer_payload.get("article_metadata"), list) else [])
+        try:
+            label_info = _extract_validation_label_info(
+                articles_for_labels=label_rows,
+                metadata_for_labels=observer_payload.get("article_metadata"),
+                allow_source_fallback=True,
+            )
+        except Exception:
+            label_info = None
+        features = observer_payload.get("features")
+        if label_info is not None and features is not None:
+            try:
+                alignment_metrics = _compute_alignment_metrics(features, label_info)
+            except Exception:
+                alignment_metrics = None
+            try:
+                result_like = {
+                    "features": observer_payload.get("features"),
+                    "spectral_probe_magnitudes": observer_payload.get("spectral_probe_magnitudes"),
+                    "dirichlet_fused_std": observer_payload.get("dirichlet_fused_std"),
+                    "checkpoints": {
+                        "T1_embeddings": observer_payload.get("T1_embeddings"),
+                        "T2_kernels": observer_payload.get("T2_kernels"),
+                        "T1.5_spectral": observer_payload.get("T1.5_spectral"),
+                        "T3_topology": observer_payload.get("T3_topology"),
+                    },
+                }
+                track_metrics = _collect_track_metrics_from_result(
+                    result_like,
+                    label_info,
+                    _compute_alignment_metrics,
+                )
+            except Exception:
+                track_metrics = {}
+
+    if alignment_metrics is None and isinstance(observer_payload, dict):
+        alignment_metrics = _simple_zone_alignment_metrics(observer_payload.get("features"))
+        if isinstance(alignment_metrics, dict):
+            track_inputs = {
+                "SYN": observer_payload.get("features"),
+                "T1": observer_payload.get("T1_embeddings"),
+                "T2": observer_payload.get("T2_kernels"),
+                "T1.5": observer_payload.get("spectral_probe_magnitudes"),
+            }
+            t3_payload = observer_payload.get("T3_topology")
+            if isinstance(t3_payload, dict):
+                for key in ("dirichlet_fused", "bond_matrix", "crack_matrix"):
+                    if t3_payload.get(key) is not None:
+                        track_inputs["T3"] = t3_payload.get(key)
+                        break
+            track_metrics = {}
+            for track_key, track_value in track_inputs.items():
+                metrics_payload = _simple_zone_alignment_metrics(track_value)
+                if isinstance(metrics_payload, dict):
+                    track_metrics[track_key] = metrics_payload
+
+    if isinstance(alignment_metrics, dict):
+        validation_payload.update(
+            {
+                "schema_version": "1.0",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "nmi": float(alignment_metrics.get("nmi")) if isinstance(alignment_metrics.get("nmi"), (int, float)) else None,
+                "ari": float(alignment_metrics.get("ari")) if isinstance(alignment_metrics.get("ari"), (int, float)) else None,
+                "metric_source": alignment_metrics.get("metric_source", "kmeans_on_final_features"),
+                "label_source": alignment_metrics.get("label_source", "metadata"),
+                "label_cardinality": alignment_metrics.get("label_cardinality"),
+                "n_clusters": alignment_metrics.get("n_clusters"),
+                "track_nmi": {
+                    k: float(v["nmi"])
+                    for k, v in track_metrics.items()
+                    if isinstance(v, dict) and isinstance(v.get("nmi"), (int, float))
+                },
+                "track_metrics": track_metrics,
+                "trust_level": "MEASURED",
+            }
+        )
+    elif not validation_payload:
+        validation_payload = {
+            "source": "suite-default",
+            "synthetic_placeholder": True,
+            "reason": "validation.json missing during bundle emission; canonical validation metrics unavailable",
+        }
+
+    validation_path.write_text(json.dumps(validation_payload, indent=2), encoding="utf-8")
     return validation_path
+
+
+def _emit_no_data_ablation_summary(run_dir: Path) -> Path:
+    out = run_dir / "ablation_summary.json"
+    if out.exists():
+        return _emit_ablation_summary_json(run_dir)
+    payload = _build_ablation_summary_payload({}, None)
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _emit_ablation_results_json(run_dir, payload)
+    return out
+
+
+def _emit_no_data_control_results(run_dir: Path) -> Path:
+    out = run_dir / "comprehensive_results.json"
+    if out.exists():
+        return out
+    payload = {
+        "status": "NO_DATA",
+        "source": "suite-default-placeholder",
+        "synthetic_placeholder": True,
+        "interpretation": {
+            "error": "control analysis not run for this leaf",
+            "metrics": {},
+            "consensus_residual": {
+                "real": {
+                    "consensus_pct": None,
+                    "residual_pct": None,
+                }
+            },
+        },
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def _normalize_observer_payloads_for_verification(run_dir: Path) -> None:
+    run_dir = Path(run_dir)
+    payload_paths: List[Path] = []
+    global_payload = run_dir / "observer_global.pt"
+    if global_payload.exists():
+        payload_paths.append(global_payload)
+    payload_paths.extend(list(run_dir.glob("observer_*.pt")))
+    payload_paths.extend(sorted((run_dir / "relativity_cache").glob("observer_*.pt")))
+    if not payload_paths or not TORCH_AVAILABLE:
+        return
+
+    import torch as torch_lib
+
+    for payload_path in payload_paths:
+        try:
+            payload = torch_lib.load(payload_path, map_location="cpu", weights_only=False)
+            if not isinstance(payload, dict):
+                continue
+            meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+            normalized = _normalize_run_provenance(payload, meta)
+            payload["provenance"] = normalized
+            payload.setdefault("meta", {})["provenance"] = normalized
+            torch_lib.save(payload, payload_path)
+        except Exception:
+            continue
+
+
+def _write_leaf_verification_artifacts(run_dir: Path, exp_dir: Path) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    exp_dir = Path(exp_dir)
+    try:
+        _normalize_observer_payloads_for_verification(run_dir)
+        analysis_path = Path("analysis").resolve()
+        if str(analysis_path) not in sys.path:
+            sys.path.append(str(analysis_path))
+        try:
+            from analysis.verification.verify_run import discover_all_layers, verify_layer_data, write_report
+        except ImportError:
+            from verification.verify_run import discover_all_layers, verify_layer_data, write_report
+
+        all_layers = discover_all_layers(exp_dir)
+        resolved_run_dir = run_dir.resolve()
+        target_layer = next(
+            (
+                layer
+                for layer in all_layers
+                if Path(layer.get("layer_dir", run_dir)).resolve() == resolved_run_dir
+            ),
+            None,
+        )
+        if target_layer is None:
+            return {
+                "status": "skipped",
+                "reason": f"no verification layer discovered for {run_dir}",
+            }
+
+        report = verify_layer_data(
+            target_layer["layer_id"],
+            target_layer["layer_name"],
+            target_layer["artifacts"],
+            Path(target_layer["layer_dir"]),
+            exp_dir,
+        )
+        write_report(
+            [report],
+            run_dir,
+            global_pass_override=(str(report.get("status", "")).upper() == "VERIFIED"),
+        )
+        report_path = run_dir / "verification_report.json"
+        if report_path.exists():
+            observer_payload = _load_primary_observer_payload(run_dir)
+            provenance_summary = _build_leaf_provenance_summary(run_dir, observer_payload)
+            report_json = json.loads(report_path.read_text(encoding="utf-8"))
+            report_json.update({
+                "dataset_hash": provenance_summary["dataset_hash"],
+                "code_hash_or_commit": provenance_summary["code_hash_or_commit"],
+                "weights_hash": provenance_summary["weights_hash"],
+                "kernel_params": provenance_summary["kernel_params"],
+                "rks_dim": provenance_summary["rks_dim"],
+                "crn_seed": provenance_summary["crn_seed"],
+                "alpha": provenance_summary["alpha"],
+                "verification_status": str(report.get("status", "")).upper() or "UNVERIFIED",
+            })
+            report_path.write_text(json.dumps(report_json, indent=2), encoding="utf-8")
+        return {
+            "status": "success",
+            "layer_id": str(target_layer.get("layer_id", "")),
+            "report_path": str(run_dir / "verification_report.json"),
+            "summary_path": str(run_dir / "verification_summary.csv"),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "report_path": str(run_dir / "verification_report.json"),
+            "summary_path": str(run_dir / "verification_summary.csv"),
+        }
+
+
+def _collect_track_metrics_from_result(
+    result: Dict[str, Any],
+    label_info: Optional[Dict[str, Any]],
+    compute_alignment_metrics,
+) -> Dict[str, Dict[str, Any]]:
+    if label_info is None or not callable(compute_alignment_metrics):
+        return {}
+
+    pipeline_checkpoints = result.get("checkpoints", {}) if isinstance(result.get("checkpoints"), dict) else {}
+
+    def _as_metric_array(value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        if TORCH_AVAILABLE:
+            try:
+                import torch as torch_lib
+                if torch_lib.is_tensor(value):
+                    value = value.detach().cpu().numpy()
+            except Exception:
+                pass
+        try:
+            return np.asarray(value, dtype=np.float64)
+        except Exception:
+            return None
+
+    track_feature_inputs: Dict[str, Any] = {
+        "SYN": result.get("features"),
+    }
+    t1_src = pipeline_checkpoints.get("T1_embeddings")
+    if t1_src is None:
+        t1_src = pipeline_checkpoints.get("T0_substrate")
+    if t1_src is not None:
+        t1_arr = _as_metric_array(t1_src)
+        if t1_arr is None:
+            t1_arr = np.array([], dtype=np.float64)
+        if t1_arr.ndim > 2:
+            t1_arr = t1_arr.reshape(t1_arr.shape[0], -1)
+        track_feature_inputs["T1"] = t1_arr
+    t2_src = pipeline_checkpoints.get("T2_kernels")
+    if t2_src is not None:
+        track_feature_inputs["T2"] = _as_metric_array(t2_src)
+    t15_src = result.get("spectral_probe_magnitudes")
+    if t15_src is None:
+        t15_ckpt = pipeline_checkpoints.get("T1.5_spectral")
+        if isinstance(t15_ckpt, dict):
+            t15_src = t15_ckpt.get("probe_magnitudes")
+    if t15_src is not None:
+        track_feature_inputs["T1.5"] = _as_metric_array(t15_src)
+    t3_src = result.get("dirichlet_fused_std")
+    if t3_src is None:
+        t3_ckpt = pipeline_checkpoints.get("T3_topology")
+        if isinstance(t3_ckpt, dict):
+            for key in ("dirichlet_fused", "bond_matrix", "crack_matrix"):
+                if t3_ckpt.get(key) is not None:
+                    t3_src = t3_ckpt.get(key)
+                    break
+    if t3_src is not None:
+        track_feature_inputs["T3"] = _as_metric_array(t3_src)
+
+    track_metrics: Dict[str, Dict[str, Any]] = {}
+    for track_key, features_np in track_feature_inputs.items():
+        arr = _as_metric_array(features_np)
+        if arr is None or arr.ndim != 2:
+            continue
+        metrics_payload = compute_alignment_metrics(arr, label_info)
+        if metrics_payload is not None:
+            track_metrics[track_key] = metrics_payload
+    return track_metrics
+
+
+def _finalize_synthetic_leaf_artifacts(
+    run_dir: Path,
+    exp_root: Path,
+    *,
+    result: Dict[str, Any],
+    validation: Dict[str, Any],
+    articles: List[Dict[str, Any]],
+    kernel: str,
+    seed: int,
+    compute_alignment_metrics,
+    extract_validation_label_info,
+) -> Dict[str, Any]:
+    label_info = extract_validation_label_info(
+        articles_for_labels=articles,
+        metadata_for_labels=result.get("article_metadata"),
+        allow_source_fallback=True,
+    ) if callable(extract_validation_label_info) else None
+
+    alignment_metrics = compute_alignment_metrics(
+        result.get("features"),
+        label_info,
+    ) if callable(compute_alignment_metrics) and label_info is not None else None
+
+    track_metrics = _collect_track_metrics_from_result(
+        result,
+        label_info,
+        compute_alignment_metrics,
+    )
+
+    validation_payload = dict(validation)
+    validation_payload.update(
+        {
+            "schema_version": "1.0",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "kernel": str(kernel),
+            "channel": "cls",
+            "seed": int(seed),
+            "metric_source": (
+                alignment_metrics.get("metric_source")
+                if isinstance(alignment_metrics, dict)
+                else validation.get("feature_source", "kmeans_on_final_features")
+            ),
+            "label_source": (
+                alignment_metrics.get("label_source")
+                if isinstance(alignment_metrics, dict)
+                else "unavailable"
+            ),
+            "label_cardinality": (
+                alignment_metrics.get("label_cardinality")
+                if isinstance(alignment_metrics, dict)
+                else None
+            ),
+            "n_clusters": (
+                alignment_metrics.get("n_clusters")
+                if isinstance(alignment_metrics, dict)
+                else validation.get("n_clusters")
+            ),
+            "track_nmi": {
+                k: float(v["nmi"])
+                for k, v in track_metrics.items()
+                if isinstance(v, dict) and isinstance(v.get("nmi"), (int, float))
+            },
+            "track_metrics": track_metrics,
+            "trust_level": "MEASURED" if validation.get("status") == "success" else "UNAVAILABLE",
+        }
+    )
+    with open(run_dir / "validation.json", "w", encoding="utf-8") as f:
+        json.dump(validation_payload, f, indent=2)
+
+    _emit_no_data_ablation_summary(run_dir)
+    _emit_no_data_control_results(run_dir)
+    verification_res = _write_leaf_verification_artifacts(run_dir, exp_root)
+    return {
+        "validation_payload": validation_payload,
+        "verification_res": verification_res,
+    }
 
 
 def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
@@ -1853,10 +3211,14 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     copied: List[str] = []
 
     rows = _load_monolith_rows(monolith_csv)
+    _ensure_verification_report(run_dir)
     baseline_meta = _emit_baseline_meta(run_dir)
     baseline_state = _emit_baseline_state(run_dir, rows)
     validation_json = _emit_validation_json(run_dir)
     rel_stats = _emit_relativity_defaults(run_dir, rows)
+    control_metrics = _emit_control_metrics_json(run_dir)
+    ablation_summary = _emit_ablation_summary_json(run_dir)
+    relativity_deltas = _emit_relativity_deltas_json(run_dir)
     label_paths = _emit_label_derivatives(run_dir, rows)
 
     return {
@@ -1864,8 +3226,11 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
         "baseline_meta": str(baseline_meta),
         "baseline_state": str(baseline_state),
         "validation_json": str(validation_json),
+        "ablation_summary": str(ablation_summary),
+        "control_metrics": str(control_metrics),
         "copied": copied,
         "relativity": rel_stats,
+        "relativity_deltas": str(relativity_deltas),
         "labels": label_paths,
     }
 
@@ -2064,7 +3429,12 @@ def run_synthetic_experiment_suite(
 
     # Import pipeline components (functions load_and_mask_corpus and validate_against_ground_truth are defined above)
     try:
-        from core.complete_pipeline import initialize_full_pipeline, BeliefTransformerPipeline
+        from core.complete_pipeline import (
+            initialize_full_pipeline,
+            BeliefTransformerPipeline,
+            _compute_alignment_metrics,
+            _extract_validation_label_info,
+        )
         from core.pipeline_config import PipelineRuntimeConfig, DEFAULT_PIPELINE_RUNTIME_CONFIG
     except ImportError as e:
         print(f"[ERROR] Could not import required modules: {e}")
@@ -2146,15 +3516,88 @@ def run_synthetic_experiment_suite(
                     "checkpoint_dir": str(run_dir),
                     "output_dir": str(run_dir),
                 }
-                result = pipeline.process_month(
+                # ASTER v3.2 NUCLEAR DAG: Re-run the entire pipeline for EVERY observer
+                # to perform true root-level metric warping (Track 1.5).
+                print(f"    [NUCLEAR DAG] Re-running physics for {len(articles)} observers...")
+                
+                # Base metadata for provenance
+                try:
+                    from core.complete_pipeline import get_git_hash
+                    git_hash = get_git_hash()
+                except ImportError:
+                    git_hash = "unknown"
+
+                run_meta = {
+                    "kernel": kernel,
+                    "seed": seed,
+                    "channel": "cls",
+                    "n_articles": len(articles),
+                    "git_hash": git_hash,
+                }
+
+                # We still need a 'global' run for baseline_state.json and the root MONOLITH.html
+                # We treat the first article (or a mean) as global if no global_idx is set.
+                global_result = pipeline.process_month(
                     articles=articles,
                     month_name=run_key,
                     config=pipeline_config,
                 )
+                global_result["meta"] = run_meta
+                normalized_global_provenance = _normalize_run_provenance(global_result, run_meta)
+                global_result["provenance"] = normalized_global_provenance
+                global_result.setdefault("meta", {})["provenance"] = normalized_global_provenance
+                if TORCH_AVAILABLE:
+                    import torch as torch_lib
+                    torch_lib.save(global_result, run_dir / "observer_global.pt")
+                 
+                # Materialize relativity_cache directory
+                rel_cache_dir = run_dir / "relativity_cache"
+                rel_cache_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Loop through every article as an observer
+                for obs_i in range(len(articles)):
+                    print(f"\r      -> Computing Universe {obs_i}/{len(articles)}...", end="")
+                    
+                    # Each universe needs its own isolated directory for internal pipeline persistence
+                    obs_sub_dir = rel_cache_dir / f"obs_{obs_i}"
+                    obs_sub_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    obs_config = dict(pipeline_config)
+                    obs_config["output_dir"] = str(obs_sub_dir)
+                    obs_config["checkpoint_dir"] = str(obs_sub_dir)
 
-                # --- FIX: Save full observer state as .pt file ---
-                torch.save(result, run_dir / f"observer_{seed}.pt")
-                # -----------------------------------------------
+                    # RE-RUN PHYSICS (Kernels -> Topology -> Walkers)
+                    obs_result = pipeline.process_month(
+                        articles=articles,
+                        month_name=f"{run_key}_obs{obs_i}",
+                        config=obs_config,
+                        observer_idx=obs_i,
+                    )
+                    obs_result["meta"] = run_meta
+                    normalized_obs_provenance = _normalize_run_provenance(obs_result, run_meta)
+                    obs_result["provenance"] = normalized_obs_provenance
+                    obs_result.setdefault("meta", {})["provenance"] = normalized_obs_provenance
+                    
+                    # Redundant save for safety (the pipeline already writes some to obs_sub_dir)
+                    np.save(obs_sub_dir / "features.npy", obs_result['features'])
+                    if 'dirichlet_fused' in obs_result:
+                         np.save(obs_sub_dir / "gradients.npy", obs_result['dirichlet_fused'])
+                    
+                    # Save the full state payload for later hydration
+                    if TORCH_AVAILABLE:
+                        import torch as torch_lib
+                        torch_lib.save(obs_result, rel_cache_dir / f"observer_{obs_i}.pt")
+                    
+                    # ASTER v3.2: Prevent memory accumulation in the N-Universe loop
+                    del obs_result
+                    if TORCH_AVAILABLE:
+                        import torch as torch_lib
+                        torch_lib.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+
+                print(f"\n    [OK] N-Universe expansion complete.")
+                result = global_result  # Main result for standard artifacts
 
                 # Validate against ground truth
                 validation = validate_against_ground_truth(
@@ -2207,6 +3650,23 @@ def run_synthetic_experiment_suite(
                         json.dump(result['article_metadata'], mf, indent=2)
                     _write_article_metadata_csv(result['article_metadata'], run_dir / "article_metadata.csv")
                     print(f"    Saved article_metadata.json and .csv ({len(result['article_metadata'])} articles)")
+
+                leaf_artifacts = _finalize_synthetic_leaf_artifacts(
+                    run_dir,
+                    output_dir,
+                    result=result,
+                    validation=validation,
+                    articles=articles,
+                    kernel=kernel,
+                    seed=seed,
+                    compute_alignment_metrics=_compute_alignment_metrics,
+                    extract_validation_label_info=_extract_validation_label_info,
+                )
+                verification_res = leaf_artifacts.get("verification_res", {})
+                if verification_res.get("status") != "success":
+                    print(f"    [VERIFY][WARN] {verification_res}")
+                else:
+                    print(f"    [VERIFY][OK] {verification_res.get('report_path')}")
 
                 # Petal glyph visualization (Track 1.5)
                 if 'spectral_probe_magnitudes' in result and 'spectral_evr' in result:
@@ -3487,6 +4947,35 @@ def main():
                 print(f"{'='*80}\n")
                 sys.stdout.flush()
 
+    # Refresh direct control metrics after all sibling corpora exist.
+    refreshed_control_metrics: List[str] = []
+    refreshed_contract_bundles: List[str] = []
+    refreshed_control_dirs: set[str] = set()
+    for res in results:
+        output_dir_str = res.get("output_dir")
+        if not output_dir_str:
+            continue
+        output_dir = Path(str(output_dir_str))
+        if not output_dir.exists():
+            continue
+        key = str(output_dir)
+        if key in refreshed_control_dirs:
+            continue
+        refreshed_control_dirs.add(key)
+        try:
+            refreshed_path = _emit_control_metrics_json(output_dir)
+            refreshed_control_metrics.append(str(refreshed_path))
+        except Exception as refresh_exc:
+            print(f"[CONTROL][WARN] Failed to refresh direct control metrics for {output_dir}: {refresh_exc}")
+        try:
+            bundle_res = emit_consumer_contract_bundle(output_dir)
+            if bundle_res.get("status") == "success":
+                refreshed_contract_bundles.append(str(output_dir))
+            else:
+                print(f"[CONTRACT][WARN] Failed to refresh consumer bundle for {output_dir}: {bundle_res}")
+        except Exception as bundle_exc:
+            print(f"[CONTRACT][WARN] Failed to refresh consumer bundle for {output_dir}: {bundle_exc}")
+
     # Save manifest
     config = {
         "limit": args.limit,
@@ -3509,7 +4998,9 @@ def main():
             "max_length": args.probe_max_length,
             "batch_size": args.probe_batch_size,
             "nonfatal": args.probe_nonfatal,
-        }
+        },
+        "refreshed_control_metrics": refreshed_control_metrics,
+        "refreshed_contract_bundles": refreshed_contract_bundles,
     }
     save_manifest(exp_dir, results, config)
 
@@ -4205,7 +5696,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
-
-
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

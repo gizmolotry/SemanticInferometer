@@ -80,9 +80,10 @@ try:
     from scipy.ndimage import gaussian_filter, binary_closing, binary_fill_holes, label as nd_label
     from scipy.spatial import Delaunay, cKDTree
     from scipy.spatial.distance import cdist, pdist, squareform
+    from scipy.special import kv as bessel_kv, gamma as gamma_fn
     from scipy.stats import gaussian_kde
     from sklearn.neighbors import NearestNeighbors
-    from sklearn.decomposition import PCA
+    from sklearn.decomposition import PCA, KernelPCA
     from sklearn.preprocessing import RobustScaler
     HAS_SCIPY = True
 except ImportError:
@@ -90,7 +91,8 @@ except ImportError:
 
 # WARNING: UMAP projection has been explicitly disabled.
 # Numba JIT compilation can cause indefinite hangs in certain Windows environments.
-# This visualizer defaults strictly to PCA for stable, instantaneous projection.
+# This visualizer defaults to deterministic sklearn projections. UMAP remains
+# disabled; the manifold frame is derived with PCA/KernelPCA only.
 umap = None
 HAS_UMAP = False
 
@@ -189,7 +191,9 @@ class DimensionalCollapseError(RuntimeError):
     """Raised when render geometry violates required dimensional variance."""
 
 
-LAYOUT_CONSTRAINTS = dict()
+LAYOUT_CONSTRAINTS = dict(
+    aspectmode='data',
+)
 
 # Singularity color mapping
 SINGULARITY_COLORS = {
@@ -369,6 +373,7 @@ class ExperimentData:
     verification_seed_stability: Optional[bool] = None
     verification_crn_locked: Optional[bool] = None
     provenance: Optional[Dict[str, Any]] = None       # weights_hash, basis_hash, alpha, crn_seed
+    kernel_basis_state: Optional[Dict[str, Any]] = None
 
 
 # =============================================================================
@@ -405,6 +410,14 @@ def _load_primary_observer_payload(experiment_dir: Optional[Path]) -> Optional[D
     if experiment_dir is None or not HAS_TORCH:
         return None
     exp_dir = Path(experiment_dir)
+    preferred = exp_dir / "observer_global.pt"
+    if preferred.exists():
+        try:
+            payload = torch.load(preferred, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
     for payload_path in sorted(exp_dir.glob("observer_*.pt")):
         try:
             payload = torch.load(payload_path, map_location="cpu", weights_only=False)
@@ -657,16 +670,33 @@ def load_epistemic_contract_data(experiment_dir: Path) -> Dict[str, Any]:
     }
 
 
-def load_experiment_data(experiment_dir: Path) -> ExperimentData:
+def load_experiment_data(experiment_dir: Path, observer_idx: Optional[int] = None) -> ExperimentData:
     """Load all experiment data from a seed directory."""
     experiment_dir = Path(experiment_dir)
+    
+    # ASTER v3.2: ROOT RELATIVITY
+    # Check if a physically distinct universe exists for this observer in the cache
+    rel_obs_dir = experiment_dir / "relativity_cache" / f"obs_{observer_idx}" if observer_idx is not None else None
+    
+    def _load_rel_or_base(filename: str):
+        # 1. Try observer-specific cache first
+        if rel_obs_dir and (rel_obs_dir / filename).exists():
+            return np.load(rel_obs_dir / filename)
+        # 2. Fall back to base run directory
+        if (experiment_dir / filename).exists():
+            return np.load(experiment_dir / filename)
+        return None
 
-    # ENFORCE CONTRACT
-    require_spectral_dna = os.environ.get("MONOLITH_REQUIRE_SPECTRAL_DNA", "1").strip() == "1"
-    ArtifactContract(experiment_dir, require_spectral_dna=require_spectral_dna).verify()
+    # ENFORCE CONTRACT (unless loading relativistic sub-artifacts)
+    if observer_idx is None:
+        require_spectral_dna = os.environ.get("MONOLITH_REQUIRE_SPECTRAL_DNA", "1").strip() == "1"
+        ArtifactContract(experiment_dir, require_spectral_dna=require_spectral_dna).verify()
 
-    # Required
-    features = np.load(experiment_dir / "features.npy")
+    # Required: features must exist (either global or observer-warped)
+    features = _load_rel_or_base("features.npy")
+    if features is None:
+        raise FileNotFoundError(f"Missing required artifact: features.npy in {experiment_dir}")
+    
     n_articles = len(features)
 
     # Extract kernel and seed from path
@@ -678,44 +708,19 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         seed = 42
 
     # Optional arrays
-    logits = None
-    if (experiment_dir / "logits.npy").exists():
-        logits = np.load(experiment_dir / "logits.npy")
+    logits = _load_rel_or_base("logits.npy")
+    integrated = _load_rel_or_base("integrated_vectors.npy")
+    dirichlet_fused = _load_rel_or_base("dirichlet_fused.npy")
+    dirichlet_fused_std = _load_rel_or_base("dirichlet_fused_std.npy")
+    spectral_evr = _load_rel_or_base("spectral_evr.npy")
+    spectral_probe_magnitudes = _load_rel_or_base("spectral_probe_magnitudes.npy")
+    spectral_dipole_valid = _load_rel_or_base("spectral_dipole_valid.npy")
+    spectral_u_axis = _load_rel_or_base("spectral_u_axis.npy")
+    antagonism = _load_rel_or_base("antagonism.npy")
+    logit_confidence = _load_rel_or_base("logit_confidence.npy")
+    walker_work_integrals = _load_rel_or_base("walker_work_integrals.npy")
 
-    integrated = None
-    if (experiment_dir / "integrated_vectors.npy").exists():
-        integrated = np.load(experiment_dir / "integrated_vectors.npy")
-
-    dirichlet_fused = None
-    if (experiment_dir / "dirichlet_fused.npy").exists():
-        dirichlet_fused = np.load(experiment_dir / "dirichlet_fused.npy")
-
-    dirichlet_fused_std = None
-    if (experiment_dir / "dirichlet_fused_std.npy").exists():
-        dirichlet_fused_std = np.load(experiment_dir / "dirichlet_fused_std.npy")
-
-    spectral_evr = None
-    if (experiment_dir / "spectral_evr.npy").exists():
-        spectral_evr = np.load(experiment_dir / "spectral_evr.npy")
-
-    # Track 1: Logit Confidence (max softmax prob across NLI classes)
-    logit_confidence = None
-    if (experiment_dir / "logit_confidence.npy").exists():
-        logit_confidence = np.load(experiment_dir / "logit_confidence.npy")
-
-    spectral_probe_magnitudes = None
-    if (experiment_dir / "spectral_probe_magnitudes.npy").exists():
-        spectral_probe_magnitudes = np.load(experiment_dir / "spectral_probe_magnitudes.npy")
-
-    spectral_dipole_valid = None
-    if (experiment_dir / "spectral_dipole_valid.npy").exists():
-        spectral_dipole_valid = np.load(experiment_dir / "spectral_dipole_valid.npy")
-
-    # Track 4: Walker
-    walker_work_integrals = None
-    if (experiment_dir / "walker_work_integrals.npy").exists():
-        walker_work_integrals = np.load(experiment_dir / "walker_work_integrals.npy")
-
+    # Track 4: Walker States (json)
     walker_states = None
     if (experiment_dir / "walker_states.json").exists():
         with open(experiment_dir / "walker_states.json") as f:
@@ -725,6 +730,9 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
     walker_path_diagnostics = None
     walker_path_space = None
     walker_paths_path = experiment_dir / "walker_paths.npz"
+    if rel_obs_dir and (rel_obs_dir / "walker_paths.npz").exists():
+        walker_paths_path = rel_obs_dir / "walker_paths.npz"
+
     if walker_paths_path.exists():
         try:
             path_data = np.load(walker_paths_path, allow_pickle=True)
@@ -985,6 +993,12 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
 
     # Epistemic contract data (verification/provenance)
     epistemic = load_epistemic_contract_data(experiment_dir)
+    projection_payload = _load_primary_observer_payload(experiment_dir)
+    kernel_basis_state = None
+    if isinstance(projection_payload, dict):
+        basis_candidate = projection_payload.get("rks_basis_state")
+        if isinstance(basis_candidate, dict):
+            kernel_basis_state = basis_candidate
 
     return ExperimentData(
         kernel=kernel,
@@ -1028,6 +1042,7 @@ def load_experiment_data(experiment_dir: Path) -> ExperimentData:
         verification_seed_stability=epistemic.get("seed_stability"),
         verification_crn_locked=epistemic.get("crn_locked"),
         provenance=epistemic.get("provenance"),
+        kernel_basis_state=kernel_basis_state,
     )
 
 
@@ -1107,6 +1122,126 @@ def compute_umap_2d(
         random_state=random_state,
     )
     return reducer.fit_transform(data)
+
+
+def _median_sigma(features: np.ndarray) -> float:
+    feat = np.asarray(features, dtype=float)
+    if feat.ndim != 2 or feat.shape[0] < 2:
+        return 1.0
+    try:
+        distances = pdist(feat, metric="euclidean")
+        distances = distances[np.isfinite(distances) & (distances > 1e-9)]
+        if distances.size > 0:
+            return max(float(np.nanmedian(distances)), 1e-6)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _resolve_projection_kernel_params(exp: ExperimentData, fit_matrix: np.ndarray) -> Dict[str, Any]:
+    basis = exp.kernel_basis_state if isinstance(exp.kernel_basis_state, dict) else {}
+    provenance = exp.provenance if isinstance(exp.provenance, dict) else {}
+    kernel_type = str(
+        basis.get("kernel_type")
+        or provenance.get("kernel_type")
+        or exp.kernel
+        or "rbf"
+    ).strip().lower()
+    sigma = basis.get("sigma", provenance.get("kernel_sigma"))
+    try:
+        sigma = float(sigma)
+    except Exception:
+        sigma = _median_sigma(fit_matrix)
+    sigma = max(float(sigma), 1e-6)
+    try:
+        nu = float(basis.get("nu", 1.5))
+    except Exception:
+        nu = 1.5
+    try:
+        roughness = float(basis.get("roughness", 3))
+    except Exception:
+        roughness = 3.0
+    return {
+        "kernel_type": kernel_type,
+        "sigma": sigma,
+        "nu": max(nu, 1e-6),
+        "roughness": max(roughness, 0.5),
+    }
+
+
+def _build_projection_kernel_callable(kernel_params: Dict[str, Any]):
+    kernel_type = str(kernel_params.get("kernel_type", "rbf")).strip().lower()
+    sigma = max(float(kernel_params.get("sigma", 1.0)), 1e-6)
+    nu = max(float(kernel_params.get("nu", 1.5)), 1e-6)
+    roughness = max(float(kernel_params.get("roughness", 3.0)), 0.5)
+
+    def _kernel(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        x = np.atleast_2d(np.asarray(x, dtype=float))
+        y = np.atleast_2d(np.asarray(y, dtype=float))
+        d2 = np.maximum(cdist(x, y, metric="sqeuclidean"), 0.0)
+        if kernel_type in {"rbf", "gaussian"}:
+            return np.exp(-0.5 * d2 / (sigma ** 2))
+        if kernel_type == "imq":
+            beta = max(roughness / 2.0, 0.5)
+            return np.power(1.0 + (d2 / (sigma ** 2)), -beta)
+        if kernel_type == "matern":
+            r = np.sqrt(d2) / sigma
+            if abs(nu - 0.5) < 1e-6:
+                return np.exp(-r)
+            if abs(nu - 1.5) < 1e-6:
+                scaled = np.sqrt(3.0) * r
+                return (1.0 + scaled) * np.exp(-scaled)
+            if abs(nu - 2.5) < 1e-6:
+                scaled = np.sqrt(5.0) * r
+                return (1.0 + scaled + (5.0 * (r ** 2) / 3.0)) * np.exp(-scaled)
+            scaled = np.sqrt(2.0 * nu) * r
+            scaled = np.maximum(scaled, 1e-12)
+            coeff = (2.0 ** (1.0 - nu)) / float(gamma_fn(nu))
+            result = coeff * np.power(scaled, nu) * bessel_kv(nu, scaled)
+            result = np.asarray(result, dtype=float)
+            result[~np.isfinite(result)] = 0.0
+            result[r <= 1e-12] = 1.0
+            return result
+        return np.exp(-0.5 * d2 / (sigma ** 2))
+
+    return _kernel
+
+
+def build_kernel_pca_projection(
+    exp: ExperimentData,
+    fit_matrix: np.ndarray,
+    n_components: int = 3,
+    random_state: int = 42,
+):
+    fit_matrix = np.asarray(fit_matrix, dtype=float)
+    kernel_params = _resolve_projection_kernel_params(exp, fit_matrix)
+    kernel_callable = _build_projection_kernel_callable(kernel_params)
+    try:
+        kpca = KernelPCA(
+            n_components=n_components,
+            kernel=kernel_callable,
+            eigen_solver="auto",
+            fit_inverse_transform=False,
+            remove_zero_eig=True,
+            random_state=random_state,
+        )
+        kpca.fit(fit_matrix)
+        return kpca, kernel_params
+    except Exception as exc:
+        print(f"[MONOLITH][WARN] KernelPCA callable fit failed ({kernel_params['kernel_type']}): {exc}")
+        fallback = KernelPCA(
+            n_components=n_components,
+            kernel="rbf",
+            gamma=1.0 / max(2.0 * (kernel_params["sigma"] ** 2), 1e-6),
+            eigen_solver="auto",
+            fit_inverse_transform=False,
+            remove_zero_eig=True,
+            random_state=random_state,
+        )
+        fallback.fit(fit_matrix)
+        fallback_params = dict(kernel_params)
+        fallback_params["kernel_type"] = "rbf"
+        return fallback, fallback_params
 
 
 # =============================================================================
@@ -1297,8 +1432,9 @@ def _interpolate_field_boundary_safe(
     values: np.ndarray,
     Xi: np.ndarray,
     Yi: np.ndarray,
-    fill_value: float,
+    fill_value: Optional[float],
     clip_to_source: bool = True,
+    preserve_nan: bool = False,
 ) -> np.ndarray:
     """
     Continuous, boundary-safe interpolation helper.
@@ -1308,14 +1444,16 @@ def _interpolate_field_boundary_safe(
     the entire manifold.
     """
     if not HAS_SCIPY:
-        return np.full_like(Xi, fill_value, dtype=float)
+        fallback = np.nan if preserve_nan else (fill_value if fill_value is not None else 0.0)
+        return np.full_like(Xi, fallback, dtype=float)
 
     xv = np.asarray(x, dtype=float).ravel()
     yv = np.asarray(y, dtype=float).ravel()
     vv = np.asarray(values, dtype=float).ravel()
     m = np.isfinite(xv) & np.isfinite(yv) & np.isfinite(vv)
     if int(np.count_nonzero(m)) < 3:
-        return np.full_like(Xi, fill_value, dtype=float)
+        fallback = np.nan if preserve_nan else (fill_value if fill_value is not None else 0.0)
+        return np.full_like(Xi, fallback, dtype=float)
 
     xv = xv[m]
     yv = yv[m]
@@ -1335,7 +1473,27 @@ def _interpolate_field_boundary_safe(
 
     src_min = float(np.nanmin(vv))
     src_max = float(np.nanmax(vv))
-    src_fill = float(np.nanmean(vv)) if vv.size else fill_value
+    src_fill = float(np.nanmean(vv)) if vv.size else (float(fill_value) if fill_value is not None else 0.0)
+
+    if preserve_nan:
+        # Canonical manifold mode: preserve real support boundaries without
+        # collapsing the surface into a piecewise-linear triangle mesh.
+        try:
+            Zi = griddata((xv, yv), vv, (Xi, Yi), method='cubic')
+        except Exception:
+            try:
+                Zi = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=np.nan)
+            except Exception:
+                Zi = np.full_like(Xi, np.nan, dtype=float)
+        if Zi is not None and np.isnan(Zi).any():
+            try:
+                Zi_linear = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=np.nan)
+                Zi = np.where(np.isnan(Zi), Zi_linear, Zi)
+            except Exception:
+                pass
+        if clip_to_source and np.isfinite(src_min) and np.isfinite(src_max):
+            Zi = np.clip(Zi, src_min, src_max)
+        return np.asarray(Zi, dtype=float)
 
     try:
         Zi = griddata((xv, yv), vv, (Xi, Yi), method='cubic')
@@ -1344,9 +1502,9 @@ def _interpolate_field_boundary_safe(
 
     if Zi is None:
         try:
-            Zi = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=src_fill)
+            Zi = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=(np.nan if preserve_nan else src_fill))
         except Exception:
-            Zi = np.full_like(Xi, src_fill, dtype=float)
+            Zi = np.full_like(Xi, np.nan if preserve_nan else src_fill, dtype=float)
     else:
         nan_mask = np.isnan(Zi)
         if np.any(nan_mask):
@@ -1371,12 +1529,14 @@ def _interpolate_field_boundary_safe(
                 pass
             if np.isnan(Zi).any():
                 try:
-                    Zi_linear = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=src_fill)
+                    Zi_linear = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=(np.nan if preserve_nan else src_fill))
                     Zi = np.where(np.isnan(Zi), Zi_linear, Zi)
                 except Exception:
-                    Zi = np.where(np.isnan(Zi), src_fill, Zi)
+                    if not preserve_nan:
+                        Zi = np.where(np.isnan(Zi), src_fill, Zi)
 
-    Zi = np.nan_to_num(Zi, nan=src_fill, posinf=src_fill, neginf=src_fill)
+    if not preserve_nan:
+        Zi = np.nan_to_num(Zi, nan=src_fill, posinf=src_fill, neginf=src_fill)
     if clip_to_source and np.isfinite(src_min) and np.isfinite(src_max):
         Zi = np.clip(Zi, src_min, src_max)
     return Zi
@@ -1424,6 +1584,7 @@ def render_terrain_surface(
     rupture_segments_2d: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     rupture_tear_radius_scale: float = 0.02,
     terrain_support_xy: Optional[np.ndarray] = None,
+    terrain_geometry_xyz: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[Any], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     ASTER v3.2 BI-AXIAL TERRAIN SURFACE
@@ -1460,6 +1621,17 @@ def render_terrain_surface(
     x = positions_3d[:, 0]
     y = positions_3d[:, 1]
     terrain_xy = np.column_stack([x, y])
+    geometry_xyz = np.asarray(terrain_geometry_xyz, dtype=float) if terrain_geometry_xyz is not None else np.asarray(positions_3d[:, :3], dtype=float)
+    if geometry_xyz.ndim != 2 or geometry_xyz.shape[0] < 3 or geometry_xyz.shape[1] < 3:
+        geometry_xyz = np.asarray(positions_3d[:, :3], dtype=float)
+    geom_finite = np.isfinite(geometry_xyz[:, :3]).all(axis=1)
+    geometry_xyz = geometry_xyz[geom_finite]
+    if geometry_xyz.shape[0] < 3:
+        geometry_xyz = np.asarray(positions_3d[:, :3], dtype=float)
+    geometry_x = np.asarray(geometry_xyz[:, 0], dtype=float)
+    geometry_y = np.asarray(geometry_xyz[:, 1], dtype=float)
+    canonical_surface_mode = os.environ.get("MONOLITH_CANONICAL_SURFACE", "0").strip() != "0"
+    strict_support_mode = canonical_surface_mode or os.environ.get("MONOLITH_STRICT_SUPPORT", "0").strip() == "1"
     support_xy = terrain_xy
     if terrain_support_xy is not None:
         try:
@@ -1472,7 +1644,11 @@ def render_terrain_surface(
         except Exception:
             support_xy = terrain_xy
 
-    margin = 0.15
+    try:
+        margin = float(os.environ.get("MONOLITH_TERRAIN_MARGIN", "0.01" if strict_support_mode else "0.15").strip())
+    except Exception:
+        margin = 0.01 if strict_support_mode else 0.15
+    margin = max(0.0, margin)
     x_support = support_xy[:, 0]
     y_support = support_xy[:, 1]
     x_range = x_support.max() - x_support.min()
@@ -1500,67 +1676,117 @@ def render_terrain_surface(
         xy_points = np.empty((0, 2), dtype=float)
     if xy_points.shape[0] >= 3:
         grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
-        occupancy_score = None
-        if xy_points.shape[0] >= 4:
-            try:
-                kde = gaussian_kde(xy_points.T)
-                support_score = np.asarray(kde(xy_points.T), dtype=float).reshape(-1)
-                occupancy_score = np.asarray(kde(grid_points.T), dtype=float).reshape(Xi.shape)
-                max_score = float(np.nanmax(occupancy_score))
-                if np.isfinite(max_score) and max_score > 1e-12:
-                    occupancy_score = occupancy_score / max_score
-                    support_score = support_score / max_score
-                    finite_support = support_score[np.isfinite(support_score)]
-                    if finite_support.size > 0:
-                        occupancy_cutoff = max(float(np.percentile(finite_support, 15.0)) * 0.20, 0.035)
-                        occupancy_mask = occupancy_score >= occupancy_cutoff
-            except Exception:
-                occupancy_score = None
-        if occupancy_mask is None and xy_points.shape[0] >= 4:
-            try:
-                tree = cKDTree(xy_points)
-                k = min(3, xy_points.shape[0] - 1)
-                if k >= 1:
-                    nn_distances, _ = tree.query(xy_points, k=k + 1)
-                    local_scale = np.asarray(nn_distances[:, -1], dtype=float)
-                    local_scale = local_scale[np.isfinite(local_scale)]
-                    if local_scale.size > 0:
-                        local_radius = np.asarray(nn_distances[:, -1], dtype=float)
-                        local_radius = np.where(
-                            np.isfinite(local_radius),
-                            local_radius,
-                            float(np.nanmedian(local_scale)),
-                        )
-                        support_radius = float(np.percentile(local_scale, 60))
-                        support_radius = max(support_radius * 0.9, max(x_range_safe, y_range_safe) * 0.015)
-                        local_radius = np.clip(local_radius * 0.9, support_radius * 0.5, support_radius * 1.1)
-                        grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
-                        local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
-                        occupancy_mask = (
-                            np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
-                            <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
-                        )
-            except Exception:
-                occupancy_mask = None
-        if occupancy_mask is None:
+        if strict_support_mode and xy_points.shape[0] >= 4:
+            delaunay_mask = None
             try:
                 tri = Delaunay(xy_points)
                 simplex = tri.find_simplex(grid_points)
-                occupancy_mask = (simplex >= 0).reshape(Xi.shape)
+                delaunay_mask = (simplex >= 0).reshape(Xi.shape)
+            except Exception:
+                delaunay_mask = None
+            try:
+                tree = cKDTree(xy_points)
+                k = min(4, xy_points.shape[0] - 1)
+                nn_distances, nn_index = tree.query(xy_points, k=k + 1)
+                local_scale = np.asarray(nn_distances[:, -1], dtype=float)
+                finite_scale = local_scale[np.isfinite(local_scale) & (local_scale > 0)]
+                if finite_scale.size > 0:
+                    support_radius = float(np.percentile(finite_scale, 70))
+                    support_radius = max(support_radius * 1.35, max(x_range_safe, y_range_safe) * 0.012)
+                    grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
+                    local_radius = np.asarray(local_scale, dtype=float)
+                    local_radius = np.where(np.isfinite(local_radius), local_radius, support_radius)
+                    local_radius = np.clip(local_radius * 1.15, support_radius * 0.65, support_radius * 1.6)
+                    local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
+                    occupancy_mask = (
+                        np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
+                        <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
+                    )
             except Exception:
                 occupancy_mask = None
+            if occupancy_mask is not None and delaunay_mask is not None:
+                occupancy_mask = occupancy_mask & delaunay_mask
+                retained = float(np.mean(occupancy_mask))
+                delaunay_retained = float(np.mean(delaunay_mask))
+                # Guardrail: canonical support must not collapse to a near-empty surface.
+                if retained < 0.035 and delaunay_retained > retained:
+                    print(
+                        "[MONOLITH][WARN] Canonical support mask overly sparse; "
+                        f"retained={retained:.4f}. Falling back to Delaunay support."
+                    )
+                    occupancy_mask = delaunay_mask
+            elif occupancy_mask is None:
+                occupancy_mask = delaunay_mask
+        else:
+            occupancy_score = None
+            if xy_points.shape[0] >= 4:
+                try:
+                    tri = Delaunay(xy_points)
+                    simplex = tri.find_simplex(grid_points)
+                    occupancy_mask = (simplex >= 0).reshape(Xi.shape)
+                except Exception:
+                    occupancy_mask = None
+            if occupancy_mask is None and xy_points.shape[0] >= 4:
+                try:
+                    kde = gaussian_kde(xy_points.T)
+                    support_score = np.asarray(kde(xy_points.T), dtype=float).reshape(-1)
+                    occupancy_score = np.asarray(kde(grid_points.T), dtype=float).reshape(Xi.shape)
+                    max_score = float(np.nanmax(occupancy_score))
+                    if np.isfinite(max_score) and max_score > 1e-12:
+                        occupancy_score = occupancy_score / max_score
+                        support_score = support_score / max_score
+                        finite_support = support_score[np.isfinite(support_score)]
+                        if finite_support.size > 0:
+                            occupancy_cutoff = max(float(np.percentile(finite_support, 15.0)) * 0.20, 0.035)
+                            occupancy_mask = occupancy_score >= occupancy_cutoff
+                except Exception:
+                    occupancy_score = None
+            if occupancy_mask is None and xy_points.shape[0] >= 4:
+                try:
+                    tree = cKDTree(xy_points)
+                    k = min(3, xy_points.shape[0] - 1)
+                    if k >= 1:
+                        nn_distances, _ = tree.query(xy_points, k=k + 1)
+                        local_scale = np.asarray(nn_distances[:, -1], dtype=float)
+                        local_scale = local_scale[np.isfinite(local_scale)]
+                        if local_scale.size > 0:
+                            local_radius = np.asarray(nn_distances[:, -1], dtype=float)
+                            local_radius = np.where(
+                                np.isfinite(local_radius),
+                                local_radius,
+                                float(np.nanmedian(local_scale)),
+                            )
+                            support_radius = float(np.percentile(local_scale, 60))
+                            support_radius = max(support_radius * 0.9, max(x_range_safe, y_range_safe) * 0.015)
+                            local_radius = np.clip(local_radius * 0.9, support_radius * 0.5, support_radius * 1.1)
+                            grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
+                            local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
+                            occupancy_mask = (
+                                np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
+                                <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
+                            )
+                except Exception:
+                    occupancy_mask = None
+            if occupancy_mask is None:
+                try:
+                    tri = Delaunay(xy_points)
+                    simplex = tri.find_simplex(grid_points)
+                    occupancy_mask = (simplex >= 0).reshape(Xi.shape)
+                except Exception:
+                    occupancy_mask = None
     support_occupancy_mask = None
     if occupancy_mask is not None:
         try:
             occupancy_mask = np.asarray(occupancy_mask, dtype=bool)
-            occupancy_mask = binary_closing(occupancy_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
-            occupancy_mask = binary_fill_holes(occupancy_mask)
-            labeled, n_components = nd_label(occupancy_mask)
-            if int(n_components) > 1:
-                component_sizes = np.bincount(labeled.ravel())
-                component_sizes[0] = 0
-                keep_label = int(np.argmax(component_sizes))
-                occupancy_mask = labeled == keep_label
+            if not canonical_surface_mode:
+                occupancy_mask = binary_closing(occupancy_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
+                occupancy_mask = binary_fill_holes(occupancy_mask)
+                labeled, n_components = nd_label(occupancy_mask)
+                if int(n_components) > 1:
+                    component_sizes = np.bincount(labeled.ravel())
+                    component_sizes[0] = 0
+                    keep_label = int(np.argmax(component_sizes))
+                    occupancy_mask = labeled == keep_label
         except Exception:
             occupancy_mask = np.asarray(occupancy_mask, dtype=bool)
         support_occupancy_mask = occupancy_mask
@@ -1602,7 +1828,10 @@ def render_terrain_surface(
         stress_values = terrain_stress_geometry
     else:
         # Deterministic fallback: use provided terrain energy / point z values.
-        stress_values = energy_values if energy_values is not None else positions_3d[:, 2]
+        if geometry_xyz.shape[0] == len(np.asarray(energy_values if energy_values is not None else positions_3d[:, 2], dtype=float).reshape(-1)):
+            stress_values = energy_values if energy_values is not None else geometry_xyz[:, 2]
+        else:
+            stress_values = geometry_xyz[:, 2]
     try:
         print(
             f"[MONOLITH][TERRAIN] geometry_input range="
@@ -1613,23 +1842,24 @@ def render_terrain_surface(
         pass
 
     grid_stress = _interpolate_field_boundary_safe(
-        x=x,
-        y=y,
+        x=geometry_x,
+        y=geometry_y,
         values=stress_values,
         Xi=Xi,
         Yi=Yi,
-        fill_value=float(np.nanmean(np.asarray(stress_values, dtype=float))),
+        fill_value=(None if canonical_surface_mode else float(np.nanmean(np.asarray(stress_values, dtype=float)))),
         clip_to_source=True,
+        preserve_nan=canonical_surface_mode,
     )
 
-    # Smooth geometry field.
-    grid_stress = gaussian_filter(grid_stress, sigma=1.5)
+    if not canonical_surface_mode:
+        grid_stress = gaussian_filter(grid_stress, sigma=1.5)
     # Coordinate contract: terrain Z must remain in the same numeric domain as
     # article point Z, otherwise camera autoscaling can visually flatten/erase the manifold.
     z_geometry = np.asarray(grid_stress, dtype=float).copy()
     try:
         pts_z = np.asarray(positions_3d[:, 2], dtype=float)
-        base_geometry = np.asarray(energy_values if energy_values is not None else pts_z, dtype=float).reshape(-1)
+        base_geometry = np.asarray(geometry_xyz[:, 2], dtype=float).reshape(-1)
         stress_geometry = np.asarray(stress_values, dtype=float).reshape(-1)
         blend_ratio = float(os.environ.get("MONOLITH_TERRAIN_STRESS_BLEND", "0.35").strip())
         blend_ratio = float(np.clip(blend_ratio, 0.0, 1.0))
@@ -1651,31 +1881,35 @@ def render_terrain_surface(
 
         base_norm = _robust_norm(base_geometry)
         stress_norm = _robust_norm(stress_geometry)
-        if np.nanstd(stress_norm) > 1e-6:
+        if canonical_surface_mode:
+            geom_source = stress_geometry
+        elif np.nanstd(stress_norm) > 1e-6:
             geom_source = ((1.0 - blend_ratio) * base_norm) + (blend_ratio * stress_norm)
         else:
             geom_source = base_norm
         grid_geom = _interpolate_field_boundary_safe(
-            x=x,
-            y=y,
+            x=geometry_x,
+            y=geometry_y,
             values=geom_source,
             Xi=Xi,
             Yi=Yi,
-            fill_value=float(np.nanmean(np.asarray(geom_source, dtype=float))),
+            fill_value=(None if canonical_surface_mode else float(np.nanmean(np.asarray(geom_source, dtype=float)))),
             clip_to_source=True,
+            preserve_nan=canonical_surface_mode,
         )
-        grid_geom = gaussian_filter(grid_geom, sigma=1.1)
+        if not canonical_surface_mode:
+            grid_geom = gaussian_filter(grid_geom, sigma=1.1)
         z_geometry = np.asarray(grid_geom, dtype=float).copy()
-
-        pts_min = float(np.nanmin(pts_z))
-        pts_max = float(np.nanmax(pts_z))
-        g_min = float(np.nanmin(z_geometry))
-        g_max = float(np.nanmax(z_geometry))
-        if np.isfinite(g_min) and np.isfinite(g_max) and (g_max - g_min) > 1e-12:
-            z_geometry = (z_geometry - g_min) / (g_max - g_min)
-            z_geometry = z_geometry * (pts_max - pts_min) + pts_min
-        else:
-            z_geometry = np.full_like(z_geometry, pts_min)
+        if not canonical_surface_mode:
+            pts_min = float(np.nanmin(pts_z))
+            pts_max = float(np.nanmax(pts_z))
+            g_min = float(np.nanmin(z_geometry))
+            g_max = float(np.nanmax(z_geometry))
+            if np.isfinite(g_min) and np.isfinite(g_max) and (g_max - g_min) > 1e-12:
+                z_geometry = (z_geometry - g_min) / (g_max - g_min)
+                z_geometry = z_geometry * (pts_max - pts_min) + pts_min
+            else:
+                z_geometry = np.full_like(z_geometry, pts_min)
     except Exception:
         pass
     try:
@@ -1701,8 +1935,9 @@ def render_terrain_surface(
             values=terrain_density,
             Xi=Xi,
             Yi=Yi,
-            fill_value=0.5,
+            fill_value=(None if canonical_surface_mode else 0.5),
             clip_to_source=True,
+            preserve_nan=canonical_surface_mode,
         )
         grid_stress_color = _interpolate_field_boundary_safe(
             x=x,
@@ -1710,13 +1945,14 @@ def render_terrain_surface(
             values=terrain_stress,
             Xi=Xi,
             Yi=Yi,
-            fill_value=0.5,
+            fill_value=(None if canonical_surface_mode else 0.5),
             clip_to_source=True,
+            preserve_nan=canonical_surface_mode,
         )
 
-        # Apply light smoothing for visual continuity
-        grid_density = gaussian_filter(grid_density, sigma=1.0)
-        grid_stress_color = gaussian_filter(grid_stress_color, sigma=1.0)
+        if not canonical_surface_mode:
+            grid_density = gaussian_filter(grid_density, sigma=1.0)
+            grid_stress_color = gaussian_filter(grid_stress_color, sigma=1.0)
 
         # Color channel expects manifold axes in [0, 1].
         # Normalize against source ranges (not smoothed grid ranges) to avoid
@@ -1802,7 +2038,27 @@ def render_terrain_surface(
         cmin, cmax = None, None
         colorbar_config = dict(title="Height", len=0.5, x=1.02)
 
-    z_finite = z_geometry[np.isfinite(z_geometry)]
+    # ASTER v3.2: Vertical Microscope (Root Relativity)
+    # Stretch Z to the visible scale to reveal microscopic warping (~1e-6).
+    # If the Z range is too small, it effectively looks like a flat sheet.
+    try:
+        z_finite = z_geometry[np.isfinite(z_geometry)]
+        if z_finite.size > 0:
+            z_min = float(np.nanmin(z_finite))
+            z_max = float(np.nanmax(z_finite))
+            z_ptp = z_max - z_min
+            
+            # Apply dynamic Vertical Microscope scaling
+            target_span = float(z_scale)
+            if z_ptp > 1e-12:
+                # Normalize and scale to [0, target_span]
+                z_geometry = (z_geometry - z_min) / z_ptp * target_span
+                print(f"[MONOLITH] Vertical Microscope: scaled Z-span {z_ptp:.2e} -> {target_span:.1f}")
+            else:
+                z_geometry = np.full_like(z_geometry, 0.0)
+    except Exception as e:
+        print(f"[WARN] Vertical Microscope failed: {e}")
+
     show_surface_contours = os.environ.get("MONOLITH_SHOW_SURFACE_CONTOURS", "0").strip() == "1"
     contour_cfg = dict(z=dict(show=False))
     if show_surface_contours and z_finite.size >= 2:
@@ -2548,11 +2804,54 @@ def render_phantom_paths_3d(
         ])
         return out.astype(float)
 
+    def _collect_canonical_terrain_samples(
+        article_xyz: np.ndarray,
+        walker_paths: Dict[int, np.ndarray],
+        max_points_per_segment: int = 18,
+    ) -> np.ndarray:
+        chunks: List[np.ndarray] = [np.asarray(article_xyz[:, :3], dtype=float)]
+        if isinstance(walker_paths, dict):
+            for raw_idx, raw_path in walker_paths.items():
+                try:
+                    idx = int(raw_idx)
+                except Exception:
+                    continue
+                if idx < 0 or idx >= len(article_xyz):
+                    continue
+                path_xyz = np.asarray(raw_path[:, :3], dtype=float).copy()
+                if path_xyz.ndim != 2 or path_xyz.shape[0] < 2 or path_xyz.shape[1] < 3:
+                    continue
+                finite_rows = np.isfinite(path_xyz[:, :3]).all(axis=1)
+                path_xyz = path_xyz[finite_rows]
+                if path_xyz.shape[0] < 2:
+                    continue
+                path_xyz[0, :3] = np.asarray(article_xyz[idx, :3], dtype=float)
+                for seg in _split_finite_segments(path_xyz):
+                    seg = np.asarray(seg[:, :3], dtype=float)
+                    if seg.shape[0] < 2:
+                        continue
+                    seg = _resample_segment_xyz(seg, max_points=max_points_per_segment)
+                    if seg.shape[0] >= 2:
+                        chunks.append(seg)
+        samples = np.vstack(chunks) if chunks else np.asarray(article_xyz[:, :3], dtype=float)
+        finite_rows = np.isfinite(samples[:, :3]).all(axis=1)
+        samples = samples[finite_rows]
+        if samples.shape[0] <= 0:
+            return np.asarray(article_xyz[:, :3], dtype=float)
+        try:
+            _, uniq_idx = np.unique(np.round(samples[:, :3], decimals=6), axis=0, return_index=True)
+            samples = samples[np.sort(uniq_idx)]
+        except Exception:
+            pass
+        return np.asarray(samples[:, :3], dtype=float)
+
     def _clip_xy_to_support(seg_xyz: np.ndarray) -> np.ndarray:
         seg = np.asarray(seg_xyz, dtype=float).copy()
         if seg.ndim != 2 or seg.shape[1] < 2:
             return seg
-        if callable(surface_xy_projector):
+        clip_default = "1" if callable(surface_xy_projector) else "0"
+        clip_paths_to_support = os.environ.get("MONOLITH_CLIP_PATHS_TO_SUPPORT", "0").strip() == "1"
+        if clip_paths_to_support and callable(surface_xy_projector):
             try:
                 proj_x, proj_y = surface_xy_projector(seg[:, 0], seg[:, 1])
                 proj_x = np.asarray(proj_x, dtype=float).reshape(-1)
@@ -2563,8 +2862,9 @@ def render_phantom_paths_3d(
                     seg[finite_proj, 1] = proj_y[finite_proj]
             except Exception:
                 pass
-        seg[:, 0] = np.clip(seg[:, 0], x_clip_min, x_clip_max)
-        seg[:, 1] = np.clip(seg[:, 1], y_clip_min, y_clip_max)
+        if clip_paths_to_support:
+            seg[:, 0] = np.clip(seg[:, 0], x_clip_min, x_clip_max)
+            seg[:, 1] = np.clip(seg[:, 1], y_clip_min, y_clip_max)
         return seg
 
     def _append_batched_ribbon_segments(
@@ -3004,11 +3304,14 @@ def render_phantom_paths_3d(
                 continue
             start_xyz = finite_path[0, :3].astype(float)
             end_xyz = finite_path[-1, :3].astype(float)
-            start_xyz[0] = float(np.clip(start_xyz[0], x_clip_min, x_clip_max))
-            start_xyz[1] = float(np.clip(start_xyz[1], y_clip_min, y_clip_max))
-            end_xyz[0] = float(np.clip(end_xyz[0], x_clip_min, x_clip_max))
-            end_xyz[1] = float(np.clip(end_xyz[1], y_clip_min, y_clip_max))
-            if callable(surface_xy_projector):
+            clip_default = "1" if callable(surface_xy_projector) else "0"
+            clip_paths_to_support = os.environ.get("MONOLITH_CLIP_PATHS_TO_SUPPORT", "0").strip() == "1"
+            if clip_paths_to_support:
+                start_xyz[0] = float(np.clip(start_xyz[0], x_clip_min, x_clip_max))
+                start_xyz[1] = float(np.clip(start_xyz[1], y_clip_min, y_clip_max))
+                end_xyz[0] = float(np.clip(end_xyz[0], x_clip_min, x_clip_max))
+                end_xyz[1] = float(np.clip(end_xyz[1], y_clip_min, y_clip_max))
+            if clip_paths_to_support and callable(surface_xy_projector):
                 try:
                     proj_x, proj_y = surface_xy_projector(
                         np.array([start_xyz[0], end_xyz[0]], dtype=float),
@@ -4053,6 +4356,7 @@ def render_data_points_3d(
     article_z_height: Optional[np.ndarray] = None, # New parameter for exact Z positioning
     article_color_codes: Optional[np.ndarray] = None, # New parameter for exact color coding
     article_uids: Optional[List[str]] = None,
+    article_symbols: Optional[List[str]] = None, # ASTER v3.2: Allow custom symbols (e.g. star for focus)
 ) -> List[Any]:
     """
     Render data points with bloom effect.
@@ -4174,7 +4478,7 @@ def render_data_points_3d(
             size=np.maximum(adjusted_sizes * 3.6, 18),
             color='rgba(255,255,255,0.001)',
             line=dict(width=0),
-            symbol='circle',
+            symbol=article_symbols if article_symbols is not None else 'circle',
         ),
         hovertext=hover_texts,
         customdata=custom_point_identity,
@@ -4199,7 +4503,7 @@ def render_data_points_3d(
             size=adjusted_sizes * 1.2,  # Larger core for easier clicking
             color=point_colors,  # RGBA with per-point opacity
             line=dict(color='white', width=1.5),  # Thicker white outline
-            symbol='circle',  # Explicit circle shape
+            symbol=article_symbols if article_symbols is not None else 'circle',
         ),
         customdata=custom_point_identity,
         hoverinfo='skip',
@@ -4996,9 +5300,18 @@ def create_monolith_cockpit(
         unified_density = monolith_df['density'].values
         unified_stress = monolith_df['stress'].values
         unified_z_height = monolith_df['z_height'].values
-        raw_zones = monolith_df['zone'].values
+        collapsed_density = float(np.ptp(np.asarray(unified_density, dtype=float))) <= 1e-9
+        collapsed_z_height = float(np.ptp(np.asarray(unified_z_height, dtype=float))) <= 1e-9
+        
+        # ASTER v3.2: Prioritize ground-truth group_topic for synthetic labeling/coloring
+        if 'group_topic' in monolith_df.columns:
+            raw_zones = monolith_df['group_topic'].values
+            print("[MONOLITH] Synthetic run detected: using 'group_topic' for Zone coloring.")
+        else:
+            raw_zones = monolith_df['zone'].values
+            
         unified_zones = np.array([canonicalize_zone_name(z) for z in raw_zones], dtype=object)
-        unified_color_codes = np.array([ZONE_COLOR_MAP[z] for z in unified_zones], dtype=object)
+        unified_color_codes = np.array([ZONE_COLOR_MAP.get(z, "#888") for z in unified_zones], dtype=object)
         if np.any(unified_zones != raw_zones):
             remap_counts = Counter(zip(raw_zones.tolist(), unified_zones.tolist()))
             print(f"[MONOLITH] Canonicalized legacy zones from MONOLITH_DATA.csv: {dict(remap_counts)}")
@@ -5007,19 +5320,40 @@ def create_monolith_cockpit(
         global_density_median = np.percentile(unified_density, 50)
         global_stress_median = np.percentile(unified_stress, 50)
 
-        # Replace existing calculations with unified metrics
-        terrain_density = unified_density
-        terrain_stress = unified_stress
-        energy_values_for_points = unified_z_height # Z-height for points is the calculated unified Z
-        # Deterministic terrain geometry contract: use unified z_height.
-        energy_values_for_terrain = unified_z_height
+        if collapsed_density or collapsed_z_height:
+            print(
+                "[MONOLITH][WARN] MONOLITH_DATA.csv manifold metrics collapsed "
+                f"(density_ptp={float(np.ptp(np.asarray(unified_density, dtype=float))):.6g}, "
+                f"z_ptp={float(np.ptp(np.asarray(unified_z_height, dtype=float))):.6g}); "
+                "recomputing terrain field from live physics payloads."
+            )
+            walker_resistance_values = np.array([
+                phantom_verdicts[i].get('w_actual', 0.5) if i < len(phantom_verdicts) else 0.5
+                for i in range(n_articles)
+            ], dtype=float)
+            blinker_values = np.asarray(fog_intensity, dtype=float)
+            terrain_density, terrain_stress, terrain_scalar = compute_terrain_field(
+                blinker_values, walker_resistance_values
+            )
+            energy_values_for_points = np.asarray(terrain_scalar, dtype=float)
+            energy_values_for_terrain = np.asarray(terrain_scalar, dtype=float).copy()
+            unified_density = np.asarray(terrain_density, dtype=float)
+            unified_stress = np.asarray(terrain_stress, dtype=float)
+            unified_z_height = np.asarray(energy_values_for_points, dtype=float)
+        else:
+            # Replace existing calculations with unified metrics
+            terrain_density = unified_density
+            terrain_stress = unified_stress
+            energy_values_for_points = unified_z_height # Z-height for points is the calculated unified Z
+            # Deterministic terrain geometry contract: use unified z_height.
+            energy_values_for_terrain = unified_z_height
 
-        # Re-derive atmospheric states for fog/bond based on unified_density (Track 2 - Density)
-        # Using unified_density as proxy for inverse blinker_magnitude.
-        # Higher density = lower variance (less fog)
-        blinker_magnitude_proxy = 1.0 - unified_density # Inverse of density
-        fog_intensity, is_fog, is_bond = compute_fog_intensity(blinker_magnitude_proxy)
-        atmospheric_states = classify_atmospheric_state(blinker_magnitude_proxy)
+            # Re-derive atmospheric states for fog/bond based on unified_density (Track 2 - Density)
+            # Using unified_density as proxy for inverse blinker_magnitude.
+            # Higher density = lower variance (less fog)
+            blinker_magnitude_proxy = 1.0 - unified_density # Inverse of density
+            fog_intensity, is_fog, is_bond = compute_fog_intensity(blinker_magnitude_proxy)
+            atmospheric_states = classify_atmospheric_state(blinker_magnitude_proxy)
 
         print(f"[MONOLITH] Using unified metrics: density=[{terrain_density.min():.2f}, {terrain_density.max():.2f}], "
               f"stress=[{terrain_stress.min():.2f}, {terrain_stress.max():.2f}], "
@@ -5079,44 +5413,57 @@ def create_monolith_cockpit(
         unified_zones = np.array(unified_zones)
         unified_color_codes = np.array(unified_color_codes)
 
-    # Force fresh 3D PCA each run; do not trust cached projection columns.
-    # Fit PCA on a shared basis that includes walker trajectory samples when possible.
-    # This prevents article XY from collapsing when features alone are near-degenerate.
-    print("[MONOLITH] Forcing unified 3D projection (points + paths)...")
+    # Canonical geometry contract: fit the manifold basis on article features
+    # only. Paths are projected into that frozen article frame afterward so
+    # outlier trajectories cannot rotate/stretch the manifold itself.
+    pca_include_paths = os.environ.get("MONOLITH_PCA_INCLUDE_PATHS", "0").strip() == "1"
+    print("[MONOLITH] Forcing unified 3D projection...")
     projection_fit_matrix = features
-    try:
-        if walker_paths_raw:
-            path_samples = []
-            for _p in walker_paths_raw.values():
-                _arr = np.asarray(_p, dtype=float)
-                if _arr.ndim == 2 and _arr.shape[0] >= 2:
-                    # ASTER v3.2 Dimensionality Bridge:
-                    # If path dimension < feature dimension, pad with zeros to match PCA basis.
-                    if _arr.shape[1] < features.shape[1]:
-                        _padded = np.zeros((_arr.shape[0], features.shape[1]), dtype=float)
-                        _padded[:, :_arr.shape[1]] = _arr
-                        _arr = _padded
-                    
-                    if _arr.shape[1] == features.shape[1]:
-                        # Sample every 12th step + last point to keep memory bounded.
-                        _sample = _arr[::12]
-                        if _sample.shape[0] == 0 or not np.array_equal(_sample[-1], _arr[-1]):
-                            _sample = np.vstack([_sample, _arr[-1:]])
-                        path_samples.append(_sample)
-            if path_samples:
-                path_fit = np.vstack(path_samples)
-                projection_fit_matrix = np.vstack([features, path_fit])
-                inferred_path_space = exp.walker_path_space or f"embedding:{features.shape[1]}d"
-                print(
-                    "[MONOLITH] PCA fit basis: features+paths "
-                    f"({projection_fit_matrix.shape[0]}x{projection_fit_matrix.shape[1]} | path_space={inferred_path_space})"
-                )
-    except Exception as _e:
-        print(f"[MONOLITH] PCA fit basis fallback to features only: {_e}")
-
-    pca_3d = PCA(n_components=3, random_state=42, whiten=False)
-    pca_3d.fit(projection_fit_matrix)
-    article_proj = pca_3d.transform(features)
+    if pca_include_paths:
+        try:
+            if walker_paths_raw:
+                path_samples = []
+                for _p in walker_paths_raw.values():
+                    _arr = np.asarray(_p, dtype=float)
+                    if _arr.ndim == 2 and _arr.shape[0] >= 2:
+                        if _arr.shape[1] < features.shape[1]:
+                            _padded = np.zeros((_arr.shape[0], features.shape[1]), dtype=float)
+                            _padded[:, :_arr.shape[1]] = _arr
+                            _arr = _padded
+                        if _arr.shape[1] == features.shape[1]:
+                            _sample = _arr[::12]
+                            if _sample.shape[0] == 0 or not np.array_equal(_sample[-1], _arr[-1]):
+                                _sample = np.vstack([_sample, _arr[-1:]])
+                            path_samples.append(_sample)
+                if path_samples:
+                    path_fit = np.vstack(path_samples)
+                    projection_fit_matrix = np.vstack([features, path_fit])
+                    inferred_path_space = exp.walker_path_space or f"embedding:{features.shape[1]}d"
+                    print(
+                        "[MONOLITH][LEGACY] PCA fit basis: features+paths "
+                        f"({projection_fit_matrix.shape[0]}x{projection_fit_matrix.shape[1]} | path_space={inferred_path_space})"
+                    )
+        except Exception as _e:
+            print(f"[MONOLITH] KernelPCA fit basis fallback to features only: {_e}")
+    else:
+        print(
+            "[MONOLITH] KernelPCA fit basis: features only "
+            f"({projection_fit_matrix.shape[0]}x{projection_fit_matrix.shape[1]})"
+        )
+    projection_model, projection_kernel = build_kernel_pca_projection(
+        exp,
+        projection_fit_matrix,
+        n_components=3,
+        random_state=42,
+    )
+    print(
+        "[MONOLITH] Using KernelPCA manifold basis: "
+        f"kernel={projection_kernel['kernel_type']} "
+        f"sigma={projection_kernel['sigma']:.4f} "
+        f"nu={projection_kernel['nu']:.3f} "
+        f"roughness={projection_kernel['roughness']:.3f}"
+    )
+    article_proj = projection_model.transform(features)
 
     # PATH PROJECTION CONTRACT:
     # Persisted walker paths may be emitted from physics in high-D embedding space
@@ -5136,7 +5483,7 @@ def create_monolith_cockpit(
                 path_arr = _padded
 
             if path_arr.shape[1] == features.shape[1]:
-                path_proj = pca_3d.transform(path_arr)
+                path_proj = projection_model.transform(path_arr)
             elif path_arr.shape[1] == 3:
                 path_proj = path_arr.copy()
             else:
@@ -5152,9 +5499,33 @@ def create_monolith_cockpit(
     if observer_coord_override is not None and observer_coord_override.shape == positions_3d.shape:
         finite_override = np.isfinite(observer_coord_override)
         if finite_override.any():
-            positions_3d = positions_3d.copy()
-            positions_3d[finite_override] = observer_coord_override[finite_override]
-            observer_geometry_active = True
+            base_span = float(
+                max(
+                    np.ptp(np.asarray(article_proj[:, 0], dtype=float)),
+                    np.ptp(np.asarray(article_proj[:, 1], dtype=float)),
+                    np.ptp(np.asarray(article_proj[:, 2], dtype=float)),
+                )
+            )
+            override_probe = positions_3d.copy()
+            override_probe[finite_override] = observer_coord_override[finite_override]
+            override_span = float(
+                max(
+                    np.ptp(np.asarray(override_probe[:, 0], dtype=float)),
+                    np.ptp(np.asarray(override_probe[:, 1], dtype=float)),
+                    np.ptp(np.asarray(override_probe[:, 2], dtype=float)),
+                )
+            )
+            if np.isfinite(override_span) and (
+                base_span <= 1e-9 or override_span >= max(base_span * 1e-3, 1e-5)
+            ):
+                positions_3d = override_probe
+                observer_geometry_active = True
+            else:
+                print(
+                    "[MONOLITH][WARN] Ignoring observer geometry override because "
+                    f"its span collapsed relative to the global manifold "
+                    f"(override_span={override_span:.6e}, base_span={base_span:.6e})."
+                )
     positions_2d = positions_3d[:, :2]
 
     # RAW POINT Z: use persisted pure_z from MONOLITH_DATA.csv when available.
@@ -5169,7 +5540,13 @@ def create_monolith_cockpit(
 
     if observer_geometry_active:
         pure_z = positions_3d[:, 2].astype(float)
-        if len(pure_z) != n_articles or not np.isfinite(pure_z).all() or float(np.ptp(pure_z)) <= 1e-6:
+        global_z_span = float(np.ptp(np.asarray(global_pure_z, dtype=float))) if len(global_pure_z) == n_articles else 0.0
+        pure_z_span = float(np.ptp(pure_z)) if len(pure_z) == n_articles else 0.0
+        if (
+            len(pure_z) != n_articles
+            or not np.isfinite(pure_z).all()
+            or pure_z_span <= max(1e-6, global_z_span * 1e-3)
+        ):
             pure_z = np.asarray(global_pure_z, dtype=float)
         positions_3d[:, 2] = pure_z
     else:
@@ -5182,133 +5559,100 @@ def create_monolith_cockpit(
     for article_idx, path_proj in walker_paths_projected.items():
         walker_paths_projected_raw[int(article_idx)] = np.asarray(path_proj[:, :3], dtype=float)
 
-    # Deterministic XY normalization (no runtime source fallback):
-    # keep relative geometry, center XY, and scale into a stable display range.
+    # Canonical geometry contract: preserve the PCA manifold in its native scale.
+    # Legacy display normalization is available only behind an explicit flag.
     positions_xy_raw = np.asarray(positions_3d[:, :2], dtype=float).copy()
     xy_ptp = np.ptp(positions_xy_raw, axis=0)
     if xy_ptp.size != 2 or not np.isfinite(xy_ptp).all() or np.any(xy_ptp <= 1e-12):
         raise DimensionalCollapseError(
             f"CRITICAL: XY manifold collapsed at projection stage (ptp={xy_ptp})."
         )
-    target_xy_span = np.array([6.0, 6.0], dtype=float)
-    xy_center = np.mean(positions_xy_raw, axis=0, keepdims=True)
-    xy_scale = target_xy_span / xy_ptp
-    positions_3d[:, 0:2] = (positions_xy_raw - xy_center) * xy_scale
+    legacy_xy_box = os.environ.get("MONOLITH_LEGACY_XY_BOX", "0").strip() == "1"
+    if legacy_xy_box:
+        target_xy_span = np.array([6.0, 6.0], dtype=float)
+        xy_center = np.mean(positions_xy_raw, axis=0, keepdims=True)
+        xy_scale = target_xy_span / xy_ptp
+        positions_3d[:, 0:2] = (positions_xy_raw - xy_center) * xy_scale
+        print(
+            "[MONOLITH][LEGACY] Applied deterministic per-axis XY normalization: "
+            f"scale_x={xy_scale[0]:.1f}, scale_y={xy_scale[1]:.1f}, "
+            f"ptp=({xy_ptp[0]:.6f},{xy_ptp[1]:.6f})->(6.0,6.0)"
+        )
+    else:
+        print(
+            "[MONOLITH] Preserving raw XY manifold span: "
+            f"ptp=({xy_ptp[0]:.6f},{xy_ptp[1]:.6f})"
+        )
     positions_xy_norm = np.asarray(positions_3d[:, :2], dtype=float)
-    n_pts = int(positions_xy_raw.shape[0])
-    local_k = int(max(1, min(12, n_pts - 1)))
-    article_local_span_raw = np.zeros(n_pts, dtype=float)
-    article_local_span_norm = np.zeros(n_pts, dtype=float)
-    if local_k > 0:
-        for _i in range(n_pts):
-            _delta_raw = positions_xy_raw - positions_xy_raw[_i]
-            _dist2 = np.sum(_delta_raw * _delta_raw, axis=1)
-            _order = np.argsort(_dist2, kind="mergesort")
-            _nbr = _order[1:1 + local_k]
-            _sel = np.concatenate(([int(_i)], _nbr.astype(int)))
-            _raw_local = positions_xy_raw[_sel]
-            _norm_local = positions_xy_norm[_sel]
-            _raw_span = float(np.max(np.ptp(_raw_local, axis=0)))
-            _norm_span = float(np.max(np.ptp(_norm_local, axis=0)))
-            article_local_span_raw[_i] = _raw_span if np.isfinite(_raw_span) else 0.0
-            article_local_span_norm[_i] = _norm_span if np.isfinite(_norm_span) else 0.0
-    global_norm_span = float(np.max(np.ptp(positions_xy_norm, axis=0)))
-    if not np.isfinite(global_norm_span) or global_norm_span <= 1e-12:
-        global_norm_span = float(np.max(target_xy_span))
-    min_norm_span = max(1e-3, global_norm_span * 0.02)
-    max_segment_norm_len = max(1e-3, global_norm_span * 0.35)
-    max_total_path_norm_span = max(1e-3, global_norm_span * 1.10)
-    max_target_path_norm_span = max(1e-3, global_norm_span * 0.85)
-
-    # Normalize path XY via local span mapping and anchor each path to source article XY.
-    compatible_paths: Dict[int, np.ndarray] = {}
+    walker_paths_pure: Dict[int, np.ndarray] = {}
     skipped_invalid_paths = 0
-    clipped_segment_count = 0
-    clipped_path_span_count = 0
     for _idx, _path in walker_paths_projected_raw.items():
-        idx = int(_idx)
-        if idx < 0 or idx >= n_pts:
-            skipped_invalid_paths += 1
-            continue
-        if _path.ndim != 2 or _path.shape[0] < 2 or _path.shape[1] < 2:
-            skipped_invalid_paths += 1
-            continue
         _path_arr = np.asarray(_path, dtype=float)
-        _xy = np.asarray(_path_arr[:, 0:2], dtype=float)
-        finite_rows = np.isfinite(_xy).all(axis=1)
+        if _path_arr.ndim != 2 or _path_arr.shape[0] < 2 or _path_arr.shape[1] < 2:
+            skipped_invalid_paths += 1
+            continue
+        finite_rows = np.isfinite(_path_arr[:, :2]).all(axis=1)
         if _path_arr.shape[1] > 2:
             finite_rows = finite_rows & np.isfinite(_path_arr[:, 2])
         _path_finite = _path_arr[finite_rows]
         if _path_finite.shape[0] < 2:
             skipped_invalid_paths += 1
             continue
-        raw_xy = np.asarray(_path_finite[:, 0:2], dtype=float)
-        raw_anchor = np.asarray(raw_xy[0], dtype=float)
-        raw_rel = raw_xy - raw_anchor
-        raw_span = float(np.max(np.ptp(raw_xy, axis=0)))
-        local_raw_span = float(article_local_span_raw[idx])
-        local_norm_span = float(article_local_span_norm[idx])
-        if not np.isfinite(raw_span) or raw_span <= 1e-12:
-            skipped_invalid_paths += 1
-            continue
-        if not np.isfinite(local_raw_span) or local_raw_span <= 1e-12:
-            local_raw_span = raw_span
-        if not np.isfinite(local_norm_span) or local_norm_span <= 1e-12:
-            local_norm_span = min(global_norm_span, max_target_path_norm_span)
-        target_span = local_norm_span * (raw_span / local_raw_span)
-        if not np.isfinite(target_span):
-            skipped_invalid_paths += 1
-            continue
-        target_span = float(np.clip(target_span, min_norm_span, max_target_path_norm_span))
-        scale_local = target_span / max(raw_span, 1e-12)
-        anchor_xy = np.asarray(positions_xy_norm[idx], dtype=float)
-        norm_xy = anchor_xy + (raw_rel * scale_local)
-        if norm_xy.shape[0] >= 2:
-            clipped_xy = [np.asarray(norm_xy[0], dtype=float)]
-            for _pt in norm_xy[1:]:
-                prev = clipped_xy[-1]
-                step = np.asarray(_pt, dtype=float) - prev
-                step_len = float(np.linalg.norm(step))
-                if np.isfinite(step_len) and step_len > max_segment_norm_len and step_len > 1e-12:
-                    _pt = prev + (step * (max_segment_norm_len / step_len))
-                    clipped_segment_count += 1
-                clipped_xy.append(np.asarray(_pt, dtype=float))
-            norm_xy = np.asarray(clipped_xy, dtype=float)
-        norm_span = float(np.max(np.ptp(norm_xy, axis=0)))
-        if np.isfinite(norm_span) and norm_span > max_total_path_norm_span and norm_span > 1e-12:
-            shrink = max_total_path_norm_span / norm_span
-            norm_xy = anchor_xy + ((norm_xy - anchor_xy) * shrink)
-            clipped_path_span_count += 1
-        _path_norm = np.asarray(_path_finite, dtype=float).copy()
-        _path_norm[:, 0:2] = norm_xy
-        compatible_paths[idx] = _path_norm
-    walker_paths_pure = compatible_paths
+        walker_paths_pure[int(_idx)] = _path_finite[:, :3].astype(float)
     normalize_paths = bool(walker_paths_pure)
     if skipped_invalid_paths > 0:
         print(
-            "[MONOLITH] Skipped invalid walker paths during XY normalization: "
+            "[MONOLITH] Skipped invalid walker paths during canonical geometry pass: "
             f"{skipped_invalid_paths}"
         )
-    if clipped_segment_count > 0:
-        print(
-            "[MONOLITH] Clipped long walker path segments during XY normalization: "
-            f"{clipped_segment_count}"
-        )
-    if clipped_path_span_count > 0:
-        print(
-            "[MONOLITH] Capped walker path span during XY normalization: "
-            f"{clipped_path_span_count}"
-        )
-    if not normalize_paths and len(walker_paths_raw) > 0:
-        print(
-            "[MONOLITH] No compatible walker paths after per-path normalization guardrails; "
-            f"raw_paths={len(walker_paths_raw)}"
-        )
-    print(
-        "[MONOLITH] Applied deterministic per-axis XY normalization: "
-        f"scale_x={xy_scale[0]:.1f}, scale_y={xy_scale[1]:.1f}, "
-        f"ptp=({xy_ptp[0]:.6f},{xy_ptp[1]:.6f})->(6.0,6.0)"
-    )
+
+    def _collect_canonical_terrain_samples_local(
+        article_xyz: np.ndarray,
+        walker_paths: Dict[int, np.ndarray],
+        max_points_per_segment: int = 18,
+    ) -> np.ndarray:
+        chunks: List[np.ndarray] = [np.asarray(article_xyz[:, :3], dtype=float)]
+        if isinstance(walker_paths, dict):
+            for raw_idx, raw_path in walker_paths.items():
+                try:
+                    idx = int(raw_idx)
+                except Exception:
+                    continue
+                if idx < 0 or idx >= len(article_xyz):
+                    continue
+                path_xyz = np.asarray(raw_path[:, :3], dtype=float).copy()
+                if path_xyz.ndim != 2 or path_xyz.shape[0] < 2 or path_xyz.shape[1] < 3:
+                    continue
+                finite_rows = np.isfinite(path_xyz[:, :3]).all(axis=1)
+                path_xyz = path_xyz[finite_rows]
+                if path_xyz.shape[0] < 2:
+                    continue
+                path_xyz[0, :3] = np.asarray(article_xyz[idx, :3], dtype=float)
+                seg_deltas = np.linalg.norm(np.diff(path_xyz[:, :3], axis=0), axis=1)
+                seg_arc = np.concatenate(([0.0], np.cumsum(seg_deltas)))
+                total = float(seg_arc[-1]) if seg_arc.size > 0 else 0.0
+                if total <= 1e-9:
+                    chunks.append(path_xyz[:1, :3])
+                    continue
+                n_points = int(min(max_points_per_segment, max(2, path_xyz.shape[0])))
+                sample_arc = np.linspace(0.0, total, n_points, dtype=float)
+                sample_xyz = np.column_stack([
+                    np.interp(sample_arc, seg_arc, path_xyz[:, 0]),
+                    np.interp(sample_arc, seg_arc, path_xyz[:, 1]),
+                    np.interp(sample_arc, seg_arc, path_xyz[:, 2]),
+                ])
+                chunks.append(sample_xyz.astype(float))
+        samples = np.vstack(chunks) if chunks else np.asarray(article_xyz[:, :3], dtype=float)
+        finite_rows = np.isfinite(samples[:, :3]).all(axis=1)
+        samples = samples[finite_rows]
+        if samples.shape[0] <= 0:
+            return np.asarray(article_xyz[:, :3], dtype=float)
+        try:
+            _, uniq_idx = np.unique(np.round(samples[:, :3], decimals=6), axis=0, return_index=True)
+            samples = samples[np.sort(uniq_idx)]
+        except Exception:
+            pass
+        return np.asarray(samples[:, :3], dtype=float)
 
     rupture_segments_2d: List[Tuple[np.ndarray, np.ndarray]] = []
     if path_ablation_mode == "thermodynamic":
@@ -5334,9 +5678,16 @@ def create_monolith_cockpit(
                 if np.isfinite(start_xy).all() and np.isfinite(end_xy).all():
                     rupture_segments_2d.append((start_xy, end_xy))
 
-    terrain_support_xy = None
-    if walker_paths_pure:
-        terrain_support_xy = np.asarray(positions_3d[:, :2], dtype=float)
+    # Canonical manifold contract:
+    # article coordinates define the manifold support/geometry.
+    # Track 4 paths are draped onto that surface; they must not become the surface.
+    terrain_geometry_xyz = np.asarray(positions_3d[:, :3], dtype=float)
+    terrain_support_xy = np.asarray(positions_3d[:, :2], dtype=float)
+    use_path_support = bool(walker_paths_pure) and os.environ.get("MONOLITH_USE_PATH_SUPPORT", "0").strip() == "1"
+    if use_path_support:
+        terrain_geometry_xyz = _collect_canonical_terrain_samples_local(positions_3d, walker_paths_pure)
+        terrain_support_xy = np.asarray(terrain_geometry_xyz[:, :2], dtype=float)
+        print("[MONOLITH][LEGACY] Path-derived terrain support enabled by MONOLITH_USE_PATH_SUPPORT=1")
 
     # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
     energy_values_for_terrain = _compress_surface_height_field(pure_z.copy())
@@ -5531,18 +5882,27 @@ def create_monolith_cockpit(
             (csv_row.get('source') if csv_row is not None and pd.notna(csv_row.get('source')) else None)
             or meta.get('publication', meta.get('source', ''))
         )[:40]
+        
+        # ASTER v3.2: Explicitly handle synthetic perspectives
+        persp_type = (
+            (csv_row.get('perspective_type') if csv_row is not None and pd.notna(csv_row.get('perspective_type')) else None)
+            or meta.get('perspective_type')
+        )
+        persp_tag = (
+            (csv_row.get('perspective_tag') if csv_row is not None and pd.notna(csv_row.get('perspective_tag')) else None)
+            or meta.get('perspective_tag')
+        )
+
         affiliation = str(
             (csv_row.get('affiliation') if csv_row is not None and pd.notna(csv_row.get('affiliation')) else None)
-            or (csv_row.get('perspective_type') if csv_row is not None and pd.notna(csv_row.get('perspective_type')) else None)
+            or persp_type
             or meta.get('affiliation', '')
-            or meta.get('perspective_type', '')
             or 'unknown'
         )[:40]
         bias = str(
             (csv_row.get('bias') if csv_row is not None and pd.notna(csv_row.get('bias')) else None)
-            or (csv_row.get('perspective_tag') if csv_row is not None and pd.notna(csv_row.get('perspective_tag')) else None)
+            or persp_tag
             or meta.get('bias', '')
-            or meta.get('perspective_tag', '')
             or 'unknown'
         )[:40]
         snippet_raw = (
@@ -5558,10 +5918,21 @@ def create_monolith_cockpit(
         pub = html.escape(pub)
         affiliation = html.escape(affiliation)
         bias = html.escape(bias)
+        persp_type_esc = html.escape(str(persp_type or ""))
+        persp_tag_esc = html.escape(str(persp_tag or ""))
         snippet = html.escape(snippet)
+        
         pub_line = f'<b>Source:</b> {pub}<br>' if pub else ''
-        affiliation_line = f'<b>Affiliation:</b> {affiliation}<br>'
-        bias_line = f'<b>Bias:</b> {bias}<br>'
+        
+        # ASTER v3.2: First-class synthetic label lines
+        perspective_line = ""
+        if persp_tag:
+            perspective_line = f'<b>Perspective:</b> <span style="color:#FFD700">{persp_tag_esc}</span><br>'
+        if persp_type:
+            perspective_line += f'<b>Type:</b> {persp_type_esc}<br>'
+            
+        affiliation_line = f'<b>Affiliation:</b> {affiliation}<br>' if not persp_type else ""
+        bias_line = f'<b>Bias:</b> {bias}<br>' if not persp_tag else ""
         snippet_line = f'<b>Snippet:</b> {snippet}<br>' if snippet else ''
 
         # Format d and w values (handle infinity)
@@ -5582,12 +5953,16 @@ def create_monolith_cockpit(
             f'<b style="font-size:14px">Article #{i}</b><br>'
             f"{focus_line}"
             f'<span style="color:#00F0FF">{title}</span><br>'
-            f'<span style="color:#888">UID: {bt_uid}</span><br>'
+            f'<span style="color:#888">UID: {bt_uid_raw}</span><br>'
+            f'{perspective_line}'
             f'{pub_line}'
             f'{affiliation_line}'
             f'{bias_line}'
             f'{snippet_line}'
             f'<b>═══════════════════════</b><br>'
+            f'<b>Provenance:</b><br>'
+            f'  <span style="color:#888">DS: {exp.provenance.get("dataset_hash", "n/a")[:12]}</span><br>'
+            f'  <span style="color:#888">WT: {exp.provenance.get("weights_hash", "n/a")[:12]}</span><br>'
             f'<b>EVR:</b> {evr:.3f}<br>'
             f'<b>Zone:</b> {unified_zones[i]}<br>' # Add this line
             f'<b>T4 Walker:</b> {ws}<br>'
@@ -5638,6 +6013,7 @@ def create_monolith_cockpit(
             rupture_segments_2d=rupture_segments_2d if path_ablation_mode == "thermodynamic" else None,
             rupture_tear_radius_scale=0.02,
             terrain_support_xy=terrain_support_xy,
+            terrain_geometry_xyz=terrain_geometry_xyz,
         )
         if terrain:
             terrain.visible = True
@@ -5713,14 +6089,15 @@ def create_monolith_cockpit(
             # Ensure x_coord and y_coord are numpy arrays for interpolation
             x_coord_np = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
             y_coord_np = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
-            if callable(surface_support_projector):
+            clip_surface_queries = os.environ.get("MONOLITH_CLIP_SURFACE_QUERIES", "0").strip() == "1"
+            if clip_surface_queries and callable(surface_support_projector):
                 try:
                     x_coord_np, y_coord_np = surface_support_projector(x_coord_np, y_coord_np)
                     x_coord_np = np.asarray(x_coord_np, dtype=float).reshape(-1)
                     y_coord_np = np.asarray(y_coord_np, dtype=float).reshape(-1)
                 except Exception:
                     pass
-            if terrain_grid_x is not None and terrain_grid_y is not None:
+            if clip_surface_queries and terrain_grid_x is not None and terrain_grid_y is not None:
                 x_min_grid = float(np.nanmin(terrain_grid_x[0, :]))
                 x_max_grid = float(np.nanmax(terrain_grid_x[0, :]))
                 y_min_grid = float(np.nanmin(terrain_grid_y[:, 0]))
@@ -5836,14 +6213,20 @@ def create_monolith_cockpit(
     print(f"[MONOLITH] Rendering {n_articles} data points...")
     # Match marker size to density: consensus points (Bridge - high density) are solid, sparse points (Void - low density) are small/dimmed.
     sizes = np.ones(n_articles) * 10 * (0.5 + 0.5 * terrain_density) # Scale size by density (5 to 10)
+    
+    # ASTER v3.2: Visual Distinction for Observer
+    symbols = ['circle'] * n_articles
     if focus_idx is not None:
         sizes[focus_idx] = max(sizes[focus_idx] * 1.8, 14.0)
+        symbols[focus_idx] = 'diamond-open'
+        
     point_traces = render_data_points_3d(
         positions_3d, spectral_evr, sizes, hover_texts,
         phantom_verdicts=phantom_verdicts, is_fog=is_fog,
         article_z_height=article_marker_z, # Prefer terrain-manifold Z for marker anchoring
         article_color_codes=unified_color_codes, # Pass unified_color_codes for coloring
         article_uids=article_uid_values,
+        article_symbols=symbols, # Pass the symbol list
     )
     for t in point_traces:
         if getattr(t, 'name', '') in {'glow_outer', 'glow_mid'}:
@@ -6022,20 +6405,68 @@ def create_monolith_cockpit(
     # LAYOUT
     # ==========================================================================
     show_axes_initial = physics_mode != "synthesis"
+
+    def _scene_extent(values: Any) -> Optional[Tuple[float, float]]:
+        try:
+            arr = np.asarray(values, dtype=float)
+            finite = arr[np.isfinite(arr)]
+            if finite.size <= 0:
+                return None
+            return float(np.nanmin(finite)), float(np.nanmax(finite))
+        except Exception:
+            return None
+
+    extent_sources = [positions_3d[:, 0], positions_3d[:, 1], positions_3d[:, 2]]
+    if "terrain_grid_x" in locals() and terrain_grid_x is not None:
+        extent_sources[0] = terrain_grid_x
+    if "terrain_grid_y" in locals() and terrain_grid_y is not None:
+        extent_sources[1] = terrain_grid_y
+    if "terrain_grid_z" in locals() and terrain_grid_z is not None:
+        extent_sources[2] = terrain_grid_z
+
+    x_extent = _scene_extent(extent_sources[0]) or (-1.0, 1.0)
+    y_extent = _scene_extent(extent_sources[1]) or (-1.0, 1.0)
+    z_extent = _scene_extent(extent_sources[2]) or (-0.5, 3.5)
+
+    def _pad_extent(lo: float, hi: float, ratio: float = 0.08) -> List[float]:
+        span = max(float(hi - lo), 1e-6)
+        pad = span * ratio
+        return [lo - pad, hi + pad]
+
+    x_range_layout = _pad_extent(*x_extent)
+    y_range_layout = _pad_extent(*y_extent)
+    z_range_layout = _pad_extent(*z_extent, ratio=0.05)
+
+    span_x = x_range_layout[1] - x_range_layout[0]
+    span_y = y_range_layout[1] - y_range_layout[0]
+    span_z = z_range_layout[1] - z_range_layout[0]
+    dominant_span = max(span_x, span_y, span_z, 1e-6)
+    camera_scale = max(1.0, dominant_span / 2.0)
     camera_presets = {
-        "synthesis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=1.5, y=1.5, z=1.2)),
-        "diagnostics": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=2.1, y=0.8, z=1.7)),
-        "analysis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=0.0, y=2.4, z=1.3)),
+        "synthesis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=1.6 * camera_scale, y=1.35 * camera_scale, z=0.95 * camera_scale)),
+        "diagnostics": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=2.0 * camera_scale, y=0.9 * camera_scale, z=1.4 * camera_scale)),
+        "analysis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=0.0, y=2.3 * camera_scale, z=1.2 * camera_scale)),
     }
-    scene_layout = dict(
-        xaxis=dict(title=axis_label_x, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial),
-        yaxis=dict(title=axis_label_y, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial),
-        zaxis=dict(title=axis_label_z, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial),
+    camera_presets_js = json.dumps(camera_presets)
+    scene_layout = dict(LAYOUT_CONSTRAINTS)
+    scene_layout.update(
+        xaxis=dict(title=axis_label_x, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial, range=x_range_layout),
+        yaxis=dict(title=axis_label_y, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial, range=y_range_layout),
         bgcolor=PALETTE.void,
         camera=camera_presets.get(physics_mode, camera_presets["synthesis"]),
         dragmode='orbit',
-        **LAYOUT_CONSTRAINTS,
     )
+    scene_layout["zaxis"] = {
+        **dict(LAYOUT_CONSTRAINTS.get("zaxis", {})),
+        "title": axis_label_z,
+        "visible": show_axes_initial,
+        "showticklabels": show_axes_initial,
+        "showgrid": show_axes_initial,
+        "zeroline": False,
+        "showbackground": False,
+        "showline": show_axes_initial,
+        "range": z_range_layout,
+    }
     fig.update_layout(
         scene=scene_layout,
         paper_bgcolor=PALETTE.void,
@@ -6580,11 +7011,7 @@ def create_monolith_cockpit(
             }};
         }}
 
-        var CAMERA_PRESETS = {{
-            synthesis: {{up: {{x: 0, y: 0, z: 1}}, center: {{x: 0, y: 0, z: 0}}, eye: {{x: 1.5, y: 1.5, z: 1.2}}}},
-            diagnostics: {{up: {{x: 0, y: 0, z: 1}}, center: {{x: 0, y: 0, z: 0}}, eye: {{x: 2.1, y: 0.8, z: 1.7}}}},
-            analysis: {{up: {{x: 0, y: 0, z: 1}}, center: {{x: 0, y: 0, z: 0}}, eye: {{x: 0.0, y: 2.4, z: 1.3}}}}
-        }};
+        var CAMERA_PRESETS = {camera_presets_js};
 
         function setMode(mode) {{
             if (!SECONDARY_MODES_ENABLED && mode !== 'synthesis') {{
@@ -6780,9 +7207,23 @@ def create_monolith_cockpit(
         if sx.size == 0 or sy.size == 0 or sz.size == 0:
             raise DimensionalCollapseError("CRITICAL: Terrain surface has empty coordinates.")
         surface_span = float(max(np.ptp(sx), np.ptp(sy), np.ptp(sz)))
-        if not np.isfinite(surface_span) or surface_span <= 1e-6:
+        point_span = float(
+            max(
+                np.ptp(np.asarray(positions_3d[:, 0], dtype=float)),
+                np.ptp(np.asarray(positions_3d[:, 1], dtype=float)),
+                np.ptp(np.asarray(positions_3d[:, 2], dtype=float)),
+            )
+        )
+        effective_surface_span = float(max(surface_span, point_span))
+        if not np.isfinite(effective_surface_span) or effective_surface_span <= 1e-6:
             raise DimensionalCollapseError(
                 f"CRITICAL: Terrain surface span collapsed ({surface_span})."
+            )
+        if surface_span <= 1e-6 and effective_surface_span > surface_span:
+            print(
+                "[MONOLITH][WARN] Terrain surface span collapsed; "
+                f"falling back to article cloud span {effective_surface_span:.6f} "
+                f"(surface_span={surface_span:.6f})."
             )
         max_path_span = 0.0
         for _t in fig.data:
@@ -6819,24 +7260,27 @@ def create_monolith_cockpit(
             path_span = float(max(np.ptp(tx), np.ptp(ty), np.ptp(tz)))
             if np.isfinite(path_span):
                 max_path_span = max(max_path_span, path_span)
-        if max_path_span > (surface_span * 50.0):
+        if max_path_span > (effective_surface_span * 50.0):
             raise DimensionalCollapseError(
                 "CRITICAL: Path traces exceed terrain scale budget "
-                f"(max_path_span={max_path_span:.3f}, surface_span={surface_span:.3f})."
+                f"(max_path_span={max_path_span:.3f}, surface_span={effective_surface_span:.3f})."
             )
 
     # NEVER AGAIN PROTOCOL: hard-fail on dimensional collapse instead of silently rendering.
     pure_z_values = np.asarray(positions_3d[:, 2], dtype=float)
+    collapse_warnings: List[str] = []
     if float(np.ptp(pure_z_values)) <= 1e-2:
-        raise DimensionalCollapseError("CRITICAL: Point cloud Z-variance collapsed.")
+        collapse_warnings.append("Point cloud Z-variance collapsed.")
     if float(np.ptp(np.asarray(energy_values_for_terrain, dtype=float))) <= 1e-2:
-        raise DimensionalCollapseError("CRITICAL: Terrain stress gradient collapsed.")
+        collapse_warnings.append("Terrain stress gradient collapsed.")
     if len(walker_paths_raw) <= 0:
         raise DimensionalCollapseError("CRITICAL: Walker paths not loaded.")
     if len(walker_paths_pure) <= 0:
         raise DimensionalCollapseError(
             "CRITICAL: Walker paths loaded but rejected by normalization guardrails."
         )
+    if collapse_warnings:
+        raise DimensionalCollapseError("[MONOLITH][COLLAPSE] " + " | ".join(collapse_warnings))
 
     # Final validation gate: fail fast if canonical zone semantics or synthesis NMI drift.
     validation_errors = []
