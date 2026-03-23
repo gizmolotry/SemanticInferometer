@@ -872,6 +872,21 @@ def test_emit_ablation_summary_json_translates_lab_diagnostics(tmp_path):
     assert blob["metrics"]["retained_pct"] == pytest.approx(80.0)
 
 
+def test_normalize_validation_payload_promotes_existing_numeric_nmi():
+    existing = {
+        "status": "failed",
+        "trust_level": "UNAVAILABLE",
+        "nmi": 0.91,
+    }
+
+    normalized = suite._normalize_validation_payload(existing)
+
+    assert normalized is not None
+    assert normalized["nmi"] == pytest.approx(0.91)
+    assert normalized["status"] == "success"
+    assert normalized["trust_level"] == "MEASURED"
+
+
 def test_repair_validation_payload_promotes_syn_track_nmi():
     existing = {
         "status": "failed",

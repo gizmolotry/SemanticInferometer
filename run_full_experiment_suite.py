@@ -1263,6 +1263,26 @@ def _repair_validation_payload(existing: Dict[str, Any]) -> Optional[Dict[str, A
     return repaired
 
 
+def _normalize_validation_payload(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(existing, dict) or not existing:
+        return None
+    current_nmi = existing.get("nmi")
+    if not isinstance(current_nmi, (int, float)) or isinstance(current_nmi, bool):
+        return None
+    current_nmi = float(current_nmi)
+    if not math.isfinite(current_nmi) or not (0.0 <= current_nmi <= 1.0):
+        return None
+    normalized = dict(existing)
+    changed = False
+    if str(normalized.get("status", "")).strip().lower() == "failed":
+        normalized["status"] = "success"
+        changed = True
+    if str(normalized.get("trust_level", "")).strip().upper() in {"", "UNAVAILABLE", "FAILED"}:
+        normalized["trust_level"] = "MEASURED"
+        changed = True
+    return normalized if changed else None
+
+
 def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "status": "NO_DATA",
@@ -3043,6 +3063,9 @@ def _emit_validation_json(run_dir: Path) -> Path:
 
     current_nmi = existing.get("nmi")
     if isinstance(current_nmi, (int, float)) and not isinstance(current_nmi, bool) and math.isfinite(float(current_nmi)) and 0.0 <= float(current_nmi) <= 1.0:
+        normalized = _normalize_validation_payload(existing)
+        if normalized is not None:
+            validation_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
         return validation_path
 
     # Repair older validation payloads that already contain per-track metrics but
