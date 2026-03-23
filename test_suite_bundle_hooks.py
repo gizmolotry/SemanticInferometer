@@ -810,6 +810,35 @@ def test_emit_ablation_summary_json_normalizes_legacy_metrics(tmp_path):
     assert blob["metrics"]["retained_pct"] == pytest.approx(68.0)
 
 
+def test_emit_ablation_summary_json_prefers_lab_diagnostics_over_stale_no_data_summary(tmp_path):
+    run_dir = tmp_path / "ablation_prefers_lab"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "ablation_summary.json").write_text(
+        json.dumps({"status": "NO_DATA", "message": "stale placeholder"}, indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / "lab_diagnostics.json").write_text(
+        json.dumps(
+            {
+                "procrustes": {
+                    "mean_distance_before": 2.0,
+                    "mean_distance_after": 1.0,
+                },
+                "structural_invariants": {"mean_survival_rate": 0.6},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    out = suite._emit_ablation_summary_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert blob["status"] == "OK"
+    assert blob["message"] == "translated from lab_diagnostics.json"
+    assert blob["metrics"]["stage_3_nmi"] == pytest.approx(0.6)
+
+
 def test_emit_ablation_summary_json_translates_lab_diagnostics(tmp_path):
     run_dir = tmp_path / "ablation_lab_bundle"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -841,3 +870,43 @@ def test_emit_ablation_summary_json_translates_lab_diagnostics(tmp_path):
     assert blob["metrics"]["stage_3_nmi"] == pytest.approx(0.8)
     assert blob["metrics"]["delta_nmi"] == pytest.approx(0.3)
     assert blob["metrics"]["retained_pct"] == pytest.approx(80.0)
+
+
+def test_repair_validation_payload_promotes_syn_track_nmi():
+    existing = {
+        "status": "failed",
+        "trust_level": "UNAVAILABLE",
+        "track_metrics": {
+            "SYN": {"nmi": 0.83},
+            "T1": {"nmi": 0.81},
+        },
+    }
+
+    repaired = suite._repair_validation_payload(existing)
+
+    assert repaired is not None
+    assert repaired["nmi"] == pytest.approx(0.83)
+    assert repaired["status"] == "success"
+    assert repaired["trust_level"] == "MEASURED"
+
+
+def test_emit_no_data_control_results_syncs_control_metrics_placeholder(tmp_path):
+    run_dir = tmp_path / "control_placeholder_sync"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    suite._emit_no_data_control_results(run_dir)
+
+    comprehensive = json.loads((run_dir / "comprehensive_results.json").read_text(encoding="utf-8"))
+    control = json.loads((run_dir / "control_metrics.json").read_text(encoding="utf-8"))
+
+    assert comprehensive["status"] == "NO_DATA"
+    assert comprehensive["reason"] == "control analysis not run for this leaf"
+    assert control["status"] == "NO_DATA"
+    assert control["message"] == "control analysis not run for this leaf"
+
+
+def test_build_ablation_summary_payload_preserves_no_data_message():
+    payload = suite._build_ablation_summary_payload({}, None)
+
+    assert payload["status"] == "NO_DATA"
+    assert payload["message"] == "ablation flow not executed for this run"

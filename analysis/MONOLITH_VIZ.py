@@ -5303,12 +5303,9 @@ def create_monolith_cockpit(
         collapsed_density = float(np.ptp(np.asarray(unified_density, dtype=float))) <= 1e-9
         collapsed_z_height = float(np.ptp(np.asarray(unified_z_height, dtype=float))) <= 1e-9
         
-        # ASTER v3.2: Prioritize ground-truth group_topic for synthetic labeling/coloring
-        if 'group_topic' in monolith_df.columns:
-            raw_zones = monolith_df['group_topic'].values
-            print("[MONOLITH] Synthetic run detected: using 'group_topic' for Zone coloring.")
-        else:
-            raw_zones = monolith_df['zone'].values
+        # Hidden-label metadata must not drive terrain/zone coloring. The
+        # manifold skin stays anchored to canonical terrain zones only.
+        raw_zones = monolith_df['zone'].values
             
         unified_zones = np.array([canonicalize_zone_name(z) for z in raw_zones], dtype=object)
         unified_color_codes = np.array([ZONE_COLOR_MAP.get(z, "#888") for z in unified_zones], dtype=object)

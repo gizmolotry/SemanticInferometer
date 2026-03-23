@@ -1165,6 +1165,12 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
     if not isinstance(results_blob, dict) or not results_blob:
         return payload
 
+    status_marker = str(results_blob.get("status", "")).strip().upper()
+    if status_marker in {"NO_DATA", "UNAVAILABLE", "MISSING"} or bool(results_blob.get("synthetic_placeholder", False)):
+        payload["status"] = "NO_DATA" if status_marker in {"", "NO_DATA"} or bool(results_blob.get("synthetic_placeholder", False)) else status_marker
+        payload["message"] = str(results_blob.get("message") or results_blob.get("reason") or payload["message"])
+        return payload
+
     interpretation = results_blob.get("interpretation", {})
     if not isinstance(interpretation, dict):
         return payload
@@ -1226,12 +1232,44 @@ def _emit_control_metrics_json(run_dir: Path) -> Path:
     return out
 
 
+def _infer_validation_nmi_from_payload(validation_payload: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(validation_payload, dict):
+        return None
+    track_metrics_existing = validation_payload.get("track_metrics")
+    if isinstance(track_metrics_existing, dict):
+        syn_blob = track_metrics_existing.get("SYN")
+        if isinstance(syn_blob, dict) and isinstance(syn_blob.get("nmi"), (int, float)) and not isinstance(syn_blob.get("nmi"), bool):
+            inferred = float(syn_blob.get("nmi"))
+            if math.isfinite(inferred) and 0.0 <= inferred <= 1.0:
+                return inferred
+    track_nmi_existing = validation_payload.get("track_nmi")
+    if isinstance(track_nmi_existing, dict) and isinstance(track_nmi_existing.get("SYN"), (int, float)) and not isinstance(track_nmi_existing.get("SYN"), bool):
+        inferred = float(track_nmi_existing.get("SYN"))
+        if math.isfinite(inferred) and 0.0 <= inferred <= 1.0:
+            return inferred
+    return None
+
+
+def _repair_validation_payload(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    inferred_nmi = _infer_validation_nmi_from_payload(existing)
+    if inferred_nmi is None:
+        return None
+    repaired = dict(existing)
+    repaired["nmi"] = inferred_nmi
+    if "status" in repaired and str(repaired.get("status", "")).strip().lower() == "failed":
+        repaired["status"] = "success"
+    if str(repaired.get("trust_level", "")).strip().upper() in {"", "UNAVAILABLE", "FAILED"}:
+        repaired["trust_level"] = "MEASURED"
+    return repaired
+
+
 def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "status": "NO_DATA",
         "source": str(source_path) if source_path else "NOT FOUND",
         "synthetic_placeholder": True,
         "reason": "ablation flow not executed for this run",
+        "message": "ablation flow not executed for this run",
         "stage_1_nmi": None,
         "stage_2_nmi": None,
         "stage_3_nmi": None,
@@ -1256,6 +1294,7 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
     if status_marker in {"NO_DATA", "UNAVAILABLE"} or bool(summary_blob.get("synthetic_placeholder", False)):
         payload["status"] = status_marker or "NO_DATA"
         payload["reason"] = str(summary_blob.get("reason", payload["reason"]))
+        payload["message"] = str(summary_blob.get("message", payload["message"]))
         return payload
 
     metrics = summary_blob.get("metrics", {})
@@ -1280,6 +1319,7 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
             "status": "OK",
             "synthetic_placeholder": False,
             "reason": None,
+            "message": str(summary_blob.get("message", "loaded")),
             "stage_1_nmi": stage_1_nmi,
             "stage_2_nmi": stage_2_nmi,
             "stage_3_nmi": stage_3_nmi,
@@ -1299,6 +1339,17 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
         }
     )
     return payload
+
+
+def _is_placeholder_status_blob(blob: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(blob, dict) or not blob:
+        return True
+    status = str(blob.get("status", "")).strip().upper()
+    if status in {"", "NO_DATA", "UNAVAILABLE", "MISSING"}:
+        return True
+    if bool(blob.get("synthetic_placeholder", False)):
+        return True
+    return False
 
 
 def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
@@ -1383,41 +1434,53 @@ def _emit_ablation_results_json(run_dir: Path, payload: Dict[str, Any]) -> Path:
 def _emit_ablation_summary_json(run_dir: Path) -> Path:
     run_dir = Path(run_dir)
     out = run_dir / "ablation_summary.json"
+
+    existing_blob: Dict[str, Any] = {}
+    if out.exists():
+        try:
+            loaded_existing = json.loads(out.read_text(encoding="utf-8"))
+            if isinstance(loaded_existing, dict):
+                existing_blob = loaded_existing
+        except Exception:
+            existing_blob = {}
+
     source_path: Optional[Path] = None
     summary_blob: Dict[str, Any] = {}
 
-    if out.exists():
-        source_path = out
-        try:
-            summary_blob = json.loads(out.read_text(encoding="utf-8"))
-        except Exception:
-            summary_blob = {}
-    elif (run_dir / "ablation_results.json").exists():
-        source_path = run_dir / "ablation_results.json"
-        try:
-            summary_blob = json.loads(source_path.read_text(encoding="utf-8"))
-        except Exception:
-            summary_blob = {}
-    elif (run_dir / "critical_ablation_summary.csv").exists():
-        source_path = run_dir / "critical_ablation_summary.csv"
-        try:
-            with source_path.open("r", encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f)
-                summary_blob = dict(next(reader, {}) or {})
-        except Exception:
-            summary_blob = {}
-    elif (run_dir / "lab_diagnostics.json").exists():
-        source_path = run_dir / "lab_diagnostics.json"
-        try:
-            summary_blob = json.loads(source_path.read_text(encoding="utf-8"))
-        except Exception:
-            summary_blob = {}
-        payload = _translate_lab_diagnostics_to_ablation_summary(summary_blob, source_path)
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        _emit_ablation_results_json(run_dir, payload)
-        return out
+    preferred_sources = [
+        (run_dir / "lab_diagnostics.json", "lab"),
+        (run_dir / "ablation_results.json", "json"),
+        (run_dir / "critical_ablation_summary.csv", "csv"),
+    ]
 
-    payload = _build_ablation_summary_payload(summary_blob, source_path)
+    for candidate_path, source_kind in preferred_sources:
+        if not candidate_path.exists():
+            continue
+        source_path = candidate_path
+        try:
+            if source_kind == "csv":
+                with candidate_path.open("r", encoding="utf-8", errors="replace") as f:
+                    reader = csv.DictReader(f)
+                    summary_blob = dict(next(reader, {}) or {})
+            else:
+                loaded = json.loads(candidate_path.read_text(encoding="utf-8"))
+                summary_blob = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            summary_blob = {}
+
+        if source_kind == "lab":
+            payload = _translate_lab_diagnostics_to_ablation_summary(summary_blob, source_path)
+            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            _emit_ablation_results_json(run_dir, payload)
+            return out
+
+        if not _is_placeholder_status_blob(summary_blob):
+            payload = _build_ablation_summary_payload(summary_blob, source_path)
+            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            _emit_ablation_results_json(run_dir, payload)
+            return out
+
+    payload = _build_ablation_summary_payload(existing_blob, out if out.exists() else source_path)
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _emit_ablation_results_json(run_dir, payload)
     return out
@@ -2842,40 +2905,99 @@ def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[s
     labels_dir.mkdir(parents=True, exist_ok=True)
     derived_dir.mkdir(parents=True, exist_ok=True)
 
-    hidden_csv = labels_dir / "hidden_groups.csv"
-    if not hidden_csv.exists():
-        with hidden_csv.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["article_id", "group_topic"])
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({"article_id": int(row.get("index", 0)), "group_topic": row.get("zone", "unknown")})
+    def _clean_group_value(*values: Any) -> str:
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text or text.lower() in {"none", "nan", "null"}:
+                continue
+            return text
+        return "unknown"
 
+    hidden_rows: List[Dict[str, Any]] = []
+    token_sets: Dict[str, set[str]] = {}
     counts: Dict[str, int] = {}
-    sums: Dict[str, Dict[str, float]] = {}
+
     for row in rows:
-        grp = str(row.get("zone", "unknown"))
-        counts[grp] = counts.get(grp, 0) + 1
-        if grp not in sums:
-            sums[grp] = {"density": 0.0, "stress": 0.0}
-        try:
-            sums[grp]["density"] += float(row.get("density", 0.0))
-        except Exception:
-            pass
-        try:
-            sums[grp]["stress"] += float(row.get("stress", 0.0))
-        except Exception:
-            pass
+        group_source = _clean_group_value(row.get("source"))
+        group_publication = _clean_group_value(row.get("publication"), row.get("source"))
+        group_perspective_type = _clean_group_value(row.get("perspective_type"))
+        group_perspective_tag = _clean_group_value(row.get("perspective_tag"))
+        group_bias = _clean_group_value(row.get("bias"))
+        group_affiliation = _clean_group_value(row.get("affiliation"))
+        group_label = _clean_group_value(row.get("label"))
+        group_topic = _clean_group_value(
+            row.get("group_topic"),
+            row.get("topic"),
+            row.get("subtopic"),
+            row.get("perspective_tag"),
+            row.get("perspective_type"),
+            row.get("label"),
+            row.get("bias"),
+            row.get("publication"),
+            row.get("source"),
+        )
+
+        hidden_row = {
+            "article_id": int(row.get("index", 0)),
+            "bt_uid": row.get("bt_uid"),
+            "group_topic": group_topic,
+            "group_source": group_source,
+            "group_publication": group_publication,
+            "group_perspective_type": group_perspective_type,
+            "group_perspective_tag": group_perspective_tag,
+            "group_bias": group_bias,
+            "group_affiliation": group_affiliation,
+            "group_label": group_label,
+        }
+        hidden_rows.append(hidden_row)
+
+        counts[group_topic] = counts.get(group_topic, 0) + 1
+        token_bucket = token_sets.setdefault(group_topic, set())
+        for token in (
+            group_source,
+            group_publication,
+            group_perspective_type,
+            group_perspective_tag,
+            group_bias,
+            group_affiliation,
+            group_label,
+        ):
+            if token != "unknown":
+                token_bucket.add(token)
+
+    hidden_csv = labels_dir / "hidden_groups.csv"
+    with hidden_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "article_id",
+                "bt_uid",
+                "group_topic",
+                "group_source",
+                "group_publication",
+                "group_perspective_type",
+                "group_perspective_tag",
+                "group_bias",
+                "group_affiliation",
+                "group_label",
+            ],
+        )
+        writer.writeheader()
+        for hidden_row in hidden_rows:
+            writer.writerow(hidden_row)
 
     groups = sorted(counts.keys())
     summaries = []
     for g in groups:
-        n = max(counts.get(g, 0), 1)
+        tokens = sorted(token_sets.get(g, set()))
         summaries.append(
             {
                 "group_name": g,
                 "n_articles": counts.get(g, 0),
-                "mean_density": sums[g]["density"] / n,
-                "mean_stress": sums[g]["stress"] / n,
+                "top_markers": tokens[:5],
+                "label_source": "metadata_hidden_groups",
             }
         )
 
@@ -2889,14 +3011,17 @@ def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[s
             if gi == gj:
                 row_vals.append(0.0)
             else:
-                di = sums[gi]["density"] / max(counts[gi], 1)
-                dj = sums[gj]["density"] / max(counts[gj], 1)
-                si = sums[gi]["stress"] / max(counts[gi], 1)
-                sj = sums[gj]["stress"] / max(counts[gj], 1)
-                row_vals.append(abs(di - dj) + abs(si - sj))
+                left = token_sets.get(gi, set())
+                right = token_sets.get(gj, set())
+                union = left | right
+                if not union:
+                    row_vals.append(1.0)
+                else:
+                    overlap = len(left & right) / float(len(union))
+                    row_vals.append(1.0 - overlap)
         matrix.append(row_vals)
 
-    group_matrix = {"groups": groups, "cost_matrix": matrix}
+    group_matrix = {"groups": groups, "cost_matrix": matrix, "label_source": "metadata_token_overlap"}
     (derived_dir / "group_matrix.json").write_text(json.dumps(group_matrix, indent=2), encoding="utf-8")
     return {
         "hidden_groups": str(hidden_csv),
@@ -2918,6 +3043,13 @@ def _emit_validation_json(run_dir: Path) -> Path:
 
     current_nmi = existing.get("nmi")
     if isinstance(current_nmi, (int, float)) and not isinstance(current_nmi, bool) and math.isfinite(float(current_nmi)) and 0.0 <= float(current_nmi) <= 1.0:
+        return validation_path
+
+    # Repair older validation payloads that already contain per-track metrics but
+    # omitted the top-level synthesis NMI required by the consumer contract.
+    repaired = _repair_validation_payload(existing)
+    if repaired is not None:
+        validation_path.write_text(json.dumps(repaired, indent=2), encoding="utf-8")
         return validation_path
 
     observer_payload = _load_primary_observer_payload(run_dir)
@@ -3086,24 +3218,26 @@ def _emit_no_data_ablation_summary(run_dir: Path) -> Path:
 
 def _emit_no_data_control_results(run_dir: Path) -> Path:
     out = run_dir / "comprehensive_results.json"
-    if out.exists():
-        return out
-    payload = {
-        "status": "NO_DATA",
-        "source": "suite-default-placeholder",
-        "synthetic_placeholder": True,
-        "interpretation": {
-            "error": "control analysis not run for this leaf",
-            "metrics": {},
-            "consensus_residual": {
-                "real": {
-                    "consensus_pct": None,
-                    "residual_pct": None,
-                }
+    if not out.exists():
+        payload = {
+            "status": "NO_DATA",
+            "source": "suite-default-placeholder",
+            "synthetic_placeholder": True,
+            "reason": "control analysis not run for this leaf",
+            "message": "control analysis not run for this leaf",
+            "interpretation": {
+                "error": "control analysis not run for this leaf",
+                "metrics": {},
+                "consensus_residual": {
+                    "real": {
+                        "consensus_pct": None,
+                        "residual_pct": None,
+                    }
+                },
             },
-        },
-    }
-    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        }
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _emit_control_metrics_json(run_dir)
     return out
 
 

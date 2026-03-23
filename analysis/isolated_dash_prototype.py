@@ -1038,6 +1038,17 @@ def _control_results_candidates(run_key: Optional[str]) -> List[Path]:
     return out
 
 
+def _empty_panel_state(status: str, source: Path, message: str, fields: List[str]) -> dict:
+    payload = {
+        "status": status,
+        "source": str(source),
+        "message": message,
+    }
+    for field in fields:
+        payload[field] = None
+    return payload
+
+
 def load_control_state(run_key: Optional[str]) -> dict:
     for path in _control_results_candidates(run_key):
         data = _safe_json(path, {})
@@ -1045,16 +1056,14 @@ def load_control_state(run_key: Optional[str]) -> dict:
             metrics = data.get("metrics", {})
             status = str(data.get("status", "")).strip().upper()
             if status in {"NO_DATA", "UNAVAILABLE"} or bool(data.get("synthetic_placeholder", False)):
-                return {
-                    "status": "UNAVAILABLE",
-                    "source": str(path),
-                    "message": str(data.get("message", "control analysis unavailable")),
-                    "procrustes_ratio": None,
-                    "distance_corr_ratio": None,
-                    "separates_count": 0,
-                    "consensus_pct": None,
-                    "residual_pct": None,
-                }
+                payload = _empty_panel_state(
+                    "NO_DATA" if status == "NO_DATA" or bool(data.get("synthetic_placeholder", False)) else "UNAVAILABLE",
+                    path,
+                    str(data.get("message", "control analysis unavailable")),
+                    ["procrustes_ratio", "distance_corr_ratio", "consensus_pct", "residual_pct"],
+                )
+                payload["separates_count"] = 0
+                return payload
             return {
                 "status": "OK",
                 "source": str(path),
@@ -1069,16 +1078,14 @@ def load_control_state(run_key: Optional[str]) -> dict:
         if not isinstance(interp, dict):
             continue
         if interp.get("error"):
-            return {
-                "status": "UNAVAILABLE",
-                "source": str(path),
-                "message": str(interp.get("error")),
-                "procrustes_ratio": None,
-                "distance_corr_ratio": None,
-                "separates_count": 0,
-                "consensus_pct": None,
-                "residual_pct": None,
-            }
+            payload = _empty_panel_state(
+                "UNAVAILABLE",
+                path,
+                str(interp.get("error")),
+                ["procrustes_ratio", "distance_corr_ratio", "consensus_pct", "residual_pct"],
+            )
+            payload["separates_count"] = 0
+            return payload
         metrics = interp.get("metrics", {}) if isinstance(interp.get("metrics"), dict) else {}
         procrustes_ratio = _safe_float((metrics.get("procrustes", {}) or {}).get("ratio"), default=float("nan"))
         distance_corr_ratio = _safe_float((metrics.get("distance_corr", {}) or {}).get("ratio"), default=float("nan"))
@@ -1165,16 +1172,13 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                 continue
             status_marker = str(blob.get("status", "")).strip().upper()
             if status_marker in {"NO_DATA", "UNAVAILABLE"} or bool(blob.get("synthetic_placeholder", False)):
-                return {
-                    "status": "UNAVAILABLE",
-                    "source": str(path),
-                    "stage_1_nmi": None,
-                    "stage_2_nmi": None,
-                    "stage_3_nmi": None,
-                    "delta_nmi": None,
-                    "retained_pct": None,
-                    "legacy_mean_variance": None,
-                }
+                payload = _empty_panel_state(
+                    "NO_DATA" if status_marker == "NO_DATA" or bool(blob.get("synthetic_placeholder", False)) else "UNAVAILABLE",
+                    path,
+                    str(blob.get("reason") or blob.get("message") or "ablation analysis unavailable"),
+                    ["stage_1_nmi", "stage_2_nmi", "stage_3_nmi", "delta_nmi", "retained_pct", "legacy_mean_variance"],
+                )
+                return payload
             metrics = blob.get("metrics", {})
             metrics = metrics if isinstance(metrics, dict) else {}
             s1 = blob.get("stage_1_nmi", metrics.get("stage_1_nmi"))
@@ -1228,6 +1232,7 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
     return {
         "status": "MISSING",
         "source": "NOT FOUND",
+        "message": "no ablation analysis results",
         "stage_1_nmi": None,
         "stage_2_nmi": None,
         "stage_3_nmi": None,
@@ -2153,7 +2158,12 @@ def refresh_hidden_label_filters(run_key: str, current_col: Optional[str], curre
 
     columns = sorted({k for r in rows if isinstance(r, dict) for k in r.keys() if k.startswith("group_")})
     col_opts = [{"label": c, "value": c} for c in columns]
-    chosen_col = current_col if current_col in columns else (columns[0] if columns else None)
+    if current_col in columns:
+        chosen_col = current_col
+    elif "group_topic" in columns:
+        chosen_col = "group_topic"
+    else:
+        chosen_col = columns[0] if columns else None
 
     value_opts = []
     if chosen_col:
@@ -2498,7 +2508,9 @@ def _build_group_panel(contract: dict, label_col: Optional[str], label_values: O
                 continue
             name = g.get("group_name", "unknown")
             n = g.get("n_articles", "n/a")
-            summary_lines.append(f"  - {name}: n={n}")
+            markers = g.get("top_markers") or []
+            marker_text = f" | markers={', '.join(map(str, markers[:3]))}" if markers else ""
+            summary_lines.append(f"  - {name}: n={n}{marker_text}")
 
     return html.Pre("\n".join(lines + [""] + summary_lines), style={"margin": "0", "color": PALETTE["text"], "fontSize": "0.82rem"})
 
@@ -2761,6 +2773,8 @@ def _render_dashboard_impl(
         f"stage3={ab.get('stage_3_nmi', 'n/a')} | delta={ab.get('delta_nmi', 'n/a')} | retained={ab.get('retained_pct', 'n/a')}\n"
         f"source={ab.get('source', 'NOT FOUND')}"
     )
+    if str(ab.get("status", "")).upper() in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ab.get("message"):
+        ablation_text += f"\nmessage={ab.get('message')}"
     if ab.get("legacy_mean_variance") is not None:
         ablation_text = (
             f"status=LEGACY | mean_variance={ab.get('legacy_mean_variance')} (no stage NMI fields)\n"
@@ -2772,6 +2786,8 @@ def _render_dashboard_impl(
         f"consensus={ctrl.get('consensus_pct', 'n/a')}% | residual={ctrl.get('residual_pct', 'n/a')}%\n"
         f"source={ctrl.get('source', 'NOT FOUND')}"
     )
+    if str(ctrl.get("status", "")).upper() in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ctrl.get("message"):
+        control_text += f"\nmessage={ctrl.get('message')}"
 
     provenance_line = (
         " | ".join(
@@ -2790,7 +2806,11 @@ def _render_dashboard_impl(
     if hidden_rows:
         hidden_badge_text = "[HIDDEN LABELS READY]"
         hidden_badge_style = {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["green"], "border": f"1px solid {PALETTE['green']}", "backgroundColor": "rgba(0,255,65,0.10)"}
-        hidden_detail = f"rows={len(hidden_rows)} | group_summaries={contract.get('paths', {}).get('group_summaries', 'NOT FOUND')} | group_matrix={contract.get('paths', {}).get('group_matrix', 'NOT FOUND')}"
+        hidden_detail = (
+            f"rows={len(hidden_rows)} | "
+            f"group_summaries={contract.get('paths', {}).get('labels/derived/group_summaries.json', 'NOT FOUND')} | "
+            f"group_matrix={contract.get('paths', {}).get('labels/derived/group_matrix.json', 'NOT FOUND')}"
+        )
     else:
         hidden_badge_text = "[HIDDEN LABELS MISSING]"
         hidden_badge_style = {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["amber"], "border": f"1px solid {PALETTE['amber']}", "backgroundColor": "rgba(255,179,71,0.12)"}
