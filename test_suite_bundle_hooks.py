@@ -753,6 +753,54 @@ def test_emit_relativity_deltas_json_aggregates_vector_fields(tmp_path):
     assert vector["delta"]["z"] == pytest.approx(-0.5)
 
 
+def test_emit_consumer_contract_bundle_marks_observer_backed_bundle_non_comparable_when_validation_unavailable(tmp_path):
+    if not suite.TORCH_AVAILABLE:
+        pytest.skip("torch unavailable")
+
+    run_dir = tmp_path / "observer_backed_non_comparable"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "features": np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=float),
+        "article_metadata": [
+            {"index": 0, "bt_uid": "a0", "title": "A0", "source": "same"},
+            {"index": 1, "bt_uid": "a1", "title": "A1", "source": "same"},
+        ],
+    }
+    suite.torch.save(payload, run_dir / "observer_42.pt")
+
+    result = suite.emit_consumer_contract_bundle(run_dir)
+    validation = json.loads((run_dir / "validation.json").read_text(encoding="utf-8"))
+
+    assert result["status"] == "success"
+    assert result["mode"] == "non_comparable"
+    assert validation["comparability_status"] == "NON_COMPARABLE"
+
+
+def test_emit_consumer_contract_bundle_falls_back_to_observer_backed_bundle_without_monolith(tmp_path):
+    if not suite.TORCH_AVAILABLE:
+        pytest.skip("torch unavailable")
+
+    run_dir = tmp_path / "observer_backed_bundle"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "features": np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=float),
+        "article_metadata": [
+            {"index": 0, "bt_uid": "a0", "title": "A0", "source": "src0", "perspective_tag": "p0", "zone": "z0"},
+            {"index": 1, "bt_uid": "a1", "title": "A1", "source": "src1", "perspective_tag": "p1", "zone": "z1"},
+        ],
+    }
+    suite.torch.save(payload, run_dir / "observer_42.pt")
+
+    result = suite.emit_consumer_contract_bundle(run_dir)
+
+    assert result["status"] == "success"
+    assert result["mode"] == "observer_backed"
+    assert (run_dir / "baseline_meta.json").exists()
+    assert (run_dir / "baseline_state.json").exists()
+    assert (run_dir / "verification_report.json").exists()
+    assert (run_dir / "validation.json").exists()
+
+
 def test_emit_control_metrics_json_prefers_direct_control_results_blob(tmp_path, monkeypatch):
     run_dir = tmp_path / "control_metrics_direct"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -870,6 +918,32 @@ def test_emit_ablation_summary_json_translates_lab_diagnostics(tmp_path):
     assert blob["metrics"]["stage_3_nmi"] == pytest.approx(0.8)
     assert blob["metrics"]["delta_nmi"] == pytest.approx(0.3)
     assert blob["metrics"]["retained_pct"] == pytest.approx(80.0)
+
+
+def test_emit_validation_json_falls_back_to_article_metadata_rows_without_monolith(tmp_path):
+    if not suite.TORCH_AVAILABLE:
+        pytest.skip("torch unavailable")
+
+    run_dir = tmp_path / "validation_metadata_fallback"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "features": np.asarray([[0.0, 0.0], [0.1, 0.2], [5.0, 5.0], [5.1, 5.2]], dtype=float),
+        "article_metadata": [
+            {"index": 0, "bt_uid": "a0", "title": "A0", "zone": "left", "source": "s0"},
+            {"index": 1, "bt_uid": "a1", "title": "A1", "zone": "left", "source": "s1"},
+            {"index": 2, "bt_uid": "a2", "title": "A2", "zone": "right", "source": "s2"},
+            {"index": 3, "bt_uid": "a3", "title": "A3", "zone": "right", "source": "s3"},
+        ],
+    }
+    suite.torch.save(payload, run_dir / "observer_42.pt")
+    suite._hydrate_run_leaf_from_observer(run_dir)
+
+    out = suite._emit_validation_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert isinstance(blob["nmi"], float)
+    assert 0.0 <= blob["nmi"] <= 1.0
+    assert blob["trust_level"] == "MEASURED"
 
 
 def test_normalize_validation_payload_promotes_existing_numeric_nmi():

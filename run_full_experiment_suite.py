@@ -2001,6 +2001,71 @@ def _load_metadata_rows(metadata_csv: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _emit_observer_backed_contract_bundle(run_dir: Path, reason: str) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    hydrate_result = _hydrate_run_leaf_from_observer(run_dir)
+    observer_payload = _load_primary_observer_payload(run_dir)
+    rows = _load_metadata_rows(run_dir / "article_metadata.csv")
+    if not rows and isinstance(observer_payload, dict):
+        metadata = observer_payload.get("article_metadata")
+        if isinstance(metadata, list):
+            for i, item in enumerate(metadata):
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        "index": int(item.get("index", i)),
+                        "bt_uid": str(item.get("bt_uid", f"article_{i}")),
+                        "title": str(item.get("title", ""))[:200],
+                        "zone": str(item.get("zone", "observer_backed")) or "observer_backed",
+                        "density": str(item.get("density", 0)),
+                        "stress": str(item.get("stress", 0)),
+                        "z_height": str(item.get("z_height", 0)),
+                        "source": str(item.get("source", "")),
+                        "perspective_tag": str(item.get("perspective_tag", "")),
+                    }
+                )
+
+    if not rows:
+        return {
+            "status": "failed",
+            "stage": "observer_backed_bundle",
+            "error": f"unable to build fallback article rows: {reason}",
+            "run_dir": str(run_dir),
+            "hydration": hydrate_result,
+        }
+
+    _ensure_verification_report(run_dir)
+    baseline_meta = _emit_baseline_meta(run_dir)
+    baseline_state = _emit_baseline_state(run_dir, rows)
+    validation_json = _emit_validation_json(run_dir)
+    try:
+        validation_blob = json.loads(validation_json.read_text(encoding="utf-8"))
+    except Exception:
+        validation_blob = {}
+    if validation_blob.get("nmi") is None:
+        return _emit_non_comparable_contract_bundle(
+            run_dir,
+            f"{reason}; validation metrics unavailable",
+        )
+    control_metrics = _emit_control_metrics_json(run_dir)
+    ablation_summary = _emit_ablation_summary_json(run_dir)
+    label_paths = _emit_label_derivatives(run_dir, rows)
+
+    return {
+        "status": "success",
+        "mode": "observer_backed",
+        "reason": reason,
+        "run_dir": str(run_dir),
+        "baseline_meta": str(baseline_meta),
+        "baseline_state": str(baseline_state),
+        "validation_json": str(validation_json),
+        "control_metrics": str(control_metrics),
+        "ablation_summary": str(ablation_summary),
+        "labels": label_paths,
+    }
+
+
 def _emit_non_comparable_contract_bundle(run_dir: Path, reason: str) -> Dict[str, Any]:
     run_dir = Path(run_dir)
     hydrate_result = _hydrate_run_leaf_from_observer(run_dir)
@@ -3077,6 +3142,27 @@ def _emit_validation_json(run_dir: Path) -> Path:
 
     observer_payload = _load_primary_observer_payload(run_dir)
     rows = _load_monolith_rows(run_dir / "MONOLITH_DATA.csv")
+    if not rows:
+        rows = _load_metadata_rows(run_dir / "article_metadata.csv")
+        if not rows and isinstance(observer_payload, dict):
+            metadata = observer_payload.get("article_metadata")
+            if isinstance(metadata, list):
+                for i, item in enumerate(metadata):
+                    if not isinstance(item, dict):
+                        continue
+                    rows.append(
+                        {
+                            "index": int(item.get("index", i)),
+                            "bt_uid": str(item.get("bt_uid", f"article_{i}")),
+                            "title": str(item.get("title", ""))[:200],
+                            "zone": str(item.get("zone", "non_comparable")) or "non_comparable",
+                            "density": str(item.get("density", 0)),
+                            "stress": str(item.get("stress", 0)),
+                            "z_height": str(item.get("z_height", 0)),
+                            "source": str(item.get("source", "")),
+                            "perspective_tag": str(item.get("perspective_tag", "")),
+                        }
+                    )
     validation_payload = dict(existing) if isinstance(existing, dict) else {}
 
     try:
@@ -3516,14 +3602,26 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     monolith_csv = run_dir / "MONOLITH_DATA.csv"
     if not monolith_csv.exists():
         has_observer_payload = (run_dir / "observer_global.pt").exists() or any(run_dir.glob("observer_*.pt"))
-        if run_dir.name == "control_constant" and has_observer_payload:
-            fallback = _emit_non_comparable_contract_bundle(
-                run_dir,
-                "MONOLITH_DATA.csv unavailable; leaf treated as non-comparable",
-            )
-            if fallback.get("status") == "success":
-                return fallback
-        return {"status": "failed", "error": f"missing MONOLITH_DATA.csv at {monolith_csv}"}
+        if has_observer_payload:
+            monolith_ready = _ensure_monolith_csv_ready(run_dir)
+            if monolith_ready.get("status") in {"success", "already_exists"}:
+                monolith_csv = run_dir / "MONOLITH_DATA.csv"
+            elif run_dir.name == "control_constant":
+                fallback = _emit_non_comparable_contract_bundle(
+                    run_dir,
+                    "MONOLITH_DATA.csv unavailable; leaf treated as non-comparable",
+                )
+                if fallback.get("status") == "success":
+                    return fallback
+            else:
+                fallback = _emit_observer_backed_contract_bundle(
+                    run_dir,
+                    "MONOLITH_DATA.csv unavailable; emitted observer-backed contract bundle",
+                )
+                if fallback.get("status") == "success":
+                    return fallback
+        if not monolith_csv.exists():
+            return {"status": "failed", "error": f"missing MONOLITH_DATA.csv at {monolith_csv}"}
 
     # Verification artifacts are leaf-local by contract. Do not copy from parent
     # directories; inherited reports can misstate leaf verification status.
