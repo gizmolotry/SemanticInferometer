@@ -236,6 +236,8 @@ def validate_validation_json(validation: Dict[str, Any]) -> ValidationResult:
     warnings: List[str] = []
     source = str(validation.get("source", "")).strip().lower()
     provenance_source = str(validation.get("provenance_source", "")).strip().lower()
+    comparability_status = str(validation.get("comparability_status", "")).strip().upper()
+    trust_level = str(validation.get("trust_level", "")).strip().upper()
     if bool(validation.get("synthetic_placeholder", False)) or source in {"suite-default", "suite-default-placeholder"}:
         errors.append("validation contains synthetic placeholder data")
     elif provenance_source in {"suite-default", "suite-default-placeholder"}:
@@ -246,6 +248,8 @@ def validate_validation_json(validation: Dict[str, Any]) -> ValidationResult:
         return ValidationResult(False, errors, warnings)
 
     nmi = validation.get("nmi")
+    if nmi is None and (comparability_status == LayerStatus.NON_COMPARABLE.value or trust_level == LayerStatus.NON_COMPARABLE.value):
+        return ValidationResult(True, errors, warnings)
     if isinstance(nmi, bool) or not isinstance(nmi, (int, float)):
         errors.append("validation.nmi must be a numeric value in [0, 1] (bool not allowed)")
         return ValidationResult(False, errors, warnings)

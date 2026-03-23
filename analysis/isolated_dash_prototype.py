@@ -84,14 +84,11 @@ def _root_has_run_directory(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
     try:
-        for child in path.iterdir():
-            if not child.is_dir():
-                continue
-            if _is_run_directory(child):
+        if _is_run_directory(path):
+            return True
+        for child in path.rglob("*"):
+            if child.is_dir() and _is_run_directory(child):
                 return True
-            for grandchild in child.iterdir():
-                if grandchild.is_dir() and _is_run_directory(grandchild):
-                    return True
     except Exception:
         return False
     return False
@@ -100,6 +97,7 @@ def _root_has_run_directory(path: Path) -> bool:
 def _discover_artifact_roots() -> List[Path]:
     explicit_roots = [
         ROOT / "experiments_20260221_175416" / "synthetic",
+        ROOT / "outputs" / "experiments" / "runs",
         ROOT / "outputs",
     ]
     patterns = (
@@ -727,17 +725,82 @@ def _collect_run_dirs(artifact_root: Optional[Path]) -> List[Path]:
     if not artifact_root or not artifact_root.exists():
         return []
     run_dirs: List[Path] = []
-    for d in artifact_root.iterdir():
-        if not d.is_dir():
-            continue
-        if _is_run_directory(d):
+    seen: set[str] = set()
+    try:
+        candidates = [artifact_root]
+        candidates.extend(p for p in artifact_root.rglob("*") if p.is_dir())
+        for d in candidates:
+            if not _is_run_directory(d):
+                continue
+            key = str(d.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
             run_dirs.append(d)
-            continue
-        for child in d.iterdir():
-            if child.is_dir() and _is_run_directory(child):
-                run_dirs.append(child)
+    except Exception:
+        return []
     run_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return run_dirs
+
+
+def _run_selection_health(run_dir: Path) -> Dict[str, Any]:
+    try:
+        diag = evaluate_consumer_contract(run_dir)
+    except Exception:
+        return {
+            "score": 0,
+            "contract_ok": False,
+            "verification_status": LayerStatus.UNVERIFIED.value,
+            "schema_errors": ["contract evaluation failed"],
+        }
+
+    verification_status = str(diag.verification_status or LayerStatus.UNVERIFIED.value).upper()
+    if diag.contract_ok:
+        score = 3
+    elif verification_status == LayerStatus.NON_COMPARABLE.value:
+        # Keep explicit NON_COMPARABLE controls selectable, but do not prefer
+        # them over fully valid leaves when auto-selecting a run.
+        score = 2
+    elif len(diag.missing_required_artifacts) == 0:
+        score = 1
+    else:
+        score = 0
+    corpus_name = str(run_dir.name).lower()
+    if corpus_name == "real":
+        corpus_priority = 4
+    elif corpus_name in {"control_shuffled", "control_random"}:
+        corpus_priority = 3
+    elif corpus_name == "synthetic":
+        corpus_priority = 2
+    elif corpus_name == "control_constant":
+        corpus_priority = 1
+    else:
+        corpus_priority = 0
+    return {
+        "score": score,
+        "corpus_priority": corpus_priority,
+        "contract_ok": bool(diag.contract_ok),
+        "verification_status": verification_status,
+        "schema_errors": list(diag.schema_errors),
+    }
+
+
+def _preferred_run_key(index: dict) -> str:
+    run_keys = list(index.get("run_keys", []))
+    runs = index.get("runs", {})
+    if not run_keys:
+        return ""
+
+    ranked = sorted(
+        run_keys,
+        key=lambda rk: (
+            int((runs.get(rk, {}) or {}).get("selection_score", 0)),
+            int((runs.get(rk, {}) or {}).get("selection_corpus_priority", 0)),
+            int((runs.get(rk, {}) or {}).get("run_dir").stat().st_mtime_ns if isinstance((runs.get(rk, {}) or {}).get("run_dir"), Path) and (runs.get(rk, {}) or {}).get("run_dir").exists() else 0),
+        ),
+        reverse=True,
+    )
+    return ranked[0] if ranked else run_keys[0]
 
 
 def _run_display_key(run_dir: Path) -> str:
@@ -1560,6 +1623,7 @@ def build_artifact_index() -> dict:
         primary_metrics = run_manifest.get("primary_metrics", {}) if isinstance(run_manifest, dict) else {}
         if item.get("nmi") is None and _is_number(primary_metrics.get("synthesis_nmi")):
             item["nmi"] = float(primary_metrics.get("synthesis_nmi"))
+        selection_health = _run_selection_health(run_dir)
         run = {
             "run_key": run_key,
             "kernel": str(item.get("kernel", "unknown")),
@@ -1576,6 +1640,11 @@ def build_artifact_index() -> dict:
             "observer_manifest": {},
             "observer_artifacts": {},
             "run_manifest": run_manifest if isinstance(run_manifest, dict) else {},
+            "selection_score": int(selection_health.get("score", 0)),
+            "selection_corpus_priority": int(selection_health.get("corpus_priority", 0)),
+            "contract_ok": bool(selection_health.get("contract_ok", False)),
+            "selection_verification_status": str(selection_health.get("verification_status", LayerStatus.UNVERIFIED.value)),
+            "selection_schema_errors": list(selection_health.get("schema_errors", [])),
         }
         manifest_path = run["observer_manifest_path"]
         if manifest_path.exists():
@@ -1594,7 +1663,7 @@ def build_artifact_index() -> dict:
         runs[run_key] = run
         run_keys.append(run_key)
 
-    default_run = run_keys[0] if run_keys else ""
+    default_run = _preferred_run_key({"run_keys": run_keys, "runs": runs}) if run_keys else ""
 
     observers_by_run: Dict[str, List[dict]] = {}
     article_rows_by_run: Dict[str, Dict[int, dict]] = {}
@@ -1954,7 +2023,9 @@ def reindex_runs(n_clicks: Optional[int], current_run: Optional[str]):
     DEFAULT_PRIMARY_VARIANT = _preferred_variant(DEFAULT_VARIANTS)
 
     option_values = [opt["value"] for opt in RUN_OPTIONS]
-    if current_run in option_values:
+    current_run_blob = INDEX.get("runs", {}).get(current_run or "", {})
+    current_run_healthy = bool(current_run_blob.get("contract_ok")) or str(current_run_blob.get("selection_verification_status", "")).upper() == LayerStatus.NON_COMPARABLE.value
+    if current_run in option_values and current_run_healthy:
         run_value = current_run
     else:
         run_value = DEFAULT_RUN if DEFAULT_RUN in option_values else (option_values[0] if option_values else "")

@@ -597,6 +597,12 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     if not monolith_csv.exists():
         monolith_ready = _ensure_monolith_csv_ready(target_dir)
         if monolith_ready.get("status") not in {"success", "already_exists"}:
+            err_text = str(monolith_ready.get("error", "") or "")
+            if "metric fusion failed:" in err_text and "refusing to emit flat manifold metrics" in err_text:
+                return _emit_non_comparable_contract_bundle(
+                    target_dir,
+                    "flat manifold metrics collapsed during bundle materialization",
+                )
             payload = {
                 "status": monolith_ready.get("status", "skipped"),
                 "run_dir": str(run_dir),
@@ -1879,6 +1885,154 @@ def _load_monolith_rows(monolith_csv: Path) -> List[Dict[str, Any]]:
             hydrated["stress"] = row.get("stress", "0")
             rows.append(hydrated)
     return rows
+
+
+def _load_metadata_rows(metadata_csv: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not metadata_csv.exists():
+        return rows
+    with metadata_csv.open("r", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return rows
+        for i, row in enumerate(reader):
+            ridx = row.get("index", "")
+            try:
+                idx = int(ridx)
+            except Exception:
+                idx = i
+            title = (row.get("title", "") or row.get("article_title", "") or "")[:200]
+            rows.append(
+                {
+                    "index": idx,
+                    "bt_uid": row.get("bt_uid", f"article_{idx}"),
+                    "title": title,
+                    "zone": row.get("zone", "non_comparable"),
+                    "density": "0",
+                    "stress": "0",
+                    "z_height": "0",
+                    "source": row.get("source", ""),
+                    "perspective_tag": row.get("perspective_tag", ""),
+                }
+            )
+    return rows
+
+
+def _emit_non_comparable_contract_bundle(run_dir: Path, reason: str) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    hydrate_result = _hydrate_run_leaf_from_observer(run_dir)
+    observer_payload = _load_primary_observer_payload(run_dir)
+    rows = _load_metadata_rows(run_dir / "article_metadata.csv")
+    if not rows and isinstance(observer_payload, dict):
+        metadata = observer_payload.get("article_metadata")
+        if isinstance(metadata, list):
+            for i, item in enumerate(metadata):
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        "index": int(item.get("index", i)),
+                        "bt_uid": str(item.get("bt_uid", f"article_{i}")),
+                        "title": str(item.get("title", ""))[:200],
+                        "zone": "non_comparable",
+                        "density": "0",
+                        "stress": "0",
+                        "z_height": "0",
+                        "source": str(item.get("source", "")),
+                        "perspective_tag": str(item.get("perspective_tag", "")),
+                    }
+                )
+
+    if not rows:
+        return {
+            "status": "failed",
+            "stage": "non_comparable_bundle",
+            "error": f"unable to build fallback article rows: {reason}",
+            "run_dir": str(run_dir),
+            "hydration": hydrate_result,
+        }
+
+    summary = _build_leaf_provenance_summary(run_dir, observer_payload)
+    summary["verification_status"] = "NON_COMPARABLE"
+    summary["provenance_source"] = "observer_payload_non_comparable"
+    baseline_meta = run_dir / "baseline_meta.json"
+    baseline_meta.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    baseline_state = {
+        "articles": rows,
+        "paths": [],
+        "axes": {"x": "density", "y": "stress"},
+        "metrics": {
+            "source": "article_metadata.csv",
+            "comparability_status": "NON_COMPARABLE",
+            "reason": reason,
+        },
+    }
+    baseline_state_path = run_dir / "baseline_state.json"
+    baseline_state_path.write_text(json.dumps(baseline_state, indent=2), encoding="utf-8")
+
+    validation_payload = {
+        "schema_version": "1.0",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "n_observers": 1,
+        "nmi": None,
+        "ari": None,
+        "nmi_std": None,
+        "ari_std": None,
+        "metric_source": "non_comparable_flat_manifold",
+        "source": "non_comparable_flat_manifold",
+        "provenance_source": "observer_payload_non_comparable",
+        "comparability_status": "NON_COMPARABLE",
+        "track_nmi": {},
+        "track_metrics": {},
+        "trust_level": "NON_COMPARABLE",
+        "reason": reason,
+    }
+    validation_path = run_dir / "validation.json"
+    validation_path.write_text(json.dumps(validation_payload, indent=2), encoding="utf-8")
+
+    report_payload = {
+        "schema_version": "1.0",
+        "contract_version": "1.0",
+        "run_id": run_dir.name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "global_pass": False,
+        "status": "NON_COMPARABLE",
+        "verification_status": "NON_COMPARABLE",
+        "comparability_status": "NON_COMPARABLE",
+        "dataset_hash": summary["dataset_hash"],
+        "code_hash_or_commit": summary["code_hash_or_commit"],
+        "weights_hash": summary["weights_hash"],
+        "kernel_params": summary["kernel_params"],
+        "rks_dim": summary["rks_dim"],
+        "crn_seed": summary["crn_seed"],
+        "alpha": summary["alpha"],
+        "layers": [
+            {
+                "layer_id": run_dir.name,
+                "layer_name": run_dir.name,
+                "status": "NON_COMPARABLE",
+                "checks": [],
+                "fail_reasons": [reason],
+            }
+        ],
+    }
+    report_path = run_dir / "verification_report.json"
+    report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+    _emit_no_data_ablation_summary(run_dir)
+    _emit_control_metrics_json(run_dir)
+
+    return {
+        "status": "success",
+        "mode": "non_comparable",
+        "reason": reason,
+        "run_dir": str(run_dir),
+        "baseline_meta": str(baseline_meta),
+        "baseline_state": str(baseline_state_path),
+        "validation_json": str(validation_path),
+        "verification_report": str(report_path),
+    }
 
 
 def _emit_baseline_state(run_dir: Path, rows: List[Dict[str, Any]]) -> Path:
@@ -3204,6 +3358,14 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     run_dir = Path(run_dir)
     monolith_csv = run_dir / "MONOLITH_DATA.csv"
     if not monolith_csv.exists():
+        has_observer_payload = (run_dir / "observer_global.pt").exists() or any(run_dir.glob("observer_*.pt"))
+        if run_dir.name == "control_constant" and has_observer_payload:
+            fallback = _emit_non_comparable_contract_bundle(
+                run_dir,
+                "MONOLITH_DATA.csv unavailable; leaf treated as non-comparable",
+            )
+            if fallback.get("status") == "success":
+                return fallback
         return {"status": "failed", "error": f"missing MONOLITH_DATA.csv at {monolith_csv}"}
 
     # Verification artifacts are leaf-local by contract. Do not copy from parent
@@ -4065,6 +4227,87 @@ def save_manifest(exp_dir: Path, results: List[Dict], config: Dict):
     print(f"\n Saved manifest: {manifest_path}")
 
 
+def _iter_suite_leaf_dirs(exp_dir: Path, config: Dict[str, Any]) -> List[Path]:
+    kernels = list(config.get("kernels") or [])
+    channels = list(config.get("channels") or [])
+    corpora = list(config.get("corpora") or [])
+    leafs: List[Path] = []
+    seen: set[str] = set()
+    for corpus in corpora:
+        for channel in channels:
+            if channel == "gradient":
+                candidate = exp_dir / "gradient" / corpus
+                key = str(candidate)
+                if key not in seen:
+                    leafs.append(candidate)
+                    seen.add(key)
+                continue
+            for kernel in kernels:
+                candidate = exp_dir / kernel / channel / corpus
+                key = str(candidate)
+                if key not in seen:
+                    leafs.append(candidate)
+                    seen.add(key)
+    return leafs
+
+
+def _restore_args_from_resume(args: argparse.Namespace, exp_dir: Path) -> argparse.Namespace:
+    """Restore core run settings from prior suite config/manifest when resuming."""
+    stored: Optional[Dict[str, Any]] = _load_suite_config(exp_dir)
+    if not isinstance(stored, dict):
+        manifest_path = exp_dir / "experiment_manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                maybe_cfg = manifest.get("config")
+                if isinstance(maybe_cfg, dict):
+                    stored = maybe_cfg
+            except Exception:
+                stored = None
+
+    if not isinstance(stored, dict):
+        return args
+
+    for key in ("limit", "mode"):
+        if key in stored and stored[key] is not None:
+            setattr(args, key, stored[key])
+
+    for key in ("seeds", "kernels", "channels", "corpora"):
+        value = stored.get(key)
+        if isinstance(value, list) and value:
+            setattr(args, key, value)
+
+    variance_tracking = stored.get("variance_tracking")
+    if isinstance(variance_tracking, bool):
+        args.no_variance_tracking = not variance_tracking
+
+    probe_cfg = stored.get("probe")
+    if isinstance(probe_cfg, dict):
+        for arg_key, cfg_key in (
+            ("probe_script", "script"),
+            ("probe_model", "model"),
+            ("probe_hypotheses", "hypotheses"),
+            ("probe_entities", "entities"),
+            ("probe_corpus_jsonl", "corpus_jsonl"),
+            ("probe_corpus_field", "corpus_field"),
+        ):
+            if probe_cfg.get(cfg_key):
+                setattr(args, arg_key, probe_cfg[cfg_key])
+        for arg_key, cfg_key in (
+            ("probe_n_synth", "n_synth"),
+            ("probe_corpus_limit", "corpus_limit"),
+            ("probe_max_length", "max_length"),
+            ("probe_batch_size", "batch_size"),
+        ):
+            if probe_cfg.get(cfg_key) is not None:
+                setattr(args, arg_key, probe_cfg[cfg_key])
+        if "nonfatal" in probe_cfg:
+            args.probe_nonfatal = bool(probe_cfg["nonfatal"])
+
+    print("[RESUME] Restored config from prior suite metadata.")
+    return args
+
+
 def run_post_thesis_sync(run_validation: bool = False) -> None:
     """
     Sync thesis-facing registry/docs after a suite run.
@@ -4477,6 +4720,7 @@ def main():
         exp_dir = Path(args.resume)
         if not exp_dir.exists():
             raise SystemExit(f"ERROR: Resume directory not found: {exp_dir}")
+        args = _restore_args_from_resume(args, exp_dir)
         print(f"\n{'='*80}")
         print(" RESUMING EXPERIMENT SUITE")
         print(f"{'='*80}")
@@ -4513,6 +4757,32 @@ def main():
     else:
         print(f"Probe: DISABLED (missing files)")
     print(f"{'='*80}")
+
+    base_config = {
+        "limit": args.limit,
+        "seeds": args.seeds,
+        "kernels": args.kernels,
+        "channels": args.channels,
+        "corpora": args.corpora,
+        "variance_tracking": not args.no_variance_tracking,
+        "structure": "kernel/channel/corpus/observer_SEED.pt",
+        "probe": {
+            "enabled": bool(probe_enabled),
+            "script": args.probe_script,
+            "model": args.probe_model,
+            "hypotheses": str(probe_hyp_path),
+            "entities": args.probe_entities,
+            "n_synth": args.probe_n_synth,
+            "corpus_jsonl": args.probe_corpus_jsonl or "auto",
+            "corpus_field": args.probe_corpus_field,
+            "corpus_limit": args.probe_corpus_limit,
+            "max_length": args.probe_max_length,
+            "batch_size": args.probe_batch_size,
+            "nonfatal": args.probe_nonfatal,
+        },
+    }
+    _write_suite_config(exp_dir, base_config)
+    save_manifest(exp_dir, [], base_config)
 
     # ============================================================
     # WATERFALL VIZ-ONLY MODE (Generate dashboard from existing checkpoints)
@@ -4778,11 +5048,13 @@ def main():
 
                 if result["status"] == "failed":
                     results.append(result)
+                    save_manifest(exp_dir, results, base_config)
                     print(f"\n Gradient analysis failed: {corpus}")
                     print("Stopping experiment suite.")
                     break
 
                 results.append(result)
+                save_manifest(exp_dir, results, base_config)
                 print(f"\n Gradient analysis completed: {corpus}")
                 continue  # Skip kernel loop for gradient channel
 
@@ -4829,6 +5101,7 @@ def main():
                 # Stop early on failure
                 if result["status"] == "failed":
                     results.append(result)
+                    save_manifest(exp_dir, results, base_config)
                     print(f"\n Experiment failed: {corpus}")
                     print("Stopping experiment suite.")
                     break
@@ -4883,6 +5156,7 @@ def main():
                         # If probe failed and nonfatal is off, stop suite
                         if probe_result.get("status") != "success" and not args.probe_nonfatal:
                             results.append(result)
+                            save_manifest(exp_dir, results, base_config)
                             print("\n Probe failed and --probe-nonfatal is not set.")
                             print("Stopping experiment suite.")
                             break
@@ -4896,6 +5170,7 @@ def main():
                         }
                         if not args.probe_nonfatal:
                             results.append(result)
+                            save_manifest(exp_dir, results, base_config)
                             print(f"\n Probe exception: {e}")
                             print("Stopping experiment suite.")
                             break
@@ -4938,6 +5213,7 @@ def main():
                         result["alpha_stability"] = {"status": "failed", "error": str(e)}
 
                 results.append(result)
+                save_manifest(exp_dir, results, base_config)
 
                 # Progress update
                 completed_so_far = len([r for r in results if r.get("status") == "success"])
@@ -4951,11 +5227,7 @@ def main():
     refreshed_control_metrics: List[str] = []
     refreshed_contract_bundles: List[str] = []
     refreshed_control_dirs: set[str] = set()
-    for res in results:
-        output_dir_str = res.get("output_dir")
-        if not output_dir_str:
-            continue
-        output_dir = Path(str(output_dir_str))
+    for output_dir in _iter_suite_leaf_dirs(exp_dir, base_config):
         if not output_dir.exists():
             continue
         key = str(output_dir)
@@ -4977,31 +5249,12 @@ def main():
             print(f"[CONTRACT][WARN] Failed to refresh consumer bundle for {output_dir}: {bundle_exc}")
 
     # Save manifest
-    config = {
-        "limit": args.limit,
-        "seeds": args.seeds,
-        "kernels": args.kernels,
-        "channels": args.channels,
-        "corpora": args.corpora,
-        "variance_tracking": not args.no_variance_tracking,
-        "structure": "kernel/channel/corpus/observer_SEED.pt",
-        "probe": {
-            "enabled": True,  # FIXED: Always enabled now
-            "script": args.probe_script,
-            "model": args.probe_model,
-            "hypotheses": str(probe_hyp_path),
-            "entities": args.probe_entities,
-            "n_synth": args.probe_n_synth,
-            "corpus_jsonl": args.probe_corpus_jsonl or "auto",
-            "corpus_field": args.probe_corpus_field,
-            "corpus_limit": args.probe_corpus_limit,
-            "max_length": args.probe_max_length,
-            "batch_size": args.probe_batch_size,
-            "nonfatal": args.probe_nonfatal,
-        },
+    config = dict(base_config)
+    config.update({
         "refreshed_control_metrics": refreshed_control_metrics,
         "refreshed_contract_bundles": refreshed_contract_bundles,
-    }
+    })
+    _write_suite_config(exp_dir, config)
     save_manifest(exp_dir, results, config)
 
     # =========================================================================
