@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 import shutil
 import json
 from pathlib import Path
@@ -70,9 +72,13 @@ def test_materialize_baseline_bundle_happy_path(mock_run_dir):
 
 
 def test_materialize_baseline_bundle_viz_fail(mock_run_dir):
-    """Scenario 2: Monolith render fails - first subprocess non-zero."""
-    with patch("subprocess.run") as mock_run:
+    """Scenario 2: Monolith render fails - first render subprocess non-zero."""
+    with (
+        patch("subprocess.run") as mock_run,
+        patch("run_full_experiment_suite.emit_consumer_contract_bundle") as mock_emit,
+    ):
         mock_run.return_value = MagicMock(returncode=1)
+        mock_emit.return_value = {"status": "success"}
 
         result = materialize_baseline_bundle(mock_run_dir, strict=True)
 
@@ -84,12 +90,16 @@ def test_materialize_baseline_bundle_viz_fail(mock_run_dir):
 
 
 def test_materialize_baseline_bundle_precompute_fail(mock_run_dir):
-    """Scenario 3: Observer manifest fails - first success, second non-zero."""
-    with patch("subprocess.run") as mock_run:
+    """Scenario 3: Observer manifest fails - render succeeds, precompute non-zero."""
+    with (
+        patch("subprocess.run") as mock_run,
+        patch("run_full_experiment_suite.emit_consumer_contract_bundle") as mock_emit,
+    ):
         mock_run.side_effect = [
             MagicMock(returncode=0),
             MagicMock(returncode=2),
         ]
+        mock_emit.return_value = {"status": "success"}
 
         result = materialize_baseline_bundle(mock_run_dir, strict=True)
 
@@ -619,10 +629,10 @@ def test_emit_relativity_defaults_uses_observer_feature_matrix_for_nmi(tmp_path)
             "label_source": "test",
         }
 
-    with (
-        patch("core.complete_pipeline._extract_validation_label_info", side_effect=fake_extract_validation_label_info),
-        patch("core.complete_pipeline._compute_alignment_metrics", side_effect=fake_compute_alignment_metrics),
-    ):
+    fake_complete_pipeline = types.ModuleType("core.complete_pipeline")
+    fake_complete_pipeline._extract_validation_label_info = fake_extract_validation_label_info
+    fake_complete_pipeline._compute_alignment_metrics = fake_compute_alignment_metrics
+    with patch.dict(sys.modules, {"core.complete_pipeline": fake_complete_pipeline}):
         result = suite._emit_relativity_defaults(run_dir, rows)
 
     assert result["mode"] == "observer_payload_relativity_v1"

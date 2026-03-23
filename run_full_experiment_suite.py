@@ -1364,12 +1364,29 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
 def _is_placeholder_status_blob(blob: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(blob, dict) or not blob:
         return True
-    status = str(blob.get("status", "")).strip().upper()
-    if status in {"", "NO_DATA", "UNAVAILABLE", "MISSING"}:
-        return True
     if bool(blob.get("synthetic_placeholder", False)):
         return True
-    return False
+    status = str(blob.get("status", "")).strip().upper()
+    if status in {"NO_DATA", "UNAVAILABLE", "MISSING"}:
+        return True
+    if status:
+        return False
+    meaningful_metric_keys = {
+        "stage_1_nmi",
+        "stage_2_nmi",
+        "stage_3_nmi",
+        "delta_nmi",
+        "retained_percentage",
+        "retained_pct",
+        "legacy_mean_variance",
+        "mean_variance",
+    }
+    if any(blob.get(key) is not None for key in meaningful_metric_keys):
+        return False
+    metrics = blob.get("metrics")
+    if isinstance(metrics, dict) and any(metrics.get(key) is not None for key in meaningful_metric_keys):
+        return False
+    return True
 
 
 def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
