@@ -1050,6 +1050,36 @@ def _empty_panel_state(status: str, source: Path, message: str, fields: List[str
     return payload
 
 
+def _describe_control_explanation(controls: Any) -> str:
+    if not isinstance(controls, dict):
+        return "Type 1 controls compare the real leaf against matched control siblings."
+    present_set = set()
+    for raw_name in controls.keys():
+        name = str(raw_name).strip().lower()
+        if name in {"", "real"}:
+            continue
+        if name == "constant":
+            present_set.add("constant")
+        elif name == "shuffled":
+            present_set.add("shuffled")
+        elif name == "random":
+            present_set.add("random")
+        else:
+            present_set.add(name)
+    ordered = ["constant", "shuffled", "random"]
+    present = [name for name in ordered if name in present_set]
+    present.extend(sorted(name for name in present_set if name not in ordered))
+    if not present:
+        sibling_phrase = "matched control siblings"
+    elif len(present) == 1:
+        sibling_phrase = f"the matched {present[0]} control"
+    elif len(present) == 2:
+        sibling_phrase = f"matched {present[0]} and {present[1]} controls"
+    else:
+        sibling_phrase = "matched " + ", ".join(present[:-1]) + f", and {present[-1]} controls"
+    return f"Type 1 controls compare the real leaf against {sibling_phrase}."
+
+
 def load_control_state(run_key: Optional[str]) -> dict:
     for path in _control_results_candidates(run_key):
         data = _safe_json(path, {})
@@ -1106,7 +1136,7 @@ def load_control_state(run_key: Optional[str]) -> dict:
             "status": "OK",
             "source": str(path),
             "message": "loaded",
-            "explanation": "Type 1 controls compare the real leaf against matched constant, shuffled, and random controls.",
+            "explanation": _describe_control_explanation(data.get("results", {})),
             "procrustes_ratio": None if str(procrustes_ratio) == "nan" else procrustes_ratio,
             "distance_corr_ratio": None if str(distance_corr_ratio) == "nan" else distance_corr_ratio,
             "separates_count": int(separates_count),

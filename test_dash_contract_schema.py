@@ -837,6 +837,32 @@ def test_load_contract_state_accepts_relativity_deltas_bundle(monkeypatch, mod, 
     assert state["observer_delta"]["axis_delta"]["rotation_deg"] == 9.0
 
 
+def test_load_control_state_legacy_explanation_matches_available_controls(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "legacy_control_explanation"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "comprehensive_results.json",
+        {
+            "interpretation": {
+                "metrics": {
+                    "procrustes": {"ratio": 1.2, "separates": True},
+                    "distance_corr": {"ratio": 0.9, "separates": False},
+                },
+                "consensus_residual": {"real": {"consensus_pct": 55.0, "residual_pct": 45.0}},
+            },
+            "results": {"Real": {}, "Random": {}, "Shuffled": {}},
+        },
+    )
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _run_key: run_dir)
+
+    payload = mod.load_control_state("legacy")
+
+    assert payload["status"] == "OK"
+    assert "shuffled and random controls" in payload["explanation"]
+    assert "constant" not in payload["explanation"]
+
+
 def test_build_artifact_index_discovers_modern_run_layouts(monkeypatch, mod, tmp_path):
     honest_run = tmp_path / "outputs" / "honest_matern"
     honest_run.mkdir(parents=True, exist_ok=True)

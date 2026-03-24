@@ -1148,16 +1148,49 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
 
 
 def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
+    def _control_explanation(controls_blob: Any) -> str:
+        if not isinstance(controls_blob, dict):
+            return (
+                "Type 1 controls compare the real leaf against matched control siblings "
+                "to show whether the manifold is carrying structured signal rather than noise."
+            )
+        present_set = set()
+        for raw_name in controls_blob.keys():
+            name = str(raw_name).strip().lower()
+            if name in {"real", ""}:
+                continue
+            if name == "constant":
+                present_set.add("constant")
+            elif name == "shuffled":
+                present_set.add("shuffled")
+            elif name == "random":
+                present_set.add("random")
+            else:
+                present_set.add(name)
+        ordered = ["constant", "shuffled", "random"]
+        present = [name for name in ordered if name in present_set]
+        present.extend(sorted(name for name in present_set if name not in ordered))
+        if not present:
+            sibling_phrase = "matched control siblings"
+        elif len(present) == 1:
+            sibling_phrase = f"the matched {present[0]} control"
+        elif len(present) == 2:
+            sibling_phrase = f"matched {present[0]} and {present[1]} controls"
+        else:
+            sibling_phrase = "matched " + ", ".join(present[:-1]) + f", and {present[-1]} controls"
+        return (
+            f"Type 1 controls compare the real leaf against {sibling_phrase} "
+            "to show whether the manifold is carrying structured signal rather than noise."
+        )
+
+    controls_blob = results_blob.get("results", {}) if isinstance(results_blob, dict) else {}
     payload: Dict[str, Any] = {
         "status": "NO_DATA",
         "panel_type": "type_1_epistemic_controls",
         "source": str(source_path) if source_path else "NOT FOUND",
         "synthetic_placeholder": True,
         "message": "control analysis not run for this leaf",
-        "explanation": (
-            "Type 1 controls compare the real leaf against constant, shuffled, and random "
-            "siblings to show whether the manifold is carrying structured signal rather than noise."
-        ),
+        "explanation": _control_explanation(controls_blob),
         "metrics": {
             "procrustes_ratio": None,
             "distance_corr_ratio": None,
@@ -1195,7 +1228,7 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
     distance_corr_ratio = _safe_float((metrics.get("distance_corr", {}) or {}).get("ratio"), default=float("nan"))
     separates_count = sum(1 for m in metrics.values() if isinstance(m, dict) and bool(m.get("separates")))
     consensus_residual = ((interpretation.get("consensus_residual", {}) or {}).get("real", {}) or {})
-    controls = results_blob.get("results", {})
+    controls = controls_blob
     controls = controls if isinstance(controls, dict) else {}
 
     payload.update(
@@ -1203,6 +1236,7 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
             "status": "OK",
             "synthetic_placeholder": bool(results_blob.get("synthetic_placeholder", False)),
             "message": "loaded",
+            "explanation": _control_explanation(controls),
             "metrics": {
                 "procrustes_ratio": None if str(procrustes_ratio) == "nan" else procrustes_ratio,
                 "distance_corr_ratio": None if str(distance_corr_ratio) == "nan" else distance_corr_ratio,
@@ -1574,6 +1608,7 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
     }
     observers: List[Dict[str, Any]] = []
     coord_deltas_all: List[float] = []
+    synthetic_observer_count = 0
     for state_path in state_paths:
         observer_key = state_path.stem.replace("state_", "", 1)
         try:
@@ -1593,6 +1628,9 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
         metrics = metrics if isinstance(metrics, dict) else {}
         articles = state_blob.get("articles", [])
         articles = articles if isinstance(articles, list) else []
+        synthetic_placeholder = bool(state_blob.get("synthetic_placeholder", False)) or bool(delta_blob.get("synthetic_placeholder", False))
+        if synthetic_placeholder:
+            synthetic_observer_count += 1
         observer_density = _safe_float(metrics.get("observer_density"), default=0.0)
         observer_stress = _safe_float(metrics.get("observer_stress"), default=0.0)
         observer_z_height = _safe_float(metrics.get("observer_z_height"), default=0.0)
@@ -1632,7 +1670,7 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
                     "coord_delta": coord_delta,
                 }
             )
-            if math.isfinite(coord_delta):
+            if math.isfinite(coord_delta) and not synthetic_placeholder:
                 coord_deltas_all.append(coord_delta)
         observers.append(
             {
@@ -1646,18 +1684,28 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
                 "metrics_delta": delta_blob.get("metrics_delta", {}),
                 "axis_delta": delta_blob.get("axis_delta", {}),
                 "translation_only_comparison": delta_blob.get("translation_only_comparison", {}),
+                "synthetic_placeholder": synthetic_placeholder,
                 "vectors": vectors,
             }
         )
 
+    all_synthetic = bool(observers) and synthetic_observer_count == len(observers)
     payload = {
-        "status": "OK" if observers else "NO_DATA",
+        "status": "NO_DATA" if (not observers or all_synthetic) else "OK",
         "panel_type": "type_2_relativity",
         "source": str(rel_dir),
         "observer_count": len(observers),
+        "synthetic_placeholder": all_synthetic,
+        "message": (
+            "observer-conditioned relativity payloads were not materialized for this leaf"
+            if all_synthetic
+            else "loaded"
+        ),
         "explanation": (
             "Type 2 relativity measures vector displacement between the global mean manifold "
             "and each observer-conditioned manifold in a shared coordinate frame."
+            if not all_synthetic
+            else "Type 2 relativity is unavailable because this leaf does not carry observer-conditioned local universes in a shared displacement frame."
         ),
         "summary": {
             "mean_coord_delta": float(np.mean(coord_deltas_all)) if coord_deltas_all else None,
@@ -1665,6 +1713,8 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
             "interpretation": (
                 "Larger displacement magnitudes indicate stronger ideological shear between "
                 "the observer frame and the global mean frame."
+                if not all_synthetic
+                else "No displacement field was computed for this leaf."
             ),
         },
         "observers": observers,
@@ -2797,6 +2847,12 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
 
     rel_dir = run_dir / "relativity_cache"
     rel_dir.mkdir(parents=True, exist_ok=True)
+    observer_payload_paths = sorted(rel_dir.glob("observer_*.pt"))
+    if not observer_payload_paths:
+        return {
+            "status": "fallback",
+            "reason": "observer-conditioned relativity payloads missing",
+        }
 
     written_state = 0
     written_delta = 0
@@ -3026,29 +3082,29 @@ def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict
     for idx in indices:
         state_path = rel_dir / f"state_{idx}.json"
         delta_path = rel_dir / f"delta_{idx}.json"
-        if not state_path.exists():
-            state_payload = {
-                "observer_id": idx,
-                "articles": rows,
-                "paths": [f"observer_{idx}/MONOLITH.html"],
-                "axes": {"x": "density", "y": "stress"},
-                "metrics": {},
-                "synthetic_placeholder": True,
-                "provenance": {"source": "suite-default", "synthetic_placeholder": True},
-            }
-            state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
-            written_state += 1
-        if not delta_path.exists():
-            delta_payload = {
-                "observer_id": idx,
-                "synthetic_placeholder": True,
-                "null_observer_equivalence": {"max_coord_delta": 0.0, "path_flip_count": 0, "axis_rotation_deg": 0.0},
-                "path_flip_delta": {},
-                "metrics_delta": {"d_rupture_rate": 0.0, "d_mean_work": 0.0, "d_survival_pct": 0.0},
-                "axis_delta": {"rotation_deg": 0.0, "d_explained_variance_axis1": 0.0},
-            }
-            delta_path.write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
-            written_delta += 1
+        state_payload = {
+            "observer_id": idx,
+            "articles": rows,
+            "paths": [f"observer_{idx}/MONOLITH.html"],
+            "axes": {"x": "density", "y": "stress"},
+            "metrics": {},
+            "synthetic_placeholder": True,
+            "message": str(real.get("reason", "observer payload unavailable")),
+            "provenance": {"source": "suite-default", "synthetic_placeholder": True},
+        }
+        state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+        written_state += 1
+        delta_payload = {
+            "observer_id": idx,
+            "synthetic_placeholder": True,
+            "message": str(real.get("reason", "observer payload unavailable")),
+            "null_observer_equivalence": {"max_coord_delta": 0.0, "path_flip_count": 0, "axis_rotation_deg": 0.0},
+            "path_flip_delta": {},
+            "metrics_delta": {"d_rupture_rate": 0.0, "d_mean_work": 0.0, "d_survival_pct": 0.0},
+            "axis_delta": {"rotation_deg": 0.0, "d_explained_variance_axis1": 0.0},
+        }
+        delta_path.write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
+        written_delta += 1
     return {
         "state_files": written_state,
         "delta_files": written_delta,

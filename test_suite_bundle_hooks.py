@@ -546,6 +546,29 @@ def test_emit_relativity_defaults_prefers_real_observer_payload_metrics(tmp_path
     assert delta["axis_delta"]["rotation_deg"] > 0.0
 
 
+def test_emit_relativity_defaults_overwrites_stale_cache_when_local_payloads_missing(tmp_path):
+    run_dir = tmp_path / "stale_relativity_cache"
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"index": 0, "bt_uid": "u0", "title": "A0", "zone": "Bridge", "verdict": "HONEST", "density": "0.1", "stress": "0.2", "z_height": "0.3"},
+    ]
+    state_path = rel_dir / "state_0.json"
+    delta_path = rel_dir / "delta_0.json"
+    state_path.write_text(json.dumps({"observer_id": 0, "articles": [{"coord_delta": 9.9}]}), encoding="utf-8")
+    delta_path.write_text(json.dumps({"observer_id": 0, "null_observer_equivalence": {"max_coord_delta": 9.9}}), encoding="utf-8")
+
+    result = suite._emit_relativity_defaults(run_dir, rows)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    delta = json.loads(delta_path.read_text(encoding="utf-8"))
+
+    assert result["mode"] == "suite-default"
+    assert state["synthetic_placeholder"] is True
+    assert state["message"] in {"observer-conditioned relativity payloads missing", "observer payload unavailable"}
+    assert delta["synthetic_placeholder"] is True
+    assert delta["null_observer_equivalence"]["max_coord_delta"] == 0.0
+
+
 def test_emit_relativity_defaults_uses_observer_feature_matrix_for_nmi(tmp_path):
     run_dir = tmp_path / "observer_metric_bundle"
     rel_dir = run_dir / "relativity_cache"
@@ -763,6 +786,35 @@ def test_emit_relativity_deltas_json_aggregates_vector_fields(tmp_path):
     assert vector["delta"]["z"] == pytest.approx(-0.5)
 
 
+def test_emit_relativity_deltas_json_marks_placeholder_bundle_no_data(tmp_path):
+    run_dir = tmp_path / "relativity_delta_placeholder_bundle"
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    state_payload = {
+        "observer_id": 0,
+        "articles": [],
+        "metrics": {},
+        "synthetic_placeholder": True,
+    }
+    delta_payload = {
+        "observer_id": 0,
+        "synthetic_placeholder": True,
+        "null_observer_equivalence": {"max_coord_delta": 0.0},
+        "path_flip_delta": {},
+        "metrics_delta": {},
+        "axis_delta": {},
+    }
+    (rel_dir / "state_0.json").write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+    (rel_dir / "delta_0.json").write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
+
+    out = suite._emit_relativity_deltas_json(run_dir)
+    blob = json.loads(out.read_text(encoding="utf-8"))
+
+    assert blob["status"] == "NO_DATA"
+    assert blob["synthetic_placeholder"] is True
+    assert "observer-conditioned relativity payloads were not materialized" in blob["message"]
+
+
 def test_emit_consumer_contract_bundle_marks_observer_backed_bundle_non_comparable_when_validation_unavailable(tmp_path):
     if not suite.TORCH_AVAILABLE:
         pytest.skip("torch unavailable")
@@ -826,7 +878,11 @@ def test_emit_control_metrics_json_prefers_direct_control_results_blob(tmp_path,
             },
             "consensus_residual": {"real": {"consensus_pct": 72.0, "residual_pct": 28.0}},
         },
-        "results": {"Real": {"procrustes": {"mean": 0.2}}},
+        "results": {
+            "Real": {"procrustes": {"mean": 0.2}},
+            "Shuffled": {"procrustes": {"mean": 0.21}},
+            "Random": {"procrustes": {"mean": 0.19}},
+        },
     }
     monkeypatch.setattr(suite, "_build_direct_control_results_blob", lambda _run_dir: direct_blob)
 
@@ -840,6 +896,20 @@ def test_emit_control_metrics_json_prefers_direct_control_results_blob(tmp_path,
     assert blob["metrics"]["separates_count"] == 3
     assert blob["metrics"]["consensus_pct"] == pytest.approx(72.0)
     assert blob["metrics"]["residual_pct"] == pytest.approx(28.0)
+    assert "shuffled and random controls" in blob["explanation"]
+    assert "constant" not in blob["explanation"]
+
+
+def test_build_control_metrics_payload_explanation_matches_available_controls():
+    payload = suite._build_control_metrics_payload(
+        {
+            "interpretation": {"metrics": {}, "consensus_residual": {}},
+            "results": {"Real": {}, "Shuffled": {}, "Random": {}},
+        },
+        None,
+    )
+    assert "shuffled and random controls" in payload["explanation"]
+    assert "constant" not in payload["explanation"]
 
 
 def test_emit_ablation_summary_json_normalizes_legacy_metrics(tmp_path):
