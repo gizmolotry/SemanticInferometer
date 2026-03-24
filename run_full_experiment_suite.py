@@ -1343,8 +1343,13 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
         "message": "ablation flow not executed for this run",
         "explanation": (
             "Ablations compare null and mature pipeline branches so we can see which structural "
-            "choices preserve the manifold and which ones wash it out."
+            "choices preserve the manifold and which ones wash it out. Alignment scores are "
+            "distance-derived proxies, not literal NMI."
         ),
+        "stage_1_alignment_score": None,
+        "stage_2_alignment_score": None,
+        "stage_3_survival_rate": None,
+        "delta_alignment_score": None,
         "stage_1_nmi": None,
         "stage_2_nmi": None,
         "stage_3_nmi": None,
@@ -1354,6 +1359,10 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
         "legacy_mean_variance": None,
         "mean_variance": None,
         "metrics": {
+            "stage_1_alignment_score": None,
+            "stage_2_alignment_score": None,
+            "stage_3_survival_rate": None,
+            "delta_alignment_score": None,
             "stage_1_nmi": None,
             "stage_2_nmi": None,
             "stage_3_nmi": None,
@@ -1363,6 +1372,9 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
         },
         "summary": {
             "stage_map": {
+                "stage_1_alignment_score": "null or pre-refactor alignment score",
+                "stage_2_alignment_score": "post-repair alignment score",
+                "stage_3_survival_rate": "structural invariant survival rate",
                 "stage_1_nmi": "null or pre-refactor alignment proxy",
                 "stage_2_nmi": "post-repair alignment proxy",
                 "stage_3_nmi": "structural invariant survival proxy",
@@ -1390,10 +1402,26 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
             val = metrics.get(metric_key)
         return val
 
+    stage_1_alignment = _pick("stage_1_alignment_score", "stage_1_alignment_score")
+    stage_2_alignment = _pick("stage_2_alignment_score", "stage_2_alignment_score")
+    stage_3_survival = _pick("stage_3_survival_rate", "stage_3_survival_rate")
+    delta_alignment = _pick("delta_alignment_score", "delta_alignment_score")
     stage_1_nmi = _pick("stage_1_nmi")
     stage_2_nmi = _pick("stage_2_nmi")
     stage_3_nmi = _pick("stage_3_nmi")
     delta_nmi = _pick("delta_nmi")
+    if stage_1_alignment is None:
+        stage_1_alignment = stage_1_nmi
+    if stage_2_alignment is None:
+        stage_2_alignment = stage_2_nmi
+    if stage_3_survival is None:
+        stage_3_survival = stage_3_nmi
+    if delta_alignment is None:
+        delta_alignment = delta_nmi
+    stage_1_nmi = stage_1_alignment
+    stage_2_nmi = stage_2_alignment
+    stage_3_nmi = stage_3_survival
+    delta_nmi = delta_alignment
     retained_pct = _pick("retained_percentage", "retained_pct")
     legacy_mean_variance = _pick("legacy_mean_variance")
 
@@ -1403,6 +1431,11 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
             "synthetic_placeholder": False,
             "reason": None,
             "message": str(summary_blob.get("message", "loaded")),
+            "explanation": str(summary_blob.get("explanation", payload["explanation"])),
+            "stage_1_alignment_score": stage_1_alignment,
+            "stage_2_alignment_score": stage_2_alignment,
+            "stage_3_survival_rate": stage_3_survival,
+            "delta_alignment_score": delta_alignment,
             "stage_1_nmi": stage_1_nmi,
             "stage_2_nmi": stage_2_nmi,
             "stage_3_nmi": stage_3_nmi,
@@ -1412,6 +1445,10 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
             "legacy_mean_variance": legacy_mean_variance,
             "mean_variance": legacy_mean_variance,
             "metrics": {
+                "stage_1_alignment_score": stage_1_alignment,
+                "stage_2_alignment_score": stage_2_alignment,
+                "stage_3_survival_rate": stage_3_survival,
+                "delta_alignment_score": delta_alignment,
                 "stage_1_nmi": stage_1_nmi,
                 "stage_2_nmi": stage_2_nmi,
                 "stage_3_nmi": stage_3_nmi,
@@ -1435,6 +1472,10 @@ def _is_placeholder_status_blob(blob: Optional[Dict[str, Any]]) -> bool:
     if status:
         return False
     meaningful_metric_keys = {
+        "stage_1_alignment_score",
+        "stage_2_alignment_score",
+        "stage_3_survival_rate",
+        "delta_alignment_score",
         "stage_1_nmi",
         "stage_2_nmi",
         "stage_3_nmi",
@@ -1491,6 +1532,14 @@ def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, 
             "reason": None,
             "source": str(source_path) if source_path else "lab_diagnostics.json",
             "message": "translated from lab_diagnostics.json",
+            "explanation": (
+                "Ablation laboratory output translated from observer alignment distances and "
+                "invariant survival rates. Alignment scores are distance-derived proxies, not literal NMI."
+            ),
+            "stage_1_alignment_score": stage_1,
+            "stage_2_alignment_score": stage_2,
+            "stage_3_survival_rate": stage_3,
+            "delta_alignment_score": delta_nmi,
             "stage_1_nmi": stage_1,
             "stage_2_nmi": stage_2,
             "stage_3_nmi": stage_3,
@@ -1500,6 +1549,10 @@ def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, 
             "legacy_mean_variance": None,
             "mean_variance": None,
             "metrics": {
+                "stage_1_alignment_score": stage_1,
+                "stage_2_alignment_score": stage_2,
+                "stage_3_survival_rate": stage_3,
+                "delta_alignment_score": delta_nmi,
                 "stage_1_nmi": stage_1,
                 "stage_2_nmi": stage_2,
                 "stage_3_nmi": stage_3,
@@ -1519,6 +1572,9 @@ def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, 
             },
             "summary": {
                 "stage_map": {
+                    "stage_1_alignment_score": "alignment before repair / null-side similarity proxy",
+                    "stage_2_alignment_score": "alignment after repair / mature-side similarity proxy",
+                    "stage_3_survival_rate": "structural invariant survival rate",
                     "stage_1_nmi": "alignment before repair / null-side similarity proxy",
                     "stage_2_nmi": "alignment after repair / mature-side similarity proxy",
                     "stage_3_nmi": "structural invariant survival rate",

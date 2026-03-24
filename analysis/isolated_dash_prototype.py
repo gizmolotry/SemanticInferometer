@@ -1229,7 +1229,11 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                     "status": "OK",
                     "source": str(path),
                     "message": "translated from lab_diagnostics.json",
-                    "explanation": "Ablation laboratory output translated directly from observer alignment and invariant survival diagnostics.",
+                    "explanation": "Ablation laboratory output translated from observer alignment distances and invariant survival rates. Alignment scores are distance-derived proxies, not literal NMI.",
+                    "stage_1_alignment_score": stage_1,
+                    "stage_2_alignment_score": stage_2,
+                    "stage_3_survival_rate": stage_3,
+                    "delta_alignment_score": (stage_2 - stage_1) if stage_1 is not None and stage_2 is not None else None,
                     "stage_1_nmi": stage_1,
                     "stage_2_nmi": stage_2,
                     "stage_3_nmi": stage_3,
@@ -1238,9 +1242,9 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                     "legacy_mean_variance": None,
                     "summary": {
                         "stage_map": {
-                            "stage_1_nmi": "alignment before repair / null-side proxy",
-                            "stage_2_nmi": "alignment after repair / mature-side proxy",
-                            "stage_3_nmi": "structural invariant survival rate",
+                            "stage_1_alignment_score": "alignment before repair / null-side similarity proxy",
+                            "stage_2_alignment_score": "alignment after repair / mature-side similarity proxy",
+                            "stage_3_survival_rate": "structural invariant survival rate",
                         }
                     },
                 }
@@ -1254,13 +1258,29 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                 )
                 payload["summary"] = blob.get("summary", {})
                 payload["explanation"] = str(blob.get("explanation", ""))
+                payload["stage_1_alignment_score"] = blob.get("stage_1_alignment_score")
+                payload["stage_2_alignment_score"] = blob.get("stage_2_alignment_score")
+                payload["stage_3_survival_rate"] = blob.get("stage_3_survival_rate")
+                payload["delta_alignment_score"] = blob.get("delta_alignment_score")
                 return payload
             metrics = blob.get("metrics", {})
             metrics = metrics if isinstance(metrics, dict) else {}
+            a1 = blob.get("stage_1_alignment_score", metrics.get("stage_1_alignment_score"))
+            a2 = blob.get("stage_2_alignment_score", metrics.get("stage_2_alignment_score"))
+            a3 = blob.get("stage_3_survival_rate", metrics.get("stage_3_survival_rate"))
+            adelta = blob.get("delta_alignment_score", metrics.get("delta_alignment_score"))
             s1 = blob.get("stage_1_nmi", metrics.get("stage_1_nmi"))
             s2 = blob.get("stage_2_nmi", metrics.get("stage_2_nmi"))
             s3 = blob.get("stage_3_nmi", metrics.get("stage_3_nmi"))
             delta = blob.get("delta_nmi", metrics.get("delta_nmi"))
+            if a1 is None:
+                a1 = s1
+            if a2 is None:
+                a2 = s2
+            if a3 is None:
+                a3 = s3
+            if adelta is None:
+                adelta = delta
             retained = blob.get("retained_percentage", metrics.get("retained_pct"))
             legacy_mean_variance = blob.get("legacy_mean_variance", metrics.get("legacy_mean_variance"))
             if any(v is not None for v in (s1, s2, s3, delta, retained)):
@@ -1269,6 +1289,10 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                     "source": str(path),
                     "message": str(blob.get("message", "loaded")),
                     "explanation": str(blob.get("explanation", "")),
+                    "stage_1_alignment_score": a1,
+                    "stage_2_alignment_score": a2,
+                    "stage_3_survival_rate": a3,
+                    "delta_alignment_score": adelta,
                     "stage_1_nmi": s1,
                     "stage_2_nmi": s2,
                     "stage_3_nmi": s3,
@@ -1290,6 +1314,10 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                         "source": str(path),
                         "message": "loaded from csv summary",
                         "explanation": "Legacy CSV ablation summary loaded.",
+                        "stage_1_alignment_score": first.get("stage_1_alignment_score", first.get("stage_1_nmi")),
+                        "stage_2_alignment_score": first.get("stage_2_alignment_score", first.get("stage_2_nmi")),
+                        "stage_3_survival_rate": first.get("stage_3_survival_rate", first.get("stage_3_nmi")),
+                        "delta_alignment_score": first.get("delta_alignment_score", first.get("delta_nmi")),
                         "stage_1_nmi": first.get("stage_1_nmi"),
                         "stage_2_nmi": first.get("stage_2_nmi"),
                         "stage_3_nmi": first.get("stage_3_nmi"),
@@ -1319,6 +1347,10 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
         "source": "NOT FOUND",
         "message": "no ablation analysis results",
         "explanation": "No ablation laboratory outputs were found for this leaf.",
+        "stage_1_alignment_score": None,
+        "stage_2_alignment_score": None,
+        "stage_3_survival_rate": None,
+        "delta_alignment_score": None,
         "stage_1_nmi": None,
         "stage_2_nmi": None,
         "stage_3_nmi": None,
@@ -2688,16 +2720,20 @@ def _build_ablation_panel(ab: dict):
     status = str(ab.get("status", "MISSING")).upper()
     summary = ab.get("summary", {}) if isinstance(ab.get("summary"), dict) else {}
     stage_map = summary.get("stage_map", {}) if isinstance(summary.get("stage_map"), dict) else {}
+    stage_1 = ab.get("stage_1_alignment_score", ab.get("stage_1_nmi"))
+    stage_2 = ab.get("stage_2_alignment_score", ab.get("stage_2_nmi"))
+    stage_3 = ab.get("stage_3_survival_rate", ab.get("stage_3_nmi"))
+    delta_alignment = ab.get("delta_alignment_score", ab.get("delta_nmi"))
     subtitle = "Ablations tell us which pipeline choices preserve structure and which ones flatten or destabilize it."
     body: List[Any] = [
         html.Div(ab.get("explanation") or summary.get("interpretation") or ab.get("message") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
         html.Div(
             style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
             children=[
-                _metric_tile("Stage 1", ab.get("stage_1_nmi"), stage_map.get("stage_1_nmi")),
-                _metric_tile("Stage 2", ab.get("stage_2_nmi"), stage_map.get("stage_2_nmi")),
-                _metric_tile("Stage 3", ab.get("stage_3_nmi"), stage_map.get("stage_3_nmi")),
-                _metric_tile("Delta / Retained", f"{_fmt_metric(ab.get('delta_nmi'))} / {_fmt_metric(ab.get('retained_pct'))}%", "Repair lift vs retained invariants"),
+                _metric_tile("Stage 1 Align", stage_1, stage_map.get("stage_1_alignment_score", stage_map.get("stage_1_nmi"))),
+                _metric_tile("Stage 2 Align", stage_2, stage_map.get("stage_2_alignment_score", stage_map.get("stage_2_nmi"))),
+                _metric_tile("Stage 3 Survival", stage_3, stage_map.get("stage_3_survival_rate", stage_map.get("stage_3_nmi"))),
+                _metric_tile("Delta Align / Retained", f"{_fmt_metric(delta_alignment)} / {_fmt_metric(ab.get('retained_pct'))}%", "Alignment lift vs retained invariants"),
             ],
         ),
         html.Div(f"Source: {ab.get('source', 'NOT FOUND')}", style={"color": PALETTE["dim"], "fontSize": "0.72rem", "wordBreak": "break-all"}),

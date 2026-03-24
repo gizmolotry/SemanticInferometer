@@ -387,6 +387,7 @@ class AblationRunner:
         from run_full_experiment_suite import (
             _emit_ablation_results_json,
             _translate_lab_diagnostics_to_ablation_summary,
+            _normalize_run_provenance,
             emit_consumer_contract_bundle,
         )
 
@@ -448,6 +449,14 @@ class AblationRunner:
                 kernel_roughness=config.kernel_roughness,
             )
 
+            relativity_result = self._materialize_relativity_payloads(
+                corpus_dir=corpus_dir,
+                articles=articles,
+                config=config,
+                corpus_name=corpus_name,
+                normalize_run_provenance=_normalize_run_provenance,
+            )
+
             observer_payloads = self._load_observer_payloads(corpus_dir, config.observer_seeds)
             diagnostics = self._compute_lab_diagnostics(observer_payloads)
             diagnostics_path = corpus_dir / "lab_diagnostics.json"
@@ -463,6 +472,7 @@ class AblationRunner:
                 'corpus_path': corpus_path,
                 'n_articles': len(articles),
                 'observer_files': [str(corpus_dir / f"observer_{seed}.pt") for seed in config.observer_seeds],
+                'relativity_materialization': relativity_result,
                 'diagnostics_path': str(diagnostics_path),
                 'ablation_summary_path': str(ablation_summary_path),
             }
@@ -583,6 +593,104 @@ class AblationRunner:
             if observer_path.exists():
                 payloads.append(torch.load(observer_path, map_location='cpu', weights_only=False))
         return payloads
+
+    def _materialize_relativity_payloads(
+        self,
+        corpus_dir: Path,
+        articles: List[Dict[str, Any]],
+        config: AblationConfig,
+        corpus_name: str,
+        normalize_run_provenance,
+    ) -> Dict[str, Any]:
+        from .complete_pipeline import BeliefTransformerPipeline, get_git_hash, initialize_full_pipeline
+
+        corpus_dir = Path(corpus_dir)
+        rel_dir = corpus_dir / "relativity_cache"
+        rel_dir.mkdir(parents=True, exist_ok=True)
+
+        if not articles:
+            return {"status": "skipped", "reason": "no articles loaded"}
+
+        existing_local = list(rel_dir.glob("observer_*.pt"))
+        if existing_local and (corpus_dir / "observer_global.pt").exists():
+            return {
+                "status": "already_exists",
+                "observer_payloads": len(existing_local),
+                "seed": int(config.observer_seeds[0]) if config.observer_seeds else int(config.basis_seed),
+            }
+
+        canonical_seed = int(config.observer_seeds[0]) if config.observer_seeds else int(config.basis_seed)
+        pipeline_kwargs = self._config_to_pipeline_kwargs(config)
+        pipeline_kwargs.update(
+            {
+                "output_dim": int(config.rks_dim),
+                "embedding_dim": 8192,
+            }
+        )
+        components = initialize_full_pipeline(
+            random_seed=canonical_seed,
+            **pipeline_kwargs,
+        )
+        pipeline = BeliefTransformerPipeline(
+            components=components,
+            random_seed=canonical_seed,
+            enable_provenance=True,
+            provenance_dir=str(corpus_dir),
+        )
+
+        run_meta = {
+            "kernel": config.kernel_type,
+            "seed": canonical_seed,
+            "channel": "cls",
+            "corpus": corpus_name,
+            "n_articles": len(articles),
+            "git_hash": get_git_hash(),
+        }
+
+        pipeline_config = {
+            "enable_checkpoints": True,
+            "checkpoint_dir": str(corpus_dir),
+            "output_dir": str(corpus_dir),
+        }
+
+        global_result = pipeline.process_month(
+            articles=articles,
+            month_name=f"{corpus_name}_ablation_global",
+            config=pipeline_config,
+        )
+        normalized_global_provenance = normalize_run_provenance(global_result, run_meta)
+        global_result["provenance"] = normalized_global_provenance
+        global_result.setdefault("meta", {})["provenance"] = normalized_global_provenance
+        torch.save(global_result, corpus_dir / "observer_global.pt")
+
+        written = 0
+        for obs_i in range(len(articles)):
+            obs_sub_dir = rel_dir / f"obs_{obs_i}"
+            obs_sub_dir.mkdir(parents=True, exist_ok=True)
+            obs_config = dict(pipeline_config)
+            obs_config["output_dir"] = str(obs_sub_dir)
+            obs_config["checkpoint_dir"] = str(obs_sub_dir)
+            obs_result = pipeline.process_month(
+                articles=articles,
+                month_name=f"{corpus_name}_ablation_obs{obs_i}",
+                config=obs_config,
+                observer_idx=obs_i,
+            )
+            normalized_obs_provenance = normalize_run_provenance(obs_result, run_meta)
+            obs_result["provenance"] = normalized_obs_provenance
+            obs_result.setdefault("meta", {})["provenance"] = normalized_obs_provenance
+            torch.save(obs_result, rel_dir / f"observer_{obs_i}.pt")
+            written += 1
+            del obs_result
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return {
+            "status": "success",
+            "seed": canonical_seed,
+            "observer_payloads": written,
+            "global_payload": str(corpus_dir / "observer_global.pt"),
+        }
 
     def _compute_lab_diagnostics(self, observer_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
         from .procrustes import compute_consensus_and_residuals, procrustes_align
