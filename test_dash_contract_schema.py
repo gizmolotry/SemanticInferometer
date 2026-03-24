@@ -751,6 +751,33 @@ def test_load_ablation_state_accepts_normalized_ablation_summary(monkeypatch, mo
     assert state["retained_pct"] == 63.0
 
 
+def test_load_ablation_state_accepts_lab_diagnostics_json(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "run_lab_diagnostics"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "lab_diagnostics.json",
+        {
+            "procrustes": {
+                "mean_distance_before": 1.0,
+                "mean_distance_after": 0.25,
+            },
+            "structural_invariants": {
+                "mean_survival_rate": 0.8,
+            },
+        },
+    )
+
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+    state = mod.load_ablation_state("rk")
+
+    assert state["status"] == "OK"
+    assert state["message"] == "translated from lab_diagnostics.json"
+    assert state["stage_1_nmi"] == pytest.approx(0.5)
+    assert state["stage_2_nmi"] == pytest.approx(0.8)
+    assert state["stage_3_nmi"] == pytest.approx(0.8)
+    assert state["retained_pct"] == pytest.approx(80.0)
+
+
 def test_load_contract_state_accepts_relativity_deltas_bundle(monkeypatch, mod, tmp_path):
     run_dir = tmp_path / "run_relativity_bundle"
     (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)

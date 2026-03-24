@@ -1043,6 +1043,7 @@ def _empty_panel_state(status: str, source: Path, message: str, fields: List[str
         "status": status,
         "source": str(source),
         "message": message,
+        "explanation": "",
     }
     for field in fields:
         payload[field] = None
@@ -1063,16 +1064,22 @@ def load_control_state(run_key: Optional[str]) -> dict:
                     ["procrustes_ratio", "distance_corr_ratio", "consensus_pct", "residual_pct"],
                 )
                 payload["separates_count"] = 0
+                payload["summary"] = data.get("summary", {})
+                payload["controls"] = data.get("controls", {})
+                payload["explanation"] = str(data.get("explanation", ""))
                 return payload
             return {
                 "status": "OK",
                 "source": str(path),
                 "message": str(data.get("message", "loaded")),
+                "explanation": str(data.get("explanation", "")),
                 "procrustes_ratio": metrics.get("procrustes_ratio"),
                 "distance_corr_ratio": metrics.get("distance_corr_ratio"),
                 "separates_count": int(metrics.get("separates_count", 0) or 0),
                 "consensus_pct": metrics.get("consensus_pct"),
                 "residual_pct": metrics.get("residual_pct"),
+                "summary": data.get("summary", {}),
+                "controls": data.get("controls", {}),
             }
         interp = data.get("interpretation", {}) if isinstance(data, dict) else {}
         if not isinstance(interp, dict):
@@ -1085,6 +1092,8 @@ def load_control_state(run_key: Optional[str]) -> dict:
                 ["procrustes_ratio", "distance_corr_ratio", "consensus_pct", "residual_pct"],
             )
             payload["separates_count"] = 0
+            payload["summary"] = {}
+            payload["controls"] = {}
             return payload
         metrics = interp.get("metrics", {}) if isinstance(interp.get("metrics"), dict) else {}
         procrustes_ratio = _safe_float((metrics.get("procrustes", {}) or {}).get("ratio"), default=float("nan"))
@@ -1097,21 +1106,27 @@ def load_control_state(run_key: Optional[str]) -> dict:
             "status": "OK",
             "source": str(path),
             "message": "loaded",
+            "explanation": "Type 1 controls compare the real leaf against matched constant, shuffled, and random controls.",
             "procrustes_ratio": None if str(procrustes_ratio) == "nan" else procrustes_ratio,
             "distance_corr_ratio": None if str(distance_corr_ratio) == "nan" else distance_corr_ratio,
             "separates_count": int(separates_count),
             "consensus_pct": None if str(consensus_pct) == "nan" else consensus_pct,
             "residual_pct": None if str(residual_pct) == "nan" else residual_pct,
+            "summary": {},
+            "controls": data.get("results", {}) if isinstance(data, dict) else {},
         }
     return {
         "status": "MISSING",
         "source": "NOT FOUND",
         "message": "no control analysis results",
+        "explanation": "Type 1 controls are missing for this leaf.",
         "procrustes_ratio": None,
         "distance_corr_ratio": None,
         "separates_count": 0,
         "consensus_pct": None,
         "residual_pct": None,
+        "summary": {},
+        "controls": {},
     }
 
 
@@ -1145,6 +1160,7 @@ def _ablation_candidates(run_key: Optional[str]) -> List[Path]:
             [
                 run_dir / "ablation_summary.json",
                 run_dir / "ablation_results.json",
+                run_dir / "lab_diagnostics.json",
                 run_dir / "critical_ablation_summary.csv",
             ]
         )
@@ -1170,6 +1186,34 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
             blob = _safe_json(path, {})
             if not isinstance(blob, dict):
                 continue
+            if "procrustes" in blob and "structural_invariants" in blob:
+                procrustes = blob.get("procrustes", {}) if isinstance(blob.get("procrustes"), dict) else {}
+                invariants = blob.get("structural_invariants", {}) if isinstance(blob.get("structural_invariants"), dict) else {}
+                mean_before = _safe_float(procrustes.get("mean_distance_before"), default=float("nan"))
+                mean_after = _safe_float(procrustes.get("mean_distance_after"), default=float("nan"))
+                survival_rate = _safe_float(invariants.get("mean_survival_rate"), default=float("nan"))
+                stage_1 = None if str(mean_before) == "nan" else float(1.0 / (1.0 + max(mean_before, 0.0)))
+                stage_2 = None if str(mean_after) == "nan" else float(1.0 / (1.0 + max(mean_after, 0.0)))
+                stage_3 = None if str(survival_rate) == "nan" else survival_rate
+                return {
+                    "status": "OK",
+                    "source": str(path),
+                    "message": "translated from lab_diagnostics.json",
+                    "explanation": "Ablation laboratory output translated directly from observer alignment and invariant survival diagnostics.",
+                    "stage_1_nmi": stage_1,
+                    "stage_2_nmi": stage_2,
+                    "stage_3_nmi": stage_3,
+                    "delta_nmi": (stage_2 - stage_1) if stage_1 is not None and stage_2 is not None else None,
+                    "retained_pct": None if stage_3 is None else float(stage_3 * 100.0),
+                    "legacy_mean_variance": None,
+                    "summary": {
+                        "stage_map": {
+                            "stage_1_nmi": "alignment before repair / null-side proxy",
+                            "stage_2_nmi": "alignment after repair / mature-side proxy",
+                            "stage_3_nmi": "structural invariant survival rate",
+                        }
+                    },
+                }
             status_marker = str(blob.get("status", "")).strip().upper()
             if status_marker in {"NO_DATA", "UNAVAILABLE"} or bool(blob.get("synthetic_placeholder", False)):
                 payload = _empty_panel_state(
@@ -1178,6 +1222,8 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                     str(blob.get("reason") or blob.get("message") or "ablation analysis unavailable"),
                     ["stage_1_nmi", "stage_2_nmi", "stage_3_nmi", "delta_nmi", "retained_pct", "legacy_mean_variance"],
                 )
+                payload["summary"] = blob.get("summary", {})
+                payload["explanation"] = str(blob.get("explanation", ""))
                 return payload
             metrics = blob.get("metrics", {})
             metrics = metrics if isinstance(metrics, dict) else {}
@@ -1191,12 +1237,15 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                 return {
                     "status": "OK",
                     "source": str(path),
+                    "message": str(blob.get("message", "loaded")),
+                    "explanation": str(blob.get("explanation", "")),
                     "stage_1_nmi": s1,
                     "stage_2_nmi": s2,
                     "stage_3_nmi": s3,
                     "delta_nmi": delta,
                     "retained_pct": retained,
                     "legacy_mean_variance": legacy_mean_variance,
+                    "summary": blob.get("summary", {}),
                 }
         if path.suffix.lower() == ".csv":
             try:
@@ -1209,23 +1258,29 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
                     return {
                         "status": "OK",
                         "source": str(path),
+                        "message": "loaded from csv summary",
+                        "explanation": "Legacy CSV ablation summary loaded.",
                         "stage_1_nmi": first.get("stage_1_nmi"),
                         "stage_2_nmi": first.get("stage_2_nmi"),
                         "stage_3_nmi": first.get("stage_3_nmi"),
                         "delta_nmi": first.get("delta_nmi"),
                         "retained_pct": first.get("retained_percentage"),
                         "legacy_mean_variance": None,
+                        "summary": {},
                     }
                 if "mean_variance" in first:
                     return {
                         "status": "LEGACY",
                         "source": str(path),
+                        "message": "loaded legacy variance-only ablation output",
+                        "explanation": "Legacy ablation output predates the stage-based schema.",
                         "stage_1_nmi": None,
                         "stage_2_nmi": None,
                         "stage_3_nmi": None,
                         "delta_nmi": None,
                         "retained_pct": None,
                         "legacy_mean_variance": first.get("mean_variance"),
+                        "summary": {},
                     }
             except Exception:
                 continue
@@ -1233,12 +1288,14 @@ def load_ablation_state(run_key: Optional[str]) -> dict:
         "status": "MISSING",
         "source": "NOT FOUND",
         "message": "no ablation analysis results",
+        "explanation": "No ablation laboratory outputs were found for this leaf.",
         "stage_1_nmi": None,
         "stage_2_nmi": None,
         "stage_3_nmi": None,
         "delta_nmi": None,
         "retained_pct": None,
         "legacy_mean_variance": None,
+        "summary": {},
     }
 
 
@@ -1280,6 +1337,87 @@ def _fmt_metric(value: Any, digits: int = 3) -> str:
         if math.isfinite(num):
             return f"{num:.{digits}f}"
     return "n/a"
+
+
+def _panel_status_style(status: str) -> Dict[str, str]:
+    status_upper = str(status or "").upper()
+    if status_upper == "OK":
+        accent = PALETTE["green"]
+        bg = "rgba(0,255,65,0.08)"
+    elif status_upper in {"NO_DATA", "NON_COMPARABLE"}:
+        accent = PALETTE["amber"]
+        bg = "rgba(255,179,71,0.10)"
+    elif status_upper in {"UNAVAILABLE", "MISSING", "INVALID_SCHEMA"}:
+        accent = PALETTE["red"]
+        bg = "rgba(255,42,0,0.10)"
+    else:
+        accent = PALETTE["cyan"]
+        bg = "rgba(0,240,255,0.08)"
+    return {"accent": accent, "background": bg}
+
+
+def _status_pill(status: str, label: Optional[str] = None):
+    style = _panel_status_style(status)
+    return html.Span(
+        label or str(status).upper(),
+        style={
+            "display": "inline-block",
+            "padding": "3px 8px",
+            "borderRadius": "999px",
+            "fontSize": "0.72rem",
+            "fontWeight": "700",
+            "letterSpacing": "0.05em",
+            "color": style["accent"],
+            "border": f"1px solid {style['accent']}",
+            "backgroundColor": style["background"],
+        },
+    )
+
+
+def _metric_tile(label: str, value: Any, hint: Optional[str] = None):
+    return html.Div(
+        [
+            html.Div(label, style={"color": PALETTE["dim"], "fontSize": "0.68rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}),
+            html.Div(_fmt_metric(value) if _is_number(value) else (str(value) if value not in (None, "") else "n/a"), style={"color": PALETTE["text"], "fontSize": "1rem", "fontWeight": "700"}),
+            html.Div(hint or "", style={"color": PALETTE["dim"], "fontSize": "0.7rem", "lineHeight": "1.2"}) if hint else None,
+        ],
+        style={
+            "padding": "8px 10px",
+            "borderRadius": "10px",
+            "border": f"1px solid {PALETTE['grid']}",
+            "background": "linear-gradient(180deg, rgba(15,15,24,0.96) 0%, rgba(9,9,14,0.96) 100%)",
+            "minHeight": "68px",
+        },
+    )
+
+
+def _panel_shell(title: str, subtitle: str, status: str, children: List[Any]):
+    style = _panel_status_style(status)
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(title, style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem"}),
+                            html.Div(subtitle, style={"color": PALETTE["dim"], "fontSize": "0.72rem", "lineHeight": "1.3", "marginTop": "2px"}),
+                        ],
+                        style={"flex": "1"},
+                    ),
+                    _status_pill(status),
+                ],
+                style={"display": "flex", "gap": "8px", "alignItems": "flex-start", "marginBottom": "8px"},
+            ),
+            html.Div(children, style={"display": "grid", "gap": "8px"}),
+        ],
+        style={
+            "padding": "10px",
+            "borderRadius": "12px",
+            "border": f"1px solid {style['accent']}",
+            "background": f"linear-gradient(180deg, {style['background']} 0%, rgba(8,8,12,0.96) 100%)",
+            "boxShadow": f"0 0 0 1px {style['background']}",
+        },
+    )
 
 
 def _load_validation_payload(run_key: Optional[str]) -> dict:
@@ -1969,12 +2107,12 @@ app.layout = dbc.Container(
                         html.Div(id="telemetry-3", style={"color": PALETTE["cyan"], "fontWeight": "700", "fontSize": "0.92rem", "marginTop": "4px"}),
                         html.Div(id="telemetry-detail", style={"color": PALETTE["dim"], "fontSize": "0.8rem", "marginTop": "8px"}),
                         html.Hr(style={"borderColor": PALETTE["grid"], "margin": "10px 0"}),
-                        html.Div("Ablation Metrics", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
-                        html.Div(id="ablation-metrics", style={"color": PALETTE["amber"], "fontSize": "0.8rem", "whiteSpace": "pre-wrap", "marginBottom": "8px"}),
-                        html.Div("Control Metrics", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
-                        html.Div(id="control-metrics", style={"color": PALETTE["cyan"], "fontSize": "0.8rem", "whiteSpace": "pre-wrap", "marginBottom": "6px"}),
+                        html.Div("Ablation Laboratory", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
+                        html.Div(id="ablation-metrics", style={"marginBottom": "8px"}),
+                        html.Div("Type 1 Controls", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
+                        html.Div(id="control-metrics", style={"marginBottom": "6px"}),
                         html.Hr(style={"borderColor": PALETTE["grid"], "margin": "10px 0"}),
-                        html.Div("Relativity Deltas", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
+                        html.Div("Type 2 Relativity", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="relativity-panel", style={"padding": "8px", "maxHeight": "24vh", "overflowY": "auto", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "6px", "marginBottom": "8px"}),
                         html.Div("Group Path Patterns", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="group-panel", style={"padding": "8px", "maxHeight": "22vh", "overflowY": "auto", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "6px", "marginBottom": "8px"}),
@@ -2480,6 +2618,67 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
     return fig
 
 
+def _build_control_panel(ctrl: dict):
+    status = str(ctrl.get("status", "MISSING")).upper()
+    controls = ctrl.get("controls", {}) if isinstance(ctrl.get("controls"), dict) else {}
+    summary = ctrl.get("summary", {}) if isinstance(ctrl.get("summary"), dict) else {}
+    subtitle = (
+        "Type 1 proves the manifold is carrying signal by comparing the real leaf against matched noise baselines."
+    )
+    detail_bits = [
+        html.Div(ctrl.get("explanation") or summary.get("interpretation") or ctrl.get("message") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
+        html.Div(
+            style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
+            children=[
+                _metric_tile("Procrustes Ratio", ctrl.get("procrustes_ratio"), "Real vs control shape residual"),
+                _metric_tile("Distance-Corr Ratio", ctrl.get("distance_corr_ratio"), "Real vs control geometry coupling"),
+                _metric_tile("Separations", ctrl.get("separates_count"), "How many control tests cleanly separate"),
+                _metric_tile("Consensus / Residual", f"{_fmt_metric(ctrl.get('consensus_pct'))}% / {_fmt_metric(ctrl.get('residual_pct'))}%", "Shared signal vs leftover variance"),
+            ],
+        ),
+        html.Div(f"Source: {ctrl.get('source', 'NOT FOUND')}", style={"color": PALETTE["dim"], "fontSize": "0.72rem", "wordBreak": "break-all"}),
+    ]
+    if controls:
+        detail_bits.insert(
+            1,
+            html.Div(
+                "Available controls: " + ", ".join(sorted(map(str, controls.keys()))),
+                style={"color": PALETTE["cyan"], "fontSize": "0.74rem"},
+            ),
+        )
+    if status in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ctrl.get("message"):
+        detail_bits.insert(
+            1,
+            html.Div(f"Why missing: {ctrl.get('message')}", style={"color": PALETTE["amber"], "fontSize": "0.74rem", "lineHeight": "1.3"}),
+        )
+    return _panel_shell("Type 1 Controls", subtitle, status, detail_bits)
+
+
+def _build_ablation_panel(ab: dict):
+    status = str(ab.get("status", "MISSING")).upper()
+    summary = ab.get("summary", {}) if isinstance(ab.get("summary"), dict) else {}
+    stage_map = summary.get("stage_map", {}) if isinstance(summary.get("stage_map"), dict) else {}
+    subtitle = "Ablations tell us which pipeline choices preserve structure and which ones flatten or destabilize it."
+    body: List[Any] = [
+        html.Div(ab.get("explanation") or summary.get("interpretation") or ab.get("message") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
+        html.Div(
+            style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
+            children=[
+                _metric_tile("Stage 1", ab.get("stage_1_nmi"), stage_map.get("stage_1_nmi")),
+                _metric_tile("Stage 2", ab.get("stage_2_nmi"), stage_map.get("stage_2_nmi")),
+                _metric_tile("Stage 3", ab.get("stage_3_nmi"), stage_map.get("stage_3_nmi")),
+                _metric_tile("Delta / Retained", f"{_fmt_metric(ab.get('delta_nmi'))} / {_fmt_metric(ab.get('retained_pct'))}%", "Repair lift vs retained invariants"),
+            ],
+        ),
+        html.Div(f"Source: {ab.get('source', 'NOT FOUND')}", style={"color": PALETTE["dim"], "fontSize": "0.72rem", "wordBreak": "break-all"}),
+    ]
+    if status in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ab.get("message"):
+        body.insert(1, html.Div(f"Why missing: {ab.get('message')}", style={"color": PALETTE["amber"], "fontSize": "0.74rem", "lineHeight": "1.3"}))
+    if ab.get("legacy_mean_variance") is not None:
+        body.insert(1, html.Div(f"Legacy variance metric: {ab.get('legacy_mean_variance')}", style={"color": PALETTE["cyan"], "fontSize": "0.74rem"}))
+    return _panel_shell("Ablation Laboratory", subtitle, status, body)
+
+
 def _build_group_panel(contract: dict, label_col: Optional[str], label_values: Optional[List[str]]):
     rows = contract.get("hidden_groups", []) or []
     summaries = (contract.get("group_summaries", {}) or {}).get("groups", [])
@@ -2496,33 +2695,63 @@ def _build_group_panel(contract: dict, label_col: Optional[str], label_values: O
             continue
         counts[key] = counts.get(key, 0) + 1
 
-    lines = [f"{label_col} counts:"]
-    for k in sorted(counts):
-        lines.append(f"  - {k}: {counts[k]}")
-
-    summary_lines = []
+    count_tiles = [
+        html.Div(
+            [
+                html.Div(str(k), style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.75rem"}),
+                html.Div(f"{counts[k]} articles", style={"color": PALETTE["dim"], "fontSize": "0.72rem"}),
+            ],
+            style={"padding": "8px", "borderRadius": "10px", "border": f"1px solid {PALETTE['grid']}", "backgroundColor": "rgba(10,10,18,0.8)"},
+        )
+        for k in sorted(counts)
+    ]
+    summary_rows: List[Any] = []
     if isinstance(summaries, list):
-        summary_lines.append("Group summaries:")
         for g in summaries[:8]:
             if not isinstance(g, dict):
                 continue
             name = g.get("group_name", "unknown")
             n = g.get("n_articles", "n/a")
             markers = g.get("top_markers") or []
-            marker_text = f" | markers={', '.join(map(str, markers[:3]))}" if markers else ""
-            summary_lines.append(f"  - {name}: n={n}{marker_text}")
-
-    return html.Pre("\n".join(lines + [""] + summary_lines), style={"margin": "0", "color": PALETTE["text"], "fontSize": "0.82rem"})
+            summary_rows.append(
+                html.Div(
+                    [
+                        html.Div(f"{name} ({n})", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.74rem"}),
+                        html.Div(", ".join(map(str, markers[:4])) if markers else "no markers", style={"color": PALETTE["dim"], "fontSize": "0.7rem"}),
+                    ],
+                    style={"padding": "6px 0", "borderBottom": f"1px solid {PALETTE['grid']}"},
+                )
+            )
+    return _panel_shell(
+        "Hidden Label Topology",
+        "Metadata-derived groupings help compare narrative camps without letting terrain zones define the labels.",
+        "OK",
+        [
+            html.Div(f"Grouping column: {label_col}", style={"color": PALETTE["cyan"], "fontSize": "0.74rem"}),
+            html.Div(count_tiles, style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"}),
+            html.Div(summary_rows or [html.Div("No group summaries available.", style={"color": PALETTE["dim"], "fontSize": "0.74rem"})]),
+        ],
+    )
 
 
 def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str, translation_mode_values: List[str]):
     if observer_value == "global":
-        return html.Div("Global baseline selected. Choose an article observer to view Type-2 deltas.", style={"color": PALETTE["dim"]})
+        return _panel_shell(
+            "Type 2 Relativity",
+            "Type 2 measures vector displacement between the global mean manifold and an observer-conditioned manifold.",
+            "NO_DATA",
+            [html.Div("Global baseline selected. Choose an article observer to reveal elasticity and polarization deltas.", style={"color": PALETTE["dim"], "fontSize": "0.76rem"})],
+        )
 
     delta = contract.get("observer_delta", {}) or {}
     observer_state = contract.get("observer_state", {}) or {}
     if not delta:
-        return html.Div("Observer delta artifact missing.", style={"color": PALETTE["amber"]})
+        return _panel_shell(
+            "Type 2 Relativity",
+            "Type 2 measures vector displacement between the global mean manifold and an observer-conditioned manifold.",
+            "MISSING",
+            [html.Div("Observer delta artifact missing for this observer.", style={"color": PALETTE["amber"], "fontSize": "0.76rem"})],
+        )
 
     null_eq = delta.get("null_observer_equivalence", {}) or {}
     metrics_delta = delta.get("metrics_delta", {}) or {}
@@ -2532,27 +2761,62 @@ def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str
     translation_only = translation_mode_values is not None and "translation_only" in translation_mode_values
     tcomp = delta.get("translation_only_comparison", {}) if translation_only else {}
 
-    lines = [
-        f"Observer: {observer_value} | mode={delta_mode}",
-        f"Null Eq -> max_coord_delta={null_eq.get('max_coord_delta', 'n/a')} | path_flip_count={null_eq.get('path_flip_count', 'n/a')} | axis_rotation_deg={null_eq.get('axis_rotation_deg', 'n/a')}",
-        f"Metrics Delta -> d_rupture_rate={metrics_delta.get('d_rupture_rate', 'n/a')} | d_mean_work={metrics_delta.get('d_mean_work', 'n/a')} | d_survival_pct={metrics_delta.get('d_survival_pct', 'n/a')}",
-        f"Axis Delta -> rotation_deg={axis_delta.get('rotation_deg', 'n/a')} | d_explained_variance_axis1={axis_delta.get('d_explained_variance_axis1', 'n/a')}",
-        "Path Flip Delta (top):",
-    ]
     state_metrics = observer_state.get("metrics", {}) if isinstance(observer_state.get("metrics"), dict) else {}
-    if state_metrics:
-        lines.insert(
-            2,
-            f"Observer NMI -> global={state_metrics.get('global_nmi', 'n/a')} | observer={state_metrics.get('observer_conditioned_nmi', 'n/a')} | d_nmi={metrics_delta.get('d_nmi', 'n/a')}",
-        )
     flip_items = sorted(flips.items(), key=lambda kv: -float(kv[1]) if _is_number(kv[1]) else 0.0)
-    for k, v in flip_items[:8]:
-        lines.append(f"  - {k}: {v}")
+    flip_rows = [
+        html.Div(
+            f"{k}: {_fmt_metric(v)}",
+            style={"color": PALETTE["text"], "fontSize": "0.72rem", "padding": "3px 0", "borderBottom": f"1px solid {PALETTE['grid']}"},
+        )
+        for k, v in flip_items[:8]
+    ] or [html.Div("No path flips recorded.", style={"color": PALETTE["dim"], "fontSize": "0.72rem"})]
+    body: List[Any] = [
+        html.Div(
+            [
+                html.Div(f"Observer: {observer_value}", style={"color": PALETTE["cyan"], "fontSize": "0.74rem"}),
+                html.Div(f"View mode: {delta_mode}", style={"color": PALETTE["dim"], "fontSize": "0.72rem"}),
+            ]
+        ),
+        html.Div(
+            style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
+            children=[
+                _metric_tile("Max Elasticity", null_eq.get("max_coord_delta"), "Largest point displacement"),
+                _metric_tile("Path Flips", null_eq.get("path_flip_count"), "Topology disagreements vs global"),
+                _metric_tile("Axis Rotation", null_eq.get("axis_rotation_deg"), "Frame rotation in degrees"),
+                _metric_tile("Delta NMI", metrics_delta.get("d_nmi"), "Observer-conditioned minus global"),
+                _metric_tile("Mean Work Δ", metrics_delta.get("d_mean_work"), "Energetic shift under this observer"),
+                _metric_tile("Survival Δ", metrics_delta.get("d_survival_pct"), "Track 4 survival difference"),
+            ],
+        ),
+        html.Div(
+            [
+                html.Div("Observer-conditioned similarity", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.74rem"}),
+                html.Div(
+                    f"global={_fmt_metric(state_metrics.get('global_nmi'))} | observer={_fmt_metric(state_metrics.get('observer_conditioned_nmi'))} | axis_var_delta={_fmt_metric(axis_delta.get('d_explained_variance_axis1'))}",
+                    style={"color": PALETTE["dim"], "fontSize": "0.72rem"},
+                ),
+            ]
+        ),
+        html.Div(
+            [
+                html.Div("Largest path flips", style={"color": PALETTE["text"], "fontWeight": "600", "fontSize": "0.74rem", "marginBottom": "4px"}),
+                html.Div(flip_rows),
+            ]
+        ),
+    ]
     if translation_only and tcomp:
-        lines.append("Translation-only comparison:")
-        lines.append(f"  - d_path_flip_count={tcomp.get('d_path_flip_count', 'n/a')} | d_mean_work={tcomp.get('d_mean_work', 'n/a')}")
-
-    return html.Pre("\n".join(lines), style={"margin": "0", "color": PALETTE["text"], "fontSize": "0.82rem"})
+        body.append(
+            html.Div(
+                f"Translation-only comparison -> path flips Δ={_fmt_metric(tcomp.get('d_path_flip_count'))} | mean work Δ={_fmt_metric(tcomp.get('d_mean_work'))}",
+                style={"color": PALETTE["amber"], "fontSize": "0.74rem"},
+            )
+        )
+    return _panel_shell(
+        "Type 2 Relativity",
+        "Type 2 measures the observer-specific displacement field relative to the global mean manifold.",
+        "OK",
+        body,
+    )
 
 
 def _render_dashboard_impl(
@@ -2602,13 +2866,13 @@ def _render_dashboard_impl(
             "System 2: Geometric Friction = n/a",
             "System 2: Survival % = n/a",
             detail,
-            "Ablation: n/a",
-            "Control: n/a",
+            _build_ablation_panel({"status": "MISSING", "source": "NOT FOUND", "message": "no ablation analysis results", "summary": {}}),
+            _build_control_panel({"status": "MISSING", "source": "NOT FOUND", "message": "no control analysis results", "summary": {}, "controls": {}}),
             "provenance: n/a",
             "[HIDDEN LABELS MISSING]",
             {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["amber"], "border": f"1px solid {PALETTE['amber']}", "backgroundColor": "rgba(255,179,71,0.12)"},
             "labels/hidden_groups.csv not found",
-            html.Div("Relativity data unavailable", style={"color": PALETTE["amber"]}),
+            _panel_shell("Type 2 Relativity", "Type 2 measures observer displacement fields relative to the global mean frame.", "MISSING", [html.Div("Relativity data unavailable.", style={"color": PALETTE["amber"], "fontSize": "0.76rem"})]),
             html.Div("Group data unavailable", style={"color": PALETTE["amber"]}),
             empty_fig,
             "",
@@ -2768,26 +3032,8 @@ def _render_dashboard_impl(
         detail += " | diagnostics=" + "; ".join(contract_errors[:3])
     ab = load_ablation_state(run_key)
     ctrl = load_control_state(run_key)
-    ablation_text = (
-        f"status={ab.get('status')} | stage1={ab.get('stage_1_nmi', 'n/a')} | stage2={ab.get('stage_2_nmi', 'n/a')} | "
-        f"stage3={ab.get('stage_3_nmi', 'n/a')} | delta={ab.get('delta_nmi', 'n/a')} | retained={ab.get('retained_pct', 'n/a')}\n"
-        f"source={ab.get('source', 'NOT FOUND')}"
-    )
-    if str(ab.get("status", "")).upper() in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ab.get("message"):
-        ablation_text += f"\nmessage={ab.get('message')}"
-    if ab.get("legacy_mean_variance") is not None:
-        ablation_text = (
-            f"status=LEGACY | mean_variance={ab.get('legacy_mean_variance')} (no stage NMI fields)\n"
-            f"source={ab.get('source', 'NOT FOUND')}"
-        )
-    control_text = (
-        f"status={ctrl.get('status')} | procrustes_ratio={ctrl.get('procrustes_ratio', 'n/a')} | "
-        f"distance_corr_ratio={ctrl.get('distance_corr_ratio', 'n/a')} | separates={ctrl.get('separates_count', 0)} | "
-        f"consensus={ctrl.get('consensus_pct', 'n/a')}% | residual={ctrl.get('residual_pct', 'n/a')}%\n"
-        f"source={ctrl.get('source', 'NOT FOUND')}"
-    )
-    if str(ctrl.get("status", "")).upper() in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ctrl.get("message"):
-        control_text += f"\nmessage={ctrl.get('message')}"
+    ablation_text = _build_ablation_panel(ab)
+    control_text = _build_control_panel(ctrl)
 
     provenance_line = (
         " | ".join(

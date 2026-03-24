@@ -384,6 +384,11 @@ class AblationRunner:
         Returns dict with run metadata and paths to outputs.
         """
         from .complete_pipeline import run_multi_observer_experiment_simple
+        from run_full_experiment_suite import (
+            _emit_ablation_results_json,
+            _translate_lab_diagnostics_to_ablation_summary,
+            emit_consumer_contract_bundle,
+        )
 
         run_dir = Path(config.output_dir) / (config.run_name or config.config_hash)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -448,6 +453,10 @@ class AblationRunner:
             diagnostics_path = corpus_dir / "lab_diagnostics.json"
             with open(diagnostics_path, "w", encoding="utf-8") as f:
                 json.dump(diagnostics, f, indent=2, default=str)
+            ablation_payload = _translate_lab_diagnostics_to_ablation_summary(diagnostics, diagnostics_path)
+            ablation_summary_path = corpus_dir / "ablation_summary.json"
+            ablation_summary_path.write_text(json.dumps(ablation_payload, indent=2), encoding="utf-8")
+            _emit_ablation_results_json(corpus_dir, ablation_payload)
 
             results[corpus_name] = {
                 'output_dir': str(corpus_dir),
@@ -455,7 +464,19 @@ class AblationRunner:
                 'n_articles': len(articles),
                 'observer_files': [str(corpus_dir / f"observer_{seed}.pt") for seed in config.observer_seeds],
                 'diagnostics_path': str(diagnostics_path),
+                'ablation_summary_path': str(ablation_summary_path),
             }
+
+        for corpus_name, corpus_result in results.items():
+            corpus_dir = Path(corpus_result["output_dir"])
+            try:
+                bundle_result = emit_consumer_contract_bundle(corpus_dir)
+            except Exception as exc:
+                bundle_result = {
+                    "status": "failed",
+                    "error": f"consumer bundle emission failed: {exc}",
+                }
+            corpus_result["consumer_bundle"] = bundle_result
 
         elapsed = time.time() - t_start
         manifest['elapsed_seconds'] = elapsed

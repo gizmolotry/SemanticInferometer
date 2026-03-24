@@ -1150,9 +1150,14 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
 def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "status": "NO_DATA",
+        "panel_type": "type_1_epistemic_controls",
         "source": str(source_path) if source_path else "NOT FOUND",
         "synthetic_placeholder": True,
         "message": "control analysis not run for this leaf",
+        "explanation": (
+            "Type 1 controls compare the real leaf against constant, shuffled, and random "
+            "siblings to show whether the manifold is carrying structured signal rather than noise."
+        ),
         "metrics": {
             "procrustes_ratio": None,
             "distance_corr_ratio": None,
@@ -1161,6 +1166,10 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
             "residual_pct": None,
         },
         "controls": {},
+        "summary": {
+            "real_vs_controls": "not evaluated",
+            "interpretation": "no control comparison available for this leaf",
+        },
     }
     if not isinstance(results_blob, dict) or not results_blob:
         return payload
@@ -1202,6 +1211,13 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
                 "residual_pct": _safe_float(consensus_residual.get("residual_pct"), default=None),
             },
             "controls": controls,
+            "summary": {
+                "real_vs_controls": "evaluated",
+                "interpretation": (
+                    "Ratios near 1.0 indicate the real manifold behaves like controls; "
+                    "larger separation indicates signal survives against noise baselines."
+                ),
+            },
         }
     )
     return payload
@@ -1286,10 +1302,15 @@ def _normalize_validation_payload(existing: Dict[str, Any]) -> Optional[Dict[str
 def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "status": "NO_DATA",
+        "panel_type": "ablation_laboratory",
         "source": str(source_path) if source_path else "NOT FOUND",
         "synthetic_placeholder": True,
         "reason": "ablation flow not executed for this run",
         "message": "ablation flow not executed for this run",
+        "explanation": (
+            "Ablations compare null and mature pipeline branches so we can see which structural "
+            "choices preserve the manifold and which ones wash it out."
+        ),
         "stage_1_nmi": None,
         "stage_2_nmi": None,
         "stage_3_nmi": None,
@@ -1305,6 +1326,14 @@ def _build_ablation_summary_payload(summary_blob: Optional[Dict[str, Any]], sour
             "delta_nmi": None,
             "retained_pct": None,
             "legacy_mean_variance": None,
+        },
+        "summary": {
+            "stage_map": {
+                "stage_1_nmi": "null or pre-refactor alignment proxy",
+                "stage_2_nmi": "post-repair alignment proxy",
+                "stage_3_nmi": "structural invariant survival proxy",
+            },
+            "interpretation": "no ablation laboratory output available for this run",
         },
     }
     if not isinstance(summary_blob, dict) or not summary_blob:
@@ -1454,6 +1483,17 @@ def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, 
                     "residual_fraction": _safe_float(procrustes.get("residual_fraction"), default=None),
                 },
             },
+            "summary": {
+                "stage_map": {
+                    "stage_1_nmi": "alignment before repair / null-side similarity proxy",
+                    "stage_2_nmi": "alignment after repair / mature-side similarity proxy",
+                    "stage_3_nmi": "structural invariant survival rate",
+                },
+                "interpretation": (
+                    "Higher stage 2 and stage 3 values mean the mature ablation path preserved "
+                    "observer agreement and invariant survival more effectively."
+                ),
+            },
         }
     )
     return payload
@@ -1533,6 +1573,7 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
         for p in sorted(rel_dir.glob("delta_*.json"), key=lambda p: p.name)
     }
     observers: List[Dict[str, Any]] = []
+    coord_deltas_all: List[float] = []
     for state_path in state_paths:
         observer_key = state_path.stem.replace("state_", "", 1)
         try:
@@ -1591,6 +1632,8 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
                     "coord_delta": coord_delta,
                 }
             )
+            if math.isfinite(coord_delta):
+                coord_deltas_all.append(coord_delta)
         observers.append(
             {
                 "observer_id": int(state_blob.get("observer_id", observer_key)),
@@ -1609,8 +1652,21 @@ def _emit_relativity_deltas_json(run_dir: Path) -> Path:
 
     payload = {
         "status": "OK" if observers else "NO_DATA",
+        "panel_type": "type_2_relativity",
         "source": str(rel_dir),
         "observer_count": len(observers),
+        "explanation": (
+            "Type 2 relativity measures vector displacement between the global mean manifold "
+            "and each observer-conditioned manifold in a shared coordinate frame."
+        ),
+        "summary": {
+            "mean_coord_delta": float(np.mean(coord_deltas_all)) if coord_deltas_all else None,
+            "max_coord_delta": float(np.max(coord_deltas_all)) if coord_deltas_all else None,
+            "interpretation": (
+                "Larger displacement magnitudes indicate stronger ideological shear between "
+                "the observer frame and the global mean frame."
+            ),
+        },
         "observers": observers,
     }
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
