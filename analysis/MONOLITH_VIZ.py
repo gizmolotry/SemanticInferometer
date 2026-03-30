@@ -1871,17 +1871,17 @@ def render_terrain_surface(
         colorscale=colorscale,
         cmin=cmin,
         cmax=cmax,
-        opacity=0.85,
-        showscale=True,
+        opacity=0.92,
+        showscale=False,
         colorbar=colorbar_config,
         lighting=dict(
-            ambient=0.28,
-            diffuse=0.98,
-            specular=0.34,
-            roughness=0.9,
-            fresnel=0.18,
+            ambient=0.12,
+            diffuse=0.94,
+            specular=0.62,
+            roughness=0.32,
+            fresnel=0.24,
         ),
-        lightposition=dict(x=-220, y=-160, z=520),
+        lightposition=dict(x=-420, y=-260, z=220),
         hoverinfo='skip',
         flatshading=False,
         name='Energy Terrain',
@@ -6149,7 +6149,7 @@ def create_monolith_cockpit(
                     y=out_y,
                     z=out_z,
                     mode='lines',
-                    line=dict(color='rgba(0,255,255,0.65)', width=2),
+                    line=dict(color='rgba(0,255,255,0.94)', width=4),
                     name='Outlier Droplines',
                     hoverinfo='skip',
                     visible=True,
@@ -6414,20 +6414,20 @@ def create_monolith_cockpit(
     dominant_xy_span = max(span_x, span_y, 1e-6)
     aspect_x = max(0.55, span_x / dominant_xy_span)
     aspect_y = max(0.55, span_y / dominant_xy_span)
-    aspect_z = min(max(span_z / dominant_xy_span, 0.18), 0.44)
+    aspect_z = min(max(span_z / dominant_xy_span, 0.16), 0.34)
     dominant_span = max(span_x, span_y, span_z, 1e-6)
-    synthesis_depth_span = max(dominant_xy_span, min(span_z * 0.18, dominant_xy_span * 1.7), 0.9)
+    synthesis_depth_span = max(dominant_xy_span * 1.12, min(span_z * 0.16, dominant_xy_span * 1.85), 1.0)
     analysis_depth_span = max(min(max(span_x, span_y) * 0.52, dominant_span * 0.6), 1.0)
     diagnostics_depth_span = max(min(dominant_span * 0.4, dominant_xy_span * 2.8), 1.0)
-    synthesis_camera_pull_in = max(0.30, 0.64 / corpus_scale)
+    synthesis_camera_pull_in = max(0.42, 0.82 / corpus_scale)
     camera_presets = {
         "synthesis": dict(
             up=dict(x=0, y=0, z=1),
-            center=dict(x=0, y=0, z=-0.15),
+            center=dict(x=0.0, y=0.02, z=-0.24),
             eye=dict(
-                x=0.88 * synthesis_depth_span * synthesis_camera_pull_in,
-                y=-0.76 * synthesis_depth_span * synthesis_camera_pull_in,
-                z=0.22 * synthesis_depth_span * synthesis_camera_pull_in,
+                x=1.12 * synthesis_depth_span * synthesis_camera_pull_in,
+                y=-1.06 * synthesis_depth_span * synthesis_camera_pull_in,
+                z=0.14 * synthesis_depth_span * synthesis_camera_pull_in,
             ),
         ),
         "diagnostics": dict(
@@ -6855,7 +6855,8 @@ def create_monolith_cockpit(
         .legend-panel,
         .epistemic-panel,
         .mode-toggle,
-        .layer-panel {
+        .layer-panel,
+        #dash-embed-hint {
             display: none !important;
         }
         .cockpit-container {

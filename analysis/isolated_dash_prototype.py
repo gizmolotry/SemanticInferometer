@@ -161,6 +161,140 @@ def _load_artifact_view_state(path: Optional[Path]) -> dict:
         return {}
 
 
+def _mean_npy(path: Optional[Path]) -> Optional[float]:
+    if not path or not path.exists():
+        return None
+    try:
+        arr = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+    except Exception:
+        return None
+    finite = arr[np.isfinite(arr)]
+    if finite.size <= 0:
+        return None
+    return float(np.nanmean(finite))
+
+
+def _walker_survival_rate_from_states(path: Optional[Path]) -> Optional[float]:
+    if not path or not path.exists():
+        return None
+    payload = _safe_json(path, [])
+    if not isinstance(payload, list):
+        return None
+    total = 0
+    survived = 0
+    fatal_states = {
+        "FAILED",
+        "RUPTURE",
+        "BROKEN",
+        "TRAPPED",
+        "ANOMALY",
+        "TYPE 1 RUPTURE",
+        "TYPE 2 RUPTURE",
+    }
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        status = str(item.get("status", "")).strip().upper()
+        raw_state = str(item.get("raw_state", item.get("label", ""))).strip().upper()
+        if status in fatal_states or raw_state in fatal_states:
+            continue
+        survived += 1
+    if total <= 0:
+        return None
+    return float(survived / total)
+
+
+def _verdict_counts_from_payload(path: Optional[Path]) -> Dict[str, int]:
+    counts = {"honest_count": 0, "phantom_count": 0, "tautology_count": 0, "anomaly_count": 0}
+    if not path or not path.exists():
+        return counts
+    payload = _safe_json(path, [])
+    if not isinstance(payload, list):
+        return counts
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        verdict = str(item.get("verdict", "")).strip().upper()
+        if verdict == "HONEST":
+            counts["honest_count"] += 1
+        elif verdict == "PHANTOM":
+            counts["phantom_count"] += 1
+        elif verdict == "TAUTOLOGY":
+            counts["tautology_count"] += 1
+        elif verdict in {"ANOMALY", "RUPTURE"} or bool(item.get("anomaly_flag")):
+            counts["anomaly_count"] += 1
+    return counts
+
+
+def _aggregate_hott_proofs(path: Optional[Path]) -> dict:
+    if not path or not path.exists():
+        return {}
+    payload = _safe_json(path, [])
+    if not isinstance(payload, list):
+        return {}
+    equivalence = 0
+    non_equivalence = 0
+    uncertain = 0
+    total_conf = 0.0
+    counted_conf = 0
+    total = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        status = str(item.get("status", "")).strip().lower()
+        if status in {"equivalence", "consensus", "elastic", "honest", "tautology"}:
+            equivalence += 1
+        elif status in {"non_equivalence", "phantom", "anomaly", "rupture"}:
+            non_equivalence += 1
+        else:
+            uncertain += 1
+        conf = item.get("confidence")
+        if _is_number(conf):
+            total_conf += float(conf)
+            counted_conf += 1
+    if total <= 0:
+        return {}
+    return {
+        "n_proofs": total,
+        "equivalence_rate": float(equivalence / total),
+        "non_equivalence_rate": float(non_equivalence / total),
+        "uncertain_rate": float(uncertain / total),
+        "mean_confidence": float(total_conf / counted_conf) if counted_conf > 0 else None,
+        "source": "hott_proofs.json",
+    }
+
+
+def _hydrate_artifact_state(run_key: Optional[str], artifact_state: Optional[dict], artifact_path: Optional[Path]) -> dict:
+    run_dir = _resolve_run_dir(run_key)
+    hydrated = dict(artifact_state) if isinstance(artifact_state, dict) else {}
+    metrics = dict(hydrated.get("metrics", {})) if isinstance(hydrated.get("metrics"), dict) else {}
+    view_state = _load_artifact_view_state(artifact_path)
+    view_metrics = view_state.get("metrics", {}) if isinstance(view_state.get("metrics"), dict) else {}
+    if view_metrics:
+        metrics.update(view_metrics)
+    view_articles = view_state.get("articles")
+    if isinstance(view_articles, list) and view_articles:
+        hydrated["articles"] = view_articles
+
+    if run_dir:
+        if not _is_number(metrics.get("walker_mean_action")):
+            mean_action = _mean_npy(run_dir / "walker_work_integrals.npy")
+            if mean_action is not None:
+                metrics["walker_mean_action"] = mean_action
+        if not _is_number(metrics.get("walker_survival_rate")):
+            survival = _walker_survival_rate_from_states(run_dir / "walker_states.json")
+            if survival is not None:
+                metrics["walker_survival_rate"] = survival
+        if not any(_is_number(metrics.get(k)) for k in ("honest_count", "phantom_count", "tautology_count", "anomaly_count")):
+            verdict_counts = _verdict_counts_from_payload(run_dir / "phantom_verdicts.json")
+            metrics.update(verdict_counts)
+
+    hydrated["metrics"] = metrics
+    return hydrated
+
+
 def _load_run_manifest(run_dir: Path) -> dict:
     candidate = run_dir / "MONOLITH.run_manifest.json"
     if not candidate.exists():
@@ -495,15 +629,6 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
 
     baseline_meta = _safe_json(diag.paths["baseline_meta.json"], {}) if diag.paths.get("baseline_meta.json") else {}
     baseline_state = _safe_json(diag.paths["baseline_state.json"], {}) if diag.paths.get("baseline_state.json") else {}
-    contract_path = run_dir / "EPISTEMIC_CONTRACT.json"
-    if contract_path.exists():
-        contract_blob = _safe_json(contract_path, {})
-        if isinstance(contract_blob, dict):
-            provenance = contract_blob.get("provenance", {})
-            if isinstance(provenance, dict) and provenance:
-                merged = dict(baseline_meta) if isinstance(baseline_meta, dict) else {}
-                merged.update(provenance)
-                baseline_meta = merged
 
     if _is_synthetic_placeholder_blob(baseline_meta):
         missing_required.append("baseline_meta.json (synthetic placeholder)")
@@ -795,12 +920,36 @@ def _preferred_run_key(index: dict) -> str:
         run_keys,
         key=lambda rk: (
             int((runs.get(rk, {}) or {}).get("selection_score", 0)),
+            int((runs.get(rk, {}) or {}).get("selection_root_priority", 0)),
+            int((runs.get(rk, {}) or {}).get("selection_model_priority", 0)),
             int((runs.get(rk, {}) or {}).get("selection_corpus_priority", 0)),
             int((runs.get(rk, {}) or {}).get("run_dir").stat().st_mtime_ns if isinstance((runs.get(rk, {}) or {}).get("run_dir"), Path) and (runs.get(rk, {}) or {}).get("run_dir").exists() else 0),
         ),
         reverse=True,
     )
     return ranked[0] if ranked else run_keys[0]
+
+
+def _run_source_priority(run_dir: Path) -> int:
+    run_key = _run_display_key(run_dir).lower()
+    if run_key.startswith("outputs/experiments/runs/"):
+        return 3
+    if run_key.startswith("outputs/experiments/"):
+        return 2
+    if "ablation" in run_key:
+        return 1
+    return 0
+
+
+def _run_model_priority(run_dir: Path) -> int:
+    run_key = _run_display_key(run_dir).lower()
+    if "/rbf/cls/real" in run_key:
+        return 3
+    if "/cls/real" in run_key:
+        return 2
+    if run_key.endswith("/real"):
+        return 1
+    return 0
 
 
 def _run_display_key(run_dir: Path) -> str:
@@ -1010,12 +1159,16 @@ def _control_results_candidates(run_key: Optional[str]) -> List[Path]:
     candidates: List[Path] = []
     run_dir = _resolve_run_dir(run_key)
     if run_dir and run_dir.exists():
+        family_dir = run_dir.parent
         candidates.extend(
             [
+                family_dir / "control_random" / "control_metrics.json",
+                family_dir / "control_shuffled" / "control_metrics.json",
+                family_dir / "control_constant" / "control_metrics.json",
                 run_dir / "control_metrics.json",
                 run_dir / "comprehensive_results.json",
-                run_dir.parent / "control_metrics.json",
-                run_dir.parent / "comprehensive_results.json",
+                family_dir / "control_metrics.json",
+                family_dir / "comprehensive_results.json",
             ]
         )
         for cls_dir in _candidate_cls_dirs(run_key):
@@ -1493,7 +1646,10 @@ def _load_hott_summary(run_key: Optional[str]) -> dict:
     run_dir = _resolve_run_dir(run_key)
     if not run_dir:
         return {}
-    return _safe_json(run_dir / "hott_summary.json", {})
+    summary_path = run_dir / "hott_summary.json"
+    if summary_path.exists():
+        return _safe_json(summary_path, {})
+    return _aggregate_hott_proofs(run_dir / "hott_proofs.json")
 
 
 def _compute_track_snapshot(
@@ -1539,21 +1695,23 @@ def _compute_track_snapshot(
     if _is_number(artifact_metrics.get("dirichlet_cracks")):
         snapshot["T3"]["cracks"] = int(float(artifact_metrics.get("dirichlet_cracks")))
 
-    t4_online = bool(run_dir and (run_dir / "walker_paths.npz").exists()) or _is_number(artifact_metrics.get("walker_mean_action"))
+    t4_exists = bool(run_dir and ((run_dir / "walker_paths.npz").exists() or (run_dir / "walker_states.json").exists() or (run_dir / "walker_work_integrals.npy").exists()))
+    t4_has_metrics = _is_number(artifact_metrics.get("walker_mean_action")) or _is_number(artifact_metrics.get("walker_survival_rate"))
     snapshot["T4"] = {
-        "status": "online" if t4_online else "missing",
-        "source": "artifact.metrics.walker_*" if t4_online else "missing",
+        "status": "online" if t4_has_metrics else ("partial" if t4_exists else "missing"),
+        "source": "artifact.metrics.walker_*" if (t4_has_metrics or t4_exists) else "missing",
         "action": float(artifact_metrics.get("walker_mean_action")) if _is_number(artifact_metrics.get("walker_mean_action")) else None,
         "survival": float(artifact_metrics.get("walker_survival_rate")) if _is_number(artifact_metrics.get("walker_survival_rate")) else None,
     }
 
-    t5_online = bool(run_dir and (run_dir / "phantom_verdicts.json").exists()) or any(
+    t5_exists = bool(run_dir and (run_dir / "phantom_verdicts.json").exists())
+    t5_has_metrics = any(
         _is_number(artifact_metrics.get(k))
         for k in ("honest_count", "phantom_count", "tautology_count", "anomaly_count")
     )
     snapshot["T5"] = {
-        "status": "online" if t5_online else "missing",
-        "source": "artifact.metrics.*_count" if t5_online else "missing",
+        "status": "online" if t5_has_metrics else ("partial" if t5_exists else "missing"),
+        "source": "artifact.metrics.*_count" if (t5_has_metrics or t5_exists) else "missing",
         "honest": int(float(artifact_metrics.get("honest_count"))) if _is_number(artifact_metrics.get("honest_count")) else None,
         "phantom": int(float(artifact_metrics.get("phantom_count"))) if _is_number(artifact_metrics.get("phantom_count")) else None,
         "tautology": int(float(artifact_metrics.get("tautology_count"))) if _is_number(artifact_metrics.get("tautology_count")) else None,
@@ -1561,10 +1719,11 @@ def _compute_track_snapshot(
     }
 
     hott_summary = _load_hott_summary(run_key)
-    t6_online = bool(run_dir and ((run_dir / "hott_summary.json").exists() or (run_dir / "hott_proofs.json").exists()))
+    t6_exists = bool(run_dir and ((run_dir / "hott_summary.json").exists() or (run_dir / "hott_proofs.json").exists()))
+    t6_has_metrics = any(_is_number(hott_summary.get(k)) for k in ("n_proofs", "equivalence_rate", "mean_confidence"))
     snapshot["T6"] = {
-        "status": "online" if t6_online else "missing",
-        "source": "hott_summary.json" if t6_online else "missing",
+        "status": "online" if t6_has_metrics else ("partial" if t6_exists else "missing"),
+        "source": str(hott_summary.get("source", "hott_summary.json")) if (t6_has_metrics or t6_exists) else "missing",
         "n_proofs": int(float(hott_summary.get("n_proofs"))) if _is_number(hott_summary.get("n_proofs")) else None,
         "equivalence_rate": float(hott_summary.get("equivalence_rate")) if _is_number(hott_summary.get("equivalence_rate")) else None,
         "mean_confidence": float(hott_summary.get("mean_confidence")) if _is_number(hott_summary.get("mean_confidence")) else None,
@@ -1719,7 +1878,10 @@ def _track_status_component(track_state: Dict[str, str]):
         else:
             line = f"T6: proofs={payload.get('n_proofs', 'n/a')} | equiv={_fmt_metric(payload.get('equivalence_rate'))} | conf={_fmt_metric(payload.get('mean_confidence'))}"
         detail_lines.append(line)
-    return html.Div([html.Div(chips), html.Pre("\n".join(detail_lines), style={"margin": "6px 0 0 0", "color": PALETTE["dim"], "fontSize": "0.74rem", "whiteSpace": "pre-wrap"})])
+    return html.Div([
+        html.Div(chips, style={"display": "flex", "flexWrap": "wrap", "gap": "6px"}),
+        html.Pre("\n".join(detail_lines), style={"margin": "6px 0 0 0", "color": PALETTE["dim"], "fontSize": "0.74rem", "whiteSpace": "pre-wrap"})
+    ])
 
 
 def _track_delta_component(track_a: Dict[str, str], track_b: Dict[str, str]):
@@ -1757,7 +1919,10 @@ def _track_delta_component(track_a: Dict[str, str], track_b: Dict[str, str]):
     syn_payload = summary.get("SYN", {})
     if syn_payload:
         detail_lines.insert(0, f"SYN: {syn_payload.get('summary', 'n/a')}")
-    return html.Div([html.Div(chips), html.Pre("\n".join(detail_lines), style={"margin": "6px 0 0 0", "color": PALETTE["dim"], "fontSize": "0.74rem", "whiteSpace": "pre-wrap"})])
+    return html.Div([
+        html.Div(chips, style={"display": "flex", "flexWrap": "wrap", "gap": "6px"}),
+        html.Pre("\n".join(detail_lines), style={"margin": "6px 0 0 0", "color": PALETTE["dim"], "fontSize": "0.74rem", "whiteSpace": "pre-wrap"})
+    ])
 
 
 def _build_run_observers_and_rows(run: dict) -> Tuple[List[dict], Dict[int, dict]]:
@@ -1846,6 +2011,8 @@ def build_artifact_index() -> dict:
             "observer_artifacts": {},
             "run_manifest": run_manifest if isinstance(run_manifest, dict) else {},
             "selection_score": int(selection_health.get("score", 0)),
+            "selection_root_priority": _run_source_priority(run_dir),
+            "selection_model_priority": _run_model_priority(run_dir),
             "selection_corpus_priority": int(selection_health.get("corpus_priority", 0)),
             "contract_ok": bool(selection_health.get("contract_ok", False)),
             "selection_verification_status": str(selection_health.get("verification_status", LayerStatus.UNVERIFIED.value)),
@@ -2060,12 +2227,12 @@ app.layout = dbc.Container(
             children=[
                 dbc.Col(
                     xs=12,
-                    md=3,
-                    lg=3,
+                    md=2,
+                    lg=2,
                     style={
                         "background": "linear-gradient(180deg, #050505 0%, #0b0b14 100%)",
                         "borderRight": f"1px solid {PALETTE['grid']}",
-                        "padding": "16px",
+                        "padding": "10px 12px",
                         "maxHeight": "100vh",
                         "overflowY": "auto",
                     },
@@ -2184,18 +2351,18 @@ app.layout = dbc.Container(
                 ),
                 dbc.Col(
                     xs=12,
-                    md=9,
-                    lg=9,
+                    md=10,
+                    lg=10,
                     style={"minHeight": "100vh", "padding": "0", "backgroundColor": "#020208"},
                     children=[
                         html.Div(
-                            style={"height": "90vh", "width": "100%"},
+                            style={"height": "100vh", "width": "100%"},
                             children=[
                                 dcc.Loading(
                                     id="artifact-loading",
                                     type="default",
                                     color=PALETTE["cyan"],
-                                    children=[html.Div(id="artifact-container", style={"height": "90vh", "width": "100%"})],
+                                    children=[html.Div(id="artifact-container", style={"height": "100vh", "width": "100%"})],
                                 ),
                                 html.Div(id="watermark-overlay", style={"display": "none"}),
                             ],
@@ -2629,7 +2796,7 @@ def _compute_gate_presentation(
         badge_text = "[NON-COMPARABLE]"
     else:
         badge_text = "[UNVERIFIED]"
-    watermark_visible = not claims_enabled
+    watermark_visible = badge_text in {"[INVALID SCHEMA]", "[MISSING ARTIFACTS]", "[NON-COMPARABLE]"}
     return {
         "claims_enabled": claims_enabled,
         "badge_text": badge_text,
@@ -2805,8 +2972,11 @@ def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str
         return _panel_shell(
             "Type 2 Relativity",
             "Type 2 measures vector displacement between the global mean manifold and an observer-conditioned manifold.",
-            "NO_DATA",
-            [html.Div("Global baseline selected. Choose an article observer to reveal elasticity and polarization deltas.", style={"color": PALETTE["dim"], "fontSize": "0.76rem"})],
+            "BASELINE",
+            [
+                html.Div("Global baseline selected.", style={"color": PALETTE["text"], "fontSize": "0.76rem", "fontWeight": "600"}),
+                html.Div("Choose an article observer to reveal elasticity and polarization deltas relative to this baseline.", style={"color": PALETTE["dim"], "fontSize": "0.76rem"}),
+            ],
         )
 
     delta = contract.get("observer_delta", {}) or {}
@@ -3001,8 +3171,10 @@ def _render_dashboard_impl(
 
     graph_observer_a = "global" if (view_mode == "observer" and observer_value.startswith("article:")) else effective_observer
     graph_observer_b = effective_observer
-    artifact_state_a = contract_global.get("baseline_state", {}) if graph_observer_a == "global" else contract_global.get("observer_state", {})
-    artifact_state_b = contract.get("baseline_state", {}) if graph_observer_b == "global" else contract.get("observer_state", {})
+    raw_state_a = contract_global.get("baseline_state", {}) if graph_observer_a == "global" else contract_global.get("observer_state", {})
+    raw_state_b = contract.get("baseline_state", {}) if graph_observer_b == "global" else contract.get("observer_state", {})
+    artifact_state_a = _hydrate_artifact_state(run_key, raw_state_a, p_a)
+    artifact_state_b = _hydrate_artifact_state(run_key, raw_state_b, p_b)
     artifact_state = artifact_state_b if (view_mode == "observer" and observer_value.startswith("article:")) else artifact_state_a
     artifact_metrics = artifact_state.get("metrics", {}) if isinstance(artifact_state, dict) else {}
 
@@ -3013,7 +3185,8 @@ def _render_dashboard_impl(
             f"NMI={artifact_metrics.get('synthesis_nmi', run.get('nmi', 'n/a'))} "
             f"| Signal={artifact_metrics.get('spectral_signal', 'n/a')} "
             f"| T3 bonds/cracks={artifact_metrics.get('dirichlet_bonds', 'n/a')}/{artifact_metrics.get('dirichlet_cracks', 'n/a')} "
-            f"| T4 action={artifact_metrics.get('walker_mean_action', 'n/a')} surv={artifact_metrics.get('walker_survival_rate', 'n/a')}"
+            f"| T4 action={artifact_metrics.get('walker_mean_action', 'n/a')} surv={artifact_metrics.get('walker_survival_rate', 'n/a')} "
+            f"| T5 H/P/T/A={artifact_metrics.get('honest_count', 'n/a')}/{artifact_metrics.get('phantom_count', 'n/a')}/{artifact_metrics.get('tautology_count', 'n/a')}/{artifact_metrics.get('anomaly_count', 'n/a')}"
         )
     if effective_observer.startswith("article:"):
         observer_state_metrics = contract.get("observer_state", {}).get("metrics", {}) if isinstance(contract.get("observer_state", {}), dict) else {}
@@ -3082,10 +3255,14 @@ def _render_dashboard_impl(
         t1 = f"System 1: Topologic Integrity | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))} [cite: 2026-02-04]"
         t2 = f"System 2: Geometric Friction = {state.get('geometric_friction', 0.0):.3f} (broken={state.get('n_broken', 0)}, trapped={state.get('n_trapped', 0)}) [cite: 2026-02-04]"
         t3 = f"System 2: Survival % = {state.get('survival_pct', 100.0):.2f}% [cite: 2026-02-04]"
+    elif badge_text == "[UNVERIFIED]":
+        t1 = "System 1: Verification status is UNVERIFIED; provenance contract loaded but claims are not thesis-safe yet."
+        t2 = f"System 2: Geometric Friction = {state.get('geometric_friction', 0.0):.3f} (telemetry available, interpret as unverified)"
+        t3 = f"System 2: Survival % = {state.get('survival_pct', 100.0):.2f}% (telemetry available, interpret as unverified)"
     else:
         t1 = "System 1: Claims disabled (verification/provenance gate not satisfied)"
-        t2 = "System 2: Claims disabled (exploratory mode)"
-        t3 = "System 2: Claims disabled (exploratory mode)"
+        t2 = "System 2: Claims disabled (artifact contract incomplete or non-comparable)"
+        t3 = "System 2: Claims disabled (artifact contract incomplete or non-comparable)"
 
     detail = f"source={state.get('verification_source')} | verification_summary.csv: {state.get('summary_path')} | verification_report.json: {state.get('report_path')}"
     if missing_required:
@@ -3136,7 +3313,7 @@ def _render_dashboard_impl(
 
     watermark_visible = bool(gate.get("watermark_visible"))
     if watermark_visible:
-        watermark_text = "UNVERIFIED / EXPLORATORY"
+        watermark_text = badge_text.strip("[]")
         watermark_style = {
             "display": "flex",
             "position": "fixed",
