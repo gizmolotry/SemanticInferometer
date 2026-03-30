@@ -1584,8 +1584,8 @@ def build_synthesis_display_transform(
         return identity, _identity_projector
 
     strength = float(np.clip(spread_strength, 0.0, 1.0))
-    expanded_lo = -0.18
-    expanded_hi = 1.18
+    expanded_lo = -0.42
+    expanded_hi = 1.42
     axis_maps: List[Dict[str, np.ndarray]] = []
     spread_xy = np.asarray(xy[:, :2], dtype=float).copy()
 
@@ -1628,7 +1628,7 @@ def build_synthesis_display_transform(
 
     spread_center = np.nanmean(spread_xy, axis=0, keepdims=True)
     spread_xy = np.clip(
-        spread_center + (spread_xy - spread_center) * (1.0 + 0.42 * strength),
+        spread_center + (spread_xy - spread_center) * (1.0 + 0.82 * strength),
         expanded_lo,
         expanded_hi,
     )
@@ -1657,7 +1657,7 @@ def build_synthesis_display_transform(
             )
             out[:, axis] = (1.0 - strength) * raw_norm + strength * quantile_norm
         out = np.clip(
-            spread_center + (out - spread_center) * (1.0 + 0.42 * strength),
+            spread_center + (out - spread_center) * (1.0 + 0.82 * strength),
             expanded_lo,
             expanded_hi,
         )
@@ -4178,6 +4178,10 @@ def render_data_points_3d(
         'TAUTOLOGY': (136, 136, 136),  # Gray
         'UNKNOWN': (255, 215, 0),      # Yellow
     }
+    finite_sizes = np.asarray(sizes, dtype=float)
+    finite_mask = np.isfinite(finite_sizes)
+    size_floor = float(np.nanmin(finite_sizes[finite_mask])) if np.any(finite_mask) else 0.0
+    size_span = max(float(np.nanmax(finite_sizes[finite_mask]) - size_floor) if np.any(finite_mask) else 0.0, 1e-6)
 
     for i in range(n):
         # Determine base color for the point
@@ -4196,14 +4200,15 @@ def render_data_points_3d(
                 )
             r, g, b = verdict_colors.get(verdict, verdict_colors['UNKNOWN'])
         
-        core_opacity = 0.95 # Core point opacity, always solid
+        size_norm = float(np.clip((float(finite_sizes[i]) - size_floor) / size_span, 0.0, 1.0)) if i < len(finite_sizes) and np.isfinite(finite_sizes[i]) else 0.5
+        core_opacity = 0.34 + 0.58 * size_norm
 
-        glow_opacity_val = 0.3  # Default glow opacity
-        glow_size_factor_val = 1.0 # Default glow size factor for points
+        glow_opacity_val = 0.06 + 0.22 * size_norm
+        glow_size_factor_val = 0.8 + 0.45 * size_norm
 
                 # FAMILY C: NODE FAILURES (Internal Singularity)
         if spectral_evr is not None and i < len(spectral_evr) and spectral_evr[i] < 0.5:
-            glow_opacity_val = 0.8
+            glow_opacity_val = max(glow_opacity_val, 0.55)
             glow_size_factor_val = 2.5
         if is_fog is not None and i < len(is_fog) and is_fog[i]:
             # Decoherent (Fog): glow is minimal
@@ -4289,7 +4294,7 @@ def render_data_points_3d(
         marker=dict(
             size=adjusted_sizes * 1.2,  # Larger core for easier clicking
             color=point_colors,  # RGBA with per-point opacity
-            line=dict(color='rgba(255,255,255,0.98)', width=2.2),  # Thicker bright outline
+            line=dict(color='rgba(255,255,255,0.78)', width=1.4),
             symbol=article_symbols if article_symbols is not None else 'circle',
         ),
         customdata=custom_point_identity,
@@ -5471,7 +5476,7 @@ def create_monolith_cockpit(
         and synthesis_positions_3d.shape[0] >= 24
     )
     if synthesis_display_transform_active:
-        spread_strength = min(max(0.48 + 0.2 * np.log10(max(n_articles, 10)), 0.58), 0.94)
+        spread_strength = min(max(0.62 + 0.24 * np.log10(max(n_articles, 10)), 0.74), 1.0)
         synthesis_positions_2d, synthesis_xy_projector = build_synthesis_display_transform(
             np.asarray(positions_3d[:, :2], dtype=float),
             spread_strength=spread_strength,
@@ -6164,7 +6169,8 @@ def create_monolith_cockpit(
     marker_corpus_scale = min(max((max(int(n_articles), 1) / 120.0) ** 0.35, 1.0), 2.2)
     marker_scale = max(0.42, 0.78 / max(marker_corpus_scale ** 0.58, 1.0))
     density_emphasis = np.power(np.clip(np.asarray(terrain_density, dtype=float), 0.0, 1.0), 1.6)
-    sizes = (2.8 + 4.6 * density_emphasis) * marker_scale
+    density_emphasis = np.power(np.clip(np.asarray(terrain_density, dtype=float), 0.0, 1.0), 2.25)
+    sizes = (1.8 + 4.0 * density_emphasis) * marker_scale
     
     # ASTER v3.2: Visual Distinction for Observer
     symbols = ['circle'] * n_articles
@@ -6423,11 +6429,11 @@ def create_monolith_cockpit(
     camera_presets = {
         "synthesis": dict(
             up=dict(x=0, y=0, z=1),
-            center=dict(x=0.0, y=0.02, z=-0.24),
+            center=dict(x=0.02, y=0.06, z=-0.34),
             eye=dict(
-                x=1.12 * synthesis_depth_span * synthesis_camera_pull_in,
-                y=-1.06 * synthesis_depth_span * synthesis_camera_pull_in,
-                z=0.14 * synthesis_depth_span * synthesis_camera_pull_in,
+                x=1.34 * synthesis_depth_span * synthesis_camera_pull_in,
+                y=-1.18 * synthesis_depth_span * synthesis_camera_pull_in,
+                z=0.07 * synthesis_depth_span * synthesis_camera_pull_in,
             ),
         ),
         "diagnostics": dict(
@@ -6495,11 +6501,13 @@ def create_monolith_cockpit(
     }
     plot_title_text = "" if physics_mode == "synthesis" else f"<b>ASTER v3.2 MONOLITH [{exp.kernel.upper()}]{verification_title_stamp}</b>"
     top_margin = 0 if physics_mode == "synthesis" else 40
+    left_margin = 24 if physics_mode == "synthesis" else 220
+    right_margin = 4 if physics_mode == "synthesis" else 20
     fig.update_layout(
         scene=scene_layout,
         paper_bgcolor="#0a0a0a",
         plot_bgcolor="#0a0a0a",
-        margin=dict(l=260 if physics_mode == "synthesis" else 220, r=20, t=top_margin, b=0),
+        margin=dict(l=left_margin, r=right_margin, t=top_margin, b=0),
         uirevision='constant',
         showlegend=False,
         title=dict(
