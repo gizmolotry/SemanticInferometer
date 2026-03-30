@@ -192,7 +192,7 @@ class DimensionalCollapseError(RuntimeError):
 
 
 LAYOUT_CONSTRAINTS = dict(
-    aspectmode='data',
+    aspectmode='manual',
 )
 
 # Singularity color mapping
@@ -1477,20 +1477,14 @@ def _interpolate_field_boundary_safe(
 
     if preserve_nan:
         # Canonical manifold mode: preserve real support boundaries without
-        # collapsing the surface into a piecewise-linear triangle mesh.
+        # fabricating a smooth sheet across sparse occupied support.
         try:
-            Zi = griddata((xv, yv), vv, (Xi, Yi), method='cubic')
+            Zi = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=np.nan)
         except Exception:
             try:
-                Zi = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=np.nan)
+                Zi = griddata((xv, yv), vv, (Xi, Yi), method='nearest')
             except Exception:
                 Zi = np.full_like(Xi, np.nan, dtype=float)
-        if Zi is not None and np.isnan(Zi).any():
-            try:
-                Zi_linear = griddata((xv, yv), vv, (Xi, Yi), method='linear', fill_value=np.nan)
-                Zi = np.where(np.isnan(Zi), Zi_linear, Zi)
-            except Exception:
-                pass
         if clip_to_source and np.isfinite(src_min) and np.isfinite(src_max):
             Zi = np.clip(Zi, src_min, src_max)
         return np.asarray(Zi, dtype=float)
@@ -1568,10 +1562,116 @@ def project_points_onto_terrain(
     return np.column_stack([x, y, z_values])
 
 
+def build_synthesis_display_transform(
+    positions_xy: np.ndarray,
+    spread_strength: float = 0.78,
+    margin: float = 0.03,
+) -> Tuple[np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+    """
+    Build a deterministic, display-only XY spread transform for synthesis mode.
+
+    The transform is monotonic per axis, driven by empirical quantiles, and is
+    used only for presentation. It preserves point order and neighborhood
+    structure more faithfully than arbitrary jitter while opening dense regions.
+    """
+    xy = np.asarray(positions_xy, dtype=float)
+    if xy.ndim != 2 or xy.shape[1] < 2 or xy.shape[0] < 4:
+        identity = np.asarray(xy[:, :2], dtype=float)
+
+        def _identity_projector(query_xy: np.ndarray) -> np.ndarray:
+            return np.asarray(query_xy, dtype=float)
+
+        return identity, _identity_projector
+
+    strength = float(np.clip(spread_strength, 0.0, 1.0))
+    expanded_lo = -0.18
+    expanded_hi = 1.18
+    axis_maps: List[Dict[str, np.ndarray]] = []
+    spread_xy = np.asarray(xy[:, :2], dtype=float).copy()
+
+    for axis in range(2):
+        values = np.asarray(xy[:, axis], dtype=float).reshape(-1)
+        finite = values[np.isfinite(values)]
+        if finite.size < 2:
+            axis_maps.append(
+                {
+                    "raw_sorted": np.asarray([0.0, 1.0], dtype=float),
+                    "target_sorted": np.asarray([0.0, 1.0], dtype=float),
+                    "raw_min": np.asarray([0.0], dtype=float),
+                    "raw_span": np.asarray([1.0], dtype=float),
+                }
+            )
+            continue
+
+        raw_min = float(np.nanmin(finite))
+        raw_max = float(np.nanmax(finite))
+        raw_span = max(raw_max - raw_min, 1e-9)
+        raw_norm = np.clip((values - raw_min) / raw_span, 0.0, 1.0)
+
+        raw_sorted = np.unique(np.sort(finite))
+        if raw_sorted.size == 1:
+            target_sorted = np.asarray([0.5], dtype=float)
+        else:
+            quantile_positions = np.linspace(margin, 1.0 - margin, raw_sorted.size, dtype=float)
+            target_sorted = quantile_positions
+
+        quantile_norm = np.interp(values, raw_sorted, target_sorted, left=target_sorted[0], right=target_sorted[-1])
+        spread_xy[:, axis] = (1.0 - strength) * raw_norm + strength * quantile_norm
+        axis_maps.append(
+            {
+                "raw_sorted": np.asarray(raw_sorted, dtype=float),
+                "target_sorted": np.asarray(target_sorted, dtype=float),
+                "raw_min": np.asarray([raw_min], dtype=float),
+                "raw_span": np.asarray([raw_span], dtype=float),
+            }
+        )
+
+    spread_center = np.nanmean(spread_xy, axis=0, keepdims=True)
+    spread_xy = np.clip(
+        spread_center + (spread_xy - spread_center) * (1.0 + 0.42 * strength),
+        expanded_lo,
+        expanded_hi,
+    )
+
+    def _projector(query_xy: np.ndarray) -> np.ndarray:
+        q = np.asarray(query_xy, dtype=float)
+        scalar_input = q.ndim == 1
+        if scalar_input:
+            q = q.reshape(1, -1)
+        if q.ndim != 2 or q.shape[1] < 2:
+            return np.asarray(query_xy, dtype=float)
+        out = np.asarray(q[:, :2], dtype=float).copy()
+        for axis in range(2):
+            axis_map = axis_maps[axis]
+            raw_sorted = axis_map["raw_sorted"]
+            target_sorted = axis_map["target_sorted"]
+            raw_min = float(axis_map["raw_min"][0])
+            raw_span = float(axis_map["raw_span"][0])
+            raw_norm = np.clip((out[:, axis] - raw_min) / max(raw_span, 1e-9), 0.0, 1.0)
+            quantile_norm = np.interp(
+                out[:, axis],
+                raw_sorted,
+                target_sorted,
+                left=target_sorted[0],
+                right=target_sorted[-1],
+            )
+            out[:, axis] = (1.0 - strength) * raw_norm + strength * quantile_norm
+        out = np.clip(
+            spread_center + (out - spread_center) * (1.0 + 0.42 * strength),
+            expanded_lo,
+            expanded_hi,
+        )
+        if scalar_input:
+            return out.reshape(-1)
+        return out
+
+    return spread_xy, _projector
+
+
 def render_terrain_surface(
     positions_3d: np.ndarray,
     energy_values: np.ndarray,
-    grid_resolution: int = 150,
+    grid_resolution: int = 250,
     z_scale: float = 3.0,
     terrain_scalar: Optional[np.ndarray] = None,
     terrain_density: Optional[np.ndarray] = None,
@@ -1589,444 +1689,81 @@ def render_terrain_surface(
     """
     ASTER v3.2 BI-AXIAL TERRAIN SURFACE
     ===================================
-    Decouples Z-axis (geometry) from Color (skin) for proper 4-zone mapping.
-
-    The Two Axes:
-    - Z-Axis (Height) = STRESS (Gradient magnitude)
-      Mountains = High Conflict, Valleys = Low Conflict
-    - Color (Skin) = DENSITY (Mass)
-      Creates 4 zones: BRIDGE, SWAMP, TIGHTROPE, VOID
-
-    The 4 Zones (Density × Stress):
-    - BRIDGE (Cyan): High Density, Low Stress → Deep Blue Valleys
-    - SWAMP (Purple): High Density, High Stress → Purple Mountains
-    - TIGHTROPE (Yellow): Low Density, Low Stress → Yellow Plains
-    - VOID (Red): Low Density, High Stress → Red Spikes
-
-    Args:
-        positions_3d: [N, 3] UMAP positions (articles already placed on terrain)
-        energy_values: [N] values for terrain height (stress proxy)
-        grid_resolution: Grid interpolation resolution
-        z_scale: Vertical exaggeration factor (default 3.0 for dramatic mountains)
-        terrain_scalar: [N] legacy 1D scalar (ignored if density/stress provided)
-        terrain_density: [N] density values [0,1] for color mapping
-        terrain_stress: [N] stress values [0,1] for Z geometry
-        use_manifold_colormap: If True, use 4-zone discrete colormap
+    Renders the synthesis terrain as a Delaunay shrink-wrap over the actual
+    article support so the manifold only exists where data exists.
     """
     if not HAS_PLOTLY or not HAS_SCIPY:
-        return None
+        return None, None, None, None, None, None
 
-    from scipy.interpolate import griddata
+    point_xyz = np.asarray(positions_3d[:, :3], dtype=float)
+    if point_xyz.ndim != 2 or point_xyz.shape[0] < 3 or point_xyz.shape[1] < 3:
+        return None, None, None, None, None, None
 
-    x = positions_3d[:, 0]
-    y = positions_3d[:, 1]
-    terrain_xy = np.column_stack([x, y])
-    geometry_xyz = np.asarray(terrain_geometry_xyz, dtype=float) if terrain_geometry_xyz is not None else np.asarray(positions_3d[:, :3], dtype=float)
-    if geometry_xyz.ndim != 2 or geometry_xyz.shape[0] < 3 or geometry_xyz.shape[1] < 3:
-        geometry_xyz = np.asarray(positions_3d[:, :3], dtype=float)
-    geom_finite = np.isfinite(geometry_xyz[:, :3]).all(axis=1)
-    geometry_xyz = geometry_xyz[geom_finite]
-    if geometry_xyz.shape[0] < 3:
-        geometry_xyz = np.asarray(positions_3d[:, :3], dtype=float)
-    geometry_x = np.asarray(geometry_xyz[:, 0], dtype=float)
-    geometry_y = np.asarray(geometry_xyz[:, 1], dtype=float)
-    canonical_surface_mode = os.environ.get("MONOLITH_CANONICAL_SURFACE", "0").strip() != "0"
-    strict_support_mode = canonical_surface_mode or os.environ.get("MONOLITH_STRICT_SUPPORT", "0").strip() == "1"
-    support_xy = terrain_xy
-    if terrain_support_xy is not None:
-        try:
-            support_candidate = np.asarray(terrain_support_xy, dtype=float)
-            if support_candidate.ndim == 2 and support_candidate.shape[0] >= 3 and support_candidate.shape[1] >= 2:
-                finite_rows = np.isfinite(support_candidate[:, :2]).all(axis=1)
-                support_candidate = support_candidate[finite_rows, :2]
-                if support_candidate.shape[0] >= 3:
-                    support_xy = support_candidate
-        except Exception:
-            support_xy = terrain_xy
+    point_mask = np.isfinite(point_xyz[:, :3]).all(axis=1)
+    if np.count_nonzero(point_mask) < 3:
+        return None, None, None, None, None, None
 
-    try:
-        margin = float(os.environ.get("MONOLITH_TERRAIN_MARGIN", "0.01" if strict_support_mode else "0.15").strip())
-    except Exception:
-        margin = 0.01 if strict_support_mode else 0.15
-    margin = max(0.0, margin)
-    x_support = support_xy[:, 0]
-    y_support = support_xy[:, 1]
-    x_range = x_support.max() - x_support.min()
-    y_range = y_support.max() - y_support.min()
-    # Guard against degenerate axes so mesh construction cannot collapse to a line.
-    x_range_safe = max(float(x_range), 1e-6)
-    y_range_safe = max(float(y_range), 1e-6)
+    point_x = np.asarray(point_xyz[point_mask, 0], dtype=float)
+    point_y = np.asarray(point_xyz[point_mask, 1], dtype=float)
 
-    x_min = x_support.min() - margin * x_range_safe
-    x_max = x_support.max() + margin * x_range_safe
-    y_min = y_support.min() - margin * y_range_safe
-    y_max = y_support.max() + margin * y_range_safe
-
-    xi = np.linspace(x_min, x_max, grid_resolution)
-    yi = np.linspace(y_min, y_max, grid_resolution)
-    Xi, Yi = np.meshgrid(xi, yi)
-    occupancy_mask = None
-    try:
-        xy_points = np.asarray(support_xy, dtype=float)
-        if xy_points.shape[0] > 0:
-            _, uniq_idx = np.unique(np.round(xy_points, decimals=9), axis=0, return_index=True)
-            xy_points = xy_points[np.sort(uniq_idx)]
-    except Exception:
-        occupancy_mask = None
-        xy_points = np.empty((0, 2), dtype=float)
-    if xy_points.shape[0] >= 3:
-        grid_points = np.column_stack([Xi.ravel(), Yi.ravel()])
-        if strict_support_mode and xy_points.shape[0] >= 4:
-            delaunay_mask = None
-            try:
-                tri = Delaunay(xy_points)
-                simplex = tri.find_simplex(grid_points)
-                delaunay_mask = (simplex >= 0).reshape(Xi.shape)
-            except Exception:
-                delaunay_mask = None
-            try:
-                tree = cKDTree(xy_points)
-                k = min(4, xy_points.shape[0] - 1)
-                nn_distances, nn_index = tree.query(xy_points, k=k + 1)
-                local_scale = np.asarray(nn_distances[:, -1], dtype=float)
-                finite_scale = local_scale[np.isfinite(local_scale) & (local_scale > 0)]
-                if finite_scale.size > 0:
-                    support_radius = float(np.percentile(finite_scale, 70))
-                    support_radius = max(support_radius * 1.35, max(x_range_safe, y_range_safe) * 0.012)
-                    grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
-                    local_radius = np.asarray(local_scale, dtype=float)
-                    local_radius = np.where(np.isfinite(local_radius), local_radius, support_radius)
-                    local_radius = np.clip(local_radius * 1.15, support_radius * 0.65, support_radius * 1.6)
-                    local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
-                    occupancy_mask = (
-                        np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
-                        <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
-                    )
-            except Exception:
-                occupancy_mask = None
-            if occupancy_mask is not None and delaunay_mask is not None:
-                occupancy_mask = occupancy_mask & delaunay_mask
-                retained = float(np.mean(occupancy_mask))
-                delaunay_retained = float(np.mean(delaunay_mask))
-                # Guardrail: canonical support must not collapse to a near-empty surface.
-                if retained < 0.035 and delaunay_retained > retained:
-                    print(
-                        "[MONOLITH][WARN] Canonical support mask overly sparse; "
-                        f"retained={retained:.4f}. Falling back to Delaunay support."
-                    )
-                    occupancy_mask = delaunay_mask
-            elif occupancy_mask is None:
-                occupancy_mask = delaunay_mask
-        else:
-            occupancy_score = None
-            if xy_points.shape[0] >= 4:
-                try:
-                    tri = Delaunay(xy_points)
-                    simplex = tri.find_simplex(grid_points)
-                    occupancy_mask = (simplex >= 0).reshape(Xi.shape)
-                except Exception:
-                    occupancy_mask = None
-            if occupancy_mask is None and xy_points.shape[0] >= 4:
-                try:
-                    kde = gaussian_kde(xy_points.T)
-                    support_score = np.asarray(kde(xy_points.T), dtype=float).reshape(-1)
-                    occupancy_score = np.asarray(kde(grid_points.T), dtype=float).reshape(Xi.shape)
-                    max_score = float(np.nanmax(occupancy_score))
-                    if np.isfinite(max_score) and max_score > 1e-12:
-                        occupancy_score = occupancy_score / max_score
-                        support_score = support_score / max_score
-                        finite_support = support_score[np.isfinite(support_score)]
-                        if finite_support.size > 0:
-                            occupancy_cutoff = max(float(np.percentile(finite_support, 15.0)) * 0.20, 0.035)
-                            occupancy_mask = occupancy_score >= occupancy_cutoff
-                except Exception:
-                    occupancy_score = None
-            if occupancy_mask is None and xy_points.shape[0] >= 4:
-                try:
-                    tree = cKDTree(xy_points)
-                    k = min(3, xy_points.shape[0] - 1)
-                    if k >= 1:
-                        nn_distances, _ = tree.query(xy_points, k=k + 1)
-                        local_scale = np.asarray(nn_distances[:, -1], dtype=float)
-                        local_scale = local_scale[np.isfinite(local_scale)]
-                        if local_scale.size > 0:
-                            local_radius = np.asarray(nn_distances[:, -1], dtype=float)
-                            local_radius = np.where(
-                                np.isfinite(local_radius),
-                                local_radius,
-                                float(np.nanmedian(local_scale)),
-                            )
-                            support_radius = float(np.percentile(local_scale, 60))
-                            support_radius = max(support_radius * 0.9, max(x_range_safe, y_range_safe) * 0.015)
-                            local_radius = np.clip(local_radius * 0.9, support_radius * 0.5, support_radius * 1.1)
-                            grid_nn_distance, grid_nn_index = tree.query(grid_points, k=1)
-                            local_radius_grid = local_radius[np.asarray(grid_nn_index, dtype=int)]
-                            occupancy_mask = (
-                                np.asarray(grid_nn_distance, dtype=float).reshape(Xi.shape)
-                                <= np.asarray(local_radius_grid, dtype=float).reshape(Xi.shape)
-                            )
-                except Exception:
-                    occupancy_mask = None
-            if occupancy_mask is None:
-                try:
-                    tri = Delaunay(xy_points)
-                    simplex = tri.find_simplex(grid_points)
-                    occupancy_mask = (simplex >= 0).reshape(Xi.shape)
-                except Exception:
-                    occupancy_mask = None
-    support_occupancy_mask = None
-    if occupancy_mask is not None:
-        try:
-            occupancy_mask = np.asarray(occupancy_mask, dtype=bool)
-            if not canonical_surface_mode:
-                occupancy_mask = binary_closing(occupancy_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
-                occupancy_mask = binary_fill_holes(occupancy_mask)
-                labeled, n_components = nd_label(occupancy_mask)
-                if int(n_components) > 1:
-                    component_sizes = np.bincount(labeled.ravel())
-                    component_sizes[0] = 0
-                    keep_label = int(np.argmax(component_sizes))
-                    occupancy_mask = labeled == keep_label
-        except Exception:
-            occupancy_mask = np.asarray(occupancy_mask, dtype=bool)
-        support_occupancy_mask = occupancy_mask
-    tear_mask = np.zeros(Xi.shape, dtype=bool)
-    if rupture_segments_2d:
-        tear_radius = max(x_range_safe, y_range_safe) * float(max(rupture_tear_radius_scale, 1e-6))
-        tear_radius_sq = tear_radius * tear_radius
-        for seg in rupture_segments_2d:
-            try:
-                p0 = np.asarray(seg[0], dtype=float).reshape(2)
-                p1 = np.asarray(seg[1], dtype=float).reshape(2)
-                if not (np.isfinite(p0).all() and np.isfinite(p1).all()):
-                    continue
-                vx = p1[0] - p0[0]
-                vy = p1[1] - p0[1]
-                seg_len_sq = (vx * vx) + (vy * vy)
-                if seg_len_sq <= 1e-12:
-                    dx = Xi - p0[0]
-                    dy = Yi - p0[1]
-                    dist_sq = (dx * dx) + (dy * dy)
-                else:
-                    t = ((Xi - p0[0]) * vx + (Yi - p0[1]) * vy) / seg_len_sq
-                    t = np.clip(t, 0.0, 1.0)
-                    proj_x = p0[0] + t * vx
-                    proj_y = p0[1] + t * vy
-                    dx = Xi - proj_x
-                    dy = Yi - proj_y
-                    dist_sq = (dx * dx) + (dy * dy)
-                tear_mask |= (dist_sq <= tear_radius_sq)
-            except Exception:
-                continue
-
-    # =========================================
-    # 1. THE GEOMETRY (Z-AXIS) = STRESS
-    # =========================================
-    # Z represents STRESS (gradient magnitude / walker resistance)
-    # High Z = High Conflict (Mountains), Low Z = Consensus (Valleys)
-    if terrain_stress_geometry is not None:
-        stress_values = terrain_stress_geometry
+    if terrain_stress_geometry is not None and len(terrain_stress_geometry) == len(positions_3d):
+        point_z = np.asarray(terrain_stress_geometry, dtype=float).reshape(-1)[point_mask]
+    elif energy_values is not None and len(np.asarray(energy_values).reshape(-1)) == len(positions_3d):
+        point_z = np.asarray(energy_values, dtype=float).reshape(-1)[point_mask]
     else:
-        # Deterministic fallback: use provided terrain energy / point z values.
-        if geometry_xyz.shape[0] == len(np.asarray(energy_values if energy_values is not None else positions_3d[:, 2], dtype=float).reshape(-1)):
-            stress_values = energy_values if energy_values is not None else geometry_xyz[:, 2]
-        else:
-            stress_values = geometry_xyz[:, 2]
+        point_z = np.asarray(point_xyz[point_mask, 2], dtype=float)
+
     try:
         print(
             f"[MONOLITH][TERRAIN] geometry_input range="
-            f"[{float(np.nanmin(stress_values)):.3f}, {float(np.nanmax(stress_values)):.3f}] "
+            f"[{float(np.nanmin(point_z)):.3f}, {float(np.nanmax(point_z)):.3f}] "
             f"(stress_override={'yes' if terrain_stress_geometry is not None else 'no'})"
         )
     except Exception:
         pass
 
-    grid_stress = _interpolate_field_boundary_safe(
-        x=geometry_x,
-        y=geometry_y,
-        values=stress_values,
-        Xi=Xi,
-        Yi=Yi,
-        fill_value=(None if canonical_surface_mode else float(np.nanmean(np.asarray(stress_values, dtype=float)))),
-        clip_to_source=True,
-        preserve_nan=canonical_surface_mode,
-    )
-
-    if not canonical_surface_mode:
-        grid_stress = gaussian_filter(grid_stress, sigma=1.5)
-    # Coordinate contract: terrain Z must remain in the same numeric domain as
-    # article point Z, otherwise camera autoscaling can visually flatten/erase the manifold.
-    z_geometry = np.asarray(grid_stress, dtype=float).copy()
-    try:
-        pts_z = np.asarray(positions_3d[:, 2], dtype=float)
-        base_geometry = np.asarray(geometry_xyz[:, 2], dtype=float).reshape(-1)
-        stress_geometry = np.asarray(stress_values, dtype=float).reshape(-1)
-        blend_ratio = float(os.environ.get("MONOLITH_TERRAIN_STRESS_BLEND", "0.35").strip())
-        blend_ratio = float(np.clip(blend_ratio, 0.0, 1.0))
-
-        def _robust_norm(arr: np.ndarray) -> np.ndarray:
-            arr = np.asarray(arr, dtype=float)
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            finite = arr[np.isfinite(arr)]
-            if finite.size <= 0:
-                return np.full(arr.shape, 0.5, dtype=float)
-            lo = float(np.percentile(finite, 5.0))
-            hi = float(np.percentile(finite, 95.0))
-            if hi <= lo + 1e-12:
-                lo = float(np.nanmin(finite))
-                hi = float(np.nanmax(finite))
-            if hi <= lo + 1e-12:
-                return np.full(arr.shape, 0.5, dtype=float)
-            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-
-        base_norm = _robust_norm(base_geometry)
-        stress_norm = _robust_norm(stress_geometry)
-        if canonical_surface_mode:
-            geom_source = stress_geometry
-        elif np.nanstd(stress_norm) > 1e-6:
-            geom_source = ((1.0 - blend_ratio) * base_norm) + (blend_ratio * stress_norm)
-        else:
-            geom_source = base_norm
-        grid_geom = _interpolate_field_boundary_safe(
-            x=geometry_x,
-            y=geometry_y,
-            values=geom_source,
-            Xi=Xi,
-            Yi=Yi,
-            fill_value=(None if canonical_surface_mode else float(np.nanmean(np.asarray(geom_source, dtype=float)))),
-            clip_to_source=True,
-            preserve_nan=canonical_surface_mode,
-        )
-        if not canonical_surface_mode:
-            grid_geom = gaussian_filter(grid_geom, sigma=1.1)
-        z_geometry = np.asarray(grid_geom, dtype=float).copy()
-        if not canonical_surface_mode:
-            pts_min = float(np.nanmin(pts_z))
-            pts_max = float(np.nanmax(pts_z))
-            g_min = float(np.nanmin(z_geometry))
-            g_max = float(np.nanmax(z_geometry))
-            if np.isfinite(g_min) and np.isfinite(g_max) and (g_max - g_min) > 1e-12:
-                z_geometry = (z_geometry - g_min) / (g_max - g_min)
-                z_geometry = z_geometry * (pts_max - pts_min) + pts_min
-            else:
-                z_geometry = np.full_like(z_geometry, pts_min)
-    except Exception:
-        pass
-    try:
-        print(
-            f"[MONOLITH][TERRAIN] z_geometry range="
-            f"[{float(np.nanmin(z_geometry)):.3f}, {float(np.nanmax(z_geometry)):.3f}]"
-        )
-    except Exception:
-        pass
-    if support_occupancy_mask is not None:
-        z_geometry = np.where(support_occupancy_mask, z_geometry, np.nan)
-    if np.any(tear_mask):
-        z_geometry = np.where(tear_mask, np.nan, z_geometry)
-    # =========================================
-    # 2. THE SKIN (COLOR) = CONTINUOUS MANIFOLD GRADIENT
-    # =========================================
     if use_manifold_colormap and terrain_density is not None and terrain_stress is not None:
-        # Interpolate density and stress using continuous RBF helper to avoid
-        # cubic+nearest boundary seams.
-        grid_density = _interpolate_field_boundary_safe(
-            x=x,
-            y=y,
-            values=terrain_density,
-            Xi=Xi,
-            Yi=Yi,
-            fill_value=(None if canonical_surface_mode else 0.5),
-            clip_to_source=True,
-            preserve_nan=canonical_surface_mode,
-        )
-        grid_stress_color = _interpolate_field_boundary_safe(
-            x=x,
-            y=y,
-            values=terrain_stress,
-            Xi=Xi,
-            Yi=Yi,
-            fill_value=(None if canonical_surface_mode else 0.5),
-            clip_to_source=True,
-            preserve_nan=canonical_surface_mode,
-        )
-
-        if not canonical_surface_mode:
-            grid_density = gaussian_filter(grid_density, sigma=1.0)
-            grid_stress_color = gaussian_filter(grid_stress_color, sigma=1.0)
-
-        # Color channel expects manifold axes in [0, 1].
-        # Normalize against source ranges (not smoothed grid ranges) to avoid
-        # narrow-band color collapse after interpolation/smoothing.
-        def _normalize_with_bounds(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
-            arr = np.asarray(arr, dtype=float)
-            arr = np.nan_to_num(arr, nan=0.5)
-            if not np.isfinite(lo) or not np.isfinite(hi):
-                return np.full_like(arr, 0.5, dtype=float)
-            if hi - lo <= 1e-9:
-                return np.full_like(arr, 0.5, dtype=float)
-            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-
-        density_src = np.nan_to_num(np.asarray(terrain_density, dtype=float), nan=0.5)
-        stress_src = np.nan_to_num(np.asarray(terrain_stress, dtype=float), nan=0.5)
-        d_lo, d_hi = float(np.nanmin(density_src)), float(np.nanmax(density_src))
-        s_lo, s_hi = float(np.nanmin(stress_src)), float(np.nanmax(stress_src))
-        density_color = _normalize_with_bounds(grid_density, d_lo, d_hi)
-        stress_color = _normalize_with_bounds(grid_stress_color, s_lo, s_hi)
-
-        # Compute continuous terrain_scalar using the manifold formula:
-        # terrain_scalar = 0.25 - 0.25*density + 0.75*stress
-        # This maps 2D (density, stress) to 1D [0,1] for colormap:
-        #   BRIDGE (density=1, stress=0) → 0.0
-        #   TIGHTROPE (density=0, stress=0) → 0.25
-        #   SWAMP (density=1, stress=1) → 0.75
-        #   VOID (density=0, stress=1) → 1.0
-        terrain_scalar_grid = 0.25 - 0.25 * density_color + 0.75 * stress_color
-
-        # Clamp to [0, 1] for safety
-        terrain_scalar_grid = np.clip(terrain_scalar_grid, 0.0, 1.0)
-        if support_occupancy_mask is not None:
-            terrain_scalar_grid = np.where(support_occupancy_mask, terrain_scalar_grid, np.nan)
-        if np.any(tear_mask):
-            terrain_scalar_grid = np.where(tear_mask, np.nan, terrain_scalar_grid)
-
-        # Use continuous manifold colorscale
+        density_src = np.nan_to_num(np.asarray(terrain_density, dtype=float).reshape(-1)[point_mask], nan=0.5)
+        stress_src = np.nan_to_num(np.asarray(terrain_stress, dtype=float).reshape(-1)[point_mask], nan=0.5)
+        density_src = np.clip(density_src, 0.0, 1.0)
+        stress_src = np.clip(stress_src, 0.0, 1.0)
+        point_intensity = np.clip(0.25 - 0.25 * density_src + 0.75 * stress_src, 0.0, 1.0)
         colorscale = get_continuous_manifold_colorscale()
-        surfacecolor = terrain_scalar_grid
         cmin, cmax = 0.0, 1.0
         colorbar_config = dict(
             title="Terrain<br>Gradient",
             tickvals=[0.0, 0.25, 0.5, 0.75, 1.0],
-            ticktext=["BRIDGE", "TIGHTROPE", "—", "SWAMP", "VOID"],
+            ticktext=["BRIDGE", "TIGHTROPE", "?", "SWAMP", "VOID"],
             len=0.5,
             x=1.02,
         )
-    elif terrain_scalar is not None:
-        # Legacy continuous colorscale
-        color_values = _interpolate_field_boundary_safe(
-            x=x,
-            y=y,
-            values=terrain_scalar,
-            Xi=Xi,
-            Yi=Yi,
-            fill_value=0.5,
-            clip_to_source=True,
+    elif terrain_scalar is not None and len(np.asarray(terrain_scalar).reshape(-1)) == len(positions_3d):
+        point_intensity = np.clip(
+            np.nan_to_num(np.asarray(terrain_scalar, dtype=float).reshape(-1)[point_mask], nan=0.5),
+            0.0,
+            1.0,
         )
-        if support_occupancy_mask is not None:
-            color_values = np.where(support_occupancy_mask, color_values, np.nan)
-        if np.any(tear_mask):
-            color_values = np.where(tear_mask, np.nan, color_values)
         colorscale = get_terrain_colorscale()
-        surfacecolor = color_values
-        cmin, cmax = 0, 1
+        cmin, cmax = 0.0, 1.0
         colorbar_config = dict(
             title="Terrain",
             tickvals=[0, 0.25, 0.5, 0.75, 1.0],
-            ticktext=["BRIDGE", "TIGHTROPE", "—", "SWAMP", "VOID"],
+            ticktext=["BRIDGE", "TIGHTROPE", "?", "SWAMP", "VOID"],
             len=0.5,
             x=1.02,
         )
     else:
-        # Fallback: height-based coloring
+        z_for_color = np.asarray(point_z, dtype=float)
+        finite_z = z_for_color[np.isfinite(z_for_color)]
+        if finite_z.size > 0:
+            z_min = float(np.nanmin(finite_z))
+            z_max = float(np.nanmax(finite_z))
+            if z_max - z_min > 1e-12:
+                point_intensity = np.clip((z_for_color - z_min) / (z_max - z_min), 0.0, 1.0)
+            else:
+                point_intensity = np.full(z_for_color.shape, 0.5, dtype=float)
+        else:
+            point_intensity = np.full(z_for_color.shape, 0.5, dtype=float)
         colorscale = [
             [0.0, PALETTE.void],
             [0.2, PALETTE.magma_cold],
@@ -2034,74 +1771,121 @@ def render_terrain_surface(
             [0.75, PALETTE.magma_hot],
             [1.0, PALETTE.magma_rupture],
         ]
-        surfacecolor = z_geometry
-        cmin, cmax = None, None
+        cmin, cmax = 0.0, 1.0
         colorbar_config = dict(title="Height", len=0.5, x=1.02)
 
-    # ASTER v3.2: Vertical Microscope (Root Relativity)
-    # Stretch Z to the visible scale to reveal microscopic warping (~1e-6).
-    # If the Z range is too small, it effectively looks like a flat sheet.
+    vertex_xy = np.column_stack([point_x, point_y])
+    rounded_xy = np.round(vertex_xy, decimals=9)
+    unique_xy, unique_idx, inverse_idx = np.unique(rounded_xy, axis=0, return_index=True, return_inverse=True)
+    if unique_xy.shape[0] < 3:
+        return None, None, None, None, None, None
+
+    vertex_z = np.asarray(point_z, dtype=float)[unique_idx]
+    vertex_intensity = np.asarray(point_intensity, dtype=float)[unique_idx]
+    vertex_x = np.asarray(unique_xy[:, 0], dtype=float)
+    vertex_y = np.asarray(unique_xy[:, 1], dtype=float)
+
     try:
-        z_finite = z_geometry[np.isfinite(z_geometry)]
-        if z_finite.size > 0:
-            z_min = float(np.nanmin(z_finite))
-            z_max = float(np.nanmax(z_finite))
-            z_ptp = z_max - z_min
-            
-            # Apply dynamic Vertical Microscope scaling
-            target_span = float(z_scale)
-            if z_ptp > 1e-12:
-                # Normalize and scale to [0, target_span]
-                z_geometry = (z_geometry - z_min) / z_ptp * target_span
-                print(f"[MONOLITH] Vertical Microscope: scaled Z-span {z_ptp:.2e} -> {target_span:.1f}")
-            else:
-                z_geometry = np.full_like(z_geometry, 0.0)
-    except Exception as e:
-        print(f"[WARN] Vertical Microscope failed: {e}")
+        support_tree = cKDTree(unique_xy)
+        k = min(7, max(unique_xy.shape[0] - 1, 1))
+        if k >= 2:
+            nn_distances, _ = support_tree.query(unique_xy, k=k + 1)
+            nn_distances = np.asarray(nn_distances, dtype=float)
+            local_radius = nn_distances[:, -1]
+            finite_radius = local_radius[np.isfinite(local_radius) & (local_radius > 0)]
+            if finite_radius.size > 0:
+                base_radius = float(np.percentile(finite_radius, 58))
+                neighbor_radius = max(base_radius * 1.22, 1e-4)
+                neighborhoods = support_tree.query_ball_point(unique_xy, r=neighbor_radius)
+                support_counts = np.asarray([max(len(idx_list) - 1, 0) for idx_list in neighborhoods], dtype=int)
+                support_mask = (local_radius <= base_radius * 1.55) | (support_counts >= 4)
+                if int(np.count_nonzero(support_mask)) >= 3:
+                    unique_xy = unique_xy[support_mask]
+                    vertex_x = vertex_x[support_mask]
+                    vertex_y = vertex_y[support_mask]
+                    vertex_z = vertex_z[support_mask]
+                    vertex_intensity = vertex_intensity[support_mask]
+    except Exception:
+        pass
 
-    show_surface_contours = os.environ.get("MONOLITH_SHOW_SURFACE_CONTOURS", "0").strip() == "1"
-    contour_cfg = dict(z=dict(show=False))
-    if show_surface_contours and z_finite.size >= 2:
-        z_min = float(np.min(z_finite))
-        z_max = float(np.max(z_finite))
-        z_span = z_max - z_min
-        if z_span > 1e-9:
-            n_iso = 30
-            z_step = z_span / float(n_iso)
-            contour_cfg = dict(
-                z=dict(
-                    show=True,
-                    start=z_min,
-                    end=z_max,
-                    size=z_step,
-                    usecolormap=False,
-                    color="black",
-                    width=2,
-                    highlightcolor="white",
-                    project_z=False,
-                )
-            )
+    try:
+        tri = Delaunay(unique_xy)
+    except Exception:
+        return None, vertex_x, vertex_y, vertex_z, None, None
 
-    return go.Surface(
-        x=Xi, y=Yi, z=z_geometry,
-        surfacecolor=surfacecolor,
+    simplices = np.asarray(tri.simplices, dtype=int)
+    if simplices.ndim != 2 or simplices.shape[0] < 1 or simplices.shape[1] < 3:
+        return None, vertex_x, vertex_y, vertex_z, None, None
+
+    try:
+        support_tree = cKDTree(unique_xy)
+        k = min(6, max(unique_xy.shape[0] - 1, 1))
+        if k >= 1:
+            nn_distances, _ = support_tree.query(unique_xy, k=k + 1)
+            local_radius = np.asarray(nn_distances[:, -1], dtype=float)
+            finite_radius = local_radius[np.isfinite(local_radius) & (local_radius > 0)]
+            if finite_radius.size > 0:
+                base_radius = float(np.percentile(finite_radius, 60))
+                local_radius = np.where(np.isfinite(local_radius), local_radius, base_radius)
+                local_radius = np.clip(local_radius, base_radius * 0.75, base_radius * 2.5)
+
+                p0 = unique_xy[simplices[:, 0]]
+                p1 = unique_xy[simplices[:, 1]]
+                p2 = unique_xy[simplices[:, 2]]
+                edge01 = np.linalg.norm(p0 - p1, axis=1)
+                edge12 = np.linalg.norm(p1 - p2, axis=1)
+                edge20 = np.linalg.norm(p2 - p0, axis=1)
+                max_edge = np.maximum(edge01, np.maximum(edge12, edge20))
+                simplex_radius = np.max(local_radius[simplices], axis=1)
+                max_allowed = np.maximum(simplex_radius * 1.8, base_radius * 1.35)
+                z0 = vertex_z[simplices[:, 0]]
+                z1 = vertex_z[simplices[:, 1]]
+                z2 = vertex_z[simplices[:, 2]]
+                z_span = np.maximum(z0, np.maximum(z1, z2)) - np.minimum(z0, np.minimum(z1, z2))
+                slope_limit = np.maximum(max_edge * 2.75, 0.85)
+                keep = np.asarray((max_edge <= max_allowed) & (z_span <= slope_limit), dtype=bool)
+                if np.any(keep):
+                    simplices = simplices[keep]
+    except Exception:
+        pass
+
+    if simplices.shape[0] < 1:
+        return None, vertex_x, vertex_y, vertex_z, None, None
+
+    try:
+        print(
+            f"[MONOLITH][TERRAIN] z_geometry range="
+            f"[{float(np.nanmin(vertex_z)):.3f}, {float(np.nanmax(vertex_z)):.3f}]"
+        )
+    except Exception:
+        pass
+
+    return go.Mesh3d(
+        x=vertex_x,
+        y=vertex_y,
+        z=vertex_z,
+        i=simplices[:, 0],
+        j=simplices[:, 1],
+        k=simplices[:, 2],
+        intensity=vertex_intensity,
         colorscale=colorscale,
-        cmin=cmin, cmax=cmax,
-        opacity=opacity,
+        cmin=cmin,
+        cmax=cmax,
+        opacity=0.85,
         showscale=True,
         colorbar=colorbar_config,
         lighting=dict(
-            ambient=0.6,
-            diffuse=0.8,
-            specular=0.2,
-            roughness=0.5,
-            fresnel=0.1,
+            ambient=0.28,
+            diffuse=0.98,
+            specular=0.34,
+            roughness=0.9,
+            fresnel=0.18,
         ),
-        lightposition=dict(x=100, y=100, z=300),
-        contours=contour_cfg,
+        lightposition=dict(x=-220, y=-160, z=520),
         hoverinfo='skip',
+        flatshading=False,
         name='Energy Terrain',
-    ), Xi, Yi, z_geometry, grid_density if 'grid_density' in locals() else None, grid_stress_color if 'grid_stress_color' in locals() else None
+    ), vertex_x, vertex_y, vertex_z, None, None
 
 def render_terrain_contours(
     Xi: np.ndarray,
@@ -2702,11 +2486,11 @@ def render_phantom_paths_3d(
     walker_paths = walker_paths or {}
     walker_path_diagnostics = walker_path_diagnostics or {}
     all_path_starts: List[np.ndarray] = []
-    show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "1").strip() == "1"
+    show_shear_labels = os.environ.get("MONOLITH_SHOW_SHEAR_LABELS", "0").strip() == "1"
     try:
-        max_shear_labels = int(os.environ.get("MONOLITH_MAX_SHEAR_LABELS", "8").strip())
+        max_shear_labels = int(os.environ.get("MONOLITH_MAX_SHEAR_LABELS", "2").strip())
     except Exception:
-        max_shear_labels = 8
+        max_shear_labels = 2
     max_shear_labels = max(0, max_shear_labels)
     show_asymmetry_lines = os.environ.get("MONOLITH_SHOW_ASYMMETRY_LINES", "0").strip() == "1"
     debug_printed = 0
@@ -2850,7 +2634,7 @@ def render_phantom_paths_3d(
         if seg.ndim != 2 or seg.shape[1] < 2:
             return seg
         clip_default = "1" if callable(surface_xy_projector) else "0"
-        clip_paths_to_support = os.environ.get("MONOLITH_CLIP_PATHS_TO_SUPPORT", "0").strip() == "1"
+        clip_paths_to_support = os.environ.get("MONOLITH_CLIP_PATHS_TO_SUPPORT", clip_default).strip() == "1"
         if clip_paths_to_support and callable(surface_xy_projector):
             try:
                 proj_x, proj_y = surface_xy_projector(seg[:, 0], seg[:, 1])
@@ -3205,10 +2989,11 @@ def render_phantom_paths_3d(
         if anchor_xyz is None or not np.isfinite(anchor_xyz).all():
             return
         shear_text = _build_shear_text(article_idx, asym=asym)
+        z_label_offset = max(0.03, min(0.12, max_terrain_z * 0.03))
         traces.append(go.Scatter3d(
             x=[float(anchor_xyz[0])],
             y=[float(anchor_xyz[1])],
-            z=[float(anchor_xyz[2]) + 0.08],
+            z=[float(anchor_xyz[2]) + z_label_offset],
             mode='text',
             text=[shear_text],
             textfont=dict(
@@ -4447,6 +4232,7 @@ def render_data_points_3d(
         marker=dict(
             size=adjusted_sizes * 2.5 * glow_size_factor_val,  # Adjust glow size
             color=point_colors_glow,
+            line=dict(color='rgba(255,255,255,0.06)', width=0.5),
         ),
         showlegend=False,
         hoverinfo='skip',  # CRITICAL: 'skip' passes through, 'none' blocks!
@@ -4462,6 +4248,7 @@ def render_data_points_3d(
         marker=dict(
             size=adjusted_sizes * 1.6 * glow_size_factor_val,  # Adjust mid glow size
             color=point_colors_glow,
+            line=dict(color='rgba(255,255,255,0.12)', width=0.8),
         ),
         showlegend=False,
         hoverinfo='skip',  # CRITICAL: 'skip' passes through, 'none' blocks!
@@ -4502,7 +4289,7 @@ def render_data_points_3d(
         marker=dict(
             size=adjusted_sizes * 1.2,  # Larger core for easier clicking
             color=point_colors,  # RGBA with per-point opacity
-            line=dict(color='white', width=1.5),  # Thicker white outline
+            line=dict(color='rgba(255,255,255,0.98)', width=2.2),  # Thicker bright outline
             symbol=article_symbols if article_symbols is not None else 'circle',
         ),
         customdata=custom_point_identity,
@@ -4783,6 +4570,35 @@ def render_analysis_planes(
     return traces, nmi_scores
 
 
+def _trace_extent(traces: List[Any]) -> Dict[str, Optional[Tuple[float, float]]]:
+    """Compute finite XYZ extents across Plotly traces."""
+    def _axis_extent(axis_values: List[np.ndarray]) -> Optional[Tuple[float, float]]:
+        if not axis_values:
+            return None
+        try:
+            flat = np.concatenate([np.asarray(v, dtype=float).ravel() for v in axis_values if v is not None])
+        except Exception:
+            return None
+        finite = flat[np.isfinite(flat)]
+        if finite.size <= 0:
+            return None
+        return float(np.nanmin(finite)), float(np.nanmax(finite))
+
+    xs: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+    zs: List[np.ndarray] = []
+    for trace in traces or []:
+        for attr, bucket in (("x", xs), ("y", ys), ("z", zs)):
+            values = getattr(trace, attr, None)
+            if values is not None:
+                bucket.append(np.asarray(values))
+    return {
+        "x": _axis_extent(xs),
+        "y": _axis_extent(ys),
+        "z": _axis_extent(zs),
+    }
+
+
 # =============================================================================
 # HUD BAR
 # =============================================================================
@@ -4910,18 +4726,19 @@ HUD_CSS = '''
         position: fixed;
         top: 54px;
         left: 18px;
-        width: 330px;
-        max-height: calc(100vh - 150px);
+        width: 270px;
+        max-height: calc(100vh - 185px);
         overflow-y: auto;
-        background: rgba(8, 8, 8, 0.94);
+        background: rgba(8, 8, 8, 0.82);
         border: 1px solid #26474f;
         border-radius: 6px;
-        padding: 12px;
+        padding: 10px;
         z-index: 1002;
         font-family: 'Inter', sans-serif;
-        font-size: 11px;
-        line-height: 1.45;
+        font-size: 10px;
+        line-height: 1.35;
         color: #cde6ec;
+        backdrop-filter: blur(2px);
     }
     .ep-title { color: #00F0FF; font-weight: 600; margin-bottom: 6px; }
     .ep-sub { color: #8eb3ba; margin-bottom: 8px; }
@@ -4967,8 +4784,8 @@ HUD_CSS = '''
     }
     .compass-row {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) 110px 36px;
-        gap: 8px;
+        grid-template-columns: minmax(0, 1fr) 92px 30px;
+        gap: 6px;
         align-items: center;
     }
     .compass-label {
@@ -4998,20 +4815,20 @@ HUD_CSS = '''
     .toggle-grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 6px;
+        gap: 5px;
     }
     .toggle-chip {
         display: flex;
         align-items: center;
         gap: 6px;
-        min-height: 30px;
-        padding: 6px 8px;
+        min-height: 26px;
+        padding: 5px 7px;
         border: 1px solid #1f424c;
         border-radius: 6px;
         background: rgba(7, 14, 18, 0.86);
         color: #cde6ec;
         font-family: 'JetBrains Mono', monospace;
-        font-size: 10px;
+        font-size: 9px;
     }
     .toggle-chip input { accent-color: #00d8ff; }
     .instrument-stats {
@@ -5118,6 +4935,7 @@ def create_monolith_cockpit(
     observer_coord_override: Optional[np.ndarray] = None
     observer_probe_similarity: Optional[np.ndarray] = None
     observer_coord_delta: Optional[np.ndarray] = None
+    observer_displacement_z: Optional[np.ndarray] = None
     effective_synthesis_nmi = exp.synthesis_nmi
     effective_track_nmi = dict(exp.track_nmi) if isinstance(exp.track_nmi, dict) else {}
     if isinstance(focus_state_payload, dict):
@@ -5154,6 +4972,10 @@ def create_monolith_cockpit(
                 observer_coord_override = coords
                 observer_probe_similarity = probe_sim
                 observer_coord_delta = coord_delta
+                finite_coord_delta = np.isfinite(coord_delta)
+                if finite_coord_delta.any():
+                    displacement_z = np.nan_to_num(coord_delta, nan=0.0, posinf=0.0, neginf=0.0)
+                    observer_displacement_z = np.maximum(displacement_z.astype(float), 0.0)
 
     # Spectral data
     spectral_evr = exp.spectral_evr if exp.spectral_evr is not None else np.ones(n_articles) * 0.5
@@ -5172,8 +4994,10 @@ def create_monolith_cockpit(
         spectral_mags = np.zeros((n_articles, 8), dtype=float)
         spectral_mags_hover = spectral_mags
 
-    # Track 1: Logit confidence (for halos) - fallback to spectral_evr if not available
-    logit_confidence = exp.logit_confidence if exp.logit_confidence is not None else spectral_evr
+    # Track 1: show explicit missingness rather than borrowing Track 1.5 signal.
+    logit_confidence = None
+    if exp.logit_confidence is not None:
+        logit_confidence = np.asarray(exp.logit_confidence, dtype=float)
 
     # Track 3: Fog (Percentile-based atmospheric classification)
     fog_intensity = np.zeros(n_articles)
@@ -5186,7 +5010,7 @@ def create_monolith_cockpit(
         atmospheric_states = classify_atmospheric_state(blinker_magnitude)
 
     # Track 4: Walker
-    walker_states = exp.walker_states if exp.walker_states else ['elastic'] * n_articles
+    walker_states = exp.walker_states if exp.walker_states else ['missing'] * n_articles
     walker_work = exp.walker_work_integrals
     walker_paths_raw = exp.walker_paths if exp.walker_paths else {}
     walker_path_diagnostics = dict(exp.walker_path_diagnostics or {})
@@ -5535,6 +5359,13 @@ def create_monolith_cockpit(
     if len(global_pure_z) != n_articles:
         global_pure_z = positions_3d[:, 2].astype(float)
 
+    observer_displacement_mode = (
+        focus_idx is not None
+        and observer_displacement_z is not None
+        and len(observer_displacement_z) == n_articles
+        and np.isfinite(observer_displacement_z).any()
+    )
+
     if observer_geometry_active:
         pure_z = positions_3d[:, 2].astype(float)
         global_z_span = float(np.ptp(np.asarray(global_pure_z, dtype=float))) if len(global_pure_z) == n_articles else 0.0
@@ -5550,6 +5381,29 @@ def create_monolith_cockpit(
         pure_z = np.asarray(global_pure_z, dtype=float)
         if len(pure_z) == n_articles:
             positions_3d[:, 2] = pure_z
+
+    if observer_displacement_mode:
+        pure_z = np.asarray(observer_displacement_z, dtype=float)
+        positions_3d[:, 2] = pure_z
+        print("[MONOLITH] Focused relativity render: using coord_delta for Z-axis displacement.")
+
+    use_metric_manifold_geometry = (
+        os.environ.get("MONOLITH_USE_METRIC_MANIFOLD_GEOMETRY", "1").strip() != "0"
+        and observer_idx is None
+    )
+    if use_metric_manifold_geometry:
+        positions_3d = np.column_stack(
+            [
+                np.asarray(unified_density, dtype=float),
+                np.asarray(unified_stress, dtype=float),
+                np.asarray(pure_z, dtype=float),
+            ]
+        )
+        observer_geometry_active = False
+        print(
+            "[MONOLITH] Using canonical metric manifold geometry: "
+            "x=density, y=stress, z=z_height"
+        )
 
     # RAW PATHS: no additional normalization/clipping.
     walker_paths_projected_raw: Dict[int, np.ndarray] = {}
@@ -5603,6 +5457,37 @@ def create_monolith_cockpit(
             f"{skipped_invalid_paths}"
         )
 
+    synthesis_positions_3d = np.asarray(positions_3d[:, :3], dtype=float).copy()
+    synthesis_positions_2d = np.asarray(synthesis_positions_3d[:, :2], dtype=float)
+    synthesis_xy_projector: Optional[Callable[[np.ndarray], np.ndarray]] = None
+    walker_paths_synthesis: Dict[int, np.ndarray] = {
+        int(_idx): np.asarray(_path[:, :3], dtype=float).copy()
+        for _idx, _path in walker_paths_pure.items()
+    }
+    synthesis_display_transform_active = (
+        observer_idx is None
+        and not observer_displacement_mode
+        and use_metric_manifold_geometry
+        and synthesis_positions_3d.shape[0] >= 24
+    )
+    if synthesis_display_transform_active:
+        spread_strength = min(max(0.48 + 0.2 * np.log10(max(n_articles, 10)), 0.58), 0.94)
+        synthesis_positions_2d, synthesis_xy_projector = build_synthesis_display_transform(
+            np.asarray(positions_3d[:, :2], dtype=float),
+            spread_strength=spread_strength,
+            margin=0.05,
+        )
+        synthesis_positions_3d[:, 0:2] = synthesis_positions_2d
+        for _idx, _path in walker_paths_synthesis.items():
+            if _path.ndim == 2 and _path.shape[1] >= 2:
+                _path[:, 0:2] = synthesis_xy_projector(_path[:, 0:2])
+        print(
+            "[MONOLITH] Applied synthesis-only XY spread transform: "
+            f"strength={spread_strength:.2f}, articles={n_articles}"
+        )
+    else:
+        synthesis_positions_2d = np.asarray(synthesis_positions_3d[:, :2], dtype=float)
+
     def _collect_canonical_terrain_samples_local(
         article_xyz: np.ndarray,
         walker_paths: Dict[int, np.ndarray],
@@ -5653,7 +5538,7 @@ def create_monolith_cockpit(
 
     rupture_segments_2d: List[Tuple[np.ndarray, np.ndarray]] = []
     if path_ablation_mode == "thermodynamic":
-        for _idx, _path in walker_paths_pure.items():
+        for _idx, _path in walker_paths_synthesis.items():
             if _idx < 0 or _idx >= n_articles:
                 continue
             pv = phantom_verdicts[_idx] if (_idx < len(phantom_verdicts)) else {}
@@ -5667,8 +5552,8 @@ def create_monolith_cockpit(
             xy = xy[finite_rows]
             if xy.shape[0] < 2:
                 continue
-            xy[0, 0] = float(positions_3d[_idx, 0])
-            xy[0, 1] = float(positions_3d[_idx, 1])
+            xy[0, 0] = float(synthesis_positions_3d[_idx, 0])
+            xy[0, 1] = float(synthesis_positions_3d[_idx, 1])
             for _j in range(xy.shape[0] - 1):
                 start_xy = np.asarray(xy[_j], dtype=float)
                 end_xy = np.asarray(xy[_j + 1], dtype=float)
@@ -5678,16 +5563,22 @@ def create_monolith_cockpit(
     # Canonical manifold contract:
     # article coordinates define the manifold support/geometry.
     # Track 4 paths are draped onto that surface; they must not become the surface.
-    terrain_geometry_xyz = np.asarray(positions_3d[:, :3], dtype=float)
-    terrain_support_xy = np.asarray(positions_3d[:, :2], dtype=float)
+    terrain_geometry_xyz = np.asarray(synthesis_positions_3d[:, :3], dtype=float)
+    terrain_support_xy = np.asarray(synthesis_positions_3d[:, :2], dtype=float)
     use_path_support = bool(walker_paths_pure) and os.environ.get("MONOLITH_USE_PATH_SUPPORT", "0").strip() == "1"
     if use_path_support:
-        terrain_geometry_xyz = _collect_canonical_terrain_samples_local(positions_3d, walker_paths_pure)
+        terrain_geometry_xyz = _collect_canonical_terrain_samples_local(synthesis_positions_3d, walker_paths_synthesis)
         terrain_support_xy = np.asarray(terrain_geometry_xyz[:, :2], dtype=float)
         print("[MONOLITH][LEGACY] Path-derived terrain support enabled by MONOLITH_USE_PATH_SUPPORT=1")
 
     # Deterministic terrain source: keep terrain Z exactly aligned to point pure_z.
-    energy_values_for_terrain = _compress_surface_height_field(pure_z.copy())
+    # Focused relativity mode is the exception: the terrain becomes a flat Z=0
+    # vacuum floor so displacement can own the entire vertical axis honestly.
+    compress_surface_height = os.environ.get("MONOLITH_COMPRESS_SURFACE_HEIGHT", "0").strip() == "1"
+    if observer_displacement_mode:
+        energy_values_for_terrain = np.zeros(n_articles, dtype=float)
+    else:
+        energy_values_for_terrain = _compress_surface_height_field(pure_z.copy()) if compress_surface_height else pure_z.copy()
     # Contract guardrail: preserve explicit invalid-array fallback path.
     terrain_values_valid = False
     try:
@@ -5701,7 +5592,10 @@ def create_monolith_cockpit(
         terrain_values_valid = False
     if not terrain_values_valid:
         print("[MONOLITH] Falling back terrain Z to compressed pure_z due to invalid terrain field.")
-        energy_values_for_terrain = _compress_surface_height_field(pure_z.copy())
+        if observer_displacement_mode:
+            energy_values_for_terrain = np.zeros(n_articles, dtype=float)
+        else:
+            energy_values_for_terrain = _compress_surface_height_field(pure_z.copy()) if compress_surface_height else pure_z.copy()
 
     # Raw variance probe (requested).
     print(f"RAW TERRAIN VARIANCE: Min={np.min(unified_stress)}, Max={np.max(unified_stress)}")
@@ -5850,6 +5744,9 @@ def create_monolith_cockpit(
         collinear_warn = ""
         if float(np.var(top_dim_vals)) < 1e-3:
             collinear_warn = "<br><span style='color:#FFAA00'><b>COLLINEAR WARNING:</b> Top-3 dim magnitudes nearly identical</span>"
+        logit_conf_val = np.nan
+        if logit_confidence is not None and i < len(logit_confidence):
+            logit_conf_val = float(logit_confidence[i])
 
         # Walker state
         ws = walker_states[i] if i < len(walker_states) else "unknown"
@@ -5927,10 +5824,15 @@ def create_monolith_cockpit(
             perspective_line = f'<b>Perspective:</b> <span style="color:#FFD700">{persp_tag_esc}</span><br>'
         if persp_type:
             perspective_line += f'<b>Type:</b> {persp_type_esc}<br>'
-            
+
         affiliation_line = f'<b>Affiliation:</b> {affiliation}<br>' if not persp_type else ""
         bias_line = f'<b>Bias:</b> {bias}<br>' if not persp_tag else ""
-        snippet_line = f'<b>Snippet:</b> {snippet}<br>' if snippet else ''
+        snippet_line = f'<b>Snippet:</b> {snippet}<br>' if snippet else ""
+        t1_line = (
+            f'<b>T1 Logit:</b> {logit_conf_val:.3f}<br>'
+            if np.isfinite(logit_conf_val)
+            else '<b>T1 Logit:</b> missing<br>'
+        )
 
         # Format d and w values (handle infinity)
         d_str = f"{d_val:.2f}" if np.isfinite(d_val) else "inf"
@@ -5946,6 +5848,8 @@ def create_monolith_cockpit(
                 observer_lines += f'<b>Observer Coord Delta:</b> {coord_delta_val:.3f}<br>'
 
         focus_line = "<span style='color:#FFD700'>(FOCUS)</span><br>" if (focus_idx is not None and i == focus_idx) else ""
+        divider_line = "<b>-----------------------</b><br>"
+        provenance_blob = exp.provenance if isinstance(exp.provenance, dict) else {}
         hover_texts.append(
             f'<b style="font-size:14px">Article #{i}</b><br>'
             f"{focus_line}"
@@ -5956,22 +5860,22 @@ def create_monolith_cockpit(
             f'{affiliation_line}'
             f'{bias_line}'
             f'{snippet_line}'
-            f'<b>═══════════════════════</b><br>'
+            f'{divider_line}'
             f'<b>Provenance:</b><br>'
-            f'  <span style="color:#888">DS: {exp.provenance.get("dataset_hash", "n/a")[:12]}</span><br>'
-            f'  <span style="color:#888">WT: {exp.provenance.get("weights_hash", "n/a")[:12]}</span><br>'
+            f'  <span style="color:#888">DS: {str(provenance_blob.get("dataset_hash", "n/a"))[:12]}</span><br>'
+            f'  <span style="color:#888">WT: {str(provenance_blob.get("weights_hash", "n/a"))[:12]}</span><br>'
             f'<b>EVR:</b> {evr:.3f}<br>'
-            f'<b>Zone:</b> {unified_zones[i]}<br>' # Add this line
+            f'{t1_line}'
+            f'<b>Zone:</b> {unified_zones[i]}<br>'
             f'<b>T4 Walker:</b> {ws}<br>'
             f'<b>T5 Verdict:</b> <span style="color:{"#00F0FF" if pv=="HONEST" else "#FF00FF" if pv=="PHANTOM" else "#39FF14" if pv=="TAUTOLOGY" else "#888"}">{pv}</span><br>'
             f'<b>  d={d_str}, W={w_str}, Delta={delta:.2f}</b><br>'
             f'{observer_lines}'
             f'<b>T6 HoTT:</b> {hott_status}<br>'
-            f'<b>═══════════════════════</b><br>'
+            f'{divider_line}'
             f'<b>Spectral DNA:</b><br>{drivers}<br>'
             f'<b>Top Feature Dims:</b><br>{dim_drivers}{collinear_warn}'
         )
-    # ==========================================================================
     # BUILD FIGURE WITH DUAL-MODE TRACES
     # ==========================================================================
     fig = go.Figure()
@@ -5997,9 +5901,18 @@ def create_monolith_cockpit(
     # Layer 1: Terrain Surface (colored by density×stress manifold)
     if show_terrain:
         print("[MONOLITH] Rendering terrain surface with density×stress gradient...")
-        terrain_stress_for_geometry = None
+        terrain_stress_for_geometry = np.zeros(n_articles, dtype=float) if observer_displacement_mode else None
+        terrain_geometry_for_surface = terrain_geometry_xyz
+        if observer_displacement_mode:
+            terrain_geometry_for_surface = np.column_stack(
+                [
+                    np.asarray(synthesis_positions_3d[:, 0], dtype=float),
+                    np.asarray(synthesis_positions_3d[:, 1], dtype=float),
+                    np.zeros(n_articles, dtype=float),
+                ]
+            )
         terrain, terrain_grid_x, terrain_grid_y, terrain_grid_z, grid_density, grid_stress = render_terrain_surface(
-            positions_3d, energy_values_for_terrain,
+            synthesis_positions_3d, energy_values_for_terrain,
             terrain_density=terrain_density,
             terrain_stress=terrain_stress,
             terrain_stress_geometry=terrain_stress_for_geometry,
@@ -6010,7 +5923,7 @@ def create_monolith_cockpit(
             rupture_segments_2d=rupture_segments_2d if path_ablation_mode == "thermodynamic" else None,
             rupture_tear_radius_scale=0.02,
             terrain_support_xy=terrain_support_xy,
-            terrain_geometry_xyz=terrain_geometry_xyz,
+            terrain_geometry_xyz=terrain_geometry_for_surface,
         )
         if terrain:
             terrain.visible = True
@@ -6029,123 +5942,91 @@ def create_monolith_cockpit(
                     trace.meta = {'custom_mode': 'terrain'}
                     fig.add_trace(trace)
     
-    # --- Surface Sampling (The Nuclear Clamp) ---
-    # After generating the 'grid_z' for the Surface Plot,
-    # create a 'scipy.interpolate.RegularGridInterpolator'
-    # using the grid X, Y, and Z.
-    interp_terrain_z = None
-    if show_terrain and terrain_grid_x is not None and terrain_grid_y is not None and terrain_grid_z is not None:
-        from scipy.interpolate import RegularGridInterpolator
-        # Create the RegularGridInterpolator
-        interp_terrain_z = RegularGridInterpolator(
-            (terrain_grid_y[:, 0], terrain_grid_x[0, :]), # (Y coordinates, X coordinates)
-            terrain_grid_z, # Z values
-            method="linear",
-            bounds_error=False,
-            fill_value=np.nan,
-        )
-    
-    # Calculate visual_z for each article using the interpolator
-    # positions_2d contains the (x, y) coordinates of the articles
-    article_xy = positions_2d[:, :2] # Only X and Y
-    
-    # Enforce coordinate contract: article points default to pure_x/pure_y/pure_z.
-    # Terrain interpolator remains available for overlays that intentionally drape to surface.
+    # --- Surface Sampling (Mesh3d nearest-vertex support) ---
+    article_xy = np.asarray(synthesis_positions_3d[:, :2], dtype=float)
     energy_values_for_points = positions_3d[:, 2]
 
+    interp_terrain_z = None
     surface_support_projector = None
+    surface_support_tree = None
+    surface_support_z = None
     if terrain_grid_x is not None and terrain_grid_y is not None and terrain_grid_z is not None:
         try:
-            finite_surface = np.isfinite(np.asarray(terrain_grid_z, dtype=float))
-            if np.any(finite_surface):
-                surface_support_xy = np.column_stack(
-                    [
-                        np.asarray(terrain_grid_x, dtype=float)[finite_surface],
-                        np.asarray(terrain_grid_y, dtype=float)[finite_surface],
-                    ]
-                )
-                if surface_support_xy.shape[0] >= 1:
-                    support_tree = cKDTree(surface_support_xy)
+            surface_support_xy = np.column_stack(
+                [
+                    np.asarray(terrain_grid_x, dtype=float).reshape(-1),
+                    np.asarray(terrain_grid_y, dtype=float).reshape(-1),
+                ]
+            )
+            surface_support_z = np.asarray(terrain_grid_z, dtype=float).reshape(-1)
+            finite_surface = np.isfinite(surface_support_xy).all(axis=1) & np.isfinite(surface_support_z)
+            surface_support_xy = surface_support_xy[finite_surface]
+            surface_support_z = surface_support_z[finite_surface]
+            if surface_support_xy.shape[0] >= 1:
+                support_tree = cKDTree(surface_support_xy)
+                surface_support_tree = support_tree
 
-                    def surface_support_projector(x_coords, y_coords):
-                        xq = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
-                        yq = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
-                        q = np.column_stack((xq, yq))
-                        _, idx = support_tree.query(q, k=1)
-                        idx = np.asarray(idx, dtype=int).reshape(-1)
-                        proj = surface_support_xy[idx]
-                        if np.isscalar(x_coords) or np.ndim(np.asarray(x_coords)) == 0:
-                            return float(proj[0, 0]), float(proj[0, 1])
-                        return proj[:, 0], proj[:, 1]
+                def surface_support_projector(x_coords, y_coords):
+                    xq = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
+                    yq = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
+                    q = np.column_stack((xq, yq))
+                    _, idx = support_tree.query(q, k=1)
+                    idx = np.asarray(idx, dtype=int).reshape(-1)
+                    proj = surface_support_xy[idx]
+                    if np.isscalar(x_coords) or np.ndim(np.asarray(x_coords)) == 0:
+                        return float(proj[0, 0]), float(proj[0, 1])
+                    return proj[:, 0], proj[:, 1]
         except Exception:
             surface_support_projector = None
 
-    # Helper function to get surface Z from interpolator
     def get_surface_z(x_coords, y_coords, offset=0.0, preserve_nan=False):
-        if interp_terrain_z is not None:
-            # Ensure x_coord and y_coord are numpy arrays for interpolation
-            x_coord_np = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
-            y_coord_np = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
-            clip_surface_queries = os.environ.get("MONOLITH_CLIP_SURFACE_QUERIES", "0").strip() == "1"
-            if clip_surface_queries and callable(surface_support_projector):
-                try:
-                    x_coord_np, y_coord_np = surface_support_projector(x_coord_np, y_coord_np)
-                    x_coord_np = np.asarray(x_coord_np, dtype=float).reshape(-1)
-                    y_coord_np = np.asarray(y_coord_np, dtype=float).reshape(-1)
-                except Exception:
-                    pass
-            if clip_surface_queries and terrain_grid_x is not None and terrain_grid_y is not None:
-                x_min_grid = float(np.nanmin(terrain_grid_x[0, :]))
-                x_max_grid = float(np.nanmax(terrain_grid_x[0, :]))
-                y_min_grid = float(np.nanmin(terrain_grid_y[:, 0]))
-                y_max_grid = float(np.nanmax(terrain_grid_y[:, 0]))
-                x_coord_np = np.clip(x_coord_np, x_min_grid, x_max_grid)
-                y_coord_np = np.clip(y_coord_np, y_min_grid, y_max_grid)
-            
-            # Create points array for interpolator: (N, 2) where each row is (y, x)
-            points_for_interp = np.column_stack((y_coord_np, x_coord_np))
-            
-            interp_z = np.asarray(interp_terrain_z(points_for_interp), dtype=float)
-            invalid = ~np.isfinite(interp_z)
-            if np.any(invalid) and not preserve_nan:
-                fill_value = (
-                    float(np.nanmean(np.asarray(terrain_grid_z, dtype=float)))
-                    if terrain_grid_z is not None and np.isfinite(np.asarray(terrain_grid_z, dtype=float)).any()
-                    else float(np.nanmean(np.asarray(energy_values_for_points, dtype=float)))
-                )
-                interp_z[invalid] = fill_value
-            
-            # If input was scalar, return scalar. If array, return array.
-            if isinstance(x_coords, (int, float, np.floating)):
-                return interp_z.item() + offset
-            return interp_z + offset
-        else:
-            # Fallback if no interpolator (should not happen if show_terrain is True)
-            # Use average Z of the points, or 0.0
-            return np.full_like(np.atleast_1d(x_coords), positions_3d[:, 2].mean() if len(positions_3d) > 0 else 0.0) + offset
+        x_coord_np = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
+        y_coord_np = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
+        if surface_support_tree is not None and surface_support_z is not None:
+            try:
+                _, nn_idx = surface_support_tree.query(np.column_stack((x_coord_np, y_coord_np)), k=1)
+                nn_idx = np.asarray(nn_idx, dtype=int).reshape(-1)
+                interp_z = np.asarray(surface_support_z, dtype=float)[nn_idx]
+                if isinstance(x_coords, (int, float, np.floating)):
+                    return float(interp_z[0]) + offset
+                return interp_z + offset
+            except Exception:
+                pass
+        fallback = np.full_like(x_coord_np, positions_3d[:, 2].mean() if len(positions_3d) > 0 else 0.0, dtype=float)
+        if isinstance(x_coords, (int, float, np.floating)):
+            return float(fallback[0]) + offset
+        return fallback + offset
 
-    # Article markers should sit on the rendered terrain manifold when available.
-    # Fallback remains the current point Z contract when interpolation is unavailable/fails.
+    # Article markers keep their exact article Z in synthesis. Terrain and
+    # articles are separate semantics; unsupported outliers must float.
     article_marker_z = np.asarray(energy_values_for_points, dtype=float)
-    try:
-        if interp_terrain_z is not None:
-            article_marker_z = np.asarray(
-                get_surface_z(article_xy[:, 0], article_xy[:, 1], offset=0.01),
+    if observer_displacement_mode:
+        article_marker_z = np.asarray(observer_displacement_z, dtype=float)
+    terrain_anchor_z = np.asarray(article_marker_z, dtype=float)
+    if not observer_displacement_mode and surface_support_tree is not None:
+        try:
+            terrain_anchor_z = np.asarray(
+                get_surface_z(article_xy[:, 0], article_xy[:, 1], offset=0.0),
                 dtype=float,
             )
-            if article_marker_z.shape[0] != n_articles:
-                article_marker_z = np.asarray(energy_values_for_points, dtype=float)
-    except Exception as marker_z_err:
-        print(f"[MONOLITH] Marker Z fallback to point Z due to interpolation error: {marker_z_err}")
-        article_marker_z = np.asarray(energy_values_for_points, dtype=float)
+        except Exception:
+            terrain_anchor_z = np.asarray(article_marker_z, dtype=float)
 
 
     # Layer 2: Phantom Paths (Track 5)
-    if show_phantom_paths and phantom_verdicts:
+    show_global_paths = os.environ.get("MONOLITH_SHOW_GLOBAL_PATHS", "0").strip() == "1"
+    suppress_global_paths = (
+        observer_idx is None
+        and physics_mode == "synthesis"
+        and n_articles > 12
+        and not show_global_paths
+    )
+    effective_show_phantom_paths = show_phantom_paths and not suppress_global_paths
+    if effective_show_phantom_paths and phantom_verdicts:
         print(f"[MONOLITH] Rendering {len(phantom_verdicts)} phantom paths...")
         path_traces = render_phantom_paths_3d(
-            phantom_verdicts, positions_3d,
-            walker_paths=walker_paths_pure,
+            phantom_verdicts, synthesis_positions_3d,
+            walker_paths=walker_paths_synthesis,
             walker_path_diagnostics=walker_path_diagnostics,
             article_z_height=article_marker_z,
             terrain_z_values=energy_values_for_terrain,
@@ -6168,6 +6049,11 @@ def create_monolith_cockpit(
                 t.visible = True
             t.meta = {'custom_mode': 'synthesis'}
             fig.add_trace(t)
+    elif show_phantom_paths and phantom_verdicts:
+        print(
+            "[MONOLITH] Suppressing global Track 5 path ribbons in synthesis view. "
+            "Set MONOLITH_SHOW_GLOBAL_PATHS=1 or focus an observer to render them."
+        )
 
         # Layer 5: HoTT Icons (Track 6) — with Phantom Delta override
         if show_hott and hott_proofs:
@@ -6191,7 +6077,7 @@ def create_monolith_cockpit(
     ):
         try:
             spectral_axis_traces = render_spectral_axis_3d(
-                positions_3d=positions_3d,
+                positions_3d=synthesis_positions_3d,
                 spectral_probe_magnitudes=spectral_mags[:n_articles],
                 evr=float(np.nanmean(spectral_evr)) if np.size(spectral_evr) > 0 else 0.5,
                 get_surface_z_func=get_surface_z,
@@ -6207,9 +6093,78 @@ def create_monolith_cockpit(
     # Layer 7: Data Points (glowing muons) - Both modes
     # Color by VERDICT, size by annealing (Crystal=small, Fog=large)
     # BASE SIZE = 10 (larger for easier clicking/hover)
+    if observer_displacement_mode and observer_coord_delta is not None and len(observer_coord_delta) == n_articles and np.isfinite(observer_coord_delta).any():
+        tether_x: List[Optional[float]] = []
+        tether_y: List[Optional[float]] = []
+        tether_z: List[Optional[float]] = []
+        for i in range(n_articles):
+            x_i = float(synthesis_positions_3d[i, 0])
+            y_i = float(synthesis_positions_3d[i, 1])
+            coord_delta_i = float(observer_coord_delta[i]) if np.isfinite(observer_coord_delta[i]) else 0.0
+            tether_x.extend([x_i, x_i, None])
+            tether_y.extend([y_i, y_i, None])
+            tether_z.extend([0.0, coord_delta_i, None])
+        fig.add_trace(go.Scatter3d(
+            x=tether_x,
+            y=tether_y,
+            z=tether_z,
+            mode='lines',
+            line=dict(color='rgba(0,255,255,0.98)', width=6),
+            name='Displacement Tethers',
+            hoverinfo='skip',
+            visible=True,
+            meta={'custom_mode': 'synthesis'},
+            showlegend=False,
+        ))
+
+    if not observer_displacement_mode and surface_support_tree is not None and surface_support_z is not None:
+        try:
+            nn_distance, _ = surface_support_tree.query(article_xy, k=1)
+            nn_distance = np.asarray(nn_distance, dtype=float).reshape(-1)
+            terrain_gap = np.asarray(article_marker_z, dtype=float) - np.asarray(terrain_anchor_z, dtype=float)
+            positive_gap = terrain_gap[np.isfinite(terrain_gap) & (terrain_gap > 0)]
+            gap_threshold = float(np.nanpercentile(positive_gap, 78)) if positive_gap.size > 0 else 0.9
+            gap_threshold = max(gap_threshold, 0.9)
+            dist_threshold = max(float(np.nanpercentile(nn_distance[np.isfinite(nn_distance)], 85)) if np.isfinite(nn_distance).any() else 0.0, 0.025)
+            outlier_mask = (
+                np.isfinite(terrain_gap)
+                & np.isfinite(nn_distance)
+                & (terrain_gap > 0.0)
+                & ((terrain_gap >= gap_threshold) | (nn_distance >= dist_threshold))
+            )
+            if np.any(outlier_mask):
+                outlier_candidates = np.where(outlier_mask)[0]
+                if outlier_candidates.size > 8:
+                    ranked = np.argsort(terrain_gap[outlier_candidates])[::-1][:8]
+                    outlier_candidates = outlier_candidates[ranked]
+                out_x: List[Optional[float]] = []
+                out_y: List[Optional[float]] = []
+                out_z: List[Optional[float]] = []
+                for _i in outlier_candidates:
+                    out_x.extend([float(article_xy[_i, 0]), float(article_xy[_i, 0]), None])
+                    out_y.extend([float(article_xy[_i, 1]), float(article_xy[_i, 1]), None])
+                    out_z.extend([float(terrain_anchor_z[_i]), float(article_marker_z[_i]), None])
+                fig.add_trace(go.Scatter3d(
+                    x=out_x,
+                    y=out_y,
+                    z=out_z,
+                    mode='lines',
+                    line=dict(color='rgba(0,255,255,0.65)', width=2),
+                    name='Outlier Droplines',
+                    hoverinfo='skip',
+                    visible=True,
+                    meta={'custom_mode': 'synthesis'},
+                    showlegend=False,
+                ))
+        except Exception as outlier_tether_err:
+            print(f"[MONOLITH] Skipping synthesis outlier droplines due to error: {outlier_tether_err}")
+
     print(f"[MONOLITH] Rendering {n_articles} data points...")
     # Match marker size to density: consensus points (Bridge - high density) are solid, sparse points (Void - low density) are small/dimmed.
-    sizes = np.ones(n_articles) * 10 * (0.5 + 0.5 * terrain_density) # Scale size by density (5 to 10)
+    marker_corpus_scale = min(max((max(int(n_articles), 1) / 120.0) ** 0.35, 1.0), 2.2)
+    marker_scale = max(0.42, 0.78 / max(marker_corpus_scale ** 0.58, 1.0))
+    density_emphasis = np.power(np.clip(np.asarray(terrain_density, dtype=float), 0.0, 1.0), 1.6)
+    sizes = (2.8 + 4.6 * density_emphasis) * marker_scale
     
     # ASTER v3.2: Visual Distinction for Observer
     symbols = ['circle'] * n_articles
@@ -6218,9 +6173,9 @@ def create_monolith_cockpit(
         symbols[focus_idx] = 'diamond-open'
         
     point_traces = render_data_points_3d(
-        positions_3d, spectral_evr, sizes, hover_texts,
+        synthesis_positions_3d, spectral_evr, sizes, hover_texts,
         phantom_verdicts=phantom_verdicts, is_fog=is_fog,
-        article_z_height=article_marker_z, # Prefer terrain-manifold Z for marker anchoring
+        article_z_height=article_marker_z, # Exact article Z; terrain remains separate
         article_color_codes=unified_color_codes, # Pass unified_color_codes for coloring
         article_uids=article_uid_values,
         article_symbols=symbols, # Pass the symbol list
@@ -6271,34 +6226,31 @@ def create_monolith_cockpit(
                 t.visible = False
                 t.meta = {'custom_mode': 'diagnostics'}
                 fig.add_trace(t)
-
-        # DIAGNOSTIC Layer 3: Chromatic Ghosts
-        print("[MONOLITH] Rendering chromatic ghosts (Diagnostics)...")
-        ghost_traces = render_chromatic_ghosts(positions_3d, features, spectral_evr)
-        for t in ghost_traces:
-            t.visible = False
-            t.meta = {'custom_mode': 'diagnostics'}
-            fig.add_trace(t)
-
         # DIAGNOSTIC Layer 4: Confidence Halos
-        print("[MONOLITH] Rendering confidence halos from Track 1 logit confidence...")
-        halo_sizes = sizes * 3 * (1.0 - logit_confidence)
-        halo_trace = go.Scatter3d(
-            x=positions_3d[:, 0],
-            y=positions_3d[:, 1],
-            z=positions_3d[:, 2],
-            mode='markers',
-            marker=dict(
-                size=halo_sizes,
-                color='rgba(255,255,255,0.1)',
-                line=dict(color=PALETTE.cyan, width=1),
-            ),
-            name='Confidence Halos',
-            hoverinfo='skip',
-            visible=False,
-            meta={'custom_mode': 'diagnostics'}
-        )
-        fig.add_trace(halo_trace)
+        if logit_confidence is not None and len(logit_confidence) >= n_articles:
+            print("[MONOLITH] Rendering confidence halos from Track 1 logit confidence...")
+            halo_signal = np.asarray(logit_confidence[:n_articles], dtype=float)
+            halo_sizes = np.zeros_like(sizes, dtype=float)
+            valid_halo = np.isfinite(halo_signal)
+            halo_sizes[valid_halo] = sizes[valid_halo] * 3 * (1.0 - np.clip(halo_signal[valid_halo], 0.0, 1.0))
+            halo_trace = go.Scatter3d(
+                x=positions_3d[:, 0],
+                y=positions_3d[:, 1],
+                z=positions_3d[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=halo_sizes,
+                    color="rgba(255,255,255,0.1)",
+                    line=dict(color=PALETTE.cyan, width=1),
+                ),
+                name="Confidence Halos",
+                hoverinfo="skip",
+                visible=False,
+                meta={"custom_mode": "diagnostics"}
+            )
+            fig.add_trace(halo_trace)
+        else:
+            print("[MONOLITH] Track 1 logit confidence missing; skipping confidence halos.")
 
         # DIAGNOSTIC Layer 5: Hysteresis Highways (optional)
         enable_hysteresis_overlay = os.environ.get("MONOLITH_ENABLE_HYSTERESIS", "0").strip() == "1"
@@ -6359,6 +6311,8 @@ def create_monolith_cockpit(
 
     print(f"[MONOLITH] Trace counts: Synthesis={n_synthesis}, Diagnostics={n_diagnostics}, Analysis={n_analysis}")
 
+    analysis_extents = _trace_extent(analysis_traces if render_all_modes else [])
+
     # ==========================================================================
     # TRACK 1.5 — DERIVE SEMANTIC AXIS LABELS FROM SPECTRAL PCA
     # Find which probe dominates PC1 and PC2 so axis labels are data-driven,
@@ -6413,7 +6367,7 @@ def create_monolith_cockpit(
         except Exception:
             return None
 
-    extent_sources = [positions_3d[:, 0], positions_3d[:, 1], positions_3d[:, 2]]
+    extent_sources = [synthesis_positions_3d[:, 0], synthesis_positions_3d[:, 1], synthesis_positions_3d[:, 2]]
     if "terrain_grid_x" in locals() and terrain_grid_x is not None:
         extent_sources[0] = terrain_grid_x
     if "terrain_grid_y" in locals() and terrain_grid_y is not None:
@@ -6430,55 +6384,132 @@ def create_monolith_cockpit(
         pad = span * ratio
         return [lo - pad, hi + pad]
 
-    x_range_layout = _pad_extent(*x_extent)
-    y_range_layout = _pad_extent(*y_extent)
-    z_range_layout = _pad_extent(*z_extent, ratio=0.05)
+    corpus_scale = min(max((max(int(n_articles), 1) / 120.0) ** 0.35, 1.0), 2.2)
+    synthesis_xy_pad_ratio = max(0.025, 0.08 / corpus_scale)
+    synthesis_z_pad_ratio = max(0.018, 0.05 / corpus_scale)
+
+    synthesis_x_range_layout = _pad_extent(*x_extent, ratio=synthesis_xy_pad_ratio)
+    synthesis_y_range_layout = _pad_extent(*y_extent, ratio=synthesis_xy_pad_ratio)
+    synthesis_z_range_layout = _pad_extent(*z_extent, ratio=synthesis_z_pad_ratio)
+
+    analysis_x_extent = analysis_extents.get("x") if isinstance(analysis_extents, dict) else None
+    analysis_y_extent = analysis_extents.get("y") if isinstance(analysis_extents, dict) else None
+    analysis_z_extent = analysis_extents.get("z") if isinstance(analysis_extents, dict) else None
+    analysis_x_range_layout = _pad_extent(*(analysis_x_extent or (-5.5, 5.5)))
+    analysis_y_range_layout = _pad_extent(*(analysis_y_extent or (-5.5, 5.5)))
+    analysis_z_range_layout = _pad_extent(*(analysis_z_extent or (-0.5, 12.5)), ratio=0.05)
+
+    if physics_mode == "analysis" and analysis_x_extent and analysis_y_extent and analysis_z_extent:
+        x_range_layout = analysis_x_range_layout
+        y_range_layout = analysis_y_range_layout
+        z_range_layout = analysis_z_range_layout
+    else:
+        x_range_layout = synthesis_x_range_layout
+        y_range_layout = synthesis_y_range_layout
+        z_range_layout = synthesis_z_range_layout
 
     span_x = x_range_layout[1] - x_range_layout[0]
     span_y = y_range_layout[1] - y_range_layout[0]
     span_z = z_range_layout[1] - z_range_layout[0]
+    dominant_xy_span = max(span_x, span_y, 1e-6)
+    aspect_x = max(0.55, span_x / dominant_xy_span)
+    aspect_y = max(0.55, span_y / dominant_xy_span)
+    aspect_z = min(max(span_z / dominant_xy_span, 0.18), 0.44)
     dominant_span = max(span_x, span_y, span_z, 1e-6)
-    camera_scale = max(1.0, dominant_span / 2.0)
+    synthesis_depth_span = max(dominant_xy_span, min(span_z * 0.18, dominant_xy_span * 1.7), 0.9)
+    analysis_depth_span = max(min(max(span_x, span_y) * 0.52, dominant_span * 0.6), 1.0)
+    diagnostics_depth_span = max(min(dominant_span * 0.4, dominant_xy_span * 2.8), 1.0)
+    synthesis_camera_pull_in = max(0.30, 0.64 / corpus_scale)
     camera_presets = {
-        "synthesis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=1.6 * camera_scale, y=1.35 * camera_scale, z=0.95 * camera_scale)),
-        "diagnostics": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=2.0 * camera_scale, y=0.9 * camera_scale, z=1.4 * camera_scale)),
-        "analysis": dict(up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), eye=dict(x=0.0, y=2.3 * camera_scale, z=1.2 * camera_scale)),
+        "synthesis": dict(
+            up=dict(x=0, y=0, z=1),
+            center=dict(x=0, y=0, z=-0.15),
+            eye=dict(
+                x=0.88 * synthesis_depth_span * synthesis_camera_pull_in,
+                y=-0.76 * synthesis_depth_span * synthesis_camera_pull_in,
+                z=0.22 * synthesis_depth_span * synthesis_camera_pull_in,
+            ),
+        ),
+        "diagnostics": dict(
+            up=dict(x=0, y=0, z=1),
+            center=dict(x=0, y=0, z=0),
+            eye=dict(x=1.28 * diagnostics_depth_span, y=0.72 * diagnostics_depth_span, z=0.96 * diagnostics_depth_span),
+        ),
+        "analysis": dict(
+            up=dict(x=0, y=0, z=1),
+            center=dict(x=0, y=0, z=0),
+            eye=dict(x=0.0, y=1.18 * analysis_depth_span, z=0.58 * analysis_depth_span),
+        ),
     }
     camera_presets_js = json.dumps(camera_presets)
+    scene_ranges_js = json.dumps(
+        {
+            "synthesis": {"x": synthesis_x_range_layout, "y": synthesis_y_range_layout, "z": synthesis_z_range_layout},
+            "diagnostics": {"x": synthesis_x_range_layout, "y": synthesis_y_range_layout, "z": synthesis_z_range_layout},
+            "analysis": {"x": analysis_x_range_layout, "y": analysis_y_range_layout, "z": analysis_z_range_layout},
+        }
+    )
     scene_layout = dict(LAYOUT_CONSTRAINTS)
     scene_layout.update(
-        xaxis=dict(title=axis_label_x, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial, range=x_range_layout),
-        yaxis=dict(title=axis_label_y, visible=show_axes_initial, showticklabels=show_axes_initial, showgrid=show_axes_initial, zeroline=False, showbackground=False, showline=show_axes_initial, range=y_range_layout),
-        bgcolor=PALETTE.void,
+        xaxis=dict(
+            title="",
+            visible=False,
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            showbackground=False,
+            showline=False,
+            ticks="",
+            showspikes=False,
+            range=x_range_layout,
+        ),
+        yaxis=dict(
+            title="",
+            visible=False,
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            showbackground=False,
+            showline=False,
+            ticks="",
+            showspikes=False,
+            range=y_range_layout,
+        ),
+        bgcolor="#0a0a0a",
         camera=camera_presets.get(physics_mode, camera_presets["synthesis"]),
         dragmode='orbit',
+        aspectratio=dict(x=aspect_x, y=aspect_y, z=aspect_z),
     )
     scene_layout["zaxis"] = {
         **dict(LAYOUT_CONSTRAINTS.get("zaxis", {})),
-        "title": axis_label_z,
-        "visible": show_axes_initial,
-        "showticklabels": show_axes_initial,
-        "showgrid": show_axes_initial,
+        "title": "",
+        "visible": False,
+        "showticklabels": False,
+        "showgrid": False,
         "zeroline": False,
         "showbackground": False,
-        "showline": show_axes_initial,
+        "showline": False,
+        "ticks": "",
+        "showspikes": False,
         "range": z_range_layout,
     }
+    plot_title_text = "" if physics_mode == "synthesis" else f"<b>ASTER v3.2 MONOLITH [{exp.kernel.upper()}]{verification_title_stamp}</b>"
+    top_margin = 0 if physics_mode == "synthesis" else 40
     fig.update_layout(
         scene=scene_layout,
-        paper_bgcolor=PALETTE.void,
-        plot_bgcolor=PALETTE.void,
-        margin=dict(l=360, r=28 if render_all_modes else 28, t=40, b=0),
+        paper_bgcolor="#0a0a0a",
+        plot_bgcolor="#0a0a0a",
+        margin=dict(l=260 if physics_mode == "synthesis" else 220, r=20, t=top_margin, b=0),
         uirevision='constant',
         showlegend=False,
         title=dict(
-            text=f"<b>ASTER v3.2 MONOLITH [{exp.kernel.upper()}]{verification_title_stamp}</b>",
+            text=plot_title_text,
             font=dict(family='Inter, sans-serif', size=16, color=PALETTE.cyan),
             x=0.5,
             y=0.98,
         ),
-        width=1400,
-        height=900,
+        width=1180,
+        height=860,
     )
 
     # ==========================================================================
@@ -6571,7 +6602,7 @@ def create_monolith_cockpit(
                 <label class="toggle-chip"><input type="checkbox" id="toggle-honest-ribbons" onchange="applyFailureFilter()"> Honest Ribbons</label>
                 <label class="toggle-chip"><input type="checkbox" id="toggle-tautology-ribbons" onchange="applyFailureFilter()"> Tautology Ribbons</label>
                 <label class="toggle-chip"><input type="checkbox" id="toggle-shear-flares" checked onchange="applyFailureFilter()"> Shear Flares</label>
-                <label class="toggle-chip"><input type="checkbox" id="toggle-shear-labels" checked onchange="applyFailureFilter()"> Shear Labels</label>
+                <label class="toggle-chip"><input type="checkbox" id="toggle-shear-labels" onchange="applyFailureFilter()"> Shear Labels</label>
             </div>
         </div>
         <div class="instrument-section">
@@ -6819,6 +6850,21 @@ def create_monolith_cockpit(
     </div>
     '''
 
+    embedded_clean_canvas_css = '''
+        .hud-bar,
+        .legend-panel,
+        .epistemic-panel,
+        .mode-toggle,
+        .layer-panel {
+            display: none !important;
+        }
+        .cockpit-container {
+            margin-top: 0 !important;
+            height: 100vh !important;
+        }
+    ''' if physics_mode == "synthesis" else ''
+    modebar_visibility = 'false' if physics_mode == "synthesis" else "'hover'"
+
     html_template = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -6828,6 +6874,7 @@ def create_monolith_cockpit(
     <script src="https://cdn.plot.ly/plotly-3.3.1.min.js"></script>
     {HUD_CSS}
     {toggle_css}
+    <style>{embedded_clean_canvas_css}</style>
 </head>
 <body>
     {hud_html}
@@ -6858,7 +6905,7 @@ def create_monolith_cockpit(
         var figData = {{PLOT_DATA}};
         Plotly.newPlot('cockpit', figData.data, figData.layout, {{
             responsive: true,
-            displayModeBar: 'hover',
+            displayModeBar: {modebar_visibility},
             modeBarButtonsToRemove: ['lasso2d', 'select2d'],
         }});
 
@@ -6990,21 +7037,27 @@ def create_monolith_cockpit(
             setMode(currentMode);
         }}
 
+        var SCENE_RANGES = {scene_ranges_js};
+
         function sceneRelayoutForMode(mode) {{
             var showAxes = mode === 'diagnostics' || mode === 'analysis';
+            var modeRanges = SCENE_RANGES[mode] || SCENE_RANGES.synthesis;
             return {{
                 'scene.xaxis.visible': showAxes,
                 'scene.xaxis.showticklabels': showAxes,
                 'scene.xaxis.showgrid': showAxes,
                 'scene.xaxis.showline': showAxes,
+                'scene.xaxis.range': modeRanges.x,
                 'scene.yaxis.visible': showAxes,
                 'scene.yaxis.showticklabels': showAxes,
                 'scene.yaxis.showgrid': showAxes,
                 'scene.yaxis.showline': showAxes,
+                'scene.yaxis.range': modeRanges.y,
                 'scene.zaxis.visible': showAxes,
                 'scene.zaxis.showticklabels': showAxes,
                 'scene.zaxis.showgrid': showAxes,
-                'scene.zaxis.showline': showAxes
+                'scene.zaxis.showline': showAxes,
+                'scene.zaxis.range': modeRanges.z
             }};
         }}
 
@@ -7189,7 +7242,7 @@ def create_monolith_cockpit(
     if show_terrain:
         surface_traces = []
         for _t in fig.data:
-            if isinstance(_t, go.Surface):
+            if isinstance(_t, (go.Surface, go.Mesh3d)):
                 is_visible = (_t.visible is None) or (bool(_t.visible) is True)
                 if is_visible:
                     surface_traces.append(_t)
@@ -7266,9 +7319,9 @@ def create_monolith_cockpit(
     # NEVER AGAIN PROTOCOL: hard-fail on dimensional collapse instead of silently rendering.
     pure_z_values = np.asarray(positions_3d[:, 2], dtype=float)
     collapse_warnings: List[str] = []
-    if float(np.ptp(pure_z_values)) <= 1e-2:
+    if (not observer_displacement_mode) and float(np.ptp(pure_z_values)) <= 1e-2:
         collapse_warnings.append("Point cloud Z-variance collapsed.")
-    if float(np.ptp(np.asarray(energy_values_for_terrain, dtype=float))) <= 1e-2:
+    if (not observer_displacement_mode) and float(np.ptp(np.asarray(energy_values_for_terrain, dtype=float))) <= 1e-2:
         collapse_warnings.append("Terrain stress gradient collapsed.")
     if len(walker_paths_raw) <= 0:
         raise DimensionalCollapseError("CRITICAL: Walker paths not loaded.")
