@@ -763,6 +763,389 @@ def _load_primary_observer_payload(run_dir: Path) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
+def _normalize_text_for_match(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _candidate_corpus_paths_for_run(run_dir: Path, payload: Optional[Dict[str, Any]]) -> List[Path]:
+    payload = payload if isinstance(payload, dict) else {}
+    meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+    seen: set[str] = set()
+    candidates: List[Path] = []
+
+    def _push(path_value: Any) -> None:
+        if not path_value:
+            return
+        try:
+            candidate = Path(str(path_value)).resolve()
+        except Exception:
+            return
+        key = str(candidate).lower()
+        if key in seen or not candidate.exists():
+            return
+        seen.add(key)
+        candidates.append(candidate)
+
+    _push(meta.get("corpus_path"))
+
+    corpus_name = str(meta.get("corpus", "") or "").strip().lower()
+    if corpus_name in {"high_quality_articles", "synthetic", "synthetic30"}:
+        _push(Path("sythgen/high_quality_articles.jsonl"))
+        _push(Path("synthetic_corpus.jsonl"))
+    elif corpus_name in {"synthetic_corpus", "synthetic_corpus.jsonl"}:
+        _push(Path("synthetic_corpus.jsonl"))
+        _push(Path("sythgen/high_quality_articles.jsonl"))
+
+    for manifest_name in ("experiment_manifest.json", "suite_config.json"):
+        manifest_path = run_dir.parent / manifest_name
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        _push(manifest.get("corpus_path"))
+
+    return candidates
+
+
+def _metadata_row_matches_corpus_row(meta_row: Dict[str, Any], corpus_row: Dict[str, Any]) -> bool:
+    meta_title = _normalize_text_for_match(meta_row.get("title"))
+    corpus_title = _normalize_text_for_match(corpus_row.get("title"))
+    if meta_title and corpus_title and meta_title != corpus_title:
+        return False
+
+    meta_perspective = _normalize_text_for_match(meta_row.get("perspective_tag"))
+    corpus_perspective = _normalize_text_for_match(corpus_row.get("perspective_tag"))
+    if meta_perspective and corpus_perspective and meta_perspective != corpus_perspective:
+        return False
+
+    meta_preview = _normalize_text_for_match(
+        meta_row.get("content_preview") or meta_row.get("snippet") or meta_row.get("summary")
+    )
+    corpus_text = _normalize_text_for_match(
+        corpus_row.get("content") or corpus_row.get("text") or corpus_row.get("body")
+    )
+    if meta_preview:
+        preview_prefix = meta_preview[:120]
+        if not corpus_text or not corpus_text.startswith(preview_prefix):
+            return False
+
+    return True
+
+
+def _load_metadata_rows_for_backfill(run_dir: Path, payload: Optional[Dict[str, Any]], n_articles: int) -> List[Dict[str, Any]]:
+    payload = payload if isinstance(payload, dict) else {}
+    metadata = payload.get("article_metadata")
+    if isinstance(metadata, list) and metadata:
+        return [dict(row) for row in metadata[:n_articles] if isinstance(row, dict)]
+
+    metadata_json = run_dir / "article_metadata.json"
+    if metadata_json.exists():
+        try:
+            rows = json.loads(metadata_json.read_text(encoding="utf-8"))
+            if isinstance(rows, list):
+                return [dict(row) for row in rows[:n_articles] if isinstance(row, dict)]
+        except Exception:
+            pass
+
+    metadata_csv = run_dir / "article_metadata.csv"
+    if metadata_csv.exists():
+        try:
+            with metadata_csv.open("r", encoding="utf-8", errors="replace") as f:
+                return [dict(row) for row in csv.DictReader(f)][:n_articles]
+        except Exception:
+            pass
+
+    return []
+
+
+def _recover_articles_for_observer_backfill(
+    run_dir: Path,
+    payload: Optional[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], str]:
+    payload = payload if isinstance(payload, dict) else {}
+    n_articles = int(payload.get("n_articles") or 0)
+    metadata_rows = _load_metadata_rows_for_backfill(run_dir, payload, n_articles)
+    if n_articles <= 0 or len(metadata_rows) < n_articles:
+        return [], "insufficient article metadata for observer backfill"
+
+    for candidate in _candidate_corpus_paths_for_run(run_dir, payload):
+        try:
+            candidate_rows, _ = load_and_mask_corpus(candidate)
+        except Exception:
+            continue
+        if len(candidate_rows) < n_articles:
+            continue
+
+        prefix_rows = candidate_rows[:n_articles]
+        if all(
+            _metadata_row_matches_corpus_row(metadata_rows[i], prefix_rows[i])
+            for i in range(n_articles)
+        ):
+            return prefix_rows, f"corpus_prefix:{candidate}"
+
+        sequential_rows: List[Dict[str, Any]] = []
+        cursor = 0
+        success = True
+        for meta_row in metadata_rows:
+            match_idx = None
+            for pos in range(cursor, len(candidate_rows)):
+                if _metadata_row_matches_corpus_row(meta_row, candidate_rows[pos]):
+                    match_idx = pos
+                    break
+            if match_idx is None:
+                success = False
+                break
+            sequential_rows.append(candidate_rows[match_idx])
+            cursor = match_idx + 1
+        if success and len(sequential_rows) == n_articles:
+            return sequential_rows, f"corpus_match:{candidate}"
+
+    fallback_rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(metadata_rows[:n_articles]):
+        hydrated = dict(row)
+        content = (
+            hydrated.get("content")
+            or hydrated.get("text")
+            or hydrated.get("body")
+            or hydrated.get("content_preview")
+            or hydrated.get("snippet")
+            or hydrated.get("summary")
+            or hydrated.get("title")
+            or f"Observer backfill article {idx}"
+        )
+        hydrated["content"] = str(content)
+        fallback_rows.append(hydrated)
+    return fallback_rows, "article_metadata_fallback"
+
+
+def _infer_runtime_config_from_payload(payload: Dict[str, Any]) -> "PipelineRuntimeConfig":
+    from core.pipeline_config import PipelineRuntimeConfig, DEFAULT_PIPELINE_RUNTIME_CONFIG
+
+    meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+    basis_state = payload.get("rks_basis_state", {}) if isinstance(payload.get("rks_basis_state"), dict) else {}
+    cls_per_bot = payload.get("cls_per_bot")
+    features = payload.get("features")
+
+    hidden_dim = DEFAULT_PIPELINE_RUNTIME_CONFIG.dirichlet_hidden_dim
+    if cls_per_bot is not None:
+        try:
+            hidden_dim = int(np.asarray(cls_per_bot).shape[-1])
+        except Exception:
+            pass
+
+    rks_dim = DEFAULT_PIPELINE_RUNTIME_CONFIG.dirichlet_rks_dim
+    if features is not None:
+        try:
+            feature_arr = np.asarray(features)
+            if feature_arr.ndim >= 2:
+                rks_dim = int(feature_arr.shape[-1])
+        except Exception:
+            pass
+
+    return PipelineRuntimeConfig(
+        use_contrastive=bool(meta.get("use_contrastive", True)),
+        use_pca_removal=bool(meta.get("use_pca_removal", False)),
+        use_cls_tokens=bool(cls_per_bot is not None or str(meta.get("channel", "")).lower() == "cls"),
+        use_gru=bool(meta.get("use_gru", True)),
+        use_multi_framing_rks=bool(meta.get("use_multi_framing_rks", DEFAULT_PIPELINE_RUNTIME_CONFIG.use_multi_framing_rks)),
+        use_attention=bool(meta.get("use_attention", DEFAULT_PIPELINE_RUNTIME_CONFIG.use_attention)),
+        use_dirichlet_fusion=bool(meta.get("use_dirichlet_fusion", payload.get("T3_topology") is not None)),
+        normalize_features=bool(meta.get("normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features)),
+        normalize_before_projection=bool(
+            meta.get("normalize_before_projection", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_before_projection)
+        ),
+        geometry_mode=str(meta.get("geometry_mode", DEFAULT_PIPELINE_RUNTIME_CONFIG.geometry_mode)),
+        kernel_type=str(meta.get("kernel", basis_state.get("kernel_type", DEFAULT_PIPELINE_RUNTIME_CONFIG.kernel_type))),
+        mix_in_rkhs=bool(meta.get("mix_in_rkhs", DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs)),
+        projection_dim=int(meta.get("projection_dim", DEFAULT_PIPELINE_RUNTIME_CONFIG.projection_dim)),
+        apply_pca_to_cls=bool(meta.get("apply_pca_to_cls", DEFAULT_PIPELINE_RUNTIME_CONFIG.apply_pca_to_cls)),
+        dirichlet_rks_dim=int(meta.get("dirichlet_rks_dim", rks_dim)),
+        dirichlet_n_observers=int(meta.get("dirichlet_n_observers", DEFAULT_PIPELINE_RUNTIME_CONFIG.dirichlet_n_observers)),
+        dirichlet_alpha=float(
+            meta.get(
+                "dirichlet_alpha",
+                (payload.get("provenance", {}) or {}).get("alpha", DEFAULT_PIPELINE_RUNTIME_CONFIG.dirichlet_alpha),
+            )
+        ),
+        dirichlet_hidden_dim=int(meta.get("dirichlet_hidden_dim", hidden_dim)),
+    )
+
+
+def _save_observer_run_leaf(obs_sub_dir: Path, obs_result: Dict[str, Any]) -> None:
+    obs_sub_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_npy(name: str, value: Any) -> None:
+        if value is None:
+            return
+        try:
+            np.save(obs_sub_dir / name, np.asarray(value))
+        except Exception:
+            pass
+
+    _save_npy("features.npy", obs_result.get("features"))
+    _save_npy("integrated_vectors.npy", obs_result.get("integrated_vectors"))
+    _save_npy("dirichlet_fused.npy", obs_result.get("dirichlet_fused"))
+    _save_npy("dirichlet_fused_std.npy", obs_result.get("dirichlet_fused_std"))
+    _save_npy("walker_work_integrals.npy", obs_result.get("walker_work_integrals"))
+
+    t15 = obs_result.get("T1.5_spectral", {}) if isinstance(obs_result.get("T1.5_spectral"), dict) else {}
+    spectral_evr = obs_result.get("spectral_evr")
+    if spectral_evr is None:
+        spectral_evr = t15.get("evr")
+    spectral_probe_magnitudes = obs_result.get("spectral_probe_magnitudes")
+    if spectral_probe_magnitudes is None:
+        spectral_probe_magnitudes = t15.get("probe_magnitudes")
+    spectral_u_axis = obs_result.get("spectral_u_axis")
+    if spectral_u_axis is None:
+        spectral_u_axis = t15.get("u_axis")
+    antagonism = obs_result.get("spectral_antagonism")
+    if antagonism is None:
+        antagonism = obs_result.get("antagonism")
+    if antagonism is None:
+        antagonism = t15.get("antagonism")
+
+    _save_npy("spectral_evr.npy", spectral_evr)
+    _save_npy("spectral_probe_magnitudes.npy", spectral_probe_magnitudes)
+    _save_npy("spectral_dipole_valid.npy", obs_result.get("spectral_dipole_valid"))
+    _save_npy("spectral_u_axis.npy", spectral_u_axis)
+    _save_npy("antagonism.npy", antagonism)
+
+    walker_states = obs_result.get("walker_states")
+    if isinstance(walker_states, list):
+        (obs_sub_dir / "walker_states.json").write_text(json.dumps(walker_states, indent=2), encoding="utf-8")
+
+    phantom_verdicts = obs_result.get("phantom_verdicts")
+    if isinstance(phantom_verdicts, list):
+        (obs_sub_dir / "phantom_verdicts.json").write_text(json.dumps(phantom_verdicts, indent=2), encoding="utf-8")
+
+    walker_paths = obs_result.get("walker_paths")
+    if isinstance(walker_paths, list) and walker_paths:
+        try:
+            article_idx = np.arange(len(walker_paths), dtype=np.int64)
+            path_xyz = np.array([np.asarray(path, dtype=float) for path in walker_paths], dtype=object)
+            path_space = np.array(["embedding"], dtype=object)
+            np.savez(obs_sub_dir / "walker_paths.npz", article_idx=article_idx, path_xyz=path_xyz, path_space=path_space)
+        except Exception:
+            pass
+
+
+def _ensure_observer_universes_materialized(run_dir: Path) -> Dict[str, Any]:
+    run_dir = Path(run_dir)
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+
+    primary_payload = _load_primary_observer_payload(run_dir)
+    if not isinstance(primary_payload, dict):
+        return {"status": "failed", "reason": "primary observer payload unavailable"}
+
+    n_articles = int(primary_payload.get("n_articles") or len(primary_payload.get("article_metadata", [])) or 0)
+    if n_articles <= 0:
+        return {"status": "failed", "reason": "observer payload missing article count"}
+
+    existing_payloads = len(list(rel_dir.glob("observer_*.pt")))
+    existing_obs_dirs = len([p for p in rel_dir.glob("obs_*") if p.is_dir()])
+    if existing_payloads >= n_articles and existing_obs_dirs >= n_articles:
+        if not (run_dir / "observer_global.pt").exists() and TORCH_AVAILABLE:
+            try:
+                torch.save(primary_payload, run_dir / "observer_global.pt")
+            except Exception:
+                pass
+        return {
+            "status": "already_exists",
+            "observer_payloads": existing_payloads,
+            "observer_dirs": existing_obs_dirs,
+        }
+
+    articles, article_source = _recover_articles_for_observer_backfill(run_dir, primary_payload)
+    if len(articles) != n_articles:
+        return {
+            "status": "failed",
+            "reason": f"observer backfill article recovery failed ({article_source})",
+            "article_source": article_source,
+        }
+
+    try:
+        from core.complete_pipeline import initialize_full_pipeline, BeliefTransformerPipeline
+    except Exception as exc:
+        return {"status": "failed", "reason": f"pipeline imports unavailable: {exc}"}
+
+    runtime_cfg = _infer_runtime_config_from_payload(primary_payload)
+    device = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
+    seed = int((primary_payload.get("meta", {}) or {}).get("seed", primary_payload.get("seed", 42)) or 42)
+
+    try:
+        components = initialize_full_pipeline(
+            random_seed=seed,
+            device=device,
+            **runtime_cfg.to_initialize_kwargs(),
+        )
+        pipeline = BeliefTransformerPipeline(
+            components=components,
+            random_seed=seed,
+            enable_provenance=True,
+            provenance_dir=str(rel_dir),
+        )
+    except Exception as exc:
+        return {"status": "failed", "reason": f"observer backfill pipeline init failed: {exc}"}
+
+    run_meta = dict(primary_payload.get("meta", {}) if isinstance(primary_payload.get("meta"), dict) else {})
+    if run_meta:
+        primary_payload.setdefault("meta", run_meta)
+    normalized_global_provenance = _normalize_run_provenance(primary_payload, run_meta)
+    primary_payload["provenance"] = normalized_global_provenance
+    primary_payload.setdefault("meta", {})["provenance"] = normalized_global_provenance
+    if TORCH_AVAILABLE and not (run_dir / "observer_global.pt").exists():
+        try:
+            torch.save(primary_payload, run_dir / "observer_global.pt")
+        except Exception:
+            pass
+
+    written_payloads = 0
+    written_dirs = 0
+    for obs_i in range(n_articles):
+        obs_pt_path = rel_dir / f"observer_{obs_i}.pt"
+        obs_sub_dir = rel_dir / f"obs_{obs_i}"
+        if obs_pt_path.exists() and obs_sub_dir.exists() and (obs_sub_dir / "features.npy").exists():
+            continue
+
+        print(f"[RELATIVITY][BACKFILL] Materializing observer universe {obs_i + 1}/{n_articles} for {run_dir.name}...")
+        obs_config = {
+            "enable_checkpoints": True,
+            "output_dir": str(obs_sub_dir),
+            "checkpoint_dir": str(obs_sub_dir),
+        }
+        obs_result = pipeline.process_month(
+            articles=articles,
+            month_name=f"{run_dir.name}_obs{obs_i}",
+            config=obs_config,
+            observer_idx=obs_i,
+        )
+        obs_result["meta"] = run_meta
+        normalized_obs_provenance = _normalize_run_provenance(obs_result, run_meta)
+        obs_result["provenance"] = normalized_obs_provenance
+        obs_result.setdefault("meta", {})["provenance"] = normalized_obs_provenance
+        _save_observer_run_leaf(obs_sub_dir, obs_result)
+        if TORCH_AVAILABLE:
+            torch.save(obs_result, obs_pt_path)
+        written_payloads += 1
+        written_dirs += 1
+
+        del obs_result
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return {
+        "status": "success",
+        "observer_payloads": len(list(rel_dir.glob("observer_*.pt"))),
+        "observer_dirs": len([p for p in rel_dir.glob("obs_*") if p.is_dir()]),
+        "article_source": article_source,
+        "written_payloads": written_payloads,
+        "written_dirs": written_dirs,
+    }
+
+
 def _json_ready(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
@@ -2044,6 +2427,8 @@ def _validate_required_bundle_outputs(run_dir: Path) -> List[str]:
         run_dir / "baseline_meta.json",
         run_dir / "baseline_state.json",
         run_dir / "validation.json",
+        run_dir / "verification_report.json",
+        run_dir / "verification_summary.csv",
     ]
     missing = [p.name for p in required if not p.exists()]
     rel_dir = run_dir / "relativity_cache"
@@ -2065,6 +2450,28 @@ def _bundle_outputs_are_fresh(run_dir: Path) -> bool:
     missing = _validate_required_bundle_outputs(run_dir)
     if missing:
         return False
+
+    rel_dir = run_dir / "relativity_cache"
+    for rel_path in list(sorted(rel_dir.glob("state_*.json"))) + list(sorted(rel_dir.glob("delta_*.json"))):
+        try:
+            blob = json.loads(rel_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if bool(blob.get("synthetic_placeholder", False)):
+            return False
+
+    verification_report = run_dir / "verification_report.json"
+    if verification_report.exists():
+        try:
+            report_blob = json.loads(verification_report.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        layer_failures = []
+        for layer in report_blob.get("layers", []) if isinstance(report_blob.get("layers"), list) else []:
+            if isinstance(layer, dict):
+                layer_failures.extend(str(reason) for reason in (layer.get("fail_reasons") or []))
+        if any("verification layer not materialized during bundle emission" in reason for reason in layer_failures):
+            return False
 
     input_files = [run_dir / "MONOLITH_DATA.csv"]
     for name in ("verification_report.json", "verification_summary.csv"):
@@ -2095,7 +2502,6 @@ def _bundle_outputs_are_fresh(run_dir: Path) -> bool:
         run_dir / "baseline_state.json",
         run_dir / "validation.json",
     ]
-    rel_dir = run_dir / "relativity_cache"
     output_files.extend(sorted(rel_dir.glob("state_*.json")))
     output_files.extend(sorted(rel_dir.glob("delta_*.json")))
     oldest_output = min(int(p.stat().st_mtime_ns) for p in output_files if p.exists())
@@ -2346,6 +2752,17 @@ def _emit_non_comparable_contract_bundle(run_dir: Path, reason: str) -> Dict[str
     }
     report_path = run_dir / "verification_report.json"
     report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    walker_counts = _summarize_walker_state_counts(run_dir)
+    _write_verification_summary_csv(
+        run_dir,
+        layer_id=run_dir.name,
+        layer_name=run_dir.name,
+        status="NON_COMPARABLE",
+        fail_reasons=[reason],
+        n_broken=walker_counts["n_broken"],
+        n_trapped=walker_counts["n_trapped"],
+        n_total=walker_counts["n_total"],
+    )
 
     _emit_no_data_ablation_summary(run_dir)
     _emit_control_metrics_json(run_dir)
@@ -2507,6 +2924,106 @@ def _build_leaf_provenance_summary(run_dir: Path, payload: Optional[Dict[str, An
     }
 
 
+def _write_verification_summary_csv(
+    run_dir: Path,
+    *,
+    layer_id: str,
+    layer_name: str,
+    status: str,
+    fail_reasons: List[str],
+    crn_locked: Optional[bool] = None,
+    ordering_pass: Optional[bool] = None,
+    seed_stability: Optional[bool] = None,
+    mi: Optional[float] = None,
+    n_broken: int = 0,
+    n_trapped: int = 0,
+    n_total: int = 0,
+) -> Path:
+    summary_path = Path(run_dir) / "verification_summary.csv"
+    fieldnames = ["layer_id", "layer_name", "status", "crn_locked", "ordering_pass", "seed_stability", "mi", "n_broken", "n_trapped", "n_total", "fail_reasons"]
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "layer_id": str(layer_id),
+                "layer_name": str(layer_name),
+                "status": str(status),
+                "crn_locked": crn_locked,
+                "ordering_pass": ordering_pass,
+                "seed_stability": seed_stability,
+                "mi": mi,
+                "n_broken": int(n_broken),
+                "n_trapped": int(n_trapped),
+                "n_total": int(n_total),
+                "fail_reasons": "; ".join(str(reason) for reason in (fail_reasons or []) if str(reason).strip()),
+            }
+        )
+    return summary_path
+
+
+def _summarize_walker_state_counts(run_dir: Path) -> Dict[str, int]:
+    walker_states_path = Path(run_dir) / "walker_states.json"
+    if not walker_states_path.exists():
+        return {"n_broken": 0, "n_trapped": 0, "n_total": 0}
+    try:
+        payload = json.loads(walker_states_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"n_broken": 0, "n_trapped": 0, "n_total": 0}
+    if not isinstance(payload, list):
+        return {"n_broken": 0, "n_trapped": 0, "n_total": 0}
+
+    n_broken = 0
+    n_trapped = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        state = str(item.get("raw_state") or item.get("label") or item.get("status") or "").strip().lower()
+        if state == "broken":
+            n_broken += 1
+        elif state == "trapped":
+            n_trapped += 1
+    return {"n_broken": int(n_broken), "n_trapped": int(n_trapped), "n_total": int(len(payload))}
+
+
+def _infer_verification_exp_dir(run_dir: Path) -> Optional[Path]:
+    run_dir = Path(run_dir).resolve()
+    for candidate in [run_dir, *run_dir.parents]:
+        if candidate.name.startswith("experiments_"):
+            return candidate
+
+    if run_dir.name in {"real", "control_random", "control_shuffled", "control_constant"}:
+        try:
+            return run_dir.parents[2]
+        except IndexError:
+            return run_dir.parent
+    if run_dir.parent.name in {"cls", "logits"}:
+        try:
+            return run_dir.parents[2]
+        except IndexError:
+            return run_dir.parent
+    return run_dir.parent if run_dir.parent != run_dir else None
+
+
+def _resolve_verification_layer_for_leaf(all_layers: List[Dict[str, Any]], run_dir: Path, exp_dir: Path) -> Optional[Dict[str, Any]]:
+    resolved_run_dir = Path(run_dir).resolve()
+    for layer in all_layers:
+        layer_dir = Path(layer.get("layer_dir", exp_dir))
+        if layer_dir.exists() and layer_dir.resolve() == resolved_run_dir:
+            return layer
+
+        artifacts = layer.get("artifacts", {}) or {}
+        corpora = list(artifacts.keys()) if isinstance(artifacts, dict) and artifacts else ["real"]
+        for corpus in corpora:
+            candidate = layer_dir / str(corpus)
+            if (candidate / "MONOLITH_DATA.csv").exists() and candidate.resolve() == resolved_run_dir:
+                return layer
+
+        if (layer_dir / "MONOLITH_DATA.csv").exists() and layer_dir.resolve() == resolved_run_dir:
+            return layer
+    return None
+
+
 def _emit_baseline_meta(run_dir: Path) -> Path:
     report_path = run_dir / "verification_report.json"
     verification_status = "UNVERIFIED"
@@ -2592,6 +3109,17 @@ def _ensure_verification_report(run_dir: Path) -> Path:
         "verification_status": "UNVERIFIED",
     }
     report_path.write_text(json.dumps(placeholder, indent=2), encoding="utf-8")
+    walker_counts = _summarize_walker_state_counts(run_dir)
+    _write_verification_summary_csv(
+        run_dir,
+        layer_id=run_dir.name,
+        layer_name=run_dir.name,
+        status="UNVERIFIED",
+        fail_reasons=["verification layer not materialized during bundle emission"],
+        n_broken=walker_counts["n_broken"],
+        n_trapped=walker_counts["n_trapped"],
+        n_total=walker_counts["n_total"],
+    )
     return report_path
 
 
@@ -2607,6 +3135,17 @@ def _safe_float(value: Any, default: Any = 0.0) -> Optional[float]:
             return None
         return float(default)
     return out
+
+
+def _safe_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "1", "yes", "pass"}:
+        return True
+    if text in {"false", "0", "no", "fail"}:
+        return False
+    return None
 
 
 def _normalize_rows_for_relativity(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3576,19 +4115,11 @@ def _write_leaf_verification_artifacts(run_dir: Path, exp_dir: Path) -> Dict[str
             from verification.verify_run import discover_all_layers, verify_layer_data, write_report
 
         all_layers = discover_all_layers(exp_dir)
-        resolved_run_dir = run_dir.resolve()
-        target_layer = next(
-            (
-                layer
-                for layer in all_layers
-                if Path(layer.get("layer_dir", run_dir)).resolve() == resolved_run_dir
-            ),
-            None,
-        )
+        target_layer = _resolve_verification_layer_for_leaf(all_layers, run_dir, exp_dir)
         if target_layer is None:
             return {
                 "status": "skipped",
-                "reason": f"no verification layer discovered for {run_dir}",
+                "reason": f"no verification layer discovered for {run_dir} under {exp_dir}",
             }
 
         report = verify_layer_data(
@@ -3603,6 +4134,7 @@ def _write_leaf_verification_artifacts(run_dir: Path, exp_dir: Path) -> Dict[str
             run_dir,
             global_pass_override=(str(report.get("status", "")).upper() == "VERIFIED"),
         )
+        walker_counts = _summarize_walker_state_counts(run_dir)
         report_path = run_dir / "verification_report.json"
         if report_path.exists():
             observer_payload = _load_primary_observer_payload(run_dir)
@@ -3619,6 +4151,36 @@ def _write_leaf_verification_artifacts(run_dir: Path, exp_dir: Path) -> Dict[str
                 "verification_status": str(report.get("status", "")).upper() or "UNVERIFIED",
             })
             report_path.write_text(json.dumps(report_json, indent=2), encoding="utf-8")
+        summary_path = run_dir / "verification_summary.csv"
+        if summary_path.exists():
+            try:
+                with summary_path.open("r", encoding="utf-8", newline="") as f:
+                    rows = list(csv.DictReader(f))
+            except Exception:
+                rows = []
+            if rows:
+                row = dict(rows[0])
+                row["n_broken"] = str(walker_counts["n_broken"])
+                row["n_trapped"] = str(walker_counts["n_trapped"])
+                row["n_total"] = str(walker_counts["n_total"])
+                _write_verification_summary_csv(
+                    run_dir,
+                    layer_id=str(row.get("layer_id", report.get("layer_id", run_dir.name))),
+                    layer_name=str(row.get("layer_name", report.get("layer_name", run_dir.name))),
+                    status=str(row.get("status", report.get("status", "UNVERIFIED"))),
+                    fail_reasons=[
+                        reason.strip()
+                        for reason in str(row.get("fail_reasons", "")).split(";")
+                        if reason.strip()
+                    ],
+                    crn_locked=_safe_optional_bool(row.get("crn_locked")),
+                    ordering_pass=_safe_optional_bool(row.get("ordering_pass")),
+                    seed_stability=_safe_optional_bool(row.get("seed_stability")),
+                    mi=_safe_float(row.get("mi"), default=None),
+                    n_broken=walker_counts["n_broken"],
+                    n_trapped=walker_counts["n_trapped"],
+                    n_total=walker_counts["n_total"],
+                )
         return {
             "status": "success",
             "layer_id": str(target_layer.get("layer_id", "")),
@@ -3813,7 +4375,22 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     copied: List[str] = []
 
     rows = _load_monolith_rows(monolith_csv)
-    _ensure_verification_report(run_dir)
+    observer_backfill = None
+    rel_dir = run_dir / "relativity_cache"
+    has_observer_payloads = rel_dir.exists() and any(rel_dir.glob("observer_*.pt"))
+    if not has_observer_payloads:
+        observer_backfill = _ensure_observer_universes_materialized(run_dir)
+    verification_res: Dict[str, Any]
+    exp_root = _infer_verification_exp_dir(run_dir)
+    if exp_root is not None and exp_root.exists():
+        verification_res = _write_leaf_verification_artifacts(run_dir, exp_root)
+    else:
+        verification_res = {
+            "status": "skipped",
+            "reason": f"unable to infer experiment root for {run_dir}",
+        }
+    if verification_res.get("status") != "success":
+        _ensure_verification_report(run_dir)
     baseline_meta = _emit_baseline_meta(run_dir)
     baseline_state = _emit_baseline_state(run_dir, rows)
     validation_json = _emit_validation_json(run_dir)
@@ -3831,6 +4408,8 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
         "ablation_summary": str(ablation_summary),
         "control_metrics": str(control_metrics),
         "copied": copied,
+        "observer_backfill": observer_backfill,
+        "verification": verification_res,
         "relativity": rel_stats,
         "relativity_deltas": str(relativity_deltas),
         "labels": label_paths,

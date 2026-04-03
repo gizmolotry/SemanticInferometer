@@ -299,6 +299,16 @@ def _seed_bundle_outputs(run_dir: Path, *, input_ns: int = 1_000_000_000, output
         run_dir / "baseline_meta.json": json.dumps({"schema_version": "1.0"}, indent=2),
         run_dir / "baseline_state.json": json.dumps({"articles": [], "paths": []}, indent=2),
         run_dir / "validation.json": json.dumps({"nmi": 0.5}, indent=2),
+        run_dir / "verification_report.json": json.dumps(
+            {
+                "run_id": "freshness",
+                "timestamp": "2026-04-03T00:00:00Z",
+                "layers": [{"layer_id": "freshness", "layer_name": "freshness", "status": "VERIFIED", "checks": [], "fail_reasons": []}],
+                "global_pass": True,
+            },
+            indent=2,
+        ),
+        run_dir / "verification_summary.csv": "layer_id,layer_name,status,crn_locked,ordering_pass,seed_stability,mi,fail_reasons\nfreshness,freshness,VERIFIED,True,True,True,0.5,\n",
         rel_dir / "state_0.json": json.dumps({"observer_id": 0}, indent=2),
         rel_dir / "delta_0.json": json.dumps({"observer_id": 0}, indent=2),
         observer_dir / "MONOLITH.html": "<html>observer</html>\n",
@@ -319,6 +329,8 @@ def _seed_bundle_outputs(run_dir: Path, *, input_ns: int = 1_000_000_000, output
         run_dir / "baseline_meta.json",
         run_dir / "baseline_state.json",
         run_dir / "validation.json",
+        run_dir / "verification_report.json",
+        run_dir / "verification_summary.csv",
         rel_dir / "state_0.json",
         rel_dir / "delta_0.json",
     ]:
@@ -354,6 +366,30 @@ def test_bundle_outputs_are_fresh_invalidates_when_verification_artifact_changes
     assert suite._bundle_outputs_are_fresh(run_dir) is False
 
 
+def test_bundle_outputs_are_fresh_invalidates_placeholder_verification_report(tmp_path):
+    run_dir = tmp_path / "freshness_placeholder_verification"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _seed_bundle_outputs(run_dir)
+
+    placeholder_report = {
+        "run_id": "placeholder",
+        "timestamp": "2026-04-03T00:00:00Z",
+        "layers": [
+            {
+                "layer_id": "placeholder",
+                "layer_name": "placeholder",
+                "status": "UNVERIFIED",
+                "checks": [],
+                "fail_reasons": ["verification layer not materialized during bundle emission"],
+            }
+        ],
+        "global_pass": False,
+    }
+    (run_dir / "verification_report.json").write_text(json.dumps(placeholder_report, indent=2), encoding="utf-8")
+
+    assert suite._bundle_outputs_are_fresh(run_dir) is False
+
+
 def test_bundle_outputs_are_fresh_invalidates_when_observer_input_changes(tmp_path):
     run_dir = tmp_path / "freshness_observer"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +401,27 @@ def test_bundle_outputs_are_fresh_invalidates_when_observer_input_changes(tmp_pa
     os.utime(observer_html, ns=(3_000_000_000, 3_000_000_000))
 
     assert suite._bundle_outputs_are_fresh(run_dir) is False
+
+
+def test_resolve_verification_layer_for_leaf_matches_legacy_leaf_directory(tmp_path):
+    exp_root = tmp_path / "experiments_20260403_000000"
+    leaf_dir = exp_root / "matern" / "cls" / "real"
+    leaf_dir.mkdir(parents=True, exist_ok=True)
+    (leaf_dir / "MONOLITH_DATA.csv").write_text("index,title,bt_uid,density,stress,zone\n0,A,u0,0.5,0.7,Bridge\n", encoding="utf-8")
+
+    layer = {
+        "layer_id": "matern/cls",
+        "layer_name": "cls",
+        "layer_dir": exp_root / "matern" / "cls",
+        "artifacts": {
+            "real": {"42": {}},
+            "control_random": {"42": {}},
+        },
+    }
+
+    resolved = suite._resolve_verification_layer_for_leaf([layer], leaf_dir, exp_root)
+
+    assert resolved is layer
 
 
 def test_emit_baseline_meta_prefers_observer_provenance_when_available(tmp_path):

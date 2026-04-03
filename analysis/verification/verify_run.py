@@ -131,7 +131,14 @@ def discover_all_layers(exp_dir: Path) -> List[Dict[str, Any]]:
     # Walk the directory
     for root, dirs, files in os.walk(exp_dir):
         rel_root = Path(root).relative_to(exp_dir)
-        observer_files = [f for f in files if f.startswith("observer_") and f.endswith(".pt")]
+        if "relativity_cache" in rel_root.parts:
+            continue
+
+        observer_files = [
+            f
+            for f in files
+            if f.startswith("observer_") and f.endswith(".pt") and f != "observer_global.pt"
+        ]
         
         if not observer_files:
             continue
@@ -321,10 +328,22 @@ def resolve_alpha_sweep_path(layer_dir: Path, exp_dir: Path, corpus: str = "real
         for p in layer_dir.rglob("alpha_sweep_results.json"): return p
     return None
 
-def resolve_validation_path(layer_dir: Path) -> Optional[Path]:
-    """Deterministically resolve validation.json under a layer directory."""
+def resolve_validation_path(layer_dir: Path, corpus: str = "real") -> Optional[Path]:
+    """Deterministically resolve validation.json, preferring the real leaf for layer-scoped layouts."""
     if not layer_dir.exists():
         return None
+    direct_corpus = layer_dir / corpus / "validation.json"
+    if direct_corpus.exists():
+        return direct_corpus
+    direct_layer = layer_dir / "validation.json"
+    if direct_layer.exists():
+        return direct_layer
+    corpus_candidates = sorted(
+        (layer_dir / corpus).rglob("validation.json") if (layer_dir / corpus).exists() else [],
+        key=lambda p: p.relative_to(layer_dir).as_posix(),
+    )
+    if corpus_candidates:
+        return corpus_candidates[0]
     candidates = sorted(
         layer_dir.rglob("validation.json"),
         key=lambda p: p.relative_to(layer_dir).as_posix(),
@@ -399,7 +418,7 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
     if status == LayerStatus.VERIFIED and fail_reasons: status = LayerStatus.UNVERIFIED
         
     mi_score = None
-    validation_path = resolve_validation_path(layer_dir)
+    validation_path = resolve_validation_path(layer_dir, corpus="real" if has_real else (corpora[0] if corpora else "real"))
     validation_found = validation_path is not None
     if validation_path is not None:
         try:
