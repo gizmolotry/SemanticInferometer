@@ -52,7 +52,6 @@ Author: Belief Transformer Project (ASTER v3.2)
 
 from __future__ import annotations
 
-import warnings
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
@@ -199,59 +198,30 @@ class HadamardFusion:
         """
         Compute Hadamard (element-wise) product with dark manifold protection.
 
-        Risk: Multiplication is destructive - can create isolated nodes where
-        both kernels have low values. We detect and rescue these.
+        Risk: Multiplication is destructive - it can legitimately create isolated
+        nodes where both kernels have low values. We preserve those voids.
 
         Args:
             K_rks: [N, N] kernel from Track 2
             K_spectral: [N, N] kernel from Track 1.5
 
         Returns:
-            K_final: [N, N] Hadamard product kernel
-            n_rescued: Number of isolated nodes rescued
-            isolated_indices: Indices of rescued nodes (or None)
+            K_final: [N, N] strict Hadamard product kernel
+            n_rescued: Always 0 under the strict contract
+            isolated_indices: Indices of isolated nodes (or None)
         """
-        # Element-wise multiplication (strict logical AND in kernel space).
-        K_product = K_rks * K_spectral
+        # Strict logical AND in kernel space. No softening and no dark-manifold
+        # rescue: if cross-track support vanishes, the node remains isolated.
+        K_hadamard = K_rks * K_spectral
+        K_hadamard = K_hadamard.clamp(min=0.0, max=1.0)
 
-        # Optional softening: blend strict product with max-kernel envelope.
-        # This recovers weak bridges lost by hard AND while preserving structure.
-        alpha = float(self.config.hadamard_softening)
-        alpha = min(max(alpha, 0.0), 1.0)
-        if alpha > 0.0:
-            K_envelope = torch.max(K_rks, K_spectral)
-            K_hadamard = (1.0 - alpha) * K_product + alpha * K_envelope
-        else:
-            K_hadamard = K_product
-
-        K_hadamard = K_hadamard.clamp(min=self.config.kernel_floor, max=1.0)
-
+        row_sums = K_hadamard.sum(dim=1)
+        threshold = self.config.dark_manifold_threshold * K_hadamard.shape[0]
+        isolated_mask = row_sums < threshold
+        # Preserve the historical return contract while making the strict behavior
+        # explicit: no rows/cols are bridged back into the manifold.
         n_rescued = 0
-        isolated_indices = None
-
-        if self.config.dark_manifold_rescue:
-            # Detect isolated nodes: row sum below threshold
-            row_sums = K_hadamard.sum(dim=1)
-            threshold = self.config.dark_manifold_threshold * K_hadamard.shape[0]
-            isolated_mask = row_sums < threshold
-
-            if isolated_mask.any():
-                n_rescued = int(isolated_mask.sum().item())
-                isolated_indices = torch.where(isolated_mask)[0]
-
-                warnings.warn(
-                    f"[HadamardFusion] Dark manifold: {n_rescued} isolated nodes rescued "
-                    f"({100*n_rescued/K_hadamard.shape[0]:.1f}% of corpus)"
-                )
-
-                # Rescue strategy: use max of the two kernels for isolated rows/cols
-                # This preserves connectivity through at least one channel
-                K_rescue = torch.max(K_rks, K_spectral)
-
-                # Apply rescue to isolated rows
-                K_hadamard[isolated_mask, :] = K_rescue[isolated_mask, :]
-                # Apply rescue to isolated columns (symmetry)
-                K_hadamard[:, isolated_mask] = K_rescue[:, isolated_mask]
+        isolated_indices = torch.where(isolated_mask)[0] if isolated_mask.any() else None
 
         return K_hadamard, n_rescued, isolated_indices
 

@@ -11,6 +11,7 @@ Purpose:
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -588,7 +589,13 @@ def _is_synthetic_placeholder_blob(blob: Any) -> bool:
 
 
 def _artifact_iframe(src_doc: str) -> html.Iframe:
+    import time
+    # Force a unique key on every render by combining the content hash with a timestamp.
+    # This busts the browser's internal iframe cache.
+    content_hash = hashlib.sha1(src_doc.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    iframe_key = f"{content_hash}_{int(time.time() * 1000)}"
     return html.Iframe(
+        key=iframe_key,
         srcDoc=src_doc,
         sandbox="allow-scripts",
         referrerPolicy="no-referrer",
@@ -943,6 +950,8 @@ def _run_source_priority(run_dir: Path) -> int:
 
 def _run_model_priority(run_dir: Path) -> int:
     run_key = _run_display_key(run_dir).lower()
+    if "/matern/cls/real" in run_key:
+        return 4
     if "/rbf/cls/real" in run_key:
         return 3
     if "/cls/real" in run_key:
@@ -1092,8 +1101,8 @@ def load_verification_state(run_key: Optional[str], verification_source: Optiona
                 except Exception:
                     total += 1
 
-    survival_pct = 100.0
-    friction = 0.0
+    survival_pct = None
+    friction = None
     if total > 0:
         failures = broken + trapped
         survival_pct = max(0.0, 100.0 * (1.0 - (failures / float(total))))
@@ -1780,12 +1789,12 @@ def _compute_track_delta_summary(
                 delta_action = float(b_action) - float(a_action)
                 entry["delta_action"] = delta_action
                 entry["delta"] = entry["delta"] or abs(delta_action) > 1e-9
-                parts.append(f"action A={_fmt_metric(a_action)} B={_fmt_metric(b_action)} d={delta_action:+.3f}")
+                parts.append(f"work A={_fmt_metric(a_action)} B={_fmt_metric(b_action)} d={delta_action:+.3f}")
             if _is_number(a_surv) and _is_number(b_surv):
                 delta_surv = float(b_surv) - float(a_surv)
                 entry["delta_survival"] = delta_surv
                 entry["delta"] = entry["delta"] or abs(delta_surv) > 1e-9
-                parts.append(f"surv A={_fmt_metric(a_surv)} B={_fmt_metric(b_surv)} d={delta_surv:+.3f}")
+                parts.append(f"closed-loop A={_fmt_metric(a_surv)} B={_fmt_metric(b_surv)} d={delta_surv:+.3f}")
             entry["summary"] = " | ".join(parts) if parts else f"status A={status_a.upper()} B={status_b.upper()}"
         elif track == "T5":
             keys = ["honest", "phantom", "tautology", "anomaly"]
@@ -1872,9 +1881,9 @@ def _track_status_component(track_state: Dict[str, str]):
             if track == "T3" and (_is_number(payload.get("bonds")) or _is_number(payload.get("cracks"))):
                 line += f" | bonds/cracks={payload.get('bonds', 'n/a')}/{payload.get('cracks', 'n/a')}"
         elif track == "T4":
-            line = f"T4: action={_fmt_metric(payload.get('action'))} | surv={_fmt_metric(payload.get('survival'))}"
+            line = f"T4: work={_fmt_metric(payload.get('action'))} | closed-loop={_fmt_metric(payload.get('survival'))}"
         elif track == "T5":
-            line = f"T5: H={payload.get('honest', 'n/a')} P={payload.get('phantom', 'n/a')} T={payload.get('tautology', 'n/a')} A={payload.get('anomaly', 'n/a')}"
+            line = f"T5 terminal labels: H={payload.get('honest', 'n/a')} P={payload.get('phantom', 'n/a')} T={payload.get('tautology', 'n/a')} A={payload.get('anomaly', 'n/a')}"
         else:
             line = f"T6: proofs={payload.get('n_proofs', 'n/a')} | equiv={_fmt_metric(payload.get('equivalence_rate'))} | conf={_fmt_metric(payload.get('mean_confidence'))}"
         detail_lines.append(line)
@@ -2082,6 +2091,8 @@ def resolve_artifact(run_key: str, variant_name: str, observer_value: str) -> Op
     selected_variant = str(variant_name or "").strip()
     if not selected_variant:
         selected_variant = run.get("variants", ["MONOLITH.html"])[0]
+    
+    found_path = None
     # Observer-specific naming support (future-compatible) should take priority
     # for article viewpoints, then fallback to chosen global variant.
     if observer_value.startswith("article:"):
@@ -2093,37 +2104,46 @@ def resolve_artifact(run_key: str, variant_name: str, observer_value: str) -> Op
             and manifest_hit.exists()
             and (not manifest_variant or manifest_variant == selected_variant)
         ):
-            return manifest_hit
+            found_path = manifest_hit
 
-        idx = observer_value.split(":", 1)[1]
-        stem = Path(selected_variant).stem
-        observer_candidates = [
-            run_dir / f"observer_{idx}" / selected_variant,
-            run_dir / f"article_{idx}" / selected_variant,
-            run_dir / f"{stem}_article_{idx}.html",
-            run_dir / f"{stem}_observer_{idx}.html",
-        ]
-        monolith_named = str(selected_variant).strip().upper() == "MONOLITH.HTML"
-        if monolith_named:
-            observer_candidates.extend(
-                [
-                    run_dir / f"observer_{idx}" / "MONOLITH.html",
-                    run_dir / f"article_{idx}" / "MONOLITH.html",
-                    run_dir / f"MONOLITH_article_{idx}.html",
-                    run_dir / f"MONOLITH_observer_{idx}.html",
-                ]
-            )
-        for p in observer_candidates:
-            if p.exists():
-                return p
-    variant_path = run_dir / selected_variant
-    if variant_path.exists():
-        return variant_path
-    for fallback_name in run.get("variants", []):
-        p = run_dir / str(fallback_name)
-        if p.exists():
-            return p
-    return None
+        if not found_path:
+            idx = observer_value.split(":", 1)[1]
+            stem = Path(selected_variant).stem
+            observer_candidates = [
+                run_dir / f"observer_{idx}" / selected_variant,
+                run_dir / f"article_{idx}" / selected_variant,
+                run_dir / f"{stem}_article_{idx}.html",
+                run_dir / f"{stem}_observer_{idx}.html",
+            ]
+            monolith_named = str(selected_variant).strip().upper() == "MONOLITH.HTML"
+            if monolith_named:
+                observer_candidates.extend(
+                    [
+                        run_dir / f"observer_{idx}" / "MONOLITH.html",
+                        run_dir / f"article_{idx}" / "MONOLITH.html",
+                        run_dir / f"MONOLITH_article_{idx}.html",
+                        run_dir / f"MONOLITH_observer_{idx}.html",
+                    ]
+                )
+            for p in observer_candidates:
+                if p.exists():
+                    found_path = p
+                    break
+    
+    if not found_path:
+        variant_path = run_dir / selected_variant
+        if variant_path.exists():
+            found_path = variant_path
+        else:
+            for fallback_name in run.get("variants", []):
+                p = run_dir / str(fallback_name)
+                if p.exists():
+                    found_path = p
+                    break
+    
+    if found_path:
+        print(f"[DASH DEBUG] Serving artifact: {found_path}")
+    return found_path
 
 
 def build_terminal_fallback(observer_value: str, run_key: str, variant_name: str, tick: int):
@@ -2241,7 +2261,12 @@ app.layout = dbc.Container(
                         html.Div(
                             id="artifact-root-info",
                             children=f"Artifact Roots: {INDEX.get('artifact_root_count', 0)} | Primary: {INDEX.get('artifact_root') or 'NOT FOUND'}",
-                            style={"color": PALETTE["dim"], "fontSize": "0.74rem", "wordBreak": "break-all", "marginBottom": "8px"},
+                            style={"color": PALETTE["dim"], "fontSize": "0.74rem", "wordBreak": "break-all", "marginBottom": "4px"},
+                        ),
+                        html.Div(
+                            id="physical-path-readout",
+                            children="PHYSICAL PATH: INITIALIZING...",
+                            style={"color": PALETTE["cyan"], "fontSize": "0.68rem", "wordBreak": "break-all", "marginBottom": "8px", "fontWeight": "700"},
                         ),
                         dbc.Button("Reindex", id="reindex-btn", color="info", size="sm", style={"width": "100%", "marginBottom": "6px"}),
                         html.Div(id="reindex-status", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "marginBottom": "8px"}),
@@ -2256,7 +2281,7 @@ app.layout = dbc.Container(
                         dcc.RadioItems(
                             id="view-mode",
                             options=[{"label": "Global", "value": "global"}, {"label": "Observer", "value": "observer"}],
-                            value="observer",
+                            value="global",
                             labelStyle={"display": "inline-block", "marginRight": "10px", "color": PALETTE["text"], "fontSize": "0.8rem"},
                             style={"marginBottom": "6px"},
                         ),
@@ -2264,7 +2289,7 @@ app.layout = dbc.Container(
                         dcc.RadioItems(
                             id="delta-mode",
                             options=[{"label": "Baseline", "value": "baseline"}, {"label": "Observer", "value": "observer"}, {"label": "Delta", "value": "delta"}],
-                            value="delta",
+                            value="baseline",
                             labelStyle={"display": "inline-block", "marginRight": "10px", "color": PALETTE["text"], "fontSize": "0.8rem"},
                             style={"marginBottom": "6px"},
                         ),
@@ -2336,12 +2361,9 @@ app.layout = dbc.Container(
                         html.Div(id="telemetry-3", style={"color": PALETTE["cyan"], "fontWeight": "700", "fontSize": "0.92rem", "marginTop": "4px"}),
                         html.Div(id="telemetry-detail", style={"color": PALETTE["dim"], "fontSize": "0.8rem", "marginTop": "8px"}),
                         html.Hr(style={"borderColor": PALETTE["grid"], "margin": "10px 0"}),
-                        html.Div("Ablation Laboratory", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="ablation-metrics", style={"marginBottom": "8px"}),
-                        html.Div("Type 1 Controls", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="control-metrics", style={"marginBottom": "6px"}),
                         html.Hr(style={"borderColor": PALETTE["grid"], "margin": "10px 0"}),
-                        html.Div("Type 2 Relativity", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="relativity-panel", style={"padding": "8px", "maxHeight": "24vh", "overflowY": "auto", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "6px", "marginBottom": "8px"}),
                         html.Div("Group Path Patterns", style={"color": PALETTE["text"], "fontWeight": "700", "fontSize": "0.84rem", "marginBottom": "4px"}),
                         html.Div(id="group-panel", style={"padding": "8px", "maxHeight": "22vh", "overflowY": "auto", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "6px", "marginBottom": "8px"}),
@@ -2425,6 +2447,8 @@ def refresh_variants(run_key: str, search: Optional[str], current_a: str, curren
         qs = parse_qs((search or "").lstrip("?"))
     except Exception:
         qs = {}
+    embedded_raw = str((qs.get("embedded") or ["0"])[0]).strip().lower()
+    embedded = embedded_raw in {"1", "true", "on", "yes"}
     requested_run = str((qs.get("run_key") or [run_key])[0] or run_key)
     effective_run_key = requested_run if requested_run in INDEX.get("runs", {}) else run_key
     run = INDEX["runs"].get(effective_run_key, {})
@@ -2444,13 +2468,16 @@ def refresh_variants(run_key: str, search: Optional[str], current_a: str, curren
     obs_opts = INDEX["observers_by_run"].get(effective_run_key, [{"label": "Global Mean", "value": "global"}])
     obs_values = [o["value"] for o in obs_opts]
     observer = current_observer if current_observer in obs_values else "global"
-    requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
-    requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
-    observer_from_uid = _observer_value_from_uid(effective_run_key, requested_uid)
-    if observer_from_uid and observer_from_uid in obs_values:
-        observer = observer_from_uid
-    elif requested_observer in obs_values:
-        observer = requested_observer
+    if not embedded:
+        requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
+        requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+        observer_from_uid = _observer_value_from_uid(effective_run_key, requested_uid)
+        if observer_from_uid and observer_from_uid in obs_values:
+            observer = observer_from_uid
+        elif requested_observer in obs_values:
+            observer = requested_observer
+    else:
+        observer = "global"
     return opts, a, opts, b, obs_opts, observer
 
 
@@ -2475,24 +2502,40 @@ def apply_url_state(search: Optional[str], run_options, current_run):
     run_values = [o.get("value") for o in (run_options or []) if isinstance(o, dict)]
     requested_run = str((qs.get("run_key") or [current_run])[0] or current_run)
     run_value = requested_run if requested_run in run_values else current_run
-
-    observer = str((qs.get("observer") or ["global"])[0] or "global")
-    observer_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
-    observer_from_uid = _observer_value_from_uid(run_value, observer_uid)
-    if observer_from_uid:
-        observer = observer_from_uid
-    view_mode = str((qs.get("view_mode") or ["observer"])[0] or "observer").lower()
-    if view_mode not in {"global", "observer"}:
-        view_mode = "observer"
-    compare_raw = str((qs.get("compare") or ["0"])[0]).strip().lower()
-    compare_values = ["on"] if compare_raw in {"1", "true", "on", "yes"} else []
     embedded_raw = str((qs.get("embedded") or ["0"])[0]).strip().lower()
     embedded = embedded_raw in {"1", "true", "on", "yes"}
+
+    observer = "global"
+    if not embedded:
+        observer = str((qs.get("observer") or ["global"])[0] or "global")
+        observer_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+        observer_from_uid = _observer_value_from_uid(run_value, observer_uid)
+        if observer_from_uid:
+            observer = observer_from_uid
+    view_mode = str((qs.get("view_mode") or ["global"])[0] or "global").lower()
+    if view_mode not in {"global", "observer"}:
+        view_mode = "global"
+    compare_raw = str((qs.get("compare") or ["0"])[0]).strip().lower()
+    compare_values = ["on"] if compare_raw in {"1", "true", "on", "yes"} else []
     if embedded:
+        observer = "global"
+        view_mode = "global"
         compare_values = []
-        if observer != "global":
-            view_mode = "observer"
     return run_value, observer, view_mode, compare_values
+
+
+@app.callback(
+    Output("view-mode", "value", allow_duplicate=True),
+    Input("observer-dropdown", "value"),
+    State("view-mode", "value"),
+    prevent_initial_call=True,
+)
+def sync_view_mode_with_observer(observer_value: Optional[str], current_view_mode: Optional[str]):
+    observer_text = str(observer_value or "global").strip()
+    next_view_mode = "global" if observer_text == "global" else "observer"
+    if str(current_view_mode or "").strip().lower() == next_view_mode:
+        return no_update
+    return next_view_mode
 
 
 @app.callback(
@@ -2688,6 +2731,7 @@ def update_gallery_progress(observer_value: str, observer_options):
     Output("artifact-path", "children"),
     Output("run-score", "children"),
     Output("article-metrics", "children"),
+    Output("physical-path-readout", "children"),
     Output("track-readout", "children"),
     Output("track-compare-readout", "children"),
     Output("coverage-readout", "children"),
@@ -2709,13 +2753,13 @@ def update_gallery_progress(observer_value: str, observer_options):
     Output("watermark-overlay", "children"),
     Output("watermark-overlay", "style"),
     Input("observer-dropdown", "value"),
+    Input("view-mode", "value"),
     State("run-dropdown", "value"),
     State("variant-a-dropdown", "value"),
     State("variant-b-dropdown", "value"),
     State("verification-source", "value"),
     State("compare-enabled", "value"),
     State("transition-style", "value"),
-    State("view-mode", "value"),
     State("delta-mode", "value"),
     State("translation-mode", "value"),
     State("failure-overlays", "value"),
@@ -2724,13 +2768,13 @@ def update_gallery_progress(observer_value: str, observer_options):
 )
 def render_dashboard(
     observer_value: str,
+    view_mode: str,
     run_key: str,
     variant_a: str,
     variant_b: str,
     verification_source: str,
     compare_enabled_values: List[str],
     transition_style: str,
-    view_mode: str,
     delta_mode: str,
     translation_mode_values: List[str],
     failure_overlay_values: List[str],
@@ -2808,16 +2852,20 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
     matrix_blob = contract.get("group_matrix", {}) or {}
     groups = matrix_blob.get("groups", []) if isinstance(matrix_blob, dict) else []
     matrix = matrix_blob.get("cost_matrix", []) if isinstance(matrix_blob, dict) else []
+    label_source = str(matrix_blob.get("label_source", "unknown")) if isinstance(matrix_blob, dict) else "unknown"
 
     fig = go.Figure()
-    if not groups or not matrix:
+    def _disabled_figure(title: str, reason: str):
         fig.update_layout(
             template="plotly_dark",
             margin={"l": 30, "r": 10, "t": 30, "b": 30},
-            title="Empathy Gap Matrix (unavailable)",
-            annotations=[{"text": "group_matrix not available", "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5, "showarrow": False}],
+            title=title,
+            annotations=[{"text": reason, "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5, "showarrow": False}],
         )
         return fig
+
+    if not groups or not matrix:
+        return _disabled_figure("Empathy Gap (disabled)", "group_matrix not available")
 
     filtered_idx = list(range(len(groups)))
     if label_values:
@@ -2828,6 +2876,20 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
 
     fg = [groups[i] for i in filtered_idx]
     fm = [[float(matrix[i][j]) for j in filtered_idx] for i in filtered_idx]
+    arr = np.asarray(fm, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        return _disabled_figure("Empathy Gap (disabled)", "group_matrix shape is invalid")
+    off_diag_mask = ~np.eye(arr.shape[0], dtype=bool)
+    off_diag = arr[off_diag_mask]
+    finite_off_diag = off_diag[np.isfinite(off_diag)]
+    if finite_off_diag.size <= 0:
+        return _disabled_figure("Empathy Gap (disabled)", "group_matrix has no finite off-diagonal values")
+    if np.nanmax(finite_off_diag) - np.nanmin(finite_off_diag) <= 1e-9:
+        return _disabled_figure(
+            "Empathy Gap (disabled)",
+            f"uniform off-diagonal costs from {label_source}; panel suppressed because it carries no structure",
+        )
+
     fig.add_trace(
         go.Heatmap(
             z=fm,
@@ -2851,9 +2913,7 @@ def _build_control_panel(ctrl: dict):
     status = str(ctrl.get("status", "MISSING")).upper()
     controls = ctrl.get("controls", {}) if isinstance(ctrl.get("controls"), dict) else {}
     summary = ctrl.get("summary", {}) if isinstance(ctrl.get("summary"), dict) else {}
-    subtitle = (
-        "Type 1 proves the manifold is carrying signal by comparing the real leaf against matched noise baselines."
-    )
+    subtitle = "Type 1 checks whether the real leaf separates cleanly from matched control leaves."
     detail_bits = [
         html.Div(ctrl.get("explanation") or summary.get("interpretation") or ctrl.get("message") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
         html.Div(
@@ -2892,21 +2952,26 @@ def _build_ablation_panel(ab: dict):
     stage_3 = ab.get("stage_3_survival_rate", ab.get("stage_3_nmi"))
     delta_alignment = ab.get("delta_alignment_score", ab.get("delta_nmi"))
     subtitle = "Ablations tell us which pipeline choices preserve structure and which ones flatten or destabilize it."
-    body: List[Any] = [
-        html.Div(ab.get("explanation") or summary.get("interpretation") or ab.get("message") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
-        html.Div(
-            style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
-            children=[
-                _metric_tile("Stage 1 Align", stage_1, stage_map.get("stage_1_alignment_score", stage_map.get("stage_1_nmi"))),
-                _metric_tile("Stage 2 Align", stage_2, stage_map.get("stage_2_alignment_score", stage_map.get("stage_2_nmi"))),
-                _metric_tile("Stage 3 Survival", stage_3, stage_map.get("stage_3_survival_rate", stage_map.get("stage_3_nmi"))),
-                _metric_tile("Delta Align / Retained", f"{_fmt_metric(delta_alignment)} / {_fmt_metric(ab.get('retained_pct'))}%", "Alignment lift vs retained invariants"),
-            ],
-        ),
-        html.Div(f"Source: {ab.get('source', 'NOT FOUND')}", style={"color": PALETTE["dim"], "fontSize": "0.72rem", "wordBreak": "break-all"}),
-    ]
-    if status in {"NO_DATA", "UNAVAILABLE", "MISSING"} and ab.get("message"):
-        body.insert(1, html.Div(f"Why missing: {ab.get('message')}", style={"color": PALETTE["amber"], "fontSize": "0.74rem", "lineHeight": "1.3"}))
+    if status in {"NO_DATA", "UNAVAILABLE", "MISSING"}:
+        body: List[Any] = [
+            html.Div(ab.get("message") or "Ablation flow was not run for this leaf.", style={"color": PALETTE["amber"], "fontSize": "0.76rem", "fontWeight": "600"}),
+            html.Div(ab.get("explanation") or summary.get("interpretation") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
+            html.Div(f"Source: {ab.get('source', 'NOT FOUND')}", style={"color": PALETTE["dim"], "fontSize": "0.72rem", "wordBreak": "break-all"}),
+        ]
+    else:
+        body = [
+            html.Div(ab.get("explanation") or summary.get("interpretation") or ab.get("message") or "", style={"color": PALETTE["dim"], "fontSize": "0.76rem", "lineHeight": "1.35"}),
+            html.Div(
+                style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
+                children=[
+                    _metric_tile("Stage 1 Align", stage_1, stage_map.get("stage_1_alignment_score", stage_map.get("stage_1_nmi"))),
+                    _metric_tile("Stage 2 Align", stage_2, stage_map.get("stage_2_alignment_score", stage_map.get("stage_2_nmi"))),
+                    _metric_tile("Stage 3 Survival", stage_3, stage_map.get("stage_3_survival_rate", stage_map.get("stage_3_nmi"))),
+                    _metric_tile("Delta Align / Retained", f"{_fmt_metric(delta_alignment)} / {_fmt_metric(ab.get('retained_pct'))}%", "Alignment lift vs retained invariants"),
+                ],
+            ),
+            html.Div(f"Source: {ab.get('source', 'NOT FOUND')}", style={"color": PALETTE["dim"], "fontSize": "0.72rem", "wordBreak": "break-all"}),
+        ]
     if ab.get("legacy_mean_variance") is not None:
         body.insert(1, html.Div(f"Legacy variance metric: {ab.get('legacy_mean_variance')}", style={"color": PALETTE["cyan"], "fontSize": "0.74rem"}))
     return _panel_shell("Ablation Laboratory", subtitle, status, body)
@@ -3185,8 +3250,8 @@ def _render_dashboard_impl(
             f"NMI={artifact_metrics.get('synthesis_nmi', run.get('nmi', 'n/a'))} "
             f"| Signal={artifact_metrics.get('spectral_signal', 'n/a')} "
             f"| T3 bonds/cracks={artifact_metrics.get('dirichlet_bonds', 'n/a')}/{artifact_metrics.get('dirichlet_cracks', 'n/a')} "
-            f"| T4 action={artifact_metrics.get('walker_mean_action', 'n/a')} surv={artifact_metrics.get('walker_survival_rate', 'n/a')} "
-            f"| T5 H/P/T/A={artifact_metrics.get('honest_count', 'n/a')}/{artifact_metrics.get('phantom_count', 'n/a')}/{artifact_metrics.get('tautology_count', 'n/a')}/{artifact_metrics.get('anomaly_count', 'n/a')}"
+            f"| T4 work={artifact_metrics.get('walker_mean_action', 'n/a')} closed_loop={artifact_metrics.get('walker_survival_rate', 'n/a')} "
+            f"| T5 terminal_labels H/P/T/A={artifact_metrics.get('honest_count', 'n/a')}/{artifact_metrics.get('phantom_count', 'n/a')}/{artifact_metrics.get('tautology_count', 'n/a')}/{artifact_metrics.get('anomaly_count', 'n/a')}"
         )
     if effective_observer.startswith("article:"):
         observer_state_metrics = contract.get("observer_state", {}).get("metrics", {}) if isinstance(contract.get("observer_state", {}), dict) else {}
@@ -3231,6 +3296,14 @@ def _render_dashboard_impl(
     state = load_verification_state(run_key, verification_source)
     verification_status = str(state.get("verification_status", "UNVERIFIED")).upper()
     global_pass = state.get("global_pass")
+    sanitized_missing_optional = []
+    for item in (missing_optional or []):
+        name = str(item).strip()
+        if name == "verification_summary.csv" and str(state.get("summary_path", "NOT FOUND")) != "NOT FOUND":
+            continue
+        if name == "verification_report.json" and str(state.get("report_path", "NOT FOUND")) != "NOT FOUND":
+            continue
+        sanitized_missing_optional.append(name)
 
     # VALIDATION TYPE 2: Perspective Sensitivity (Divergence Check)
     type2_dissonance = False
@@ -3252,13 +3325,21 @@ def _render_dashboard_impl(
         badge_style = dict(base_badge, color="#FF2A00", border="1px solid #FF2A00", backgroundColor="rgba(255,42,0,0.12)", boxShadow="0 0 12px rgba(255,42,0,0.4)", animation="glitchFlash 0.9s steps(2,end) infinite")
 
     if claims_enabled:
-        t1 = f"System 1: Topologic Integrity | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))} [cite: 2026-02-04]"
-        t2 = f"System 2: Geometric Friction = {state.get('geometric_friction', 0.0):.3f} (broken={state.get('n_broken', 0)}, trapped={state.get('n_trapped', 0)}) [cite: 2026-02-04]"
-        t3 = f"System 2: Survival % = {state.get('survival_pct', 100.0):.2f}% [cite: 2026-02-04]"
+        t1 = f"System 1: Verification gate passed | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))}"
+        t2 = f"System 2: Geometric Friction = {_fmt_metric(state.get('geometric_friction'))} (broken={state.get('n_broken', 0)}, trapped={state.get('n_trapped', 0)})"
+        t3 = f"System 2: Survival % = {_fmt_metric(state.get('survival_pct'))}%"
     elif badge_text == "[UNVERIFIED]":
-        t1 = "System 1: Verification status is UNVERIFIED; provenance contract loaded but claims are not thesis-safe yet."
-        t2 = f"System 2: Geometric Friction = {state.get('geometric_friction', 0.0):.3f} (telemetry available, interpret as unverified)"
-        t3 = f"System 2: Survival % = {state.get('survival_pct', 100.0):.2f}% (telemetry available, interpret as unverified)"
+        t1 = "System 1: Verification bundle is pending; provenance is present but the formal gate has not been finalized for this leaf."
+        t2 = "System 2: Geometric Friction = " + (
+            f"{_fmt_metric(state.get('geometric_friction'))} (telemetry present, interpret as provisional)"
+            if _is_number(state.get("geometric_friction"))
+            else "unavailable (no parsed verification telemetry)"
+        )
+        t3 = "System 2: Survival % = " + (
+            f"{_fmt_metric(state.get('survival_pct'))}% (telemetry present, interpret as provisional)"
+            if _is_number(state.get("survival_pct"))
+            else "unavailable (no parsed verification telemetry)"
+        )
     else:
         t1 = "System 1: Claims disabled (verification/provenance gate not satisfied)"
         t2 = "System 2: Claims disabled (artifact contract incomplete or non-comparable)"
@@ -3267,8 +3348,8 @@ def _render_dashboard_impl(
     detail = f"source={state.get('verification_source')} | verification_summary.csv: {state.get('summary_path')} | verification_report.json: {state.get('report_path')}"
     if missing_required:
         detail += " | missing_required_artifacts=" + ",".join(missing_required)
-    if missing_optional:
-        detail += " | missing_optional_artifacts=" + ",".join(missing_optional[:5])
+    if sanitized_missing_optional:
+        detail += " | missing_optional_artifacts=" + ",".join(sanitized_missing_optional[:5])
     if schema_errors:
         detail += " | schema_errors=" + "; ".join(schema_errors[:3])
     elif contract_errors:
@@ -3304,8 +3385,8 @@ def _render_dashboard_impl(
         hidden_badge_text = "[HIDDEN LABELS MISSING]"
         hidden_badge_style = {"padding": "6px 8px", "borderRadius": "6px", "textAlign": "center", "color": PALETTE["amber"], "border": f"1px solid {PALETTE['amber']}", "backgroundColor": "rgba(255,179,71,0.12)"}
         hidden_detail = "Expected labels/hidden_groups.csv and labels/derived/group_*.json"
-        if missing_optional:
-            hidden_detail += f" | missing_optional_artifacts={','.join(missing_optional)}"
+        if sanitized_missing_optional:
+            hidden_detail += f" | missing_optional_artifacts={','.join(sanitized_missing_optional)}"
 
     relativity_panel = _build_relativity_panel(contract, effective_observer, delta_mode, translation_mode_values or [])
     group_panel = _build_group_panel(contract, label_column, label_values or [])
@@ -3333,11 +3414,14 @@ def _render_dashboard_impl(
         watermark_text = ""
         watermark_style = {"display": "none"}
 
+    physical_path = str(single_view_path.resolve()) if (not compare_enabled and single_view_path) else (f"A: {p_a.resolve() if p_a else 'n/a'} | B: {p_b.resolve() if p_b else 'n/a'}")
+
     return (
         container,
         path_text,
         run_score,
         article_metric_text,
+        f"PHYSICAL PATH: {physical_path}",
         track_readout,
         track_compare_readout,
         coverage_text,
