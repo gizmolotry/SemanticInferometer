@@ -377,6 +377,7 @@ class WaterfallCheckpoint:
         crack_matrix: np.ndarray,
         rupture_pairs: List[Tuple[int, int]],
         dirichlet_fused: Optional[np.ndarray] = None,
+        dirichlet_fused_std: Optional[np.ndarray] = None,
         walker_work: Optional[np.ndarray] = None,
         nmi_score: float = 0.0,
         ari_score: float = 0.0,
@@ -392,6 +393,8 @@ class WaterfallCheckpoint:
         }
         if dirichlet_fused is not None:
             arrays["dirichlet_fused"] = dirichlet_fused
+        if dirichlet_fused_std is not None:
+            arrays["dirichlet_fused_std"] = dirichlet_fused_std
         if walker_work is not None:
             arrays["walker_work"] = walker_work
 

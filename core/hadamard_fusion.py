@@ -74,11 +74,9 @@ class HadamardFusionConfig:
     sigma_conformal: Optional[float] = None  # For final kernel after conformal scaling
 
     # Dark manifold protection
-    dark_manifold_threshold: float = 0.01  # Min row-sum to prevent isolated nodes
-    dark_manifold_rescue: bool = True      # Whether to rescue isolated nodes
-    hadamard_softening: float = field(
-        default_factory=lambda: ThermodynamicConfig().hadamard_floor
-    )  # 0=strict product, 1=max-kernel blend
+    dark_manifold_threshold: float = 0.01  # Min row-sum used only to flag isolated nodes
+    dark_manifold_rescue: bool = False     # Deprecated/no-op under the strict contract
+    hadamard_softening: float = 0.0        # Deprecated/no-op under the strict contract
 
     # Conformal metric parameters
     temperature_scale: float = 1.0         # Scale factor for blinker variance

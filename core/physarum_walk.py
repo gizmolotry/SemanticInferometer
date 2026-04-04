@@ -114,35 +114,6 @@ class WalkerResult:
 class SemanticWalker:
     """
     MCMC walker that explores the bot-weight simplex.
-
-    ASTER v3.2 RIEMANNIAN WEB ROUTER
-    ================================
-    Pure slope/gravity physics. NO WIND.
-
-    The walker feels only the terrain gradient (∇Φ), not an external force.
-    This is the correct physical model: gravity pulls downhill, friction
-    resists motion, but there's no "wind" pushing the walker around.
-
-    Physics Model:
-    - Work integral W = ∫ (1/ρ) ds  (pure terrain friction)
-    - Divergence ratio Δ = W / d_spectral (efficiency metric)
-    - Classification based on Δ: TAUTOLOGY / HONEST / PHANTOM / RUPTURE
-
-    The u_axis from Track 1.5 is used for:
-    - Computing directional energy (projection onto compass)
-    - Starting walkers at opposing poles
-    - NOT as a "wind" force (that was the legacy bug)
-
-    ASTER v3.2 HYSTERESIS (Path Memory):
-    ====================================
-    True ant-colony / pheromone trail logic. Paths that are traversed
-    become easier to traverse again (memory reinforcement). Memory decays
-    over time (the "snow fills back in").
-
-    This creates TIME-DEPENDENT LOGIC:
-    - Return path B→A may have different cost than A→B
-    - Swarms form "Highways" over repeated traversals
-    - Geometric Hysteresis = path history affects future costs
     """
 
     def __init__(
@@ -151,91 +122,363 @@ class SemanticWalker:
         gradients: torch.Tensor,
         rks_basis,
         temperature: float = 0.5,
-        u_axis: Optional[torch.Tensor] = None,
-        anisotropy_strength: float = 2.0,
-        # Hysteresis parameters (ASTER v3.2)
-        enable_hysteresis: bool = True,
-        memory_decay: float = 0.95,
-        reinforcement_rate: float = 0.1,
-        memory_sensitivity: float = 1.0,
-        hysteresis_mode: str = "momentum",
-        hysteresis_lambda: float = 1.0,
-        observer_axis: Optional[torch.Tensor] = None,
-        observer_cost_strength: float = 0.0,
+        track3_density: Optional[torch.Tensor] = None,
+        z_coordinates: Optional[torch.Tensor] = None,
+        metric_stress: Optional[torch.Tensor] = None,
+        article_coords_2d: Optional[torch.Tensor] = None,
         thermo_config: Optional[ThermodynamicConfig] = None,
     ):
-        """
-        Args:
-            embeddings: [8, H] — positions of the 8 bots in embedding space
-            gradients: [8, H] — gradient vectors (deviation from mean)
-            rks_basis: SharedRKSBasis — projector to map trajectory to geometry
-            temperature: Plasticity. Higher = walkers climb walls easier.
-            u_axis: [H] — gauge-fixed compass direction from Track 1.5.
-                   Used for directional energy and pole initialization.
-                   NOT used as wind (legacy bug removed).
-            enable_hysteresis: Enable path memory (ant colony pheromones)
-            memory_decay: How fast memory fades (0.95 = 5% decay per step)
-            reinforcement_rate: How much each traversal reinforces the path
-            memory_sensitivity: How strongly memory affects energy costs
-        """
         self.embeddings = embeddings.float()
         self.gradients = gradients.float()
         self.kernel = rks_basis
         self.T = temperature
         self.n_bots = embeddings.shape[0]
-        self.u_axis = u_axis.float() if u_axis is not None else None
+        self.track3_density = track3_density
+        self.z_coordinates = z_coordinates
+        self.metric_stress = metric_stress
+        self.article_coords_2d = article_coords_2d
         self.thermo_config = thermo_config or ThermodynamicConfig()
-        self.observer_axis = None
-        if observer_axis is not None:
-            observer_axis = observer_axis.float()
-            observer_norm = torch.norm(observer_axis, p=2)
-            if torch.isfinite(observer_norm) and float(observer_norm.item()) > 1e-12:
-                self.observer_axis = observer_axis / observer_norm
-        self.observer_cost_strength = max(0.0, float(observer_cost_strength))
 
-        # =========================================
-        # HYSTERESIS STATE (Path Memory)
-        # =========================================
-        # Per-walker hysteresis memory. Runtime memory is NEVER shared across walkers.
-        # walker_memory_tensor[w, i, j] = accumulated traversal history for walker w
-        # transitioning from bot_i → bot_j along its own trajectory.
-        self.enable_hysteresis = enable_hysteresis
-        self.memory_decay = memory_decay
-        self.reinforcement_rate = reinforcement_rate
-        self.memory_sensitivity = memory_sensitivity
-        mode = str(hysteresis_mode).strip().lower()
-        self.hysteresis_mode = mode if mode in {"momentum", "fatigue"} else "momentum"
-        self.hysteresis_lambda = float(hysteresis_lambda)
+    def select_catalysts(self) -> List[int]:
+        """PHASE 1: POLARITY ANCHOR SELECTION (Non-Maximum Suppression)"""
+        if self.track3_density is None or self.z_coordinates is None or self.article_coords_2d is None:
+            # Fallback if data missing
+            return [0, self.n_bots // 2, self.n_bots - 1]
 
-        # Aggregate compatibility snapshot for downstream visualization/export.
-        self.aggregate_memory_matrix = torch.zeros(self.n_bots, self.n_bots)
-        self.walker_memory_tensor: Optional[torch.Tensor] = None
+        influence = torch.abs(self.z_coordinates) * self.track3_density
+        catalysts = []
+        influence_work = influence.clone()
+        
+        # Calculate max_xy_spread
+        max_xy = self.article_coords_2d.max(dim=0).values
+        min_xy = self.article_coords_2d.min(dim=0).values
+        max_xy_spread = torch.norm(max_xy - min_xy)
+        exclusion_radius = max_xy_spread * 0.25
 
-        # Track hysteresis statistics
-        self.hysteresis_stats = {
-            "total_reinforcements": 0,
-            "max_rut_depth": 0.0,
-            "highway_count": 0,  # Paths with memory > threshold
-        }
+        for _ in range(3):
+            idx = int(torch.argmax(influence_work).item())
+            catalysts.append(idx)
+            
+            # Suppression
+            cat_pos = self.article_coords_2d[idx]
+            dists = torch.norm(self.article_coords_2d - cat_pos, p=2, dim=1)
+            influence_work[dists < exclusion_radius] = 0.0
+            
+        return catalysts
 
-        # DIVERGENCE RATIO (Δ) THRESHOLDS for state classification
-        # ASTER v3.2 PATH SYSTEM: Pure slope physics, no wind
-        #
-        # Δ = W_actual / d_spectral (terrain-invariant efficiency)
-        #
-        # The 4-State Classification:
-        # - TAUTOLOGY: Δ < 1.0 or d_spectral ≈ 0 (null path, no displacement)
-        # - HONEST: 1.0 ≤ Δ < 15.0 (direct geodesic, efficient)
-        # - PHANTOM: 15.0 ≤ Δ < 25.0 (high-energy loop, spin)
-        # - RUPTURE: Δ ≥ 25.0 (impossible, topological barrier)
-        #
-        # Calibrated for W = ∫ (1/ρ) ds in 256-1536D embedding space.
-        self.tautology_threshold = self.thermo_config.tautology_work_threshold
-        self.honest_threshold = 15.0     # Below = honest (efficient)
-        self.rupture_threshold = 25.0    # Above = rupture (blocked)
+    def run_stress_triggered_cyclic_walk(
+        self,
+        n_walkers_per_catalyst: int = 1000,
+        max_steps: int = 1000,
+        gamma: float = 5.0,
+        output_dir: Optional[str] = None
+    ):
+        """PHASE 2: THE COGNITIVE HORIZON (Stress-Triggered Walkers)"""
+        catalysts_indices = self.select_catalysts()
+        all_loop_paths = []
+        all_loop_frequencies = []
+        
+        # 2. Dynamic Threshold: 90th percentile of stress
+        if self.metric_stress is not None:
+            s_max = float(torch.quantile(self.metric_stress, 0.90).item())
+        else:
+            s_max = 1.0
 
-        # Spectral distance threshold for tautology detection
-        self.min_spectral_distance = self.thermo_config.tautology_disp_threshold
+        for cat_idx in catalysts_indices:
+            print(f"[PHYSICS] Spawning walkers at catalyst {cat_idx}...")
+            # Origin weights (one-hot for the catalyst article is not quite right since we work in bot-simplex,
+            # but the directive implies articles are the anchors. In this architecture, 
+            # articles have fixed bot-weights. Let's find the weights for the catalyst article.)
+            # Assuming we have access to the full weights matrix for all articles.
+            # If not provided, we'll assume we can use the bot positions directly if n_bots == n_articles.
+            # But usually n_bots=8. Let's assume we have article_weights [N, 8].
+            
+            # For this implementation, we will use the article's position in 2D space as the target A.
+            anchor_pos_2d = self.article_coords_2d[cat_idx]
+            
+            # We track walkers in 2D space for simplicity of the "retreat" logic
+            # but the transition probabilities still use the metric gradient.
+            
+            success_paths = []
+            
+            for _ in range(n_walkers_per_catalyst):
+                curr_idx = cat_idx
+                path = [curr_idx]
+                accumulated_stress = 0.0
+                state = 0 # 0=Exploration, 1=Retreat
+                
+                for t in range(max_steps):
+                    # Current node stress
+                    node_stress = float(self.metric_stress[curr_idx]) if self.metric_stress is not None else 0.1
+                    accumulated_stress += node_stress
+                    
+                    # State Transition
+                    if state == 0 and accumulated_stress >= s_max:
+                        state = 1
+                    
+                    # Find Neighbors (using article_coords_2d proximity)
+                    # In a real graph we'd have edges. Here we'll sample from nearest neighbors.
+                    curr_pos = self.article_coords_2d[curr_idx]
+                    dists = torch.norm(self.article_coords_2d - curr_pos, p=2, dim=1)
+                    # Get indices of 10 nearest neighbors (excluding self)
+                    _, neighbors = torch.topk(dists, k=11, largest=False)
+                    neighbors = neighbors[1:] # Remove self
+                    
+                    neighbor_probs = []
+                    for nb in neighbors:
+                        # P(i -> j)
+                        # Gradient preference: favor lower Z if it's a "valley" or follow user descent
+                        # We'll use the metric stress gradient if available, or just Z gradient
+                        dz = float(self.z_coordinates[nb] - self.z_coordinates[curr_idx])
+                        
+                        # Descent preference
+                        prob = np.exp(-dz)
+                        
+                        if state == 1:
+                            # Retreat: Homing penalty exp(-gamma * distance(j, A))
+                            dist_to_anchor = torch.norm(self.article_coords_2d[nb] - anchor_pos_2d)
+                            prob *= torch.exp(-gamma * dist_to_anchor).item()
+                            
+                        # Avoid Void (NaN Z)
+                        if torch.isnan(self.z_coordinates[nb]):
+                            prob = 0.0
+                            
+                        neighbor_probs.append(prob)
+                    
+                    neighbor_probs = np.array(neighbor_probs)
+                    if neighbor_probs.sum() > 0:
+                        neighbor_probs /= neighbor_probs.sum()
+                        next_idx = int(np.random.choice(neighbors.cpu().numpy(), p=neighbor_probs))
+                        curr_idx = next_idx
+                        path.append(curr_idx)
+                    else:
+                        break # Stalled
+                        
+                    # Check if returned to A
+                    if state == 1 and curr_idx == cat_idx:
+                        success_paths.append(path)
+                        break
+            
+            # Phase 3: Aggregation for this catalyst
+            if success_paths:
+                unique_paths = {}
+                for p in success_paths:
+                    p_tuple = tuple(p)
+                    unique_paths[p_tuple] = unique_paths.get(p_tuple, 0) + 1
+                
+                max_freq = max(unique_paths.values())
+                for p, freq in unique_paths.items():
+                    # Convert article indices to XYZ coordinates
+                    p_xyz = []
+                    for idx in p:
+                        x, y = self.article_coords_2d[idx].tolist()
+                        z = self.z_coordinates[idx].item()
+                        p_xyz.append([x, y, z])
+                    
+                    all_loop_paths.append(np.array(p_xyz))
+                    all_loop_frequencies.append(freq / max_freq)
+
+        # Final Export
+        if output_dir and all_loop_paths:
+            import os
+            catalysts_xyz = []
+            for idx in catalysts_indices:
+                x, y = self.article_coords_2d[idx].tolist()
+                z = self.z_coordinates[idx].item()
+                catalysts_xyz.append([x, y, z])
+                
+            np.savez(
+                os.path.join(output_dir, "cyclic_paths.npz"),
+                path_xyz=np.array(all_loop_paths, dtype=object),
+                frequencies=np.array(all_loop_frequencies),
+                catalysts_xyz=np.array(catalysts_xyz)
+            )
+            print(f"[PHYSICS] Exported {len(all_loop_paths)} cyclic loops to cyclic_paths.npz")
+
+    def select_catalysts(self) -> List[int]:
+        """
+        PHASE 1: POLARITY ANCHOR SELECTION (Non-Maximum Suppression)
+        Algorithmically find 3 spatially distinct "Catalyst" articles to serve as origins.
+        """
+        if self.track3_density is None or self.z_coordinates is None or self.article_coords_2d is None:
+            # Fallback if essential T3/Geometry data is missing
+            return [0, self.n_bots // 2, self.n_bots - 1]
+
+        # 2. Calculate Influence: influence = |z| * Track3_density
+        influence = torch.abs(self.z_coordinates) * self.track3_density
+        catalysts = []
+        influence_work = influence.clone()
+        
+        # 3. NMS Loop
+        # Calculate max_xy_spread for exclusion radius
+        max_xy = self.article_coords_2d.max(dim=0).values
+        min_xy = self.article_coords_2d.min(dim=0).values
+        max_xy_spread = torch.norm(max_xy - min_xy)
+        exclusion_radius = max_xy_spread * 0.25
+
+        for _ in range(3):
+            # a) Find max influence
+            idx = int(torch.argmax(influence_work).item())
+            catalysts.append(idx)
+            
+            # b) Calculate 2D Euclidean distance to all other articles
+            cat_pos = self.article_coords_2d[idx]
+            dists = torch.norm(self.article_coords_2d - cat_pos, p=2, dim=1)
+            
+            # c) Suppression: exclusion_radius = max_xy_spread * 0.25
+            influence_work[dists < exclusion_radius] = 0.0
+            
+        return catalysts
+
+    def run_stress_triggered_cyclic_walk(
+        self,
+        n_walkers_per_catalyst: int = 1000,
+        max_steps: int = 1000,
+        gamma: float = 5.0,
+        output_dir: Optional[str] = None
+    ):
+        """
+        PHASE 2: THE COGNITIVE HORIZON (Stress-Triggered Walkers)
+        Implements tethered cyclic walk with stress-gated state machine.
+        """
+        catalysts_indices = self.select_catalysts()
+        all_loop_paths = []
+        all_loop_frequencies = []
+        
+        # 2. Dynamic Threshold: S_max = 90th percentile of metric stress
+        if self.metric_stress is not None:
+            s_max = float(torch.quantile(self.metric_stress, 0.90).item())
+        else:
+            s_max = 1.0
+        print(f"[PHYSICS] Cognitive Horizon (S_max): {s_max:.4f}")
+
+        for cat_idx in catalysts_indices:
+            print(f"[PHYSICS] Spawning {n_walkers_per_catalyst} walkers at catalyst {cat_idx}...")
+            anchor_pos_2d = self.article_coords_2d[cat_idx]
+            success_paths = []
+            
+            for w_idx in range(n_walkers_per_catalyst):
+                curr_idx = cat_idx
+                path = [curr_idx]
+                accumulated_stress = 0.0
+                state = 0 # 0=Exploration, 1=Retreat
+                
+                for t in range(max_steps):
+                    # Update accumulated_stress += current_node_stress
+                    node_stress = float(self.metric_stress[curr_idx]) if self.metric_stress is not None else 0.1
+                    accumulated_stress += node_stress
+                    
+                    # State Transition: If accumulated_stress >= S_max, move to Retreat
+                    if state == 0 and accumulated_stress >= s_max:
+                        state = 1
+                    
+                    # Transition Probabilities P(i -> j)
+                    curr_pos = self.article_coords_2d[curr_idx]
+                    # Sample neighbors based on 2D proximity
+                    dists = torch.norm(self.article_coords_2d - curr_pos, p=2, dim=1)
+                    _, neighbors = torch.topk(dists, k=11, largest=False)
+                    neighbors = neighbors[1:] # Remove self
+                    
+                    neighbor_probs = []
+                    for nb in neighbors:
+                        # Favor moving down the metric gradient (using Z as proxy for potential)
+                        dz = float(self.z_coordinates[nb] - self.z_coordinates[curr_idx])
+                        prob = np.exp(-dz)
+                        
+                        if state == 1:
+                            # Retreat: Severe homing penalty exp(-gamma * distance(j, A))
+                            dist_to_anchor = torch.norm(self.article_coords_2d[nb] - anchor_pos_2d)
+                            prob *= torch.exp(-gamma * dist_to_anchor).item()
+                            
+                        # Avoid Void (NaN Z)
+                        if torch.isnan(self.z_coordinates[nb]):
+                            prob = 0.0
+                            
+                        neighbor_probs.append(prob)
+                    
+                    neighbor_probs = np.array(neighbor_probs)
+                    if neighbor_probs.sum() > 0:
+                        neighbor_probs /= neighbor_probs.sum()
+                        next_idx = int(np.random.choice(neighbors.cpu().numpy(), p=neighbor_probs))
+                        curr_idx = next_idx
+                        path.append(curr_idx)
+                    else:
+                        break # Stalled
+                        
+                    # SUCCESS: Returned to Catalyst A
+                    if state == 1 and curr_idx == cat_idx:
+                        success_paths.append(path)
+                        break
+            
+            # PHASE 3: AGGREGATION AND EXPORT
+            if success_paths:
+                # Filter: Success paths are already those that returned
+                # Frequency Count
+                unique_paths = {}
+                for p in success_paths:
+                    p_tuple = tuple(p)
+                    unique_paths[p_tuple] = unique_paths.get(p_tuple, 0) + 1
+                
+                max_freq = max(unique_paths.values())
+                for p, freq in unique_paths.items():
+                    # Convert article indices to XYZ coordinates for export
+                    p_xyz = []
+                    for idx in p:
+                        x, y = self.article_coords_2d[idx].tolist()
+                        z = self.z_coordinates[idx].item()
+                        p_xyz.append([x, y, z])
+                    
+                    all_loop_paths.append(np.array(p_xyz))
+                    all_loop_frequencies.append(freq / max_freq)
+
+        # Final .npz Export
+        if output_dir and all_loop_paths:
+            import os
+            catalysts_xyz = []
+            for idx in catalysts_indices:
+                x, y = self.article_coords_2d[idx].tolist()
+                z = self.z_coordinates[idx].item()
+                catalysts_xyz.append([x, y, z])
+                
+            export_path = os.path.join(output_dir, "cyclic_paths.npz")
+            np.savez(
+                export_path,
+                path_xyz=np.array(all_loop_paths, dtype=object),
+                frequencies=np.array(all_loop_frequencies),
+                catalysts_xyz=np.array(catalysts_xyz)
+            )
+            print(f"[PHYSICS] Exported {len(all_loop_paths)} cyclic loops to {export_path}")
+
+def run_cyclic_physarum_ablation(
+    embeddings: torch.Tensor,
+    rks_basis,
+    track3_density: torch.Tensor,
+    z_coordinates: torch.Tensor,
+    metric_stress: torch.Tensor,
+    article_coords_2d: torch.Tensor,
+    output_dir: str,
+    n_walkers: int = 1000,
+    max_steps: int = 1000,
+):
+    """Entry point to execute the STRESS-TRIGGERED CYCLIC MCMC override."""
+    # bot_grads not strictly needed for the article-graph cyclic walk but kept for class init
+    bot_grads = torch.zeros_like(embeddings)
+    
+    walker = SemanticWalker(
+        embeddings=embeddings,
+        gradients=bot_grads,
+        rks_basis=rks_basis,
+        track3_density=track3_density,
+        z_coordinates=z_coordinates,
+        metric_stress=metric_stress,
+        article_coords_2d=article_coords_2d
+    )
+    
+    walker.run_stress_triggered_cyclic_walk(
+        n_walkers_per_catalyst=n_walkers,
+        max_steps=max_steps,
+        output_dir=output_dir
+    )
 
     def _compute_energy(self, weights: torch.Tensor) -> torch.Tensor:
         """

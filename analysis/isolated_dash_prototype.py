@@ -228,6 +228,21 @@ def _verdict_counts_from_payload(path: Optional[Path]) -> Dict[str, int]:
     return counts
 
 
+def _has_canonical_t3_payload(run_dir: Optional[Path]) -> bool:
+    if not run_dir or not run_dir.exists():
+        return False
+    if (run_dir / "dirichlet_fused_std.npy").exists():
+        return True
+    checkpoint_t3 = run_dir / "checkpoints" / "batch" / "T3_topology.npz"
+    if checkpoint_t3.exists():
+        try:
+            with np.load(checkpoint_t3) as payload:
+                return "dirichlet_fused_std" in payload.files
+        except Exception:
+            return False
+    return False
+
+
 def _aggregate_hott_proofs(path: Optional[Path]) -> dict:
     if not path or not path.exists():
         return {}
@@ -1698,11 +1713,18 @@ def _compute_track_snapshot(
     if _is_number(artifact_metrics.get("spectral_signal")):
         snapshot["T1.5"]["signal"] = float(artifact_metrics.get("spectral_signal"))
     snapshot["T2"] = _base_track("T2")
+    t3_canonical = _has_canonical_t3_payload(run_dir)
     snapshot["T3"] = _base_track("T3")
-    if _is_number(artifact_metrics.get("dirichlet_bonds")):
-        snapshot["T3"]["bonds"] = int(float(artifact_metrics.get("dirichlet_bonds")))
-    if _is_number(artifact_metrics.get("dirichlet_cracks")):
-        snapshot["T3"]["cracks"] = int(float(artifact_metrics.get("dirichlet_cracks")))
+    if not t3_canonical:
+        snapshot["T3"]["status"] = "missing"
+        snapshot["T3"]["source"] = "missing"
+        snapshot["T3"]["nmi"] = None
+        snapshot["T3"]["ari"] = None
+    else:
+        if _is_number(artifact_metrics.get("dirichlet_bonds")):
+            snapshot["T3"]["bonds"] = int(float(artifact_metrics.get("dirichlet_bonds")))
+        if _is_number(artifact_metrics.get("dirichlet_cracks")):
+            snapshot["T3"]["cracks"] = int(float(artifact_metrics.get("dirichlet_cracks")))
 
     t4_exists = bool(run_dir and ((run_dir / "walker_paths.npz").exists() or (run_dir / "walker_states.json").exists() or (run_dir / "walker_work_integrals.npy").exists()))
     t4_has_metrics = _is_number(artifact_metrics.get("walker_mean_action")) or _is_number(artifact_metrics.get("walker_survival_rate"))

@@ -441,8 +441,8 @@ class PhaseSpaceIntegrator:
 
                 hf_config = HadamardFusionConfig(
                     output_dim=t2.shape[-1],  # Match hologram dimension
-                    dark_manifold_rescue=True,
-                    hadamard_softening=thermo_config.hadamard_floor,
+                    dark_manifold_rescue=False,
+                    hadamard_softening=0.0,
                     kernel_floor=thermo_config.hadamard_floor,
                 )
 

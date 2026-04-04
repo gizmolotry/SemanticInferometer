@@ -1686,6 +1686,7 @@ def render_terrain_surface(
     rupture_tear_radius_scale: float = 0.02,
     terrain_support_xy: Optional[np.ndarray] = None,
     terrain_geometry_xyz: Optional[np.ndarray] = None,
+    apply_track3_void_mask: bool = False,
 ) -> Tuple[Optional[Any], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     ASTER v3.2 BI-AXIAL TERRAIN SURFACE
@@ -1864,7 +1865,7 @@ def render_terrain_surface(
             
             # SYSTEM INJECTION: TRACK 3 DIRICHLET MASKING
             try:
-                if terrain_density is not None:
+                if apply_track3_void_mask and terrain_density is not None:
                     # Interpolate T3 density across the grid
                     T3_grid = _griddata_cubic_with_nearest(terrain_density, fallback_value=0.0)
                     
@@ -1875,7 +1876,7 @@ def render_terrain_surface(
                     void_mask = (nn_dist > void_threshold) | (T3_grid < t3_threshold)
                     print(f"[MONOLITH VIZ] Track 3 Dirichlet fusion applied to Void Mask. T3 threshold: {t3_threshold:.4f}")
                 else:
-                    raise ValueError("terrain_density not provided")
+                    raise ValueError("canonical Track 3 density not provided")
             except Exception as e:
                 # Fallback to pure physical distance if T3 fails to load
                 void_mask = nn_dist > void_threshold
@@ -5035,8 +5036,10 @@ def create_monolith_cockpit(
     is_fog = np.zeros(n_articles, dtype=bool)
     is_bond = np.zeros(n_articles, dtype=bool)
     atmospheric_states = ['HAZE'] * n_articles
-    if exp.dirichlet_fused_std is not None:
-        blinker_magnitude = np.linalg.norm(exp.dirichlet_fused_std, axis=1)
+    canonical_t3_available = exp.dirichlet_fused_std is not None or exp.cp_t3_blinker is not None
+    canonical_t3_density = exp.dirichlet_fused_std if exp.dirichlet_fused_std is not None else exp.cp_t3_blinker
+    if canonical_t3_density is not None:
+        blinker_magnitude = np.linalg.norm(canonical_t3_density, axis=1)
         fog_intensity, is_fog, is_bond = compute_fog_intensity(blinker_magnitude)
         atmospheric_states = classify_atmospheric_state(blinker_magnitude)
 
@@ -6046,6 +6049,7 @@ def create_monolith_cockpit(
             terrain_density=terrain_density,
             terrain_stress=terrain_stress,
             terrain_stress_geometry=terrain_stress_for_geometry,
+            apply_track3_void_mask=canonical_t3_available,
             use_manifold_colormap=True,
             global_density_median=global_density_median,
             global_stress_median=global_stress_median,
@@ -6187,7 +6191,7 @@ def create_monolith_cockpit(
 
 
     # Layer 2: Phantom Paths (Track 5)
-    show_global_paths = os.environ.get("MONOLITH_SHOW_GLOBAL_PATHS", "1").strip() == "1"
+    show_global_paths = os.environ.get("MONOLITH_SHOW_GLOBAL_PATHS", "0").strip() == "1"
     phantom_path_policy = os.environ.get("MONOLITH_PHANTOM_PATH_POLICY", "ranked").strip().lower()
     try:
         max_phantom_ribbons = int(os.environ.get("MONOLITH_MAX_PHANTOM_RIBBONS", "12").strip())
