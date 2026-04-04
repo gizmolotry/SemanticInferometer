@@ -4915,7 +4915,7 @@ def create_monolith_cockpit(
     show_terrain: bool = True,
     show_fog: bool = True,
     show_walkers: bool = True,
-    show_phantom_paths: bool = True,
+    show_phantom_paths: bool = False,
     show_hott: bool = True,
     show_spectral_axis: bool = True,
     strict_validation: bool = False,
@@ -7349,7 +7349,7 @@ def create_monolith_cockpit(
                 <div class="ep-row"><span class="k">Stability:</span> <span class="v">{stability_text}</span></div>
                 <div class="ep-row"><span class="k">Signal:</span> <span class="v">{mean_signal:.3f}</span></div>
                 <div class="ep-row"><span class="k">Track 4 Survival:</span> <span class="v">{survival_rate * 100.0:.1f}%</span></div>
-                <div class="ep-row"><span class="k">Article Labels:</span> <span class="v">{n_honest} H / {n_phantoms} P / {n_tautology} T</span></div>
+                <div class="ep-row"><span class="k">Terminal Labels:</span> <span class="v">{n_honest} H / {n_phantoms} P / {n_tautology} T</span></div>
                 <div class="ep-row"><span class="k">Anomalies:</span> <span class="v">{n_anomalies}</span></div>
                 <div class="ep-row"><span class="k">Synthesis NMI:</span> <span class="v">{f"{effective_synthesis_nmi:.3f}" if synthesis_nmi_valid else "unavailable"}</span></div>
             </div>
@@ -7990,7 +7990,7 @@ def create_monolith_cockpit(
             if (mode === 'synthesis') {{
                 var showTerrain = !(document.getElementById('toggle-terrain') && !document.getElementById('toggle-terrain').checked);
                 var showArticles = !(document.getElementById('toggle-articles') && !document.getElementById('toggle-articles').checked);
-                var showPhantom = !!(document.getElementById('toggle-phantom-ribbons') ? document.getElementById('toggle-phantom-ribbons').checked : true);
+                var showPhantom = !!(document.getElementById('toggle-phantom-ribbons') ? document.getElementById('toggle-phantom-ribbons').checked : false);
                 var showHonest = !!(document.getElementById('toggle-honest-ribbons') ? document.getElementById('toggle-honest-ribbons').checked : false);
                 var showTautology = !!(document.getElementById('toggle-tautology-ribbons') ? document.getElementById('toggle-tautology-ribbons').checked : false);
                 var showFlares = !!(document.getElementById('toggle-shear-flares') ? document.getElementById('toggle-shear-flares').checked : true);
