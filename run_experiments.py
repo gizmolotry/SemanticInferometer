@@ -1,0 +1,1468 @@
+"""
+Belief Transformer Experimental Runner - COMPLETE VERSION
+
+Supports:
+- Multiple experiment modes (standard, enhanced, shared_pca, multi_kernel, etc.)
+- Real corpus, temporal batches, AND control corpora (NEW!)
+- Multi-kernel experiments  
+- Sigma/alpha sweeps
+- Batch temporal processing
+
+Usage:
+    # Real corpus
+    python run_experiments.py --corpus real --mode enhanced --seeds 42 43 44
+    
+    # Control corpora (NEW!)
+    python run_experiments.py --corpus control_constant --mode enhanced --seeds 42 43 44
+    python run_experiments.py --corpus control_shuffled --mode enhanced --seeds 42 43 44
+    python run_experiments.py --corpus control_random --mode enhanced --seeds 42 43 44
+    
+    # Temporal batches
+    python run_experiments.py --corpus temporal --mode enhanced --seeds 42 43 --batch-temporal
+    
+    # Legacy control (backward compatible)
+    python run_experiments.py --corpus control --mode enhanced --seeds 42 43 44
+"""
+
+# ============================================================================
+# WINDOWS UNICODE FIX - Must be before all other imports
+# ============================================================================
+import sys
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# ============================================================================
+
+from pathlib import Path
+import json
+import argparse, os
+from datetime import datetime
+import subprocess
+import torch
+import hashlib
+
+from core.data_utils import extract_article_text
+from core.canonical_ids import assign_canonical_uids
+
+# Parsed CLI args (set in main)
+args = None
+
+# Project root
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "outputs"
+
+from core.complete_pipeline import run_multi_observer_experiment
+from core.pipeline_config import PipelineRuntimeConfig
+
+
+# =========================================================================
+# EXPERIMENT CONFIGURATIONS
+# =========================================================================
+
+EXPERIMENT_MODES = {
+    'standard': {
+        'name': 'Standard Mode',
+        'description': 'Basic pipeline (no contrastive, no PCA)',
+        'use_contrastive': False,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf'
+    },
+    
+    'contrastive': {
+        'name': 'Contrastive Only',
+        'description': 'Contrastive NLI features only',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf'
+    },
+    
+    'pca': {
+        'name': 'PCA Removal Only',
+        'description': 'PCA topic removal only',
+        'use_contrastive': False,
+        'use_pca_removal': True,
+        'shared_pca': False,
+        'kernel_type': 'rbf'
+    },
+    
+    'enhanced': {
+        'name': 'Enhanced Mode',
+        'description': 'Contrastive NLI + PCA removal (original)',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': False,
+        'kernel_type': 'rbf'
+    },
+    
+    'shared_pca': {
+        'name': 'Shared PCA Control',
+        'description': 'Tests if observer variance is real vs PCA artifact',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'kernel_type': 'rbf'
+    },
+    
+    'multi_kernel': {
+        'name': 'Multi-Kernel Observers',
+        'description': 'Different kernels = genuinely different observers',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'kernel_types': ['rbf', 'laplacian', 'rq', 'imq'],
+        'seed': 42
+    },
+    
+    'sigma_sweep': {
+        'name': 'Kernel Bandwidth Sweep',
+        'description': 'Different sigma values = observers with different scales',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'kernel_type': 'rbf',
+        'sigmas': [0.3, 0.6, 0.9, 1.2, 1.5],
+        'seed': 42
+    },
+    
+    'rq_sweep': {
+        'name': 'Rational Quadratic alpha Sweep',
+        'description': 'Different smoothness parameters',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'kernel_type': 'rq',
+        'alphas': [0.5, 1.0, 2.0, 5.0],
+        'sigma': 0.6,
+        'seed': 42
+    },
+    
+    'laplacian': {
+        'name': 'Laplacian Kernel',
+        'description': 'Sharp, local kernel (better for clusters)',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'kernel_type': 'laplacian'
+    },
+    
+    'framing_kernels': {
+        'name': 'Multi-Kernel Per Framing',
+        'description': 'Different kernel for each of 8 framings (maintains structure)',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'use_multi_framing_rks': True,
+        'kernel_types_per_framing': ['rbf', 'laplacian', 'rq', 'imq', 'matern', 'rbf', 'laplacian', 'rq']
+    },
+    
+    'framing_kernels_uniform': {
+        'name': 'Same Kernel All Framings',
+        'description': 'All framings use same kernel (baseline for framing_kernels)',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'use_multi_framing_rks': True,
+        'kernel_type': 'rbf'
+    },
+    
+    'minimal': {
+        'name': 'Minimal Architecture',
+        'description': 'NLI -> RKS -> Attention (no GRU)',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'use_gru': False,
+        'kernel_type': 'rbf'
+    },
+    
+    'no_gru': {
+        'name': 'No Temporal GRU',
+        'description': 'Tests if temporal processing affects variance',
+        'use_contrastive': True,
+        'use_pca_removal': True,
+        'shared_pca': True,
+        'use_gru': False,
+        'kernel_type': 'rbf'
+    },
+    
+    'cls_logits': {
+        'name': 'CLS+Logits Stacking',
+        'description': 'Full architecture with CLS tokens and logits stacking (8192D)',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf',
+        'use_cls_tokens': True,
+        'use_attention': True,
+        'use_dirichlet_fusion': True,
+        'dirichlet_alpha': 1.0,
+        'dirichlet_n_observers': 50,
+        'projection_dim': 256,
+        'apply_pca_to_cls': True,
+        'normalize_before_projection': True,
+    },
+    
+    'cls_logits_no_pca': {
+        'name': 'CLS+Logits (No PCA)',
+        'description': 'CLS stacking without PCA topic removal',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf',
+        'use_cls_tokens': True,
+        'projection_dim': 256,
+        'apply_pca_to_cls': False,
+        'normalize_before_projection': True,
+    },
+    
+    'cls_logits_paragraph': {
+        'name': 'CLS+Logits Paragraph-Aware',
+        'description': 'CLS stacking with paragraph-aware NLI extraction',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf',
+        'use_cls_tokens': True,
+        'projection_dim': 256,
+        'apply_pca_to_cls': True,
+        'paragraph_aware': True,
+        'paragraph_weights': [0.5, 0.3, 0.2],
+        'normalize_before_projection': True,
+    },
+    
+    # =========================================================================
+    # NEW MODES (Pipeline Pivot)
+    # =========================================================================
+    
+    'unified': {
+        'name': 'Unified Pipeline (Default)',
+        'description': 'Single inference: raw logits + CLS Dirichlet fusion + optional head recording',
+        'use_unified_pipeline': True,
+        'extract_logits': True,
+        'extract_cls': True,
+        'record_heads': False,  # Set True for diagnostics
+        'dirichlet_alpha': 1.0,
+        'dirichlet_n_observers': 50,
+        'dirichlet_rks_dim': 2048,
+    },
+    
+    'unified_with_heads': {
+        'name': 'Unified + Head Recording',
+        'description': 'Full unified pipeline with attention head diagnostics',
+        'use_unified_pipeline': True,
+        'extract_logits': True,
+        'extract_cls': True,
+        'record_heads': True,
+        'dirichlet_alpha': 1.0,
+        'dirichlet_n_observers': 50,
+        'dirichlet_rks_dim': 2048,
+    },
+    
+    'dirichlet': {
+        'name': 'Dirichlet Observer Fusion',
+        'description': 'Observers are Dirichlet-weighted mixtures of bot CLS embeddings',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf',
+        'use_cls_tokens': True,
+        'use_dirichlet_fusion': True,
+        'dirichlet_alpha': 1.0,
+        'dirichlet_n_observers': 50,
+    },
+    
+    'logits_raw': {
+        'name': 'Raw Logits (No Kernel)',
+        'description': 'Logits as raw 24D coordinates - no RKS expansion',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'use_rks': False,  # KEY: no kernel expansion
+        'use_gru': False,
+        'kernel_type': None,
+    },
+    
+    'cls_dirichlet': {
+        'name': 'CLS with Dirichlet Fusion',
+        'description': 'CLS embeddings fused via Dirichlet observers (full pipeline)',
+        'use_contrastive': True,
+        'use_pca_removal': False,
+        'shared_pca': False,
+        'kernel_type': 'rbf',
+        'use_cls_tokens': True,
+        'use_dirichlet_fusion': True,
+        'dirichlet_alpha': 1.0,
+        'dirichlet_n_observers': 50,
+        'run_dirichlet_controls': True,
+    },
+}
+
+
+# =========================================================================
+# HELPER FUNCTIONS
+# =========================================================================
+
+def load_articles(filepath):
+    """Load articles from JSONL file"""
+    if not Path(filepath).exists():
+        raise FileNotFoundError(f"Article file not found: {filepath}")
+    
+    articles = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            articles.append(json.loads(line))
+
+    # Front-load canonical IDs so every downstream path starts with strict bt_uid keys.
+    articles, _uid_stats = assign_canonical_uids(articles)
+    return articles
+
+
+def load_corpus(corpus_type, limit=None):
+    """
+    Load corpus based on type - UPDATED with path support!
+    """
+    # Support for custom corpus paths (Direct Injection)
+    if os.path.exists(corpus_type):
+        articles = load_articles(Path(corpus_type))
+        if limit:
+            articles = articles[:limit]
+        return articles
+
+    if corpus_type == 'control_constant':
+        corpus_file = DATA_DIR / 'control_constant.jsonl'
+        articles = load_articles(corpus_file)
+    elif corpus_type == 'control_shuffled':
+        corpus_file = DATA_DIR / 'control_shuffled.jsonl'
+        articles = load_articles(corpus_file)
+    elif corpus_type == 'control_random':
+        corpus_file = DATA_DIR / 'control_random.jsonl'
+        articles = load_articles(corpus_file)
+    elif corpus_type == 'real':
+        corpus_file = DATA_DIR / 'real_corpus.jsonl'
+        articles = load_articles(corpus_file)
+    elif corpus_type == 'temporal':
+        # Temporal is handled separately in main loop usually
+        raise ValueError("Temporal corpus should be handled via --batch-temporal")
+    else:
+        raise ValueError(f"Unknown corpus type: {corpus_type}")
+
+    if limit:
+        articles = articles[:limit]
+    return articles
+
+
+def print_experiment_header(mode_name, mode_config):
+    """Print experiment header"""
+    print("\n" + "="*70)
+    print(f"EXPERIMENT: {mode_name}")
+    print("="*70)
+    print(f"Description: {mode_config['description']}")
+    print(f"Contrastive: {mode_config.get('use_contrastive', False)}")
+    print(f"PCA Removal: {mode_config.get('use_pca_removal', False)}")
+    print(f"Shared PCA: {mode_config.get('shared_pca', False)}")
+    print(f"Kernel Type: {mode_config.get('kernel_type', 'rbf')}")
+    print("="*70)
+
+
+def verify_articles(articles, manifest):
+    """
+    Verify a list of article records against a manifest of expected hashes.
+
+    This helper examines each article's text content, computes an MD5 hash,
+    and retains only those whose digest appears in ``manifest['article_hashes']``.
+    Articles lacking a textual field are conservatively retained. A summary
+    of the verification process is printed to stdout.
+
+    Parameters
+    ----------
+    articles : list
+        Articles loaded from a corpus via ``load_corpus``.
+    manifest : dict or None
+        Manifest object loaded from JSON. Must contain the key
+        ``'article_hashes'`` mapping to a list of hexadecimal digests.
+
+    Returns
+    -------
+    list
+        The filtered list of articles. If no manifest is provided or the
+        manifest lacks the ``'article_hashes'`` key, the original
+        ``articles`` list is returned unchanged.
+    """
+    if not manifest or 'article_hashes' not in manifest:
+        return articles
+    expected_hashes = set(manifest.get('article_hashes', []))
+    if not expected_hashes:
+        return articles
+    verified = []
+    discarded = 0
+    for article in articles:
+        try:
+            # Determine the best available textual field for hashing
+            if isinstance(article, dict):
+                if 'text' in article and isinstance(article['text'], str):
+                    body = article['text']
+                elif 'content' in article and isinstance(article['content'], str):
+                    body = article['content']
+                else:
+                    # Concatenate all string values as a fallback
+                    body_parts = [str(v) for v in article.values() if isinstance(v, str)]
+                    body = ''.join(body_parts)
+            else:
+                # Non-dict articles are retained without verification
+                verified.append(article)
+                continue
+            digest = hashlib.md5(body.encode('utf-8')).hexdigest()
+            if digest in expected_hashes:
+                verified.append(article)
+            else:
+                discarded += 1
+        except Exception:
+            # In case of any unexpected failure, keep the article
+            verified.append(article)
+    print(f"[OK] Verified articles via manifest: kept {len(verified)} / {len(articles)}")
+    if discarded:
+        print(f"  Discarded {discarded} articles not present in manifest hashes")
+    return verified
+
+
+def _ensure_verification_provenance(artifact: dict, mode_config: dict, seed: int) -> tuple[dict, bool]:
+    """
+    Ensure observer artifact contains thesis verifier-required provenance keys:
+    basis_hash, crn_seed, alpha, weights_hash.
+    """
+    if not isinstance(artifact, dict):
+        return artifact, False
+
+    meta = artifact.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    existing = artifact.get("provenance")
+    if not isinstance(existing, dict):
+        existing = meta.get("provenance", {})
+    if not isinstance(existing, dict):
+        existing = {}
+
+    prov = dict(existing)
+
+    # basis_hash fallback from kernel/basis config if not emitted by pipeline
+    if not prov.get("basis_hash"):
+        basis_src = (
+            f"{mode_config.get('kernel_type', 'rbf')}|"
+            f"{mode_config.get('dirichlet_rks_dim', mode_config.get('rks_dim', 2048))}|"
+            f"{mode_config.get('dirichlet_basis_seed', 42)}"
+        )
+        prov["basis_hash"] = hashlib.sha256(basis_src.encode("utf-8")).hexdigest()
+
+    if prov.get("crn_seed") is None:
+        # Use suite-level CRN default unless caller provided an explicit CRN seed.
+        default_crn = getattr(args, "crn_seed", 12345) if args is not None else 12345
+        prov["crn_seed"] = int(default_crn)
+
+    if prov.get("alpha") is None:
+        prov["alpha"] = float(mode_config.get("dirichlet_alpha", 1.0))
+
+    if not prov.get("weights_hash"):
+        # Fallback to a CRN contract fingerprint (invariant across corpora).
+        weights_src = (
+            f"{prov['basis_hash']}|{prov['alpha']}|{prov['crn_seed']}|"
+            f"{mode_config.get('dirichlet_n_observers', 50)}|"
+            f"{mode_config.get('kernel_type', 'rbf')}"
+        )
+        prov["weights_hash"] = hashlib.sha256(weights_src.encode("utf-8")).hexdigest()
+
+    changed = prov != existing
+    artifact["provenance"] = prov
+    meta["provenance"] = prov
+    artifact["meta"] = meta
+    return artifact, changed
+
+
+# =========================================================================
+# EXPERIMENT RUNNERS
+# =========================================================================
+
+def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *, output_root: str = None, gru_mode: str = 'intra'):
+    """
+    Run a standard experiment (single kernel type, multiple seeds).
+
+    Parameters
+    ----------
+    articles : list
+        A list of article records for the experiment.
+    mode_config : dict
+        Configuration dictionary for the selected experiment mode.
+    seeds : list[int]
+        List of random seeds to initialise independent observers.
+    corpus_name : str, optional
+        Name of the corpus being processed. Used in default output paths.
+    output_root : str, optional
+        If provided, this directory is used as the base output directory for
+        saving the results. Each seed will be saved as
+        ``Path(output_root) / f'seed_{seed}.pt'``. If ``None`` (default),
+        the results will be stored under ``outputs/<corpus_name>/<gru_mode>/``.
+    gru_mode : str, optional
+        Indicates the GRU aggregation mode (``'intra'`` or ``'inter'``). Used
+        only when ``output_root`` is ``None`` to organise the output files.
+    """
+    print_experiment_header(mode_config['name'], mode_config)
+    
+    runtime_config = PipelineRuntimeConfig.from_mode_config(mode_config)
+
+    # Prepare config for pipeline
+    pipeline_config = {
+        'use_contrastive': runtime_config.use_contrastive,
+        'use_pca_removal': runtime_config.use_pca_removal,
+        'use_cls_tokens': runtime_config.use_cls_tokens,
+        'projection_dim': runtime_config.projection_dim,
+        'apply_pca_to_cls': runtime_config.apply_pca_to_cls,
+        'normalize_before_projection': runtime_config.normalize_before_projection,
+        'normalize_features': runtime_config.normalize_features,
+        'paragraph_aware': mode_config.get('paragraph_aware', False),
+        'paragraph_weights': mode_config.get('paragraph_weights', [0.5, 0.3, 0.2]),
+        'kernel_type': runtime_config.kernel_type,
+        'kernel_params': {},
+        'use_multi_framing_rks': runtime_config.use_multi_framing_rks,
+        'use_gru': runtime_config.use_gru,
+    }
+    
+    # Add kernel types per framing if specified
+    if 'kernel_types_per_framing' in mode_config:
+        pipeline_config['kernel_types'] = mode_config['kernel_types_per_framing']
+    
+    # Add kernel-specific params
+    if mode_config.get('kernel_type') == 'rq':
+        pipeline_config['kernel_params']['alpha'] = mode_config.get('alpha', 1.0)
+    
+    # Run pipeline
+    print(f"\nRunning with seeds: {seeds}")
+    print(f"Use GRU: {pipeline_config['use_gru']}")
+    print(f"Use MultiFramingRKS: {pipeline_config['use_multi_framing_rks']}")
+    
+    results = run_multi_observer_experiment(
+        articles=articles,
+        seeds=seeds,
+        use_contrastive=pipeline_config['use_contrastive'],
+        use_pca_removal=pipeline_config['use_pca_removal'],
+        use_cls_tokens=pipeline_config['use_cls_tokens'],
+        use_attention=mode_config.get('use_attention', True),
+        use_dirichlet_fusion=mode_config.get('use_dirichlet_fusion', False),
+        shared_pca=mode_config.get('shared_pca', False),
+        kernel_type=pipeline_config.get('kernel_type', 'rbf'),
+        kernel_types=pipeline_config.get('kernel_types'),
+        kernel_params=pipeline_config.get('kernel_params', {}),
+        normalize_features=pipeline_config.get('normalize_features', True),
+        use_gru=pipeline_config['use_gru'],
+        use_multi_framing_rks=pipeline_config['use_multi_framing_rks'],
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        track_variance=args.track_variance,
+        output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
+        corpus_name=corpus_name,
+        nli_cache_path=getattr(args, 'nli_cache_path', None),
+        enable_checkpoints=True, # Always capture data lineage
+    )
+    
+    # Save results - BUT only if output_root is NOT provided
+    # When output_root IS provided, complete_pipeline.py already saved to observer_{seed}.pt
+    mode_slug = mode_config['name'].lower().replace(' ', '_').replace('-', '_')
+    output_prefix = f"{corpus_name}_{mode_slug}"
+    
+    if output_root is None:
+        # Legacy mode: save to outputs/ with mode-prefixed names
+        for seed in seeds:
+            if gru_mode == 'intra' or gru_mode is None:
+                output_path = OUTPUT_DIR / f"{output_prefix}_observer_{seed}.pt"
+            else:
+                base_dir = Path('outputs') / corpus_name / gru_mode
+                output_path = base_dir / f"seed_{seed}.pt"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            torch.save(results[seed], output_path)
+            print(f"[OK] Saved observer {seed} to {output_path}")
+    
+    else:
+        # When output_root is provided, complete_pipeline already saved files
+        for seed in seeds:
+            expected_path = Path(output_root) / f"observer_{seed}.pt"
+            if expected_path.exists():
+                # Backfill verifier-required provenance fields if pipeline omitted them.
+                try:
+                    artifact = torch.load(expected_path, map_location="cpu", weights_only=False)
+                    artifact, changed = _ensure_verification_provenance(artifact, mode_config, seed)
+                    if changed:
+                        torch.save(artifact, expected_path)
+                        print(f"[OK] Added verification provenance: {expected_path.name}")
+                except Exception as e:
+                    print(f"[WARN] Could not patch provenance for {expected_path.name}: {e}")
+                print(f"[OK] Confirmed: {expected_path}")
+            else:
+                print(f"[WARN] Expected file not found: {expected_path}")
+    return results
+
+
+def run_multi_kernel_experiment(articles, mode_config, corpus_name='real'):
+    """Run multi-kernel experiment (different kernels, same seed)"""
+    print_experiment_header(mode_config['name'], mode_config)
+    
+    kernel_types = mode_config['kernel_types']
+    seed = mode_config.get('seed', 42)
+    
+    results_by_kernel = {}
+    
+    for ktype in kernel_types:
+        print(f"\n{'='*70}")
+        print(f"KERNEL: {ktype.upper()}")
+        print(f"{'='*70}")
+        
+        pipeline_config = {
+            'use_contrastive': mode_config.get('use_contrastive', True),
+            'use_pca_removal': mode_config.get('use_pca_removal', True),
+            'kernel_type': ktype,
+            'kernel_params': {}
+        }
+        
+        if ktype == 'rq':
+            pipeline_config['kernel_params']['alpha'] = 1.0
+        
+        results = run_multi_observer_experiment(
+            articles=articles,
+            seeds=[seed],
+            use_contrastive=pipeline_config['use_contrastive'],
+            use_pca_removal=pipeline_config['use_pca_removal'],
+            shared_pca=mode_config.get('shared_pca', True),
+            kernel_type=pipeline_config['kernel_type'],
+            kernel_params=pipeline_config.get('kernel_params', {}),
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            track_variance=args.track_variance,
+            output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
+            corpus_name=corpus_name,
+        )
+        
+        results_by_kernel[ktype] = results
+        
+        output_path = OUTPUT_DIR / f"{corpus_name}_multikernel_{ktype}_seed{seed}.pt"
+        torch.save(results[seed], output_path)
+        print(f"[OK] Saved {ktype} observer to {output_path.name}")
+    
+    return results_by_kernel
+
+
+def run_sigma_sweep_experiment(articles, mode_config, corpus_name='real'):
+    """Run sigma sweep experiment (different bandwidths, same seed)"""
+    print_experiment_header(mode_config['name'], mode_config)
+    
+    sigmas = mode_config['sigmas']
+    seed = mode_config.get('seed', 42)
+    
+    for sigma in sigmas:
+        print(f"\n{'='*70}")
+        print(f"SIGMA: {sigma}")
+        print(f"{'='*70}")
+        
+        pipeline_config = {
+            'use_contrastive': mode_config.get('use_contrastive', True),
+            'use_pca_removal': mode_config.get('use_pca_removal', True),
+            'kernel_type': mode_config.get('kernel_type', 'rbf'),
+            'kernel_params': {},
+            'rks_sigma': sigma,
+        }
+        
+        results = run_multi_observer_experiment(
+            articles=articles,
+            seeds=[seed],
+            use_contrastive=pipeline_config['use_contrastive'],
+            use_pca_removal=pipeline_config['use_pca_removal'],
+            shared_pca=mode_config.get('shared_pca', True),
+            kernel_type=pipeline_config['kernel_type'],
+            rks_sigma=pipeline_config['rks_sigma'],
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            track_variance=args.track_variance,
+            output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
+            corpus_name=corpus_name,
+        )
+        
+        output_path = OUTPUT_DIR / f"{corpus_name}_sigma{sigma:.1f}_seed{seed}.pt"
+        torch.save(results[seed], output_path)
+        print(f"[OK] Saved sigma={sigma} observer to {output_path.name}")
+
+
+def run_rq_sweep_experiment(articles, mode_config, corpus_name='real'):
+    """Run RQ alpha sweep experiment (different smoothness, same seed)"""
+    print_experiment_header(mode_config['name'], mode_config)
+    
+    alphas = mode_config['alphas']
+    sigma = mode_config.get('sigma', 0.6)
+    seed = mode_config.get('seed', 42)
+    
+    for alpha in alphas:
+        print(f"\n{'='*70}")
+        print(f"ALPHA: {alpha}")
+        print(f"{'='*70}")
+        
+        pipeline_config = {
+            'use_contrastive': mode_config.get('use_contrastive', True),
+            'use_pca_removal': mode_config.get('use_pca_removal', True),
+            'kernel_type': 'rq',
+            'kernel_params': {'alpha': alpha},
+            'rks_sigma': sigma,
+        }
+        
+        results = run_multi_observer_experiment(
+            articles=articles,
+            seeds=[seed],
+            use_contrastive=pipeline_config['use_contrastive'],
+            use_pca_removal=pipeline_config['use_pca_removal'],
+            shared_pca=mode_config.get('shared_pca', True),
+            kernel_type='rq',
+            kernel_params={'alpha': alpha},
+            rks_sigma=pipeline_config['rks_sigma'],
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            track_variance=args.track_variance,
+            output_dir=Path(args.output_root) if args.output_root else Path('outputs'),
+            corpus_name=corpus_name,
+        )
+        
+        output_path = OUTPUT_DIR / f"{corpus_name}_rq_alpha{alpha:.1f}_seed{seed}.pt"
+        torch.save(results[seed], output_path)
+        print(f"[OK] Saved alpha={alpha} observer to {output_path.name}")
+
+
+def run_dirichlet_fusion_experiment(articles, mode_config, seeds, corpus_name='real', *, output_root: str = None):
+    """
+    Run Dirichlet observer fusion experiment.
+    
+    This implements the new observer model where observers are Dirichlet-weighted
+    mixtures of bot CLS embeddings, not random RKS projections.
+    """
+    print_experiment_header(mode_config['name'], mode_config)
+    
+    # Import dirichlet fusion module
+    try:
+        from core.dirichlet_fusion import DirichletFusionConfig, DirichletFusion
+    except ImportError as e:
+        print(f"ERROR: Failed to import dirichlet_fusion: {e}")
+        print("Make sure dirichlet_fusion.py is in core/")
+        return {}
+    
+    # Import NLI extractor
+    from core.nli_extraction import UnifiedNLIExtractor, ExtractionConfig
+    
+    output_dir = Path(output_root) if output_root else OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Create NLI extractor configured for CLS tokens
+    extract_config = ExtractionConfig(
+        use_cls_tokens=True,  # Correct field name
+        extract_logits=False,
+    )
+    nli_extractor = UnifiedNLIExtractor(config=extract_config)
+    
+    # Extract CLS embeddings
+    print(f"[NLI] Extracting CLS embeddings from {len(articles)} articles...")
+    print(f"[NLI] Hidden size: {nli_extractor.hidden_size}")
+    cls_per_bot_list = []
+    
+    batch_size = 512
+    for i in range(0, len(articles), batch_size):
+        batch = articles[i:i+batch_size]
+        texts = [a.get('body', a.get('text', a.get('content', '')))[:2000] for a in batch]
+        
+        with torch.no_grad():
+            result = nli_extractor.extract_batch(texts)
+            # Check various possible keys
+            if 'cls_per_bot' in result:
+                cls_per_bot_list.append(result['cls_per_bot'])
+            elif 'cls_views' in result:
+                cls_per_bot_list.append(result['cls_views'])
+            elif 'cls' in result:
+                cls_per_bot_list.append(result['cls'])
+        
+        if (i // batch_size) % 50 == 0:
+            print(f"  Processed {i+len(batch)}/{len(articles)} articles")
+    
+    cls_per_bot = torch.cat(cls_per_bot_list, dim=0).to(device)  # [N, 8, H]
+    actual_hidden = cls_per_bot.shape[-1]
+    print(f"[NLI] CLS embeddings shape: {cls_per_bot.shape}")
+    
+
+    # Handle ablations
+    alpha_val = mode_config.get('dirichlet_alpha', 1.0)
+    if getattr(args, 'alpha_collapse', False):
+        print("[ABLATION] FORCING ALPHA COLLAPSE (alpha=1e6)")
+        alpha_val = 1e6
+        
+    crn_enabled = True
+    if getattr(args, 'no_crn', False):
+        print("[ABLATION] DISABLING CRN")
+        crn_enabled = False
+
+    # Now configure fusion with actual hidden dim
+    config = DirichletFusionConfig(
+        n_bots=8,
+        hidden_dim=actual_hidden,
+        rks_dim=mode_config.get('dirichlet_rks_dim', 2048),
+        n_observers=mode_config.get('dirichlet_n_observers', 50),
+        alpha=alpha_val,
+        kernel_type=mode_config.get('kernel_type', 'rbf'),
+        basis_seed=mode_config.get('dirichlet_basis_seed', 42),
+        crn_enabled=crn_enabled,
+    )
+    
+    # Create fusion module and run
+    fusion = DirichletFusion(config)
+    
+    print(f"[FUSION] Running Dirichlet fusion with alpha={config.alpha}, K={config.n_observers}...")
+    result = fusion(cls_per_bot, return_samples=True, compute_curvature=True)
+    
+    # Save results
+    for seed in seeds:
+        output_artifact = {
+            'embeddings': result['fused'].cpu(),
+            'features': result['fused'].cpu(),
+            'observer_samples': result.get('observer_samples', torch.tensor([])).cpu(),
+            'fused_std': result['fused_std'].cpu(),
+            'bot_rkhs': result.get('bot_rkhs', result.get('rkhs_views', torch.tensor([]))).cpu(),
+            'curvature': result.get('curvature', {}),
+            'seed': seed,
+            'n_articles': result['fused'].shape[0],
+            'meta': {
+                'mode': 'dirichlet',
+                'corpus': corpus_name,
+                'config': {
+                    'alpha': config.alpha,
+                    'n_observers': config.n_observers,
+                    'rks_dim': config.rks_dim,
+                    'kernel_type': config.kernel_type,
+                },
+                'provenance': result.get('provenance', {}),
+            },
+        }
+        
+        # --- NEW: Preserve full physics payload for bridge extraction ---
+        physics_keys = [
+            'walker_states', 'walker_work_integrals', 
+            'spectral_evr', 'spectral_u_axis', 
+            'article_metadata', 'phantom_verdicts'
+        ]
+        for k in physics_keys:
+            if k in result:
+                val = result[k]
+                # Convert tensors to CPU if needed
+                if torch.is_tensor(val):
+                    output_artifact[k] = val.cpu()
+                else:
+                    output_artifact[k] = val
+        
+        output_artifact, _ = _ensure_verification_provenance(output_artifact, mode_config, seed)
+        
+        output_file = output_dir / f"observer_{seed}.pt"
+        torch.save(output_artifact, output_file)
+        print(f"[OK] Saved Dirichlet observer to {output_file}")
+    
+    return result
+
+
+def run_unified_pipeline_experiment(articles, mode_config, seeds, corpus_name='real', *, output_root: str = None):
+    """
+    Run unified pipeline: single inference for logits + CLS Dirichlet + optional heads.
+    
+    This is the new default mode implementing the pipeline pivot.
+    """
+    print_experiment_header(mode_config['name'], mode_config)
+    
+    try:
+        from core.unified_extraction import (
+            UnifiedExtractionConfig,
+            run_unified_pipeline,
+        )
+    except ImportError:
+        print("ERROR: unified_extraction.py not found in core/")
+        print("Copy it from the provided files.")
+        return {}
+    
+    output_dir = Path(output_root) if output_root else OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Configure
+    config = UnifiedExtractionConfig(
+        extract_logits=mode_config.get('extract_logits', True),
+        extract_cls=mode_config.get('extract_cls', True),
+        record_heads=mode_config.get('record_heads', False),
+        paragraph_aware=mode_config.get('paragraph_aware', True),
+        dirichlet_alpha=mode_config.get('dirichlet_alpha', 1.0),
+        dirichlet_n_observers=mode_config.get('dirichlet_n_observers', 50),
+        dirichlet_rks_dim=mode_config.get('dirichlet_rks_dim', 2048),
+    )
+    
+    # Run for each seed
+    results = {}
+    for seed in seeds:
+        print(f"\n{'='*60}")
+        print(f"SEED: {seed}")
+        print(f"{'='*60}")
+        
+        config.dirichlet_seed = seed
+        
+        result = run_unified_pipeline(
+            articles=articles,
+            config=config,
+            output_dir=output_dir,
+            seed=seed,
+        )
+        results[seed] = result
+    
+    return results
+
+
+def _git_head_short() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return proc.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _maybe_freeze_known_good_tuple(
+    *,
+    output_root: str | None,
+    corpus_name: str,
+    mode_name: str,
+    argv: list[str],
+    require_success: bool,
+) -> None:
+    """Freeze/verify a run tuple when MONOLITH HTML output is present."""
+    if output_root:
+        run_dir = Path(output_root)
+    else:
+        corpus_dir = OUTPUT_DIR / corpus_name
+        run_dir = corpus_dir if corpus_dir.exists() else OUTPUT_DIR
+
+    if not run_dir.exists():
+        if require_success:
+            raise RuntimeError(f"[FREEZE] Output directory not found: {run_dir}")
+        print(f"[FREEZE] Skip: output directory not found: {run_dir}")
+        return
+
+    html_candidates = sorted(run_dir.glob("MONOLITH*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not html_candidates:
+        if require_success:
+            raise RuntimeError(f"[FREEZE] No MONOLITH HTML found in: {run_dir}")
+        print(f"[FREEZE] Skip: no MONOLITH HTML found in {run_dir}")
+        return
+
+    source_html = html_candidates[0]
+    source_log = source_html.with_suffix(".log")
+    if not source_log.exists():
+        source_log.write_text("[FREEZE] auto-generated placeholder log\n", encoding="utf-8")
+
+    try:
+        from analysis.freeze_viz_tuple import FreezeConfig, freeze_run_snapshot, verify_snapshot
+    except Exception as e:
+        if require_success:
+            raise RuntimeError(f"[FREEZE] Failed to import freeze tooling: {e}") from e
+        print(f"[FREEZE] Skip: freeze tooling unavailable ({e})")
+        return
+
+    viz_commit = _git_head_short()
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    snapshot_name = f"{timestamp}_{viz_commit}_{corpus_name}_{mode_name}".replace("/", "_").replace(" ", "_")
+    command = "python " + " ".join(argv)
+
+    snap_dir = freeze_run_snapshot(
+        FreezeConfig(
+            snapshot_name=snapshot_name,
+            snapshot_root=Path("analysis/locked_runs"),
+            source_html=source_html,
+            source_log=source_log,
+            source_viz_code=Path("analysis/MONOLITH_VIZ.py"),
+            source_viz_code_git=Path("analysis/MONOLITH_VIZ.py"),
+            input_dir=run_dir,
+            viz_code_commit=viz_commit,
+            command=command,
+        )
+    )
+    manifest_path = snap_dir / "RUN_MANIFEST.json"
+    verify_snapshot(manifest_path)
+    print(f"[FREEZE] Snapshot written+verified: {manifest_path}")
+
+
+# =========================================================================
+# MAIN
+# =========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Belief Transformer Experimental Runner"
+    )
+    
+    parser.add_argument(
+        '--corpus',
+        type=str,
+        default='real',
+        help='Which corpus to use (NEW: separate control types!)'
+    )
+    
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='enhanced',
+        choices=list(EXPERIMENT_MODES.keys()),
+        help='Experiment mode'
+    )
+    
+    parser.add_argument(
+        '--seeds',
+        type=int,
+        nargs='+',
+        default=[42, 43, 44, 45, 46],
+        help='Observer seeds (for standard modes)'
+    )
+    
+    parser.add_argument(
+        '--use-contrastive',
+        action='store_true',
+        help='Force contrastive NLI (overrides mode)'
+    )
+    
+    parser.add_argument(
+        '--use-pca-removal',
+        action='store_true',
+        help='Force PCA removal (overrides mode)'
+    )
+    
+    parser.add_argument(
+        '--queries-config',
+        type=str,
+        default=None,
+        help='Path to contrastive queries config'
+    )
+    
+    parser.add_argument(
+        '--compare-modes',
+        action='store_true',
+        help='Run all modes and compare'
+    )
+    
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit number of articles (for testing)'
+    )
+    
+    parser.add_argument(
+        '--batch-temporal',
+        action='store_true',
+        help='Process temporal batches separately'
+    )
+    
+    parser.add_argument(
+        '--track-variance',
+        action='store_true',
+        help='Enable variance tracking at each pipeline stage'
+    )
+
+    # ------------------------------------------------------------------
+    # NEW ARGUMENTS
+    #
+    # --gru-mode: Choose GRU inter/intra attention mode. Defaults to intra.
+    # --output-root: Optional root for structured experiment outputs.
+    # --manifest: Optional path to a manifest JSON file containing
+    #             article hashes for verifying control corpora.
+    #
+    # These arguments are added to support more flexible experiment
+    # configuration without breaking backwards compatibility. If
+    # unspecified, the runner behaves exactly as before.
+    parser.add_argument(
+        '--gru-mode',
+        type=str,
+        choices=['intra', 'inter'],
+        default='intra',
+        help='GRU aggregation mode (intra or inter)'
+    )
+    parser.add_argument(
+        '--output-root',
+        type=str,
+        default=None,
+        help='Root directory for structured output files'
+    )
+    parser.add_argument(
+        '--manifest',
+        type=str,
+        default=None,
+        help='Path to manifest file (for control corpus verification)'
+    )
+    parser.add_argument(
+        '--kernel-type',
+        type=str,
+        choices=['rbf', 'laplacian', 'rq', 'imq', 'matern', 'cosine', 'linear'],
+        default=None,
+        help='Override kernel type (default: use mode default)'
+    )
+    parser.add_argument(
+        '--bandwidth',
+        type=float,
+        default=None,
+        help='Kernel bandwidth (sigma) for RBF/Laplacian kernels'
+    )
+    parser.add_argument(
+        '--rks-dim',
+        type=int,
+        default=2048,
+        help='RKS output dimension (default: 2048)'
+    )
+    parser.add_argument(
+        '--kernel-seed',
+        type=int,
+        default=42,
+        help='Seed for RKS basis generation (M-observer control)'
+    )
+    parser.add_argument(
+        '--mix-in-rkhs',
+        action='store_true',
+        help='Mode B: Map to RKHS before Dirichlet mixing (born-aligned)'
+    )
+    parser.add_argument(
+        '--nli-cache-path',
+        type=str,
+        default=None,
+        help='Path to NLI embedding cache file (for reuse across kernel runs)'
+    )
+    parser.add_argument(
+        '--nu',
+        type=float,
+        default=None,
+        help='Smoothness parameter for Matern kernel (v)'
+    )
+    parser.add_argument(
+        '--roughness',
+        type=float,
+        default=None,
+        help='Roughness parameter for IMQ kernel (df)'
+    )
+    parser.add_argument(
+        '--freeze-good-run',
+        action='store_true',
+        default=True,
+        help='Auto-freeze and verify MONOLITH run tuple after successful run (default: on).'
+    )
+    parser.add_argument(
+        '--no-freeze-good-run',
+        action='store_false',
+        dest='freeze_good_run',
+        help='Disable post-run tuple freeze.'
+    )
+    parser.add_argument(
+        '--freeze-require-success',
+        action='store_true',
+        help='Fail run if post-run tuple freeze cannot be completed.'
+    )
+    
+    # Dirichlet fusion flags
+    parser.add_argument(
+        '--dirichlet-fusion',
+        action='store_true',
+        help='Enable Dirichlet fusion for CLS views'
+    )
+    parser.add_argument(
+        '--alpha',
+        type=float,
+        default=1.0,
+        help='Dirichlet alpha parameter (default: 1.0)'
+    )
+    parser.add_argument(
+        '--fusion-samples',
+        type=int,
+        default=50,
+        help='Number of Dirichlet observer samples (default: 50)'
+    )
+    parser.add_argument(
+        '--shared-basis-path',
+        type=str,
+        default=None,
+        help='Path to shared RKS basis file for CRN reproducibility'
+    )
+    parser.add_argument(
+        '--locked-weights-path',
+        type=str,
+        default=None,
+        help='Path to locked Dirichlet weights file for CRN reproducibility'
+    )
+
+    parser.add_argument(
+        "--no-crn",
+        action="store_true",
+        help="Disable CRN for Dirichlet fusion"
+    )
+
+    parser.add_argument(
+        "--alpha-collapse",
+        action="store_true",
+        help="Force alpha=1e6 for collapse ablation"
+    )
+    
+    global args
+    args = parser.parse_args()
+    
+    # Resolve corpus name for custom paths
+    corpus_name = Path(args.corpus).stem if os.path.exists(args.corpus) else args.corpus
+
+
+    # ------------------------------------------------------------------
+    # Load manifest (if provided)
+    #
+    # If a manifest JSON file is supplied via --manifest, we read it
+    # here and optionally use it later to verify that the articles in a
+    # control corpus match the expected set of hashes. This is useful for
+    # reproducibility and to detect any accidental drift in the control
+    # datasets. The manifest is assumed to contain a key called
+    # 'article_hashes' which is a list of hex-digests. If this key is
+    # missing, the manifest is ignored.
+    manifest = None
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            try:
+                manifest = json.load(f)
+            except Exception as e:
+                raise ValueError(f"Failed to parse manifest JSON: {e}")
+
+    
+    # Print header
+    print("="*70)
+    print("BELIEF TRANSFORMER EXPERIMENTAL RUNNER")
+    print("="*70)
+    print(f"Corpus: {args.corpus}")
+    print(f"Mode: {args.mode}")
+    print(f"Seeds: {args.seeds}")
+    if args.limit:
+        print(f"Limit: {args.limit} articles")
+    print("="*70)
+    import sys; sys.stdout.flush()  # Ensure output visible in subprocess
+    
+    # Get mode config
+    mode_config = EXPERIMENT_MODES[args.mode].copy()
+    
+    # Apply overrides
+    if args.use_contrastive:
+        mode_config['use_contrastive'] = True
+    if args.use_pca_removal:
+        mode_config['use_pca_removal'] = True
+    
+    # Kernel type override (for matrix experiments)
+    if args.kernel_type:
+        mode_config['kernel_type'] = args.kernel_type
+        # Clear any multi-kernel settings since we're forcing a specific kernel
+        mode_config.pop('kernel_types', None)
+        mode_config.pop('kernel_types_per_framing', None)
+        print(f"Kernel override: {args.kernel_type}")
+    
+    # NEW: Kernel configuration for KernelContext
+    if args.bandwidth is not None:
+        mode_config['kernel_bandwidth'] = args.bandwidth
+        print(f"[CONFIG] Kernel bandwidth: {args.bandwidth}")
+    
+    if args.rks_dim:
+        mode_config['dirichlet_rks_dim'] = args.rks_dim
+        print(f"[CONFIG] RKS dimension: {args.rks_dim}")
+    
+    if args.kernel_seed != 42:  # Only print if non-default
+        mode_config['dirichlet_basis_seed'] = args.kernel_seed
+        print(f"[CONFIG] Kernel seed: {args.kernel_seed}")
+    
+    # NEW: Mix-in-RKHS (Mode B) - now default for Dirichlet
+    if args.mix_in_rkhs:
+        mode_config['mix_in_rkhs'] = True
+        print("[CONFIG] Mode B enabled: map-then-mix (born-aligned RKHS)")
+    
+    # NEW: Dirichlet fusion config
+    if args.dirichlet_fusion:
+        if not mode_config.get('use_cls_tokens', False):
+            print("[WARNING] Dirichlet fusion requires CLS tokens. Enabling CLS mode.")
+            mode_config['use_cls_tokens'] = True
+        
+        mode_config['use_dirichlet_fusion'] = True
+        mode_config['dirichlet_alpha'] = args.alpha
+        mode_config['dirichlet_n_observers'] = args.fusion_samples
+        mode_config['mix_in_rkhs'] = True  # Mode B is the only mode now
+        
+        if args.shared_basis_path:
+            mode_config['dirichlet_basis_path'] = args.shared_basis_path
+        if args.locked_weights_path:
+            mode_config['dirichlet_weights_path'] = args.locked_weights_path
+        
+        print(f"[CONFIG] Dirichlet fusion enabled: alpha={args.alpha}, K={args.fusion_samples}")
+    
+    # BATCH TEMPORAL PROCESSING
+    if args.batch_temporal and args.corpus == 'temporal':
+        print("\n" + "="*70)
+        print("[INFO] BATCH PROCESSING MODE - Temporal Evolution")
+        print("="*70)
+        
+        temporal_dir = DATA_DIR / 'temporal_cleaned'
+        
+        if not temporal_dir.exists():
+            raise FileNotFoundError(f"Temporal directory not found: {temporal_dir}")
+        
+        batch_files = sorted(temporal_dir.glob('*.jsonl'))
+        
+        if not batch_files:
+            raise FileNotFoundError(f"No batch files found in {temporal_dir}")
+        
+        print(f"Found {len(batch_files)} temporal batches\n")
+        
+        for i, batch_file in enumerate(batch_files):
+            # Extract date range from filename
+            date_range = batch_file.stem
+            
+            print("="*70)
+            print(f"BATCH {i+1}/{len(batch_files)}: {date_range}")
+            print("="*70)
+            
+            # Load batch
+            batch_articles = load_articles(batch_file)
+            # Verify batch via manifest if provided
+            if manifest:
+                batch_articles = verify_articles(batch_articles, manifest)
+            
+            if args.limit:
+                batch_articles = batch_articles[:args.limit]
+            
+            print(f"Articles: {len(batch_articles)}")
+            
+            # Run experiment
+            corpus_name = f"temporal_{date_range}"
+            
+            if 'kernel_types' in mode_config:
+                run_multi_kernel_experiment(batch_articles, mode_config, corpus_name)
+            elif 'sigmas' in mode_config:
+                run_sigma_sweep_experiment(batch_articles, mode_config, corpus_name)
+            elif 'alphas' in mode_config:
+                run_rq_sweep_experiment(batch_articles, mode_config, corpus_name)
+            else:
+                run_standard_experiment(
+                    batch_articles,
+                    mode_config,
+                    args.seeds,
+                    corpus_name,
+                    output_root=args.output_root,
+                    gru_mode=args.gru_mode
+                )
+            
+            print(f"\n[OK] Batch {date_range} complete\n")
+        
+        print("="*70)
+        print("[OK] ALL TEMPORAL BATCHES COMPLETE")
+        print("="*70)
+        return
+    
+    # NORMAL PROCESSING
+    articles = load_corpus(args.corpus, limit=args.limit)
+    # Verify articles via manifest if provided
+    if manifest:
+        articles = verify_articles(articles, manifest)
+
+    # Run appropriate experiment (single-channel only).
+    # NOTE: This runner executes exactly ONE mode per invocation.
+    #       CLS vs logits separation is handled by the outer suite/orchestrator.
+    # Policy:
+    #   - NEVER apply pipeline PCA removal to logits modes (non-CLS).
+    #   - CLS-only PCA (if enabled) may occur inside the CLS extractor/config.
+    if not mode_config.get("use_cls_tokens", False):
+        # Hard rule: logits/24D modes never use pipeline PCA removal
+        mode_config["use_pca_removal"] = False
+
+    # Optional kernel override (forces single-kernel run even if the mode defines a sweep)
+    if getattr(args, "kernel_type", None):
+        mode_config["kernel_type"] = args.kernel_type
+        mode_config.pop("kernel_types", None)
+        mode_config.pop("kernel_types_per_framing", None)
+        if 'pipeline_config' in locals():
+            pipeline_config['kernel_type'] = args.kernel_type
+        print(f"Kernel override: {args.kernel_type}")
+
+    # NEW: Handle unified pipeline mode (single inference for all outputs)
+    if mode_config.get('use_unified_pipeline', False):
+        run_unified_pipeline_experiment(
+            articles,
+            mode_config,
+            args.seeds,
+            corpus_name=corpus_name,
+            output_root=args.output_root,
+        )
+    # Handle Dirichlet fusion standalone mode (only if strictly specified as the mode)
+    elif args.mode == 'dirichlet':
+        run_dirichlet_fusion_experiment(
+            articles,
+            mode_config,
+            args.seeds,
+            corpus_name=corpus_name,
+            output_root=args.output_root,
+        )
+    elif 'kernel_types' in mode_config:
+        # Mode-defined multi-kernel sweep (legacy)
+        run_multi_kernel_experiment(articles, mode_config, args.corpus)
+    elif 'sigmas' in mode_config:
+        run_sigma_sweep_experiment(articles, mode_config, args.corpus)
+    elif 'alphas' in mode_config:
+        run_rq_sweep_experiment(articles, mode_config, args.corpus)
+    else:
+        run_standard_experiment(
+            articles,
+            mode_config,
+            args.seeds,
+            corpus_name=corpus_name,
+            output_root=args.output_root,
+            gru_mode=getattr(args, "gru_mode", "intra")
+        )
+
+    print(f"\nResults saved to: {OUTPUT_DIR}")
+
+    if args.freeze_good_run:
+        _maybe_freeze_known_good_tuple(
+            output_root=args.output_root,
+            corpus_name=corpus_name,
+            mode_name=args.mode,
+            argv=sys.argv,
+            require_success=bool(args.freeze_require_success),
+        )
+    
+    # Control-specific next steps
+    if args.corpus.startswith('control_'):
+        print(f"\nNext steps:")
+        print(f"  1. Run other controls if not done:")
+        print(f"     python run_experiments.py --corpus control_constant --mode {args.mode} --seeds {' '.join(map(str, args.seeds))}")
+        print(f"     python run_experiments.py --corpus control_shuffled --mode {args.mode} --seeds {' '.join(map(str, args.seeds))}")
+        print(f"     python run_experiments.py --corpus control_random --mode {args.mode} --seeds {' '.join(map(str, args.seeds))}")
+        print(f"  2. Compare results:")
+        print(f"     python controls/compare_controls.py --mode {args.mode}")
+    else:
+        print(f"\nNext steps:")
+        print(f"  1. Run Procrustes alignment:")
+        print(f"     cd analysis && python procrustes_alignment.py")
+        print(f"  2. Generate visualization:")
+        print(f"     python rks_viz_CLEAN.py")
+    
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()

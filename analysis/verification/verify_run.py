@@ -1,0 +1,566 @@
+import os
+import json
+import math
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from enum import Enum
+import itertools
+
+class LayerStatus(Enum):
+    VERIFIED = "VERIFIED"
+    NON_COMPARABLE = "NON_COMPARABLE"
+    MISSING_ARTIFACTS = "MISSING_ARTIFACTS"
+    UNVERIFIED = "UNVERIFIED"
+
+
+REQUIRED_CONTROL_CORPORA = ["control_shuffled", "control_constant", "control_random"]
+
+def to_native(value: Any) -> Any:
+    """Recursively convert tensors/numpy scalars/arrays to JSON-native Python types."""
+    if isinstance(value, dict):
+        return {str(k): to_native(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_native(v) for v in value]
+    if isinstance(value, torch.Tensor):
+        if value.dim() == 0:
+            return to_native(value.item())
+        return [to_native(v) for v in value.detach().cpu().tolist()]
+    if isinstance(value, np.ndarray):
+        return [to_native(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+def append_unique_reason(fail_reasons: List[str], reason: str) -> None:
+    if reason and reason not in fail_reasons:
+        fail_reasons.append(reason)
+
+def compute_gram(features: Any) -> torch.Tensor:
+    if isinstance(features, np.ndarray):
+        features = torch.from_numpy(features)
+    elif not isinstance(features, torch.Tensor):
+        features = torch.as_tensor(features)
+    if features.dim() == 3: # [N, K, D] -> take mean across O-observers
+        features = features.mean(dim=1)
+    # Normalize for coordinate-free comparison
+    norm = torch.norm(features, dim=-1, keepdim=True)
+    features = features / (norm + 1e-9)
+    return features @ features.T
+
+def compute_corr(vec1: torch.Tensor, vec2: torch.Tensor) -> float:
+    try:
+        return float(torch.corrcoef(torch.stack([vec1.detach().cpu(), vec2.detach().cpu()]))[0, 1].item())
+    except:
+        return float(np.corrcoef(vec1.detach().cpu().numpy(), vec2.detach().cpu().numpy())[0, 1])
+
+
+def _extract_features(data: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Extract feature matrix as numpy array from an observer artifact payload."""
+    feats = data.get("features", None)
+    if feats is None:
+        feats = data.get("embeddings", None)
+    if feats is None:
+        return None
+    if isinstance(feats, torch.Tensor):
+        feats = feats.detach().cpu().numpy()
+    elif not isinstance(feats, np.ndarray):
+        feats = np.asarray(feats)
+    if feats.ndim != 2:
+        return None
+    return feats.astype(np.float64, copy=False)
+
+
+def _center(X: np.ndarray) -> np.ndarray:
+    return X - X.mean(axis=0, keepdims=True)
+
+
+def _normalize_fro(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = float(np.linalg.norm(X, ord="fro"))
+    if n < eps:
+        return X.copy()
+    return X / n
+
+
+def _orthogonal_procrustes(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    M = A.T @ B
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def metric_procrustes_residual(obs1: np.ndarray, obs2: np.ndarray) -> float:
+    """
+    Rotation-invariant geometry mismatch between two observer embeddings.
+    Lower = more similar; higher = more observer disagreement.
+    """
+    n = min(obs1.shape[0], obs2.shape[0])
+    d = min(obs1.shape[1], obs2.shape[1])
+    A = _normalize_fro(_center(obs1[:n, :d]))
+    B = _normalize_fro(_center(obs2[:n, :d]))
+    R = _orthogonal_procrustes(A, B)
+    return float(np.linalg.norm((A @ R) - B, ord="fro"))
+
+
+def compute_normalized_energy(X: np.ndarray) -> float:
+    """
+    Structural energy via centered covariance trace.
+    Higher means richer geometric variance structure.
+    """
+    if X.ndim != 2 or X.shape[0] == 0:
+        return float("nan")
+    X_centered = X - X.mean(axis=0, keepdims=True)
+    cov_like = (X_centered @ X_centered.T) / float(X.shape[0])
+    return float(np.trace(cov_like))
+
+def load_pt_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        # print(f"Warning: Failed to load {path}: {e}")
+        return None
+
+def discover_all_layers(exp_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Robustly discover all layers by finding all observer_*.pt files.
+    Groups them by their logical layer identity.
+    """
+    discovered = {} # (kernel, channel/group) -> {corpus -> {seed: data}}
+    
+    # Walk the directory
+    for root, dirs, files in os.walk(exp_dir):
+        rel_root = Path(root).relative_to(exp_dir)
+        if "relativity_cache" in rel_root.parts:
+            continue
+
+        observer_files = [
+            f
+            for f in files
+            if f.startswith("observer_") and f.endswith(".pt") and f != "observer_global.pt"
+        ]
+        
+        if not observer_files:
+            continue
+            
+        # Determine Layer Identity
+        # Layout A: kernel/channel/corpus -> rel_root parts: (kernel, channel, corpus)
+        # Layout B: group/kernel_seedN -> rel_root parts: (group, kernel_seedN)
+        parts = rel_root.parts
+        
+        if len(parts) >= 4:
+            # Modern Layout A: kernel/channel/group/corpus
+            kernel, channel, group, corpus = parts[0], parts[1], parts[2], parts[3]
+            layer_id = f"{kernel}/{channel}"
+            layer_name = channel
+            if layer_id not in discovered:
+                discovered[layer_id] = {"name": layer_name, "corpora": {}, "dir": exp_dir / kernel / channel / group}
+            if discovered[layer_id].get("dir") is None or not Path(discovered[layer_id]["dir"]).exists():
+                discovered[layer_id]["dir"] = exp_dir / kernel / channel / group
+            if corpus not in discovered[layer_id]["corpora"]:
+                discovered[layer_id]["corpora"][corpus] = {}
+
+            for f in observer_files:
+                seed = f.split("_")[-1].replace(".pt", "")
+                data = load_pt_file(Path(root) / f)
+                if data:
+                    discovered[layer_id]["corpora"][corpus][seed] = data
+
+        elif len(parts) >= 3:
+            # Legacy Layout A: kernel/channel/corpus
+            kernel, channel, corpus = parts[0], parts[1], parts[2]
+            layer_id = f"{kernel}/{channel}"
+            layer_name = channel
+            if layer_id not in discovered: discovered[layer_id] = {"name": layer_name, "corpora": {}, "dir": exp_dir / kernel / channel}
+            if corpus not in discovered[layer_id]["corpora"]: discovered[layer_id]["corpora"][corpus] = {}
+            
+            for f in observer_files:
+                seed = f.split("_")[-1].replace(".pt", "")
+                data = load_pt_file(Path(root) / f)
+                if data: discovered[layer_id]["corpora"][corpus][seed] = data
+                
+        elif len(parts) == 2:
+            # Likely Layout B: group/kernel_seedN
+            group, seed_dir = parts[0], parts[1]
+            if group in ["ablation", "alpha_sweep", "alignment", "viz_output"]: continue
+            
+            # Extract kernel
+            kernel = seed_dir
+            if "_seed" in seed_dir: kernel = seed_dir.split("_seed")[0]
+            elif "_" in seed_dir: kernel = seed_dir.split("_")[0]
+            
+            layer_id = f"{group}/{kernel}"
+            layer_name = kernel
+            corpus = "real" # Layout B usually doesn't have explicit corpus subdirs
+            
+            if layer_id not in discovered: discovered[layer_id] = {"name": layer_name, "corpora": {}, "dir": exp_dir / group / seed_dir}
+            if corpus not in discovered[layer_id]["corpora"]: discovered[layer_id]["corpora"][corpus] = {}
+            
+            for f in observer_files:
+                seed = f.split("_")[-1].replace(".pt", "")
+                data = load_pt_file(Path(root) / f)
+                if data: discovered[layer_id]["corpora"][corpus][seed] = data
+
+    # Convert to list
+    layers = []
+    for lid, info in discovered.items():
+        layers.append({
+            "layer_id": lid,
+            "layer_name": info["name"],
+            "artifacts": info["corpora"],
+            "layer_dir": info["dir"]
+        })
+    return layers
+
+def check_crn_locked(artifacts: Dict[str, Any]) -> Dict[str, Any]:
+    """Check 1: Ensure basis/crn/alpha/weights provenance matches across all conditions."""
+    results = {"pass": True, "details": {}, "fail_reasons": []}
+    hashes = {}
+    required_fields = ["basis_hash", "crn_seed", "alpha", "weights_hash"]
+    
+    for corpus, seeds in artifacts.items():
+        corpus_hashes = set()
+        for seed, data in seeds.items():
+            prov = data.get("provenance") or data.get("meta", {}).get("provenance", {})
+            missing = [f for f in required_fields if f not in prov]
+            if missing:
+                results["pass"] = False
+                reason = f"Missing provenance fields in {corpus}: {missing}"
+                if reason not in results["fail_reasons"]: results["fail_reasons"].append(reason)
+                continue
+
+            b_hash = prov.get("basis_hash")
+            c_seed = prov.get("crn_seed")
+            alpha = prov.get("alpha")
+            w_hash = prov.get("weights_hash")
+            corpus_hashes.add((b_hash, c_seed, alpha, w_hash))
+            
+        if not corpus_hashes: continue
+
+        # Keep full per-corpus provenance set; multi-seed runs naturally contain
+        # multiple tuples. Comparability is checked across corpora below.
+        hashes[corpus] = sorted(list(corpus_hashes))
+            
+    if hashes:
+        canonical_sets = [set(v) for v in hashes.values()]
+        reference = canonical_sets[0]
+        for corpus_name, corpus_set in zip(hashes.keys(), canonical_sets):
+            if corpus_set != reference:
+                results["pass"] = False
+                reason = f"CRN Drift detected across corpora: {hashes}"
+                if reason not in results["fail_reasons"]:
+                    results["fail_reasons"].append(reason)
+                break
+    results["details"] = hashes
+    return results
+
+def check_control_ordering(artifacts: Dict[str, Any], is_comparable: bool) -> Dict[str, Any]:
+    """Check 2: Structural energy dominance Real > each control."""
+    scores = {}
+    for corpus, seeds in artifacts.items():
+        energies: List[float] = []
+        for _, data in seeds.items():
+            feats = _extract_features(data)
+            if feats is not None:
+                e = compute_normalized_energy(feats)
+                if np.isfinite(e):
+                    energies.append(float(e))
+        if energies:
+            scores[corpus] = float(np.mean(energies))
+
+    required = ["real", "control_shuffled", "control_random", "control_constant"]
+    failed_inequalities = []
+    valid = is_comparable and all(c in scores for c in required)
+    success = True
+    if not valid:
+        success = False
+    else:
+        controls = ["control_shuffled", "control_random", "control_constant"]
+        for ctrl in controls:
+            if not (scores["real"] > scores[ctrl]):
+                success = False
+                failed_inequalities.append(
+                    f"Ordering failed: real ({scores['real']:.6f}) <= {ctrl} ({scores[ctrl]:.6f})"
+                )
+    pass_val = bool(success) if valid else None
+    return {
+        "pass": pass_val,
+        "values": to_native({"metric": "normalized_energy_trace", "scores": scores}),
+        "valid": bool(valid),
+        "fail_reasons": to_native(failed_inequalities),
+    }
+
+def check_seed_stability(artifacts: Dict[str, Any], is_comparable: bool) -> Dict[str, Any]:
+    """Check 3: Seed stability via scale-aware dispersion (CV) of pairwise Procrustes."""
+    if "real" not in artifacts:
+        return {"pass": None, "value": 0.0, "valid": bool(is_comparable)}
+
+    mats: List[np.ndarray] = []
+    for _, data in artifacts["real"].items():
+        feats = _extract_features(data)
+        if feats is not None:
+            mats.append(feats)
+    if len(mats) < 2:
+        return {"pass": None, "value": 1.0, "note": "Single seed run", "valid": bool(is_comparable)}
+
+    pairwise = [metric_procrustes_residual(a, b) for a, b in itertools.combinations(mats, 2)]
+    mean_v = float(np.mean(pairwise))
+    std_v = float(np.std(pairwise))
+    cv = float(std_v / (mean_v + 1e-12))
+    pass_val = bool(cv <= 0.35) if is_comparable else None
+    return {
+        "pass": pass_val,
+        "value": cv,
+        "valid": bool(is_comparable),
+        "details": {"metric": "pairwise_procrustes_cv", "mean": mean_v, "std": std_v, "n_pairs": len(pairwise)},
+    }
+
+def resolve_alpha_sweep_path(layer_dir: Path, exp_dir: Path, corpus: str = "real") -> Optional[Path]:
+    """Robust resolver for alpha_sweep_results.json."""
+    paths = [
+        exp_dir / "alpha_sweep" / corpus / "alpha_sweep_results.json",
+        layer_dir / corpus / "alpha_sweep_results.json",
+        layer_dir / "alpha_sweep_results.json"
+    ]
+    for p in paths:
+        if p.exists(): return p
+    if layer_dir.exists():
+        for p in layer_dir.rglob("alpha_sweep_results.json"): return p
+    return None
+
+def resolve_validation_path(layer_dir: Path, corpus: str = "real") -> Optional[Path]:
+    """Deterministically resolve validation.json, preferring the real leaf for layer-scoped layouts."""
+    if not layer_dir.exists():
+        return None
+    direct_corpus = layer_dir / corpus / "validation.json"
+    if direct_corpus.exists():
+        return direct_corpus
+    direct_layer = layer_dir / "validation.json"
+    if direct_layer.exists():
+        return direct_layer
+    corpus_candidates = sorted(
+        (layer_dir / corpus).rglob("validation.json") if (layer_dir / corpus).exists() else [],
+        key=lambda p: p.relative_to(layer_dir).as_posix(),
+    )
+    if corpus_candidates:
+        return corpus_candidates[0]
+    candidates = sorted(
+        layer_dir.rglob("validation.json"),
+        key=lambda p: p.relative_to(layer_dir).as_posix(),
+    )
+    return candidates[0] if candidates else None
+
+def check_alpha_sweep_sanity(layer_dir: Path, exp_dir: Path) -> Dict[str, Any]:
+    """Check 4: Alpha sweep energy decrease (monotonic-ish)."""
+    sweep_path = resolve_alpha_sweep_path(layer_dir, exp_dir)
+    if not sweep_path: return {"pass": None, "value": None, "path": None}
+    try:
+        with open(sweep_path) as f: data = json.load(f)
+        wavelength = data.get("wavelength", {})
+        energies = [to_native(wavelength[p].get("energy", 0)) for p in sorted(wavelength.keys())]
+        if len(energies) < 2: return {"pass": None, "value": to_native(energies), "path": str(sweep_path)}
+        success = all(energies[i] >= energies[i+1] * 0.8 for i in range(len(energies)-1))
+        return {"pass": bool(success), "value": to_native(energies), "path": str(sweep_path)}
+    except: return {"pass": False, "value": None, "path": str(sweep_path)}
+
+def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any], layer_dir: Path, exp_dir: Path) -> Dict[str, Any]:
+    """Core verification logic shared across layouts."""
+    fail_reasons = []
+    corpora = list(artifacts.keys())
+    crn = check_crn_locked(artifacts)
+    is_comparable = crn["pass"]
+    missing_controls = [c for c in REQUIRED_CONTROL_CORPORA if c not in artifacts]
+    has_real = "real" in artifacts
+    
+    prov_missing = False
+    for corpus in artifacts:
+        for seed in artifacts[corpus]:
+            prov = artifacts[corpus][seed].get("provenance") or artifacts[corpus][seed].get("meta", {}).get("provenance", {})
+            if not all(k in prov for k in ["basis_hash", "crn_seed", "alpha", "weights_hash"]):
+                prov_missing = True
+                break
+    
+    status = LayerStatus.VERIFIED
+    if prov_missing:
+        status = LayerStatus.MISSING_ARTIFACTS
+        append_unique_reason(fail_reasons, "Missing required provenance fields (basis_hash, crn_seed, alpha, weights_hash)")
+    elif not is_comparable:
+        status = LayerStatus.NON_COMPARABLE
+        for reason in crn["fail_reasons"]:
+            append_unique_reason(fail_reasons, reason)
+    elif (not has_real) or missing_controls:
+        status = LayerStatus.UNVERIFIED
+        if not has_real:
+            append_unique_reason(fail_reasons, "Missing required corpus: real")
+        if missing_controls:
+            append_unique_reason(fail_reasons, f"Missing required control corpora: {missing_controls}")
+        
+    ordering = check_control_ordering(artifacts, is_comparable)
+    stability = check_seed_stability(artifacts, is_comparable)
+    alpha_sweep = check_alpha_sweep_sanity(layer_dir, exp_dir)
+    
+    if is_comparable and has_real and not missing_controls:
+        if ordering["pass"] is False:
+            if ordering.get("fail_reasons"):
+                for reason in ordering["fail_reasons"]:
+                    append_unique_reason(fail_reasons, reason)
+            else:
+                append_unique_reason(fail_reasons, "Control ordering invariant failed")
+        if stability["pass"] is False:
+            append_unique_reason(fail_reasons, f"Seed stability check failed: average pairwise Gram correlation={stability['value']:.6f}, threshold>0.900000")
+        if alpha_sweep["pass"] is False:
+            sweep_path = alpha_sweep.get("path")
+            if sweep_path:
+                append_unique_reason(fail_reasons, f"Alpha sweep monotonicity check failed at {sweep_path}")
+            else:
+                append_unique_reason(fail_reasons, "Alpha sweep monotonicity check failed")
+            
+    if status == LayerStatus.VERIFIED and fail_reasons: status = LayerStatus.UNVERIFIED
+        
+    mi_score = None
+    validation_path = resolve_validation_path(layer_dir, corpus="real" if has_real else (corpora[0] if corpora else "real"))
+    validation_found = validation_path is not None
+    if validation_path is not None:
+        try:
+            with open(validation_path) as f:
+                vdata = json.load(f)
+                mi_score = vdata.get("nmi", vdata.get("normalized_mutual_info"))
+        except:
+            mi_score = None
+    if not validation_found and mi_score is None:
+        for p in layer_dir.rglob("synthetic_validation_summary.json"):
+            try:
+                with open(p) as f:
+                    summary = json.load(f)
+                    mi_score = summary.get("nmi", summary.get("mean_nmi"))
+                    if mi_score is not None: break
+            except: pass
+    mi_score_valid = (
+        mi_score is not None
+        and isinstance(mi_score, (int, float))
+        and not isinstance(mi_score, bool)
+        and math.isfinite(float(mi_score))
+        and 0.0 <= float(mi_score) <= 1.0
+    )
+    if not validation_found:
+        append_unique_reason(fail_reasons, "Missing required artifact: validation.json")
+    elif not mi_score_valid:
+        append_unique_reason(fail_reasons, "Invalid or missing validation NMI in validation.json")
+    if status == LayerStatus.VERIFIED and not validation_found:
+        status = LayerStatus.MISSING_ARTIFACTS
+    elif status == LayerStatus.VERIFIED and not mi_score_valid:
+        status = LayerStatus.NON_COMPARABLE
+
+    crn_pass = to_native(crn["pass"])
+    seed_pass = to_native(stability["pass"])
+    report = {
+        "layer_id": layer_id, "layer_name": layer_name, "corpora": corpora, "status": status.value,
+        "crn_locked": crn_pass,
+        "seed_stability": seed_pass,
+        "checks": [
+            {"name": "crn_locked", "pass": crn_pass, "details": to_native(crn["details"])},
+            {"name": "control_ordering", "pass": to_native(ordering["pass"]), "values": to_native(ordering["values"]), "valid": to_native(ordering["valid"])},
+            {"name": "seed_stability", "pass": seed_pass, "value": to_native(stability["value"]), "valid": to_native(stability["valid"])},
+            {"name": "alpha_sweep_sanity", "pass": to_native(alpha_sweep["pass"]), "value": to_native(alpha_sweep["value"]), "path": to_native(alpha_sweep["path"])},
+            {"name": "mi_score", "pass": to_native(mi_score_valid), "value": to_native(mi_score)}
+        ],
+        "fail_reasons": to_native(fail_reasons), "notes": []
+    }
+    
+    return report
+
+def write_report(reports: List[Dict[str, Any]], out_dir: Path, global_pass_override: Optional[bool] = None):
+    """Write machine-readable JSON and human-readable CSV summary to one directory."""
+    timestamp = pd.Timestamp.now().isoformat()
+    run_id = out_dir.name if out_dir.name.startswith("experiments_") else f"run_{timestamp}"
+    computed_global_pass = all(r["status"] == LayerStatus.VERIFIED.value for r in reports)
+    final_report = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "layers": reports,
+        "global_pass": computed_global_pass if global_pass_override is None else bool(global_pass_override),
+    }
+    with open(out_dir / "verification_report.json", "w") as f: json.dump(final_report, f, indent=2)
+    summary_rows = []
+    for r in reports:
+        row = {"layer_id": r["layer_id"], "layer_name": r["layer_name"], "status": r["status"], "fail_reasons": "; ".join(r["fail_reasons"])}
+        for c in r["checks"]:
+            if c["name"] == "crn_locked": row["crn_locked"] = c["pass"]
+            if c["name"] == "control_ordering": row["ordering_pass"] = c["pass"]
+            if c["name"] == "seed_stability": row["seed_stability"] = c["pass"]
+            if c["name"] == "mi_score": row["mi"] = c["value"]
+        summary_rows.append(row)
+    if summary_rows:
+        df = pd.DataFrame(summary_rows)
+        cols = ["layer_id", "layer_name", "status", "crn_locked", "ordering_pass", "seed_stability", "mi", "fail_reasons"]
+        df.reindex(columns=cols).to_csv(out_dir / "verification_summary.csv", index=False)
+    print(f"Verification artifacts written to {out_dir}")
+
+
+def _leaf_output_dirs(exp_dir: Path, all_layers: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
+    """
+    Resolve leaf run directories where verification artifacts should live.
+    Leaf = directory containing MONOLITH_DATA.csv for a specific corpus/run slice.
+    """
+    leaves: List[Tuple[Path, str]] = []
+    seen = set()
+    for layer in all_layers:
+        layer_dir = Path(layer.get("layer_dir", exp_dir))
+        artifacts = layer.get("artifacts", {}) or {}
+        corpora = list(artifacts.keys()) if isinstance(artifacts, dict) else []
+        if not corpora:
+            corpora = ["real"]
+
+        for corpus in corpora:
+            candidate = layer_dir / str(corpus)
+            if (candidate / "MONOLITH_DATA.csv").exists():
+                key = str(candidate.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    leaves.append((candidate, str(layer.get("layer_id", ""))))
+                continue
+            if (layer_dir / "MONOLITH_DATA.csv").exists():
+                key = str(layer_dir.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    leaves.append((layer_dir, str(layer.get("layer_id", ""))))
+    return leaves
+
+
+def write_reports_to_leaves(reports: List[Dict[str, Any]], exp_dir: Path, all_layers: List[Dict[str, Any]]) -> List[Path]:
+    """Write verification artifacts strictly to leaf run directories."""
+    leaves = _leaf_output_dirs(exp_dir, all_layers)
+    by_layer_id: Dict[str, Dict[str, Any]] = {
+        str(r.get("layer_id", "")): r for r in reports if str(r.get("layer_id", ""))
+    }
+    global_pass_all = all(r.get("status") == LayerStatus.VERIFIED.value for r in reports)
+    out_dirs: List[Path] = []
+    for out_dir, layer_id in leaves:
+        layer_report = by_layer_id.get(layer_id)
+        if not layer_report:
+            continue
+        write_report([layer_report], out_dir, global_pass_override=global_pass_all)
+        out_dirs.append(out_dir)
+    return out_dirs
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("exp_dir", type=Path)
+    args = parser.parse_args()
+    if not args.exp_dir.exists(): exit(1)
+    
+    print(f"Discovering layers in {args.exp_dir}...")
+    all_layers = discover_all_layers(args.exp_dir)
+    
+    reports = []
+    for layer in all_layers:
+        print(f"Verifying Layer: {layer['layer_id']}")
+        reports.append(verify_layer_data(layer['layer_id'], layer['layer_name'], layer['artifacts'], layer['layer_dir'], args.exp_dir))
+            
+    if reports:
+        out_dirs = write_reports_to_leaves(reports, args.exp_dir, all_layers)
+        if not out_dirs:
+            print("No leaf MONOLITH_DATA.csv directories discovered; no verification artifacts written.")
+    else:
+        print("No layers discovered.")

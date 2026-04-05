@@ -1,0 +1,1142 @@
+"""
+metric_gradients.py - Semantic Tension Mapping via Metric Learning Gradients
+
+SEPARATE LANE from embedding-based approach.
+
+THE INSIGHT:
+Instead of classifying (NLI logits) or clustering (embeddings), we measure
+the GRADIENT of geometric alignment. This tells us the "force vector" -
+how an article would need to change to align with a pure concept.
+
+THE PHYSICS:
+- Old way: Stand on probability hill, ask "which way is up?"
+  Problem: Hill is flat at 99% confidence. Gradients vanish.
+  
+- New way: Place magnetic anchors (pure concepts), measure pull on article.
+  Fix: Even far articles have pull vectors. No confidence plateau.
+
+CRITICAL: Uses Bi-Encoder (NOT Cross-Encoder) to prevent attention leakage.
+- Pass 1: Encode Article alone -> Article_Vector
+- Pass 2: Encode Anchor alone -> Anchor_Vector  
+- Compute: cosine(Article_Vector, Anchor_Vector)
+- Backprop: gradient tells us "rotation toward anchor"
+
+WHY GRADIENTS LIVE IN TANGENT SPACE:
+Grad(cosine) is orthogonal to the vector itself.
+This is a FEATURE: filters out magnitude noise, isolates direction (framing).
+
+THESIS REFRAME (if this works):
+"Semantic Tension Mapping: We treat embedding space as a force field.
+Different framing concepts exert different pulls. The angle between pull
+vectors reveals whether an article is semantically ambiguous (parallel pulls)
+or locked into a frame (opposing pulls)."
+
+Author: Belief Transformer Project
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, Union
+from dataclasses import dataclass, asdict, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+# =============================================================================
+# PARAGRAPH UTILITIES (mirrored from nli_extraction.py for consistency)
+# =============================================================================
+
+def _split_into_paragraphs(text: str, max_paragraphs: int) -> List[str]:
+    """Split text on double-newline boundaries."""
+    if not isinstance(text, str):
+        return []
+    t = text.strip()
+    if not t:
+        return []
+    chunks = re.split(r"\n\s*\n+", t)
+    paras = [c.strip() for c in chunks if c and c.strip()]
+    return paras[:max_paragraphs] if max_paragraphs and max_paragraphs > 0 else paras
+
+
+def _normalize_weights(weights: List[float], n: int) -> List[float]:
+    """Normalize weight vector to sum to 1.0, handling variable paragraph counts."""
+    if n <= 0:
+        return []
+    w = weights[:n] if weights else []
+    if len(w) < n:
+        w = w + [w[-1] if w else 1.0] * (n - len(w))
+    s = float(sum(w))
+    if s <= 0:
+        return [1.0 / n] * n
+    return [float(x) / s for x in w]
+
+
+# =============================================================================
+# TRACK 3: GEOMETRIC STABILITY (Modern System Required)
+# =============================================================================
+# Added to support complete_pipeline.py calls without breaking legacy code.
+
+def compute_metric_gradients(
+    sweep_results: Dict[str, Any],
+    alphas: List[float],
+) -> Dict[str, Any]:
+    """
+    Compute geometric stability gradients from an alpha sweep.
+    
+    Equation: Tension(α) ≈ || Gram(α+Δ) - Gram(α) ||_F / Δα
+    """
+    wavelengths = sweep_results.get("wavelength", {})
+    
+    if not wavelengths:
+        # Fallback if no sweep data
+        return _compute_gradients_from_gram(sweep_results, alphas)
+
+    gradients = []
+    intervals = []
+    sorted_alphas = sorted(alphas)
+    
+    for i in range(len(sorted_alphas) - 1):
+        a1 = sorted_alphas[i]
+        a2 = sorted_alphas[i+1]
+        
+        # Robust key retrieval (handles different formatting)
+        key_candidates = [
+            f"{a1}_to_{a2}", 
+            f"{a2}_to_{a1}",
+            f"alpha_{a1}_to_{a2}"
+        ]
+        
+        data = None
+        for k in key_candidates:
+            if k in wavelengths:
+                data = wavelengths[k]
+                break
+            
+        if data is None:
+            continue
+            
+        # Extract energy
+        if isinstance(data, dict):
+            energy = data.get("energy", data.get("frobenius_norm", 0.0))
+        else:
+            energy = float(data)
+            
+        delta_alpha = abs(a2 - a1)
+        gradient = energy / (delta_alpha + 1e-9)
+        
+        gradients.append(float(gradient))
+        intervals.append(f"{a1}-{a2}")
+
+    if not gradients:
+        return {"mean_tension": 0.0, "stability_score": 1.0, "gradients": []}
+
+    # Aggregate Stats
+    gradients_arr = np.array(gradients)
+    mean_tension = float(np.mean(gradients_arr))
+    max_tension = float(np.max(gradients_arr))
+    std_tension = float(np.std(gradients_arr))
+    
+    # Critical Phase Transition
+    max_idx = int(np.argmax(gradients_arr))
+    critical_interval = intervals[max_idx]
+    
+    # Phase transitions
+    threshold = mean_tension + std_tension
+    phase_transitions = [intervals[i] for i, g in enumerate(gradients) if g > threshold]
+
+    # Stability Score: 1.0 = Rigid, 0.0 = Fluid
+    stability_score = 1.0 / (1.0 + mean_tension)
+
+    return {
+        "gradients": gradients,
+        "intervals": intervals,
+        "mean_tension": mean_tension,
+        "max_tension": max_tension,
+        "std_tension": std_tension,
+        "critical_interval": critical_interval,
+        "phase_transitions": phase_transitions,
+        "stability_score": stability_score,
+        "n_steps": len(gradients)
+    }
+
+def _compute_gradients_from_gram(sweep_results, alphas):
+    """Fallback for when pre-computed wavelengths are missing."""
+    gradients = []
+    intervals = []
+    sorted_alphas = sorted(alphas)
+
+    for i in range(len(sorted_alphas) - 1):
+        a1 = sorted_alphas[i]
+        a2 = sorted_alphas[i + 1]
+        
+        g1 = sweep_results.get(f"alpha_{a1}", {}).get("gram_matrix")
+        g2 = sweep_results.get(f"alpha_{a2}", {}).get("gram_matrix")
+
+        if g1 is None or g2 is None: continue
+
+        if hasattr(g1, 'cpu'): g1 = g1.cpu().numpy()
+        if hasattr(g2, 'cpu'): g2 = g2.cpu().numpy()
+
+        diff = g2 - g1
+        energy = float(np.linalg.norm(diff, ord='fro'))
+        gradient = energy / (abs(a2 - a1) + 1e-9)
+
+        gradients.append(gradient)
+        intervals.append(f"{a1}-{a2}")
+
+    if not gradients:
+        return {"mean_tension": 0.0, "stability_score": 1.0}
+
+    gradients_arr = np.array(gradients)
+    mean_tension = float(np.mean(gradients_arr))
+    stability_score = 1.0 / (1.0 + mean_tension)
+
+    return {
+        "gradients": gradients,
+        "intervals": intervals,
+        "mean_tension": mean_tension,
+        "stability_score": stability_score,
+        "method": "gram_fallback"
+    }
+
+# Alias for backward compatibility
+compute_alpha_gradients = compute_metric_gradients
+
+
+@dataclass
+class AlphaStabilityConfig:
+    """Configuration for alpha-sweep stability analysis (Track 3)."""
+    alphas: List[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 5.0, 20.0])
+    n_dirichlet_samples: int = 50
+    rks_output_dim: int = 2048
+    crn_enabled: bool = True
+    crn_seed: int = 12345
+    device: str = "cuda"
+    def to_dict(self) -> Dict: return asdict(self)
+
+
+class AlphaStabilityAnalyzer:
+    """Analyze geometric stability across Dirichlet alpha values (Track 3)."""
+    
+    def __init__(self, config: AlphaStabilityConfig = None):
+        self.config = config or AlphaStabilityConfig()
+        self.device = torch.device(self.config.device if torch.cuda.is_available() else 'cpu')
+        print(f"[AlphaStability] Initialized with {len(self.config.alphas)} alpha values")
+        
+    def compute_gram_matrix(self, embeddings: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+        if normalize: embeddings = F.normalize(embeddings, p=2, dim=-1)
+        return torch.mm(embeddings, embeddings.t())
+
+    def run_alpha_sweep(self, cls_per_bot: torch.Tensor) -> Dict[str, Any]:
+        N, n_bots, hidden = cls_per_bot.shape
+        cls_per_bot = cls_per_bot.to(self.device)
+        
+        if self.config.crn_enabled:
+            torch.manual_seed(self.config.crn_seed)
+            
+        results = {}
+        gram_matrices = {}
+        
+        for alpha in self.config.alphas:
+            alpha_vec = torch.full((n_bots,), alpha, device=self.device)
+            weights = torch.distributions.Dirichlet(alpha_vec).sample((self.config.n_dirichlet_samples,))
+            
+            # Fuse
+            weights_exp = weights.unsqueeze(0).unsqueeze(-1)
+            cls_exp = cls_per_bot.unsqueeze(1)
+            fused = (weights_exp * cls_exp).sum(dim=2)
+            fused_mean = fused.mean(dim=1)
+            fused_std = fused.std(dim=1).mean().item()
+            
+            gram = self.compute_gram_matrix(fused_mean)
+            gram_matrices[alpha] = gram
+            
+            results[f"alpha_{alpha}"] = {
+                "fused": fused_mean.cpu(),
+                "fused_std": fused_std,
+                "gram_matrix": gram.cpu(),
+            }
+            
+        wavelengths = {}
+        sorted_alphas = sorted(self.config.alphas)
+        for i in range(len(sorted_alphas) - 1):
+            a1, a2 = sorted_alphas[i], sorted_alphas[i+1]
+            diff = gram_matrices[a2] - gram_matrices[a1]
+            energy = float(torch.norm(diff, p='fro').item())
+            wavelengths[f"{a1}_to_{a2}"] = {"energy": energy, "delta_alpha": a2 - a1}
+            
+        results["wavelength"] = wavelengths
+        results["alphas"] = self.config.alphas
+        return results
+
+    def analyze_corpus(self, articles: List[Dict], cls_per_bot: torch.Tensor) -> Dict[str, Any]:
+        print(f"\n[AlphaStability] Analyzing {len(articles)} articles...")
+        sweep_results = self.run_alpha_sweep(cls_per_bot)
+        gradients = compute_metric_gradients(sweep_results, self.config.alphas)
+        
+        return {
+            "sweep_results": sweep_results,
+            "metric_gradients": gradients,
+            "config": self.config.to_dict(),
+            "n_articles": len(articles)
+        }
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+@dataclass
+class MetricGradientConfig:
+    """Configuration for metric gradient extraction."""
+    
+    # Model settings
+    model_name: str = "microsoft/deberta-v3-base"
+    device: str = "cuda"
+    
+    # Anchor definitions (pure concepts)
+    anchors: Dict[str, str] = field(default_factory=lambda: {
+        'victim': "This text describes victims and suffering.",
+        'aggressor': "This text describes aggression and violence.",
+        'neutral': "This text is a neutral factual report.",
+        'emotional': "This text is emotionally charged.",
+        'humanitarian': "This text focuses on humanitarian concerns.",
+        'security': "This text focuses on security threats.",
+        'conflict': "This text describes armed conflict.",
+        'peace': "This text describes peace and resolution.",
+    })
+    
+    # Extraction settings
+    normalize_gradients: bool = True
+    gradient_layer: str = 'last'  # 'last', 'second_last', 'mean'
+    pooling: str = 'mean'  # 'cls', 'mean', 'last_token'
+    
+    # Paragraph awareness (matches nli_extraction.py hard invariant)
+    paragraph_aware: bool = True
+    paragraph_weights: List[float] = field(default_factory=lambda: [0.5, 0.3, 0.2])
+
+    # Analysis settings
+    compute_tension_matrix: bool = True  # Compute all pairwise anchor tensions
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+# =============================================================================
+# METRIC GRADIENT EXTRACTOR (Bi-Encoder)
+# =============================================================================
+
+class MetricGradientExtractor:
+    """
+    Extract metric learning gradients for semantic tension mapping.
+    
+    Uses Bi-Encoder approach to prevent attention leakage:
+    - Article encoded separately (no hypothesis contamination)
+    - Anchor encoded separately (pure concept)
+    - Gradient of cosine similarity computed
+    
+    The gradient = "force vector" toward the anchor concept.
+    """
+    
+    def __init__(self, config: MetricGradientConfig = None):
+        self.config = config or MetricGradientConfig()
+        self.device = torch.device(self.config.device if torch.cuda.is_available() else 'cpu')
+        
+        # Lazy load model
+        self._model = None
+        self._tokenizer = None
+        
+        # Cache anchor vectors (computed once)
+        self._anchor_cache: Dict[str, torch.Tensor] = {}
+        
+        print(f"[MetricGradient] Initialized with {len(self.config.anchors)} anchors")
+        print(f"[MetricGradient] Device: {self.device}")
+    
+    @property
+    def model(self):
+        if self._model is None:
+            self._load_model()
+        return self._model
+    
+    @property
+    def tokenizer(self):
+        if self._tokenizer is None:
+            self._load_model()
+        return self._tokenizer
+    
+    def _load_model(self):
+        """Lazy load the transformer model."""
+        from transformers import AutoModel, AutoTokenizer
+        
+        print(f"[MetricGradient] Loading {self.config.model_name}...")
+        self._tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
+        self._model = AutoModel.from_pretrained(self.config.model_name)
+        self._model.to(self.device)
+        self._model.eval()
+        print(f"[MetricGradient] Model loaded")
+    
+    def _get_anchor_vector(self, anchor_name: str) -> torch.Tensor:
+        """Get cached anchor vector (pure concept embedding)."""
+        if anchor_name not in self._anchor_cache:
+            anchor_text = self.config.anchors[anchor_name]
+            
+            with torch.no_grad():
+                inputs = self.tokenizer(
+                    anchor_text, 
+                    return_tensors='pt', 
+                    padding=True, 
+                    truncation=True,
+                    max_length=128,
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                output = self.model(**inputs)
+                
+                # Pool
+                if self.config.pooling == 'cls':
+                    anchor_vec = output.last_hidden_state[:, 0, :]
+                elif self.config.pooling == 'mean':
+                    mask = inputs['attention_mask'].unsqueeze(-1).float()
+                    anchor_vec = (output.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
+                else:
+                    anchor_vec = output.last_hidden_state[:, -1, :]
+                
+                # Normalize to unit sphere
+                anchor_vec = F.normalize(anchor_vec, p=2, dim=1)
+                
+                self._anchor_cache[anchor_name] = anchor_vec
+        
+        return self._anchor_cache[anchor_name]
+    
+    def get_metric_gradient(
+        self,
+        article_text: str,
+        anchor_name: str,
+    ) -> torch.Tensor:
+        """
+        Compute gradient of article embedding moving toward anchor.
+
+        Uses Bi-Encoder: Article encoded alone, no attention leakage.
+        When paragraph_aware=True, splits text into paragraphs and
+        accumulates weighted gradients (matching nli_extraction.py invariant).
+
+        Args:
+            article_text: The article to analyze
+            anchor_name: Name of anchor concept (key in config.anchors)
+
+        Returns:
+            gradient: [hidden_dim] force vector toward anchor
+        """
+        if self.config.paragraph_aware:
+            return self._get_gradient_paragraph_aware(article_text, anchor_name)
+        return self._get_gradient_single(article_text, anchor_name)
+
+    def _get_gradient_paragraph_aware(
+        self,
+        article_text: str,
+        anchor_name: str,
+    ) -> torch.Tensor:
+        """
+        Paragraph-weighted gradient accumulation.
+
+        ∇_final = Σ_i w_i · ∇_paragraph_i
+
+        This ensures the Force field (Track 1.5) matches the structural
+        weighting of the Embedding field (Track 2), so Phase Space fusion
+        (Track 4) operates on geometrically consistent inputs.
+        """
+        weights = self.config.paragraph_weights
+        paras = _split_into_paragraphs(article_text, len(weights))
+
+        if not paras:
+            paras = [article_text.strip()]
+
+        w = _normalize_weights(weights, len(paras))
+
+        gradient_acc = None
+        for para, weight in zip(paras, w):
+            para_grad = self._get_gradient_single(para, anchor_name)
+            if gradient_acc is None:
+                gradient_acc = para_grad * weight
+            else:
+                gradient_acc = gradient_acc + para_grad * weight
+
+        # Re-normalize the accumulated gradient (weighted sum may shrink magnitude)
+        if self.config.normalize_gradients:
+            gradient_acc = F.normalize(gradient_acc.unsqueeze(0), p=2, dim=1).squeeze(0)
+
+        return gradient_acc
+
+    def _get_gradient_single(
+        self,
+        text: str,
+        anchor_name: str,
+    ) -> torch.Tensor:
+        """
+        Compute gradient for a single text span (no paragraph splitting).
+
+        Core computation: backprop cosine similarity w.r.t. hidden state.
+        """
+        self.model.eval()
+
+        # 1. Get anchor vector (cached, no grad needed)
+        anchor_vec = self._get_anchor_vector(anchor_name)
+
+        # 2. Encode article (NEED gradients)
+        inputs = self.tokenizer(
+            text,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Forward pass with hidden states
+        output = self.model(**inputs, output_hidden_states=True)
+
+        # Get the layer we want gradients from
+        if self.config.gradient_layer == 'last':
+            hidden_state = output.last_hidden_state
+        elif self.config.gradient_layer == 'second_last':
+            hidden_state = output.hidden_states[-2]
+        else:  # mean of all layers
+            hidden_state = torch.stack(output.hidden_states[1:], dim=0).mean(dim=0)
+
+        # Retain grad so we can inspect it
+        hidden_state.retain_grad()
+
+        # Pool
+        if self.config.pooling == 'cls':
+            article_vec = hidden_state[:, 0, :]
+        elif self.config.pooling == 'mean':
+            mask = inputs['attention_mask'].unsqueeze(-1).float()
+            article_vec = (hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
+        else:
+            article_vec = hidden_state[:, -1, :]
+
+        # Normalize
+        article_vec_norm = F.normalize(article_vec, p=2, dim=1)
+
+        # 3. Compute geometric similarity
+        similarity = F.cosine_similarity(article_vec_norm, anchor_vec, dim=1)
+
+        # 4. Backward - gradient of similarity w.r.t. hidden state
+        similarity.backward()
+
+        # 5. Extract gradient at pooled position
+        if self.config.pooling == 'cls':
+            gradient = hidden_state.grad[:, 0, :].detach()
+        elif self.config.pooling == 'mean':
+            mask = inputs['attention_mask'].unsqueeze(-1).float()
+            gradient = (hidden_state.grad * mask).sum(dim=1).detach() / mask.sum(dim=1)
+        else:
+            gradient = hidden_state.grad[:, -1, :].detach()
+
+        # Optionally normalize gradient
+        if self.config.normalize_gradients:
+            gradient = F.normalize(gradient, p=2, dim=1)
+
+        # Clean up
+        self.model.zero_grad()
+
+        return gradient.squeeze(0)  # [hidden_dim]
+    
+    def get_all_gradients(
+        self, 
+        article_text: str,
+        anchor_names: List[str] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Get gradients toward all specified anchors.
+        
+        Args:
+            article_text: The article to analyze
+            anchor_names: List of anchor names (default: all)
+            
+        Returns:
+            Dict of {anchor_name: gradient_vector}
+        """
+        if anchor_names is None:
+            anchor_names = list(self.config.anchors.keys())
+        
+        gradients = {}
+        for anchor_name in anchor_names:
+            gradients[anchor_name] = self.get_metric_gradient(article_text, anchor_name)
+        
+        return gradients
+    
+    def compute_tension(
+        self,
+        article_text: str,
+        anchor_a: str,
+        anchor_b: str,
+    ) -> Dict[str, float]:
+        """
+        Compute semantic tension between two framing concepts for an article.
+        
+        Tension = angle between force vectors toward different anchors.
+        
+        - High positive correlation: Article pulled equally toward both (ambiguous)
+        - Low/negative correlation: Article pulled toward one, away from other (framed)
+        
+        Returns:
+            Dict with correlation, angle, and interpretation
+        """
+        grad_a = self.get_metric_gradient(article_text, anchor_a)
+        grad_b = self.get_metric_gradient(article_text, anchor_b)
+        
+        # Cosine similarity between gradients
+        correlation = F.cosine_similarity(
+            grad_a.unsqueeze(0), 
+            grad_b.unsqueeze(0), 
+            dim=1
+        ).item()
+        
+        # Angle in degrees
+        angle = np.arccos(np.clip(correlation, -1, 1)) * 180 / np.pi
+        
+        # Interpretation
+        if correlation > 0.7:
+            interpretation = "parallel_pulls"  # Ambiguous, equally pulled
+        elif correlation > 0.3:
+            interpretation = "mild_tension"
+        elif correlation > -0.3:
+            interpretation = "orthogonal"  # Independent framings
+        elif correlation > -0.7:
+            interpretation = "opposing_tension"
+        else:
+            interpretation = "strong_opposition"  # Locked into one frame
+        
+        return {
+            'anchor_a': anchor_a,
+            'anchor_b': anchor_b,
+            'correlation': correlation,
+            'angle_degrees': angle,
+            'interpretation': interpretation,
+        }
+    
+    def compute_tension_matrix(
+        self,
+        article_text: str,
+        anchor_names: List[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute full tension matrix for all anchor pairs.
+        
+        Returns:
+            Dict with matrix, labels, and summary stats
+        """
+        if anchor_names is None:
+            anchor_names = list(self.config.anchors.keys())
+        
+        n = len(anchor_names)
+        gradients = self.get_all_gradients(article_text, anchor_names)
+        
+        # Stack gradients
+        grad_stack = torch.stack([gradients[a] for a in anchor_names], dim=0)  # [n, hidden]
+        
+        # Compute pairwise cosine similarities
+        grad_norm = F.normalize(grad_stack, p=2, dim=1)
+        tension_matrix = torch.mm(grad_norm, grad_norm.t())  # [n, n]
+        
+        # Find most opposing pair
+        triu_mask = torch.triu(torch.ones(n, n), diagonal=1).bool()
+        upper_vals = tension_matrix[triu_mask]
+        min_idx = upper_vals.argmin()
+        
+        # Convert flat index back to (i, j)
+        idx_pairs = [(i, j) for i in range(n) for j in range(i+1, n)]
+        most_opposing = idx_pairs[min_idx.item()]
+        
+        return {
+            'matrix': tension_matrix.cpu().numpy(),
+            'labels': anchor_names,
+            'most_opposing_pair': (anchor_names[most_opposing[0]], anchor_names[most_opposing[1]]),
+            'most_opposing_correlation': upper_vals[min_idx].item(),
+            'mean_correlation': upper_vals.mean().item(),
+            'std_correlation': upper_vals.std().item(),
+        }
+
+    def compute_structural_antagonism(
+        self,
+        article_text: str,
+        hypothesis_anchor: str,
+        null_anchor: str,
+    ) -> Dict[str, Any]:
+        """
+        Structural Antagonism (Holographic Truth Protocol, Axiom 4).
+
+        Instead of measuring gradient MAGNITUDE (which conflates bias with
+        confusion), we measure the PHASE relationship between the gradient
+        toward a hypothesis H and the gradient toward its negation ¬H.
+
+            S = -cos(∇L(H), ∇L(¬H))
+
+        Interpretation:
+            S ≈ +1  → Anti-parallel gradients → genuine bias (article is
+                      pulled TOWARD H and AWAY from ¬H)
+            S ≈  0  → Orthogonal gradients → confused / ambiguous
+            S ≈ -1  → Parallel gradients → model can't distinguish H from ¬H
+                      (degenerate, both attracting equally)
+
+        Args:
+            article_text: The article to analyze
+            hypothesis_anchor: Name of the hypothesis anchor (e.g., "pro_israel")
+            null_anchor: Name of the counter-hypothesis anchor (e.g., "pro_palestine")
+
+        Returns:
+            Dict with antagonism score, raw gradients, and interpretation
+        """
+        grad_h = self.get_metric_gradient(article_text, hypothesis_anchor)
+        grad_not_h = self.get_metric_gradient(article_text, null_anchor)
+
+        # S = -cos(∇L(H), ∇L(¬H))
+        cos_sim = F.cosine_similarity(
+            grad_h.unsqueeze(0),
+            grad_not_h.unsqueeze(0),
+            dim=1,
+        ).item()
+        antagonism = -cos_sim
+
+        # Magnitudes (diagnostic only — not used for scoring)
+        mag_h = grad_h.norm().item()
+        mag_not_h = grad_not_h.norm().item()
+        mag_ratio = mag_h / (mag_not_h + 1e-9)
+
+        # Interpretation
+        if antagonism > 0.7:
+            interpretation = "strong_bias"
+        elif antagonism > 0.3:
+            interpretation = "moderate_bias"
+        elif antagonism > -0.3:
+            interpretation = "ambiguous"
+        elif antagonism > -0.7:
+            interpretation = "weak_signal"
+        else:
+            interpretation = "degenerate"
+
+        return {
+            'hypothesis': hypothesis_anchor,
+            'null': null_anchor,
+            'antagonism': antagonism,
+            'raw_cosine': cos_sim,
+            'magnitude_h': mag_h,
+            'magnitude_null': mag_not_h,
+            'magnitude_ratio': mag_ratio,
+            'interpretation': interpretation,
+        }
+
+    def compute_antagonism_matrix(
+        self,
+        article_text: str,
+        anchor_pairs: Optional[List[Tuple[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute structural antagonism for all hypothesis/null pairs.
+
+        If anchor_pairs is None, treats every pair (a, b) with a≠b as
+        a candidate hypothesis/null pair.
+
+        Returns:
+            Dict with per-pair antagonism scores and summary statistics
+        """
+        if anchor_pairs is None:
+            names = list(self.config.anchors.keys())
+            anchor_pairs = [(a, b) for a in names for b in names if a != b]
+
+        results = []
+        for h, nh in anchor_pairs:
+            results.append(self.compute_structural_antagonism(article_text, h, nh))
+
+        antagonisms = [r['antagonism'] for r in results]
+        return {
+            'pairs': results,
+            'mean_antagonism': float(np.mean(antagonisms)) if antagonisms else 0.0,
+            'max_antagonism': float(np.max(antagonisms)) if antagonisms else 0.0,
+            'n_biased': sum(1 for a in antagonisms if a > 0.3),
+            'n_ambiguous': sum(1 for a in antagonisms if -0.3 <= a <= 0.3),
+            'n_degenerate': sum(1 for a in antagonisms if a < -0.7),
+        }
+
+
+# =============================================================================
+# BATCH PROCESSING FOR CORPUS ANALYSIS
+# =============================================================================
+
+class MetricGradientAnalyzer:
+    """
+    Analyze entire corpus using metric gradients.
+    
+    Computes:
+    - Per-article tension profiles
+    - Cross-article gradient variance
+    - Framing clustering based on gradient directions
+    """
+    
+    def __init__(self, extractor: MetricGradientExtractor = None):
+        self.extractor = extractor or MetricGradientExtractor()
+    
+    def analyze_corpus(
+        self,
+        articles: List[str],
+        anchor_pairs: List[Tuple[str, str]] = None,
+        article_ids: List[str] = None,
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Analyze corpus for semantic tension patterns.
+        
+        Args:
+            articles: List of article texts
+            anchor_pairs: Pairs of anchors to compute tension for
+            article_ids: Optional IDs for articles
+            
+        Returns:
+            Comprehensive analysis results
+        """
+        import datetime
+        
+        if anchor_pairs is None:
+            # Default: test victim vs aggressor
+            anchor_pairs = [
+                ('victim', 'aggressor'),
+                ('emotional', 'neutral'),
+                ('humanitarian', 'security'),
+            ]
+        
+        if article_ids is None:
+            article_ids = [f"article_{i}" for i in range(len(articles))]
+        
+        n_articles = len(articles)
+        n_pairs = len(anchor_pairs)
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"METRIC GRADIENT CORPUS ANALYSIS")
+            print(f"{'='*60}")
+            print(f"Articles: {n_articles}")
+            print(f"Anchor pairs: {anchor_pairs}")
+        
+        # Storage
+        all_tensions = {f"{a}_{b}": [] for a, b in anchor_pairs}
+        all_gradients = {anchor: [] for pair in anchor_pairs for anchor in pair}
+        per_article_results = []
+        
+        for i, (article, aid) in enumerate(zip(articles, article_ids)):
+            if verbose and (i + 1) % 10 == 0:
+                print(f"  Processing article {i+1}/{n_articles}...")
+            
+            article_result = {'id': aid, 'tensions': {}}
+            
+            # Get gradients for all relevant anchors
+            relevant_anchors = list(set(a for pair in anchor_pairs for a in pair))
+            gradients = self.extractor.get_all_gradients(article, relevant_anchors)
+            
+            for anchor, grad in gradients.items():
+                all_gradients[anchor].append(grad.cpu())
+            
+            # Compute tensions
+            for anchor_a, anchor_b in anchor_pairs:
+                grad_a = gradients[anchor_a]
+                grad_b = gradients[anchor_b]
+                
+                corr = F.cosine_similarity(
+                    grad_a.unsqueeze(0),
+                    grad_b.unsqueeze(0),
+                    dim=1
+                ).item()
+                
+                pair_key = f"{anchor_a}_{anchor_b}"
+                all_tensions[pair_key].append(corr)
+                article_result['tensions'][pair_key] = corr
+            
+            per_article_results.append(article_result)
+        
+        # Aggregate statistics
+        tension_stats = {}
+        for pair_key, tensions in all_tensions.items():
+            tensions_arr = np.array(tensions)
+            tension_stats[pair_key] = {
+                'mean': float(tensions_arr.mean()),
+                'std': float(tensions_arr.std()),
+                'min': float(tensions_arr.min()),
+                'max': float(tensions_arr.max()),
+                'median': float(np.median(tensions_arr)),
+            }
+        
+        # Gradient variance per anchor
+        gradient_variance = {}
+        for anchor, grads in all_gradients.items():
+            if grads:
+                stacked = torch.stack(grads, dim=0)  # [n_articles, hidden]
+                gradient_variance[anchor] = {
+                    'variance': float(stacked.var().item()),
+                    'mean_norm': float(stacked.norm(dim=1).mean().item()),
+                }
+        
+        result = {
+            'n_articles': n_articles,
+            'anchor_pairs': anchor_pairs,
+            'tension_stats': tension_stats,
+            'gradient_variance': gradient_variance,
+            'per_article': per_article_results,
+            'timestamp': datetime.datetime.now().isoformat(),
+        }
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print("ANALYSIS COMPLETE")
+            print(f"{'='*60}")
+            for pair_key, stats in tension_stats.items():
+                print(f"  {pair_key}: mean={stats['mean']:.3f}, std={stats['std']:.3f}")
+        
+        return result
+
+
+# =============================================================================
+# CONTROL VALIDATION
+# =============================================================================
+
+def run_gradient_controls(
+    extractor: MetricGradientExtractor,
+    real_articles: List[str],
+    n_samples: int = 100,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Run control experiments for metric gradients.
+    
+    Tests:
+    - Real articles: Should have meaningful gradient variance
+    - Constant (same article): Should have ~zero variance
+    - Random tokens: Critical test - should NOT have high variance
+    
+    Expected: real_var >> random_var > constant_var
+    """
+    import random
+    import string
+    
+    if verbose:
+        print(f"\n{'='*60}")
+        print("METRIC GRADIENT CONTROL VALIDATION")
+        print(f"{'='*60}")
+    
+    anchor_pair = ('victim', 'aggressor')
+    
+    # 1. Real articles
+    if verbose:
+        print(f"\n[1/3] Real articles ({len(real_articles)} samples)...")
+    
+    real_tensions = []
+    for article in real_articles[:n_samples]:
+        tension = extractor.compute_tension(article, *anchor_pair)
+        real_tensions.append(tension['correlation'])
+    
+    real_var = np.var(real_tensions)
+    real_mean = np.mean(real_tensions)
+    
+    # 2. Constant (same article repeated)
+    if verbose:
+        print(f"[2/3] Constant corpus (same article x {n_samples})...")
+    
+    constant_article = real_articles[0] if real_articles else "This is a test article."
+    constant_tensions = []
+    for _ in range(n_samples):
+        tension = extractor.compute_tension(constant_article, *anchor_pair)
+        constant_tensions.append(tension['correlation'])
+    
+    constant_var = np.var(constant_tensions)
+    constant_mean = np.mean(constant_tensions)
+    
+    # 3. Random tokens
+    if verbose:
+        print(f"[3/3] Random corpus ({n_samples} samples)...")
+    
+    def random_text(length=100):
+        words = [''.join(random.choices(string.ascii_lowercase, k=random.randint(3, 10))) 
+                 for _ in range(length)]
+        return ' '.join(words)
+    
+    random_tensions = []
+    for _ in range(n_samples):
+        random_article = random_text()
+        tension = extractor.compute_tension(random_article, *anchor_pair)
+        random_tensions.append(tension['correlation'])
+    
+    random_var = np.var(random_tensions)
+    random_mean = np.mean(random_tensions)
+    
+    # Analysis
+    ordering_satisfied = real_var > random_var > constant_var
+    
+    if ordering_satisfied:
+        verdict = "PASS: Real >> Random >> Constant"
+    elif real_var > constant_var:
+        verdict = "PARTIAL: Real > Constant, but random ordering unclear"
+    else:
+        verdict = "FAIL: Expected ordering not satisfied"
+    
+    result = {
+        'real': {'variance': real_var, 'mean': real_mean, 'n': len(real_tensions)},
+        'constant': {'variance': constant_var, 'mean': constant_mean, 'n': n_samples},
+        'random': {'variance': random_var, 'mean': random_mean, 'n': n_samples},
+        'ordering_satisfied': ordering_satisfied,
+        'verdict': verdict,
+        'anchor_pair': anchor_pair,
+    }
+    
+    if verbose:
+        print(f"\n{'='*60}")
+        print("CONTROL RESULTS")
+        print(f"{'='*60}")
+        print(f"  Real variance:     {real_var:.6f} (mean: {real_mean:.3f})")
+        print(f"  Constant variance: {constant_var:.6f} (mean: {constant_mean:.3f})")
+        print(f"  Random variance:   {random_var:.6f} (mean: {random_mean:.3f})")
+        print(f"\n  Verdict: {verdict}")
+    
+    return result
+
+
+# =============================================================================
+# PLOTLY VISUALIZATION HELPERS
+# =============================================================================
+
+def prepare_tension_heatmap_data(analysis: Dict) -> Dict:
+    """Prepare data for Plotly heatmap of tension matrix."""
+    # This would use the full tension matrix from compute_tension_matrix
+    return {
+        'note': 'Use extractor.compute_tension_matrix() for single article heatmap',
+    }
+
+
+def prepare_gradient_scatter_data(
+    analysis: Dict,
+    anchor_pair: Tuple[str, str] = ('victim', 'aggressor'),
+) -> Dict:
+    """
+    Prepare data for Plotly scatter plot of gradient tensions.
+    
+    X-axis: Tension toward anchor_a
+    Y-axis: Tension toward anchor_b
+    Each point: One article
+    """
+    pair_key = f"{anchor_pair[0]}_{anchor_pair[1]}"
+    
+    tensions = [r['tensions'].get(pair_key, 0) for r in analysis['per_article']]
+    ids = [r['id'] for r in analysis['per_article']]
+    
+    return {
+        'x': tensions,
+        'y': [1 - abs(t) for t in tensions],  # "Ambiguity" score
+        'ids': ids,
+        'xlabel': f'Tension ({pair_key})',
+        'ylabel': 'Ambiguity (1 - |tension|)',
+        'title': f'Semantic Tension Distribution: {pair_key}',
+    }
+
+
+# =============================================================================
+# INTEGRATION WITH EMBEDDING PIPELINE
+# =============================================================================
+
+def compare_gradient_vs_embedding(
+    articles: List[str],
+    embedding_results: Dict,  # From DirichletFusion
+    gradient_results: Dict,   # From MetricGradientAnalyzer
+) -> Dict:
+    """
+    Compare metric gradient approach with embedding approach.
+    
+    Answers: Do they find the same structure?
+    """
+    # Extract per-article measures from both
+    n = len(articles)
+    
+    # From embeddings: use observer variance per article
+    emb_variance = embedding_results.get('variance_decomposition', {}).get('v_fraction', 0)
+    
+    # From gradients: use tension std per article
+    grad_tensions = [r['tensions'] for r in gradient_results['per_article']]
+    
+    # Correlation between approaches would go here
+    # This is a placeholder for the actual comparison
+    
+    return {
+        'embedding_v_variance': emb_variance,
+        'gradient_tension_stats': gradient_results['tension_stats'],
+        'note': 'Full comparison requires aligned per-article metrics',
+    }
+
+
+# =============================================================================
+# MODULE EXPORTS
+# =============================================================================
+
+__all__ = [
+    # Track 3: Geometric Stability (Added for Modern System)
+    'compute_metric_gradients',
+    'compute_alpha_gradients',
+    'AlphaStabilityAnalyzer',
+    'AlphaStabilityConfig',
+    
+    # Track 1.5: Semantic Axis Tension (Preserved Original)
+    'MetricGradientConfig',
+    'MetricGradientExtractor',
+    'MetricGradientAnalyzer',
+    'run_gradient_controls',
+    'prepare_tension_heatmap_data',
+    'prepare_gradient_scatter_data',
+    'compare_gradient_vs_embedding',
+]
+
+
+# =============================================================================
+# TEST
+# =============================================================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Testing Metric Gradient Extraction (Dual-Track)")
+    print("=" * 60)
+    
+    # 1. Test Track 1.5 (Anchors)
+    config = MetricGradientConfig(
+        device='cpu',  # Use CPU for testing
+        anchors={
+            'victim': "This describes victims and suffering.",
+            'aggressor': "This describes aggression and violence.",
+        }
+    )
+    extractor = MetricGradientExtractor(config)
+    article = "Israel struck a hospital in Gaza, killing 50 civilians including children."
+    
+    print(f"\n[Track 1.5] Test article: {article[:60]}...")
+    tension = extractor.compute_tension(article, 'victim', 'aggressor')
+    print(f"Correlation: {tension['correlation']:.4f}")
+    print(f"Interpretation: {tension['interpretation']}")
+    
+    # 2. Test Track 3 (Stability - Mock)
+    print("\n[Track 3] Testing Stability Calculation (Mock Data)...")
+    mock_sweep = {
+        'wavelength': {
+            '0.1_to_0.5': {'energy': 0.05},
+            '0.5_to_1.0': {'energy': 0.02},
+            '1.0_to_5.0': {'energy': 0.01}
+        }
+    }
+    alphas = [0.1, 0.5, 1.0, 5.0]
+    stability = compute_metric_gradients(mock_sweep, alphas)
+    print(f"Stability Score: {stability['stability_score']:.4f}")
+    
+    print("\n" + "=" * 60)
+    print("TEST COMPLETE")
+    print("=" * 60)

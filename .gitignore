@@ -1,0 +1,68 @@
+# Data / experiment artifacts
+experiments/
+experiments_*/
+outputs/*
+!outputs/README.md
+archive/*
+!archive/README.md
+analysis/outputs/
+analysis/viz_output/
+analysis/reports/
+
+# Runtime logs / temp
+*.log
+*.stderr
+*.stdout
+*.tmp
+*.temp
+*.bak
+*.orig
+nul
+
+# Python caches / env
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+.venv/
+venv/
+env/
+ENV/
+
+# Large binaries / arrays
+*.npy
+*.npz
+*.pt
+*.pth
+*.pkl
+*.h5
+*.onnx
+
+# HTML build artifacts
+*.html
+
+# Tooling folders not part of core source
+.claude/
+.omc/
+oh-my-claudecode/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Thesis / release housekeeping
+thesis_release/*/scratch/
+thesis_release/*/tmp/
+thesis_release/*/validation_report.json
+
+# Build/package outputs
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/

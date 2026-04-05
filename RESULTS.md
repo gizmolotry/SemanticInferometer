@@ -1,0 +1,126 @@
+# Results (Canonical Evidence Ledger)
+
+This file is the single source of truth for thesis-facing results.
+
+## Reporting Policy
+- Report only canonical runs defined in `METHODS.md`.
+- Keep exploratory runs in notes, not in final claim tables.
+- Every reported number must map to a run ID and artifact path.
+
+## Current Baseline Snapshot (as of 2026-02-26)
+
+### Synthetic run example
+- Run ID: `experiments_20260225_225508`
+- Artifact: `outputs/experiments/runs/experiments_20260225_225508/experiment_manifest.json`
+- Summary:
+  - `status`: success
+  - `kernel`: rbf
+  - `seed`: 42
+  - `NMI`: 0.7123805298491227
+  - `ARI`: 0.417812262798347
+
+This is a useful baseline but not yet a full canonical matrix (single run key only).
+
+## Canonical Run Registry
+
+_Auto-generated from manifests on 2026-04-02T07:24:51._
+
+| Run ID | Date | Purpose | Command Class | Status | Canonical | Notes |
+|---|---|---|---|---|---|---|
+| experiments_20260314_162932 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260314_184111 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260314_194600 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260314_195428 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260314_200543 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260314_201423 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260314_202246 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260314_202653 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260314_203523 | 2026-03-14 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260315_121545 | 2026-03-15 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7469; mean_ari=0.4056 |
+| experiments_20260315_191129 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_191510 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_191927 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_192345 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_192654 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_193038 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=BeliefTransformerPipeline.process_month.<locals>._run_channel.<locals>._ensure_8 |
+| experiments_20260315_193600 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=BeliefTransformerPipeline.process_month.<locals>._run_channel.<locals>._ensure_8 |
+| experiments_20260315_193906 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_194211 | 2026-03-15 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim must be divisible by num_heads |
+| experiments_20260315_195022 | 2026-03-15 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260315_195247 | 2026-03-15 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260316_165114 | 2026-03-16 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=local variable 'torch' referenced before assignment |
+| experiments_20260316_165528 | 2026-03-16 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260318_124750 | 2026-03-18 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=name 'get_git_hash' is not defined |
+| experiments_20260318_124908 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.3694; mean_ari=0.1894 |
+| experiments_20260318_125330 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260318_125721 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260318_130116 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260318_135238 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7054; mean_ari=0.4407 |
+| experiments_20260318_165702 | 2026-03-18 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=embed_dim and num_heads must be greater than 0, got embed_dim=0 and num_heads=8  |
+| experiments_20260318_170147 | 2026-03-18 | Synthetic | Synthetic | Failed/Partial | No | successful_runs=0/1; error=name 'exp_dir' is not defined |
+| experiments_20260318_170238 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260318_170511 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7222; mean_ari=0.2658 |
+| experiments_20260318_172610 | 2026-03-18 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7222; mean_ari=0.2658 |
+| experiments_20260319_171221 | 2026-03-19 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.6576; mean_ari=0.2653 |
+| experiments_20260322_115758 | 2026-03-22 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.7222; mean_ari=0.2658 |
+| experiments_20260322_120905 | 2026-03-22 | Synthetic | Synthetic | Success | Yes | successful_runs=1/1; mean_nmi=0.0000; mean_ari=0.0000 |
+| experiments_20260322_124556 | 2026-03-22 | Corpus matrix | Suite | Success | Yes | experiments=10; kernels=rbf,laplacian,rq,imq,matern; channels=logits,cls; corpora=real |
+| experiments_20260322_131259 | 2026-03-22 | Corpus matrix | Suite | Success | Yes | experiments=40; kernels=rbf,laplacian,rq,imq,matern; channels=logits,cls; corpora=real,control_constant,control_shuffled,control_random |
+| experiments_20260322_164026 | 2026-03-22 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf,laplacian,rq,imq,matern; channels=logits,cls; corpora=real,control_constant,control_shuffled,control_random |
+| experiments_20260327_164553 | 2026-03-27 | Corpus matrix | Suite | Unknown/Empty | No | no experiments[] entries; config_keys=kernels,channels,corpora,seeds |
+| experiments_20260331_132547 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_132835 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_133145 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_133538 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_134827 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_140834 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_183315 | 2026-03-31 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_183617 | 2026-03-31 | Corpus matrix | Suite | Failed/Partial | No | experiments=1; failures=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_183758 | 2026-03-31 | Corpus matrix | Suite | Failed/Partial | No | experiments=1; failures=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260331_183945 | 2026-03-31 | Corpus matrix | Suite | Failed/Partial | No | experiments=1; failures=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260401_052605 | 2026-04-01 | Corpus matrix | Suite | Failed/Partial | No | experiments=1; failures=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260401_053144 | 2026-04-01 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260401_060613 | 2026-04-01 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260401_093406 | 2026-04-01 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260401_165142 | 2026-04-01 | Corpus matrix | Suite | Success | Yes | experiments=2; kernels=rbf; channels=logits,cls; corpora=real |
+| experiments_20260401_165342 | 2026-04-01 | Corpus matrix | Suite | Success | Yes | experiments=2; kernels=rbf; channels=logits,cls; corpora=real |
+| experiments_20260401_165738 | 2026-04-01 | Corpus matrix | Suite | Success | Yes | experiments=2; kernels=rbf; channels=logits,cls; corpora=real |
+| experiments_20260402_055445 | 2026-04-02 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260402_055810 | 2026-04-02 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260402_060234 | 2026-04-02 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260402_060643 | 2026-04-02 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+| experiments_20260402_072107 | 2026-04-02 | Corpus matrix | Suite | Success | Yes | experiments=1; kernels=rbf; channels=cls; corpora=real |
+
+## Thesis Tables To Populate
+
+### Table A: Real vs Controls (Representative Snapshot)
+- **Run ID**: `experiments_20260314_040950`
+- **Kernels**: rbf, laplacian, rq, imq (Table shows RBF/Logits means)
+- **Seeds**: 42, 420, 4200
+
+| Corpus | Simple Variance (mean) | Procrustes (mean) | Consensus % | Residual % |
+|---|---|---|---|---|
+| Real | 0.0254 | 0.9173 | 33.82 | 66.18 |
+| Constant | 0.0255 | 0.0021 | 33.03 | 66.97 |
+| Shuffled | 0.0251 | 0.8776 | 34.35 | 65.65 |
+| Random | 0.0253 | 0.9286 | 33.53 | 66.47 |
+
+_Note: Procrustes measures geometric alignment to the article manifold. Higher values in controls (Shuffled/Random) indicate they preserve significant structural shadows of the real embedding space even when semantic labels are destroyed._
+
+### Table B: Synthetic Ground-Truth Recovery
+- Metrics: NMI, ARI
+- Granularity: per kernel x seed and aggregate
+
+### Table C: Stability / Variance
+- Metrics: stage-wise or end-to-end stability metrics used in thesis claims
+- Granularity: per run + aggregate confidence intervals
+
+## Figure Inventory (To Fill)
+- Figure 1: Core geometry/manifold visualization from canonical run set
+- Figure 2: Real vs control separation summary
+- Figure 3: Synthetic validation performance (NMI/ARI)
+- Figure 4: Robustness/stability view across seeds and kernels
+
+## Known Non-Canonical Evidence (Do Not Claim Directly)
+- Historical logs with runtime failures (for example earlier synthetic empty-input traces).
+- Archived pre-pivot and exploratory outputs under `archive/`.

@@ -1,0 +1,55 @@
+# Contrastive Framing Queries for Gaza/Israel Bias Detection
+# 
+# Format: queries (not pairs) to match NLI extractor expectations
+
+queries:
+  # Pair 1: Israeli actions framing
+  israeli_defense_vs_aggression:
+    A: "This article portrays Israeli military actions as legitimate self-defense against terrorism"
+    B: "This article portrays Israeli military actions as disproportionate aggression against civilians"
+    description: "How Israeli military operations are framed"
+  
+  # Pair 2: Palestinian framing
+  palestinian_victim_vs_aggressor:
+    A: "This article portrays Palestinians as innocent victims of occupation and violence"
+    B: "This article portrays Palestinians as violent aggressors and terrorists"
+    description: "How Palestinians are characterized"
+  
+  # Pair 3: Proportionality framing
+  proportionate_vs_disproportionate:
+    A: "This article describes Israeli responses as proportionate and measured"
+    B: "This article describes Israeli responses as excessive collective punishment"
+    description: "Assessment of force proportionality"
+  
+  # Pair 4: Resistance vs terrorism framing
+  resistance_vs_terrorism:
+    A: "This article frames Palestinian armed groups as legitimate resistance movements"
+    B: "This article frames Palestinian armed groups as terrorist organizations"
+    description: "Characterization of Palestinian militant groups"
+  
+  # Pair 5: Occupation framing
+  occupation_vs_security:
+    A: "This article frames the situation as Israeli occupation of Palestinian territory"
+    B: "This article frames the situation as Israeli security measures against threats"
+    description: "Overall conflict framework"
+  
+  # Pair 6: Civilian casualties framing
+  civilian_targeting_vs_collateral:
+    A: "This article suggests Israeli forces deliberately target civilians"
+    B: "This article suggests civilian casualties are unintended collateral damage"
+    description: "Intentionality of civilian harm"
+  
+  # Pair 7: Historical context framing
+  colonialism_vs_indigenous:
+    A: "This article frames Israel as a colonial settler state"
+    B: "This article frames Israel as the indigenous homeland of the Jewish people"
+    description: "Historical legitimacy framing"
+  
+  # Pair 8: International law framing
+  violations_vs_compliance:
+    A: "This article emphasizes Israeli violations of international law"
+    B: "This article emphasizes Israeli compliance with international law and right to self-defense"
+    description: "Legal framework assessment"
+
+# Total: 8 pairs → 8-dimensional feature space
+# Each dimension captures a specific framing axis

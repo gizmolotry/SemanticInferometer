@@ -1,0 +1,1097 @@
+"""
+core/nli_extraction.py - Enhanced Unified Extraction with Representation Contracts
+
+ARCHITECTURE (Pipeline Pivot - Jan 2026):
+
+This module enforces the "constitution" of representation types:
+
+  rep_kind = "logits_raw"   → 24D verdict coordinates, NEVER kernelized
+  rep_kind = "cls_views"    → [B, 768] per-bot CLS embeddings (V-observers)
+  rep_kind = "cls_fused"    → [D] Dirichlet-fused in shared RKHS (O-observers)
+
+OBSERVER TAXONOMY:
+  V-observers: Bots/framings (B=8) - inside extraction, fixed per article
+  M-observers: RKS basis replicates - for uncertainty bands, NOT personalities  
+  O-observers: Dirichlet α family - the probe distribution to sweep
+
+CRITICAL INVARIANTS:
+  1. Logits path NEVER touches RKS, PCA-removal, Procrustes, or geometry_mode
+  2. CLS path MAY go through RKS + Dirichlet fusion + observer comparison
+  3. Shared RKHS basis is locked and logged (basis_hash, basis_seed, D, sigma)
+  4. CRN: Dirichlet weights are pre-generated and shared across conditions
+
+This file merges:
+- Legacy MultiFramingNLIExtractorLogits (24D triplets)
+- MultiFramingNLIExtractorCLSLogits (6144D CLS + sidecar)
+- UnifiedNLIExtractor (single-pass, all outputs)
+- DirichletFusion with proper CRN and basis locking
+"""
+
+from __future__ import annotations
+
+import re
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union, Literal
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import yaml
+
+from .data_utils import extract_article_text
+
+
+# =============================================================================
+# REPRESENTATION KIND (Constitutional Gate)
+# =============================================================================
+
+class RepKind(Enum):
+    """
+    Representation type - determines which operations are valid.
+    
+    This is the "constitutional gate" that prevents logits from being
+    hallucinated into a manifold.
+    """
+    LOGITS_RAW = "logits_raw"      # 24D verdict coordinates, NO geometry ops
+    CLS_VIEWS = "cls_views"        # [B, 768] per-bot CLS, ready for fusion
+    CLS_FUSED = "cls_fused"        # [D] Dirichlet-fused in shared RKHS
+
+
+# =============================================================================
+# CANONICAL SHAPE CONSTANTS
+# =============================================================================
+N_VIEWS = 8           # Number of views/bots/framings (B dimension)
+N_NLI_CLASSES = 3     # entail, neutral, contradict (per-view)
+HIDDEN_DIM = 768      # DeBERTa hidden size (H dimension)
+
+# Canonical shapes:
+# - logits_raw: [N, 24] = [N, N_VIEWS * N_NLI_CLASSES]  OR  [N, 8, 3]
+# - cls_per_bot: [N, N_VIEWS, HIDDEN_DIM] = [N, 8, 768]
+# - cls_flat: [N, N_VIEWS * HIDDEN_DIM] = [N, 6144]
+# - logits_sidecar: [N, N_VIEWS, N_NLI_CLASSES] = [N, 8, 3]
+
+
+def get_rep_kind(use_cls_tokens: bool, is_fused: bool = False) -> RepKind:
+    """Derive rep_kind from config - NOT user-provided."""
+    if not use_cls_tokens:
+        return RepKind.LOGITS_RAW
+    elif is_fused:
+        return RepKind.CLS_FUSED
+    else:
+        return RepKind.CLS_VIEWS
+
+
+def validate_operation(rep_kind: RepKind, operation: str) -> bool:
+    """
+    Check if operation is valid for this rep_kind.
+    
+    Returns True if allowed, raises ValueError if not.
+    """
+    FORBIDDEN = {
+        RepKind.LOGITS_RAW: [
+            'rks', 'kernel', 'pca_removal', 'procrustes', 
+            'geometry_mode', 'dirichlet', 'observer_residual',
+            'wavelength', 'curvature'
+        ],
+    }
+    
+    forbidden_ops = FORBIDDEN.get(rep_kind, [])
+    op_lower = operation.lower()
+    
+    for forbidden in forbidden_ops:
+        if forbidden in op_lower:
+            raise ValueError(
+                f"Operation '{operation}' is FORBIDDEN for rep_kind={rep_kind.value}. "
+                f"Logits are raw verdict coordinates, not a semantic manifold."
+            )
+    
+    return True
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+@dataclass
+class ExtractionConfig:
+    """Unified extraction configuration."""
+    model_name: str = "microsoft/deberta-v2-xlarge-mnli"
+    queries_config: str = "config/framing_queries.yaml"
+    max_length: int = 512
+    device: str = "cuda"
+    
+    # Output mode
+    use_cls_tokens: bool = False      # Legacy flag: False=logits_raw, True=embed_views (mean-pooled)
+    extract_logits: bool = True       # Always extract logits (as sidecar if embedding mode)
+    record_heads: bool = False        # Record attention head outputs
+
+    # Paragraph awareness (always on, but weights configurable)
+    paragraph_weights: List[float] = field(default_factory=lambda: [0.5, 0.3, 0.2])
+
+    # Embedding channel config
+    projection_dim: int = 256         # For logits sidecar projection
+    apply_pca_to_cls: bool = False    # DISABLED (Jagged Truth Protocol: use external backdrop only)
+    # NOTE: "cls" in field names is legacy nomenclature. All embedding channels
+    # now use mean pooling (attention-weighted average), not CLS tokens.
+    normalize_before_projection: bool = True
+
+    # External Tare (Jagged Truth Protocol - Authority Axiom)
+    # The ONLY valid PCA removal is subtraction of an externally-derived
+    # backdrop PC1 (e.g., from Wiki Control Corpus), applied at the 1.25 Gate
+    # (post-extraction, pre-manifold). On-the-fly PCA risks "internal taring"
+    # which removes the signal we're trying to measure.
+    external_backdrop_path: Optional[str] = None  # Path to global_backdrop_pc1.pt
+    
+    # Extraction seed (for deterministic projections, NOT observer seed)
+    extraction_seed: int = 1337
+    
+    @property
+    def rep_kind(self) -> RepKind:
+        return get_rep_kind(self.use_cls_tokens, is_fused=False)
+
+
+@dataclass
+class DirichletConfig:
+    """Configuration for Dirichlet fusion (O-observers)."""
+    n_bots: int = 8
+    hidden_dim: int = 768
+    rks_dim: int = 2048
+    n_observers: int = 50
+    alpha: float = 1.0
+    kernel_type: str = 'rbf'
+    
+    # Basis locking (M-observer control)
+    basis_seed: int = 42
+    basis_path: Optional[str] = None  # Load pre-generated basis
+    
+    # CRN: Common Random Numbers
+    crn_enabled: bool = True
+    crn_weights_path: Optional[str] = None  # Pre-generated Dirichlet weights
+    crn_seed: int = 12345
+    
+    def basis_hash(self) -> str:
+        """Compute deterministic hash of basis configuration."""
+        key = f"{self.hidden_dim}_{self.rks_dim}_{self.basis_seed}_{self.kernel_type}"
+        return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def _resolve_config_path(config_path: str) -> Path:
+    p = Path(config_path)
+    if not p.is_absolute():
+        repo_root = Path(__file__).resolve().parents[1]
+        p = repo_root / config_path
+    return p
+
+
+def _split_into_paragraphs(text: str, max_paragraphs: int) -> List[str]:
+    if not isinstance(text, str):
+        return []
+    t = text.strip()
+    if not t:
+        return []
+    chunks = re.split(r"\n\s*\n+", t)
+    paras = [c.strip() for c in chunks if c and c.strip()]
+    return paras[:max_paragraphs] if max_paragraphs and max_paragraphs > 0 else paras
+
+
+def _normalize_weights(weights: List[float], n: int) -> List[float]:
+    if n <= 0:
+        return []
+    w = weights[:n] if weights else []
+    if len(w) < n:
+        w = w + [w[-1] if w else 1.0] * (n - len(w))
+    s = float(sum(w))
+    if s <= 0:
+        return [1.0 / n] * n
+    return [float(x) / s for x in w]
+
+
+def _init_fixed_linear(in_dim: int, out_dim: int, seed: int = 1337) -> nn.Linear:
+    """Deterministic linear layer (not observer-seed-dependent)."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    linear = nn.Linear(in_dim, out_dim, bias=False)
+    nn.init.xavier_uniform_(linear.weight, generator=gen)
+    return linear
+
+
+# =============================================================================
+# UNIFIED EXTRACTOR
+# =============================================================================
+
+class UnifiedNLIExtractor(nn.Module):
+    """
+    Single-pass extractor producing all Belief Transformer outputs.
+    
+    For each article and each of B hypothesis pairs (bots), extracts:
+    - logits_raw: [B, 3] raw NLI logits → flattened to [24]
+    - cls_per_bot: [B, hidden_dim] CLS delta per bot (V-observers)
+    - (optional) attention patterns for forensics
+    
+    The rep_kind gate is enforced here and in downstream operations.
+    
+    IMPORTANT: Logits and CLS are SEPARATE channels, never combined.
+    """
+    
+    def __init__(self, config: ExtractionConfig = None):
+        super().__init__()
+        
+        if config is None:
+            config = ExtractionConfig()
+        self.config = config
+        
+        self.device = torch.device(
+            config.device if torch.cuda.is_available() else "cpu"
+        )
+        
+        # Load model
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(
+            config.model_name,
+            output_attentions=config.record_heads,
+            output_hidden_states=True,
+        )
+        self.nli_model.to(self.device)
+        self.nli_model.eval()
+        
+        for p in self.nli_model.parameters():
+            p.requires_grad = False
+        
+        self.hidden_size = self.nli_model.config.hidden_size
+        
+        # Load hypothesis pairs
+        self.hypothesis_pairs = self._load_hypothesis_pairs(config.queries_config)
+        self.n_bots = len(self.hypothesis_pairs)
+        
+        # Deterministic projections (NOT tied to observer seeds)
+        torch.manual_seed(config.extraction_seed)
+        self.logits_proj = _init_fixed_linear(6, config.projection_dim, seed=config.extraction_seed + 1)
+        self.logits_proj.to(self.device)
+        
+        # Output dimensions
+        self.logits_dim = self.n_bots * 3  # 24D
+        self.cls_dim = self.n_bots * self.hidden_size  # 6144D typically
+        
+        print(f"[UnifiedExtractor] Loaded {self.n_bots} bots (V-observers)")
+        print(f"[UnifiedExtractor] Hidden size: {self.hidden_size}")
+        print(f"[UnifiedExtractor] Logits dim: {self.logits_dim}, CLS dim: {self.cls_dim}")
+        print(f"[UnifiedExtractor] rep_kind: {config.rep_kind.value}")
+    
+    def _load_hypothesis_pairs(self, config_path: str) -> List[Tuple[str, str]]:
+        p = _resolve_config_path(config_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Queries config not found: {p}")
+        
+        with open(p, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        
+        pairs = []
+        for pair_name, pair_data in config.get('queries', {}).items():
+            if 'A' in pair_data and 'B' in pair_data:
+                pairs.append((pair_data['A'], pair_data['B']))
+        
+        if not pairs:
+            raise ValueError(f"No valid hypothesis pairs in {p}")
+        
+        return pairs
+    
+    @torch.no_grad()
+    def _encode_single(self, premise: str, hypothesis: str) -> Dict[str, torch.Tensor]:
+        """
+        Encode a single premise-hypothesis pair.
+
+        Extracts:
+        1. Logits: Raw NLI verdict (Track 1)
+        2. Mean Pool: Attention-weighted average of all hidden states (Tracks 2-4)
+
+        CLS token extraction removed (Jagged Truth Protocol - Legacy Purge).
+        Mean pooling is the sole embedding source for all non-logits tracks.
+        """
+        inputs = self.tokenizer(
+            premise,
+            hypothesis,
+            return_tensors="pt",
+            truncation="only_first",
+            max_length=self.config.max_length,
+            padding=True,
+        ).to(self.device)
+
+        outputs = self.nli_model(
+            **inputs,
+            output_hidden_states=True,
+            output_attentions=self.config.record_heads,
+            return_dict=True,
+        )
+
+        # 1. Raw Logits (The Verdict - Track 1)
+        logits = outputs.logits.squeeze(0).cpu()
+
+        # 2. Hidden States (The Geometry - Tracks 2, 3, 4)
+        last_hidden = outputs.hidden_states[-1]
+
+        # Mean Pooling: attention-weighted average (ignores padding)
+        mask = inputs['attention_mask'].unsqueeze(-1).expand(last_hidden.size()).float()
+        sum_embeddings = torch.sum(last_hidden * mask, 1)
+        sum_mask = torch.clamp(mask.sum(1), min=1e-9)
+        mean_pooled = (sum_embeddings / sum_mask).squeeze(0).cpu()
+
+        result = {
+            'logits': logits,
+            'mean_pool': mean_pooled,
+        }
+        
+        if self.config.record_heads and outputs.attentions is not None:
+            result['attentions'] = [a.squeeze(0).cpu() for a in outputs.attentions]
+        
+        return result
+    
+    @torch.no_grad()
+    def extract_article(self, article_text: str) -> Dict[str, torch.Tensor]:
+        """
+        Extract all representations for a single article.
+
+        Returns dict with:
+        - 'logits_raw': [n_bots, 3] raw verdict logits (weighted mean, Track 1)
+        - 'logits_flat': [24] flattened
+        - 'logits_triplet': [24] contrast triplets (backward compat)
+        - 'cls_per_bot': [n_bots, hidden] V-observer embeddings (weighted mean, legacy)
+        - 'cls_stacked': [n_bots * hidden] flattened (backward compat)
+
+        SUPERPOSITION OUTPUTS (Jagged Truth Protocol):
+        - 'cls_paragraphs': [n_paras, n_bots, hidden] per-paragraph embeddings (RAW)
+        - 'logits_paragraphs': [n_paras, n_bots, 3] per-paragraph logits (RAW)
+        - 'paragraph_weights': [n_paras] normalized weights
+
+        The superposition outputs enable "project-first, sum-later":
+            Φ_total = Σ w_i · φ(v_i)  instead of  φ(Σ w_i · v_i)
+        This preserves contradictory paragraph modes as distinct peaks
+        in the RKS manifold rather than collapsing them into a neutral mean.
+
+        IMPORTANT: logits and CLS are SEPARATE channels, never combined.
+        """
+        # Handle paragraph-aware extraction
+        weights = self.config.paragraph_weights
+        text = article_text.strip()
+        paras = _split_into_paragraphs(text, len(weights))
+
+        if not paras:
+            paras = [text]
+
+        w = _normalize_weights(weights, len(paras))
+
+        # Collect per-paragraph results (for superposition) AND accumulate (for legacy)
+        logits_acc = None
+        cls_acc = None
+        cls_para_list = []
+        logits_para_list = []
+        attentions_list = []
+
+        for para, weight in zip(paras, w):
+            para_logits, para_cls, para_attn = self._extract_single_text(para)
+
+            # Store raw per-paragraph vectors (superposition path)
+            cls_para_list.append(para_cls)
+            logits_para_list.append(para_logits)
+
+            # Legacy weighted accumulation (backward compat)
+            if logits_acc is None:
+                logits_acc = para_logits * weight
+                cls_acc = para_cls * weight
+            else:
+                logits_acc += para_logits * weight
+                cls_acc += para_cls * weight
+
+            if para_attn:
+                attentions_list.append(para_attn)
+
+        result = {
+            # Logits channel (NEVER kernelized) - weighted mean (legacy)
+            'logits_raw': logits_acc,                    # [n_bots, 3]
+            'logits_flat': logits_acc.reshape(-1),       # [24]
+            'logits_triplet': self._compute_triplets(logits_acc),  # [24] backward compat
+
+            # CLS channel - weighted mean (legacy, backward compat)
+            'cls_per_bot': cls_acc,                      # [n_bots, hidden]
+            'cls_stacked': cls_acc.reshape(-1),          # [n_bots * hidden]
+
+            # SUPERPOSITION: per-paragraph vectors for project-first-sum-later
+            'cls_paragraphs': torch.stack(cls_para_list),      # [n_paras, n_bots, hidden]
+            'logits_paragraphs': torch.stack(logits_para_list),  # [n_paras, n_bots, 3]
+            'paragraph_weights': torch.tensor(w, dtype=torch.float32),  # [n_paras]
+
+            # Metadata
+            'rep_kind': self.config.rep_kind.value,
+            'n_bots': self.n_bots,
+        }
+
+        if self.config.record_heads and attentions_list:
+            result['head_attentions'] = attentions_list
+
+        return result
+    
+    def _extract_single_text(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, Optional[List]]:
+        """Extract for a single text span (no paragraph weighting)."""
+        logits_list = []
+        cls_list = []
+        attentions_by_bot = []
+        
+        for bot_idx, (hyp_a, hyp_b) in enumerate(self.hypothesis_pairs):
+            enc_a = self._encode_single(text, hyp_a)
+            enc_b = self._encode_single(text, hyp_b)
+            
+            # Raw logits: [3] each, store as [2, 3] or just use A
+            # For the "raw" channel, we use the contrast: logits_a as the reference
+            logits_list.append(enc_a['logits'])
+            
+            # --- CRITICAL SWAP FOR TRACK 2 ---
+            # OLD: cls_delta = enc_a['cls'] - enc_b['cls']
+            # NEW: Use Mean Pooling Delta for geometric richness
+            # This captures the difference in "thought process" between 
+            # framing A and framing B, not just the difference in final summary.
+            
+            # We use the MEAN POOL for the 'cls_per_bot' slot to inject variance
+            # into the Dirichlet Fusion track.
+            mean_delta = enc_a['mean_pool'] - enc_b['mean_pool']
+            cls_list.append(mean_delta)
+            
+            if self.config.record_heads:
+                attentions_by_bot.append({
+                    'bot_idx': bot_idx,
+                    'attentions_a': enc_a.get('attentions'),
+                    'attentions_b': enc_b.get('attentions'),
+                })
+        
+        logits_raw = torch.stack(logits_list, dim=0)  # [n_bots, 3]
+        cls_per_bot = torch.stack(cls_list, dim=0)    # [n_bots, hidden]
+        
+        return logits_raw, cls_per_bot, attentions_by_bot if self.config.record_heads else None
+    
+    def _compute_triplets(self, logits_raw: torch.Tensor) -> torch.Tensor:
+        """Compute legacy triplet format from raw logits."""
+        # logits_raw: [n_bots, 3] where 3 = [contradict, neutral, entail]
+        probs = F.softmax(logits_raw, dim=-1)
+        # score = entail - contradict
+        scores = probs[:, 2] - probs[:, 0]  # [n_bots]
+        # For triplet format: [score, score, 0] repeated (simplified)
+        # Original was [score_a, score_b, contrast] but we only have one hyp here
+        triplets = torch.stack([scores, scores, torch.zeros_like(scores)], dim=-1)
+        return triplets.reshape(-1)  # [24]
+    
+    def extract_batch(
+        self,
+        articles: List[Union[str, Dict]],
+        show_progress: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Extract all articles in batch.
+
+        Returns:
+        - 'logits_raw': [N, n_bots, 3]
+        - 'logits_flat': [N, 24]
+        - 'cls_per_bot': [N, n_bots, hidden] (legacy weighted mean)
+        - 'cls_stacked': [N, n_bots * hidden]
+
+        SUPERPOSITION OUTPUTS (Jagged Truth Protocol):
+        - 'cls_paragraphs': list of [n_paras_i, n_bots, hidden] per article
+        - 'logits_paragraphs': list of [n_paras_i, n_bots, 3] per article
+        - 'paragraph_weights': list of [n_paras_i] per article
+
+        Note: paragraph counts vary per article, so superposition fields
+        are lists rather than stacked tensors.
+        """
+        all_logits = []
+        all_cls = []
+        all_cls_paragraphs = []
+        all_logits_paragraphs = []
+        all_paragraph_weights = []
+        all_attentions = []
+
+        n = len(articles)
+        for i, article in enumerate(articles):
+            if show_progress and (i % 50 == 0 or i == n - 1):
+                print(f"  Extracting: {i+1}/{n}")
+
+            # Get text
+            text = extract_article_text(article)
+
+            if not text or len(text.strip()) < 5:
+                # Empty article - use zeros
+                all_logits.append(torch.zeros(self.n_bots, 3))
+                all_cls.append(torch.zeros(self.n_bots, self.hidden_size))
+                # Single zero paragraph for superposition
+                all_cls_paragraphs.append(torch.zeros(1, self.n_bots, self.hidden_size))
+                all_logits_paragraphs.append(torch.zeros(1, self.n_bots, 3))
+                all_paragraph_weights.append(torch.tensor([1.0]))
+                continue
+
+            result = self.extract_article(text)
+            all_logits.append(result['logits_raw'])
+            all_cls.append(result['cls_per_bot'])
+            all_cls_paragraphs.append(result['cls_paragraphs'])
+            all_logits_paragraphs.append(result['logits_paragraphs'])
+            all_paragraph_weights.append(result['paragraph_weights'])
+
+            if self.config.record_heads and 'head_attentions' in result:
+                all_attentions.append(result['head_attentions'])
+
+        logits_raw = torch.stack(all_logits, dim=0)
+        cls_per_bot = torch.stack(all_cls, dim=0)
+
+        return {
+            # Legacy (weighted mean, backward compat)
+            'logits_raw': logits_raw,
+            'logits_flat': logits_raw.reshape(n, -1),
+            'cls_per_bot': cls_per_bot,
+            'cls_stacked': cls_per_bot.reshape(n, -1),
+
+            # Superposition (per-paragraph, for project-first-sum-later)
+            'cls_paragraphs': all_cls_paragraphs,
+            'logits_paragraphs': all_logits_paragraphs,
+            'paragraph_weights': all_paragraph_weights,
+
+            # Metadata
+            'rep_kind': self.config.rep_kind.value,
+            'n_articles': n,
+            'n_bots': self.n_bots,
+            'hidden_size': self.hidden_size,
+            'head_attentions': all_attentions if all_attentions else None,
+        }
+
+
+# =============================================================================
+# DIRICHLET FUSION (O-observers with CRN)
+# =============================================================================
+
+class DirichletFusion(nn.Module):
+    """
+    Dirichlet observer fusion for CLS embeddings (O-observers).
+    
+    Takes [N, B, hidden] CLS embeddings (V-observers) and produces
+    fused representations in a SHARED RKHS.
+    
+    KEY FEATURES:
+    1. Basis locking: RKS basis (Ω, b) is deterministic and logged
+    2. CRN support: Dirichlet weights can be pre-generated and shared
+    3. Provenance: basis_hash, sigma, seed all tracked
+    
+    The shared Hilbert space is enforced by using the SAME (Ω, b) for all bots.
+    """
+    
+    def __init__(self, config: DirichletConfig = None):
+        super().__init__()
+        
+        if config is None:
+            config = DirichletConfig()
+        self.config = config
+        
+        self.hidden_dim = config.hidden_dim
+        self.n_bots = config.n_bots
+        self.rks_dim = config.rks_dim
+        self.n_observers = config.n_observers
+        self.alpha = config.alpha
+        
+        # Load or generate RKS basis (M-observer control)
+        self._init_basis(config)
+        
+        # Load or generate Dirichlet weights (CRN)
+        self._init_crn_weights(config)
+        
+        # Estimated sigma (set on first forward)
+        self._sigma: Optional[float] = None
+        
+        # Provenance tracking
+        self._provenance = {
+            'basis_hash': config.basis_hash(),
+            'basis_seed': config.basis_seed,
+            'rks_dim': config.rks_dim,
+            'hidden_dim': config.hidden_dim,
+            'kernel_type': config.kernel_type,
+            'crn_enabled': config.crn_enabled,
+            'crn_seed': config.crn_seed if config.crn_enabled else None,
+        }
+        
+        print(f"[DirichletFusion] Basis hash: {self._provenance['basis_hash']}")
+        print(f"[DirichletFusion] CRN enabled: {config.crn_enabled}")
+    
+    def _init_basis(self, config: DirichletConfig):
+        """Initialize or load the shared RKS basis."""
+        if config.basis_path and Path(config.basis_path).exists():
+            # Load pre-generated basis
+            basis = torch.load(config.basis_path)
+            omega = basis['omega']
+            b = basis['b']
+            print(f"[DirichletFusion] Loaded basis from {config.basis_path}")
+        else:
+            # Generate deterministic basis
+            gen = torch.Generator().manual_seed(config.basis_seed)
+            omega = torch.randn(config.hidden_dim, config.rks_dim, generator=gen)
+            b = torch.rand(config.rks_dim, generator=gen) * 2 * np.pi
+        
+        self.register_buffer('omega', omega)
+        self.register_buffer('b', b)
+    
+    def _init_crn_weights(self, config: DirichletConfig):
+        """Initialize Dirichlet weights for CRN."""
+        if config.crn_enabled:
+            if config.crn_weights_path and Path(config.crn_weights_path).exists():
+                # Load pre-generated weights
+                weights_data = torch.load(config.crn_weights_path)
+                self._crn_weights = weights_data['weights']
+                print(f"[DirichletFusion] Loaded CRN weights from {config.crn_weights_path}")
+            else:
+                # Generate and cache
+                torch.manual_seed(config.crn_seed)
+                alpha_vec = torch.full((config.n_bots,), config.alpha)
+                dirichlet = torch.distributions.Dirichlet(alpha_vec)
+                self._crn_weights = dirichlet.sample((config.n_observers,))
+                print(f"[DirichletFusion] Generated CRN weights with seed {config.crn_seed}")
+        else:
+            self._crn_weights = None
+    
+    def save_basis(self, path: str):
+        """Save the RKS basis for reuse."""
+        torch.save({
+            'omega': self.omega,
+            'b': self.b,
+            'config': asdict(self.config),
+            'provenance': self._provenance,
+        }, path)
+        print(f"[DirichletFusion] Saved basis to {path}")
+    
+    def save_crn_weights(self, path: str):
+        """Save CRN weights for exact reproducibility across conditions."""
+        if self._crn_weights is not None:
+            torch.save({
+                'weights': self._crn_weights,
+                'alpha': self.alpha,
+                'n_observers': self.n_observers,
+                'n_bots': self.n_bots,
+                'crn_seed': self.config.crn_seed,
+            }, path)
+            print(f"[DirichletFusion] Saved CRN weights to {path}")
+    
+    def _estimate_sigma(self, X: torch.Tensor) -> float:
+        """Estimate bandwidth using median heuristic."""
+        with torch.no_grad():
+            flat = X.reshape(-1, self.hidden_dim)
+            n = min(500, flat.shape[0])
+            idx = torch.randperm(flat.shape[0])[:n]
+            X_sub = flat[idx]
+            
+            dists = torch.cdist(X_sub, X_sub)
+            mask = torch.triu(torch.ones_like(dists), diagonal=1).bool()
+            
+            if dists[mask].numel() > 0:
+                sigma = float(torch.median(dists[mask]).item())
+            else:
+                sigma = 1.0
+            
+            return max(sigma, 1e-6)
+    
+    def _rks_project(self, X: torch.Tensor) -> torch.Tensor:
+        """Project to RKHS using Random Kitchen Sinks."""
+        if self._sigma is None:
+            self._sigma = self._estimate_sigma(X)
+            self._provenance['sigma'] = self._sigma
+            print(f"  [DirichletFusion] Estimated σ = {self._sigma:.4f}")
+        
+        omega_scaled = self.omega / self._sigma
+        proj = X @ omega_scaled + self.b
+        scale = np.sqrt(2.0 / self.rks_dim)
+        return scale * torch.cos(proj)
+    
+    def forward(
+        self,
+        cls_per_bot: torch.Tensor,
+        return_samples: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Fuse bot CLS embeddings via Dirichlet-weighted mixtures.
+        
+        Args:
+            cls_per_bot: [N, B, hidden_dim] V-observer embeddings
+            return_samples: whether to return all observer samples
+            
+        Returns:
+            - 'fused': [N, rks_dim] mean fused representation
+            - 'fused_std': [N, rks_dim] std across O-observers (curvature proxy)
+            - 'observer_samples': [N, K, rks_dim] all samples (if return_samples)
+            - 'bot_rkhs': [N, B, rks_dim] per-bot RKHS features
+            - 'provenance': basis/sigma/CRN metadata
+        """
+        N, B, H = cls_per_bot.shape
+        
+        # Project all bots to shared RKHS
+        flat = cls_per_bot.reshape(N * B, H)
+        phi_flat = self._rks_project(flat)
+        phi = phi_flat.reshape(N, B, -1)  # [N, B, rks_dim]
+        
+        # Get Dirichlet weights (CRN or fresh sample)
+        if self._crn_weights is not None:
+            weights = self._crn_weights.to(phi.device)
+        else:
+            alpha_vec = torch.full((B,), self.alpha)
+            dirichlet = torch.distributions.Dirichlet(alpha_vec)
+            weights = dirichlet.sample((self.n_observers,)).to(phi.device)
+        
+        # Fuse: φ(article) = Σ_b w_b * φ(bot_b)
+        # phi: [N, B, D], weights: [K, B] -> observer_samples: [N, K, D]
+        observer_samples = torch.einsum('nbd,kb->nkd', phi, weights)
+        
+        fused_mean = observer_samples.mean(dim=1)
+        fused_std = observer_samples.std(dim=1)
+        
+        result = {
+            'fused': fused_mean,
+            'fused_std': fused_std,  # Curvature proxy
+            'bot_rkhs': phi,
+            'rep_kind': RepKind.CLS_FUSED.value,
+            'provenance': self._provenance.copy(),
+        }
+        
+        if return_samples:
+            result['observer_samples'] = observer_samples
+        
+        return result
+    
+    def get_provenance(self) -> Dict[str, Any]:
+        """Get full provenance for artifact logging."""
+        return {
+            **self._provenance,
+            'sigma': self._sigma,
+            'alpha': self.alpha,
+            'n_observers': self.n_observers,
+        }
+
+
+# =============================================================================
+# GRAM-FIRST ANALYSIS (per diagnostic mandate)
+# =============================================================================
+
+def compute_gram_matrix(
+    embeddings: torch.Tensor,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Compute normalized Gram matrix for wavelength analysis.
+    
+    This is the primary metric per the diagnostic mandate - 
+    coordinate-space metrics are fragile under normalization.
+    """
+    if normalize:
+        embeddings = F.normalize(embeddings, dim=-1)
+    
+    return embeddings @ embeddings.T
+
+
+def compute_wavelength_energy(
+    gram_alpha1: torch.Tensor,
+    gram_alpha2: torch.Tensor,
+) -> float:
+    """
+    Compute wavelength energy: ||G_α1 - G_α2||_F
+    
+    This measures how much the geometry changes across α values.
+    """
+    diff = gram_alpha1 - gram_alpha2
+    return float(torch.norm(diff, p='fro').item())
+
+
+def compute_knn_flip_rate(
+    gram1: torch.Tensor,
+    gram2: torch.Tensor,
+    k: int = 10,
+) -> float:
+    """
+    Compute kNN neighbor flip rate across two Gram matrices.
+    
+    Measures local structure stability.
+    """
+    n = gram1.shape[0]
+    k = min(k, n - 1)
+    
+    # Get k-nearest neighbors from each Gram
+    _, idx1 = torch.topk(gram1, k + 1, dim=-1)  # +1 to exclude self
+    _, idx2 = torch.topk(gram2, k + 1, dim=-1)
+    
+    # Remove self (diagonal)
+    idx1 = idx1[:, 1:]
+    idx2 = idx2[:, 1:]
+    
+    # Compute overlap
+    flips = 0
+    for i in range(n):
+        set1 = set(idx1[i].tolist())
+        set2 = set(idx2[i].tolist())
+        flips += len(set1 - set2)
+    
+    return flips / (n * k)
+
+
+# =============================================================================
+# CURVATURE METRICS (within-item observable)
+# =============================================================================
+
+def compute_curvature_stats(fused_std: torch.Tensor) -> Dict[str, float]:
+    """
+    Compute curvature-spectrum stats from fused_std.
+    
+    This is the within-item observable that survives even when
+    global separation doesn't.
+    """
+    # Per-item variance across observers
+    var_per_item = (fused_std ** 2).sum(dim=-1)  # [N]
+    
+    # Eigenvalue-based stats on the std matrix
+    cov = fused_std.T @ fused_std / fused_std.shape[0]
+    eigvals = torch.linalg.eigvalsh(cov)
+    eigvals = eigvals.flip(0)  # Descending
+    eigvals = eigvals.clamp(min=1e-12)
+    
+    # Participation ratio (effective rank)
+    total = eigvals.sum()
+    pr = (total ** 2) / (eigvals ** 2).sum()
+    
+    # EV90: components needed for 90% variance
+    cumsum = torch.cumsum(eigvals, dim=0) / total
+    ev90 = int((cumsum < 0.9).sum().item()) + 1
+    
+    # λ1/λ2 ratio
+    lambda_ratio = float(eigvals[0] / eigvals[1]) if len(eigvals) > 1 else float('inf')
+    
+    return {
+        'mean_item_variance': float(var_per_item.mean().item()),
+        'std_item_variance': float(var_per_item.std().item()),
+        'participation_ratio': float(pr.item()),
+        'ev90_components': ev90,
+        'lambda1_lambda2_ratio': lambda_ratio,
+        'top_eigenvalue': float(eigvals[0].item()),
+    }
+
+
+# =============================================================================
+# LEGACY COMPATIBILITY WRAPPER
+# =============================================================================
+
+class NLIExtractor:
+    """
+    Legacy-compatible wrapper around UnifiedNLIExtractor.
+    
+    Maintains the same interface as the original NLIExtractor for
+    backward compatibility with complete_pipeline.py.
+    """
+    
+    def __init__(
+        self,
+        device: str = "cuda",
+        queries_config: str = "config/framing_queries.yaml",
+        extract_cli: bool = False,
+        cli_mode: str = "contrastive",
+        paragraph_aware: bool = True,
+        paragraph_weights: Optional[List[float]] = None,
+        use_cls_tokens: bool = False,
+        projection_dim: int = 256,
+        apply_pca_to_cls: bool = False,
+        normalize_before_projection: bool = True,
+        model_name: str = "microsoft/deberta-v2-xlarge-mnli",
+        max_length: int = 512,
+        **_ignored: Any,
+    ):
+        config = ExtractionConfig(
+            model_name=model_name,
+            queries_config=queries_config,
+            max_length=max_length,
+            device=device,
+            use_cls_tokens=use_cls_tokens,
+            paragraph_weights=paragraph_weights or [0.5, 0.3, 0.2],
+            projection_dim=projection_dim,
+            apply_pca_to_cls=apply_pca_to_cls,
+            normalize_before_projection=normalize_before_projection,
+        )
+        
+        self.extractor = UnifiedNLIExtractor(config)
+        self.use_cls_tokens = use_cls_tokens
+        self.apply_pca_to_cls = apply_pca_to_cls
+        
+        # For interface compatibility
+        self.output_dim = self.extractor.cls_dim if use_cls_tokens else self.extractor.logits_dim
+    
+    def _get_text(self, article: Union[str, Dict[str, str]]) -> str:
+        return extract_article_text(article)
+    
+    def extract_nli_pairs(self, articles: List[Union[str, Dict[str, str]]]) -> List[Dict[str, Any]]:
+        """
+        Extract embeddings with full bot-level preservation.
+
+        Returns list of dicts with:
+        - 'embedding': flattened embedding for backward compat
+        - 'logits_raw': [n_bots, 3] per-bot logits BEFORE concatenation
+        - 'cls_per_bot': [n_bots, hidden] per-bot CLS BEFORE concatenation
+        - 'rep_kind': representation type
+        """
+        batch_result = self.extractor.extract_batch(articles, show_progress=False)
+
+        results = []
+        n = batch_result['n_articles']
+
+        for i in range(n):
+            # Always include bot-level data for information preservation
+            payload = {
+                # Bot-level preservation (BEFORE concatenation)
+                'logits_raw': batch_result['logits_raw'][i],      # [n_bots, 3]
+                'cls_per_bot': batch_result['cls_per_bot'][i],    # [n_bots, hidden]
+            }
+
+            if self.use_cls_tokens:
+                # CLS mode: embedding is cls_stacked
+                emb = batch_result['cls_stacked'][i]
+                payload.update({
+                    'embedding': emb,
+                    'embedding_cls': emb,
+                    'embedding_logits': batch_result['logits_flat'][i],
+                    'rep_kind': RepKind.CLS_VIEWS.value,
+                })
+            else:
+                # Logits mode: embedding is logits_flat
+                emb = batch_result['logits_flat'][i]
+                payload.update({
+                    'embedding': emb,
+                    'rep_kind': RepKind.LOGITS_RAW.value,
+                })
+
+            results.append(payload)
+
+        return results
+
+
+# =============================================================================
+# ALPHA SWEEP UTILITIES (O-observer probing)
+# =============================================================================
+
+def run_alpha_sweep(
+    cls_per_bot: torch.Tensor,
+    alphas: List[float] = [0.1, 0.5, 1.0, 5.0, 20.0],
+    base_config: DirichletConfig = None,
+    crn_seed: int = 12345,
+) -> Dict[str, Any]:
+    """
+    Sweep over Dirichlet α values with CRN.
+    
+    This is the proper way to probe observer families -
+    α is the probe distribution parameter, not a random hyperparameter.
+    
+    Returns results for each α with consistent random numbers.
+    """
+    if base_config is None:
+        base_config = DirichletConfig()
+    
+    results = {}
+    
+    # Pre-generate weights for all alphas with same RNG stream
+    torch.manual_seed(crn_seed)
+    
+    for alpha in alphas:
+        config = DirichletConfig(
+            n_bots=base_config.n_bots,
+            hidden_dim=base_config.hidden_dim,
+            rks_dim=base_config.rks_dim,
+            n_observers=base_config.n_observers,
+            alpha=alpha,
+            basis_seed=base_config.basis_seed,  # Same basis
+            crn_enabled=True,
+            crn_seed=crn_seed + int(alpha * 1000),  # Deterministic per alpha
+        )
+        
+        fusion = DirichletFusion(config)
+        output = fusion(cls_per_bot)
+        
+        # Compute Gram for wavelength analysis
+        gram = compute_gram_matrix(output['fused'])
+        curvature = compute_curvature_stats(output['fused_std'])
+        
+        results[f'alpha_{alpha}'] = {
+            'fused': output['fused'],
+            'fused_std': output['fused_std'],
+            'gram': gram,
+            'curvature': curvature,
+            'provenance': output['provenance'],
+        }
+    
+    # Compute wavelength metrics between adjacent alphas
+    alpha_pairs = list(zip(alphas[:-1], alphas[1:]))
+    wavelength_energies = {}
+    
+    for a1, a2 in alpha_pairs:
+        g1 = results[f'alpha_{a1}']['gram']
+        g2 = results[f'alpha_{a2}']['gram']
+        energy = compute_wavelength_energy(g1, g2)
+        flip_rate = compute_knn_flip_rate(g1, g2)
+        wavelength_energies[f'{a1}_to_{a2}'] = {
+            'energy': energy,
+            'knn_flip_rate': flip_rate,
+        }
+    
+    results['wavelength'] = wavelength_energies
+    
+    return results
+
+
+# =============================================================================
+# MODULE EXPORTS
+# =============================================================================
+
+__all__ = [
+    # Core types
+    'RepKind',
+    'ExtractionConfig',
+    'DirichletConfig',
+    
+    # Extractors
+    'UnifiedNLIExtractor',
+    'NLIExtractor',  # Legacy compat
+    
+    # Fusion
+    'DirichletFusion',
+    
+    # Analysis
+    'compute_gram_matrix',
+    'compute_wavelength_energy',
+    'compute_knn_flip_rate',
+    'compute_curvature_stats',
+    'run_alpha_sweep',
+    
+    # Gates
+    'get_rep_kind',
+    'validate_operation',
+]
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Testing Enhanced NLI Extraction")
+    print("=" * 60)
+    
+    # Test rep_kind gate
+    print("\n--- Rep Kind Gates ---")
+    print(f"Logits mode: {get_rep_kind(use_cls_tokens=False)}")
+    print(f"CLS mode: {get_rep_kind(use_cls_tokens=True)}")
+    print(f"Fused mode: {get_rep_kind(use_cls_tokens=True, is_fused=True)}")
+    
+    # Test forbidden operations
+    print("\n--- Forbidden Operations Test ---")
+    try:
+        validate_operation(RepKind.LOGITS_RAW, "apply_rks_kernel")
+    except ValueError as e:
+        print(f"Correctly blocked: {e}")
+    
+    print("\n[OK] All tests passed")

@@ -1,0 +1,3653 @@
+"""
+complete_pipeline.py  end-to-end orchestration for the Belief Transformer / bias-geometry experiments.
+
+This file is intentionally "pipeline glue": it wires together the NLI extractor, optional temporal modeling,
+kernel feature maps, attention aggregation, and provenance tracking. It is designed to be:
+
+1) Reproducible
+   - deterministic seeds per observer
+   - explicit device handling
+   - stable, traceable output artifacts
+
+2) Traceable (thesis-ready)
+   - every article gets a stable UID (`bt_uid`) so arrays, plots, and sidecar metadata can be joined without
+     relying on fragile "list index" assumptions.
+   - timestamps are preserved and normalized (epoch + ISO) so downstream timeline/map visualizations
+     can be built reliably, even when raw inputs mix formats.
+
+3) Safe to iterate
+   - the pipeline never mutates provenance into model inputs
+   - optional caching is explicitly surfaced via diagnostics
+   - ordering transforms (temporal sort / restoration) are recorded so you can explain them in writing.
+
+Key invariants this pipeline tries to uphold:
+
+A) Index stability
+   You should be able to re-run the same month/corpus and still match points across:
+     - embedding matrices
+     - UMAP/PCA plots
+     - polygon/line overlays
+     - per-article metadata panels
+   without hand-waving about "some list changed".
+
+B) Timestamp integrity
+   If the source dataset contains `published_at` (or any supported timestamp field), we:
+     - keep the raw value,
+     - parse it to a UTC epoch (seconds),
+     - produce a normalized ISO string,
+     - expose per-article coverage stats.
+
+C) No silent collapse
+   Exact duplicates can be detected and optionally deduplicated, but by default we preserve records and
+   instead disambiguate colliding UIDs with deterministic suffixes. This prevents accidental "clumps"
+   caused by repeated identical rows while still letting you diagnose the data problem explicitly.
+
+Supported timestamp fields (checked in order):
+  - published_at
+  - timestamp
+  - date
+  - created_at
+  - updated_at
+
+If none parse cleanly, we keep the raw values and fall back to a stable order tie-breaker (`bt_uid`, then
+original index). This keeps temporal sorting deterministic rather than "whatever Python happened to do".
+
+"""
+
+import os
+import json
+import time
+import hashlib
+import math
+import subprocess
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+import datetime
+from email.utils import parsedate_to_datetime
+
+from .nli_extraction import NLIExtractor, RepKind, validate_operation
+from .temporal_gru import TemporalGRU
+from .rks_feature_map import RKSFeatureMap, SharedBasis
+from .cross_article_attention import CrossArticleAttention
+from .pca_removal import remove_top_pca_component, fit_whitening_matrix, apply_whitening_fixed
+from .attention_recorder import AttentionRecorder
+from .provenance_tracker import ProvenanceTracker, PipelineProvenanceEntry
+from .pipeline_config import DEFAULT_PIPELINE_RUNTIME_CONFIG, PipelineRuntimeConfig
+
+# Try to import Dirichlet fusion (optional, for new pipeline)
+try:
+    from .dirichlet_fusion import DirichletFusion, DirichletFusionConfig
+    HAS_DIRICHLET_FUSION = True
+except ImportError:
+    HAS_DIRICHLET_FUSION = False
+    DirichletFusion = None
+    DirichletFusionConfig = None
+
+# Try to import PhaseSpaceIntegrator (Track 5 - Final Exit Gate)
+try:
+    from .phase_space_integrator import (
+        PhaseSpaceIntegrator,
+        IntegratorConfig,
+        IntegratedParticle,
+    )
+    HAS_PHASE_SPACE = True
+except ImportError:
+    HAS_PHASE_SPACE = False
+    PhaseSpaceIntegrator = None
+    IntegratorConfig = None
+    IntegratedParticle = None
+
+# --------------------------------------------------------------------------------------
+# GRU Hard Disable Flag
+# --------------------------------------------------------------------------------------
+# The GRU expects a specific input dimension (8192) but receives 12288 from the CLS
+# channel. This is a dimension mismatch that needs architectural changes to fix.
+# For now, we hard-disable the GRU to allow experiments to proceed.
+_GRU_HARD_DISABLED = True
+
+
+# --------------------------------------------------------------------------------------
+# Information Preservation Utilities (Thesis-Grade Provenance)
+# --------------------------------------------------------------------------------------
+
+def get_git_hash() -> str:
+    """Get current git commit hash for reproducibility."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()[:12]
+    except Exception:
+        pass
+    return 'unknown'
+
+
+def get_git_dirty() -> bool:
+    """Check if git repo has uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return len(result.stdout.strip()) > 0
+    except Exception:
+        pass
+    return True
+
+
+def build_structured_output_path(
+    output_dir: Path,
+    kernel_type: str,
+    channel: str,
+    corpus_name: str,
+    seed: int,
+) -> Path:
+    """
+    Build output path with kernel/channel/corpus structure.
+    
+    Structure: output_dir/kernel/channel/corpus/observer_{seed}.pt
+    """
+    structured_dir = output_dir / kernel_type / channel / corpus_name
+    structured_dir.mkdir(parents=True, exist_ok=True)
+    return structured_dir / f"observer_{seed}.pt"
+
+
+def compute_variance_stats(tensor: torch.Tensor, name: str) -> Dict[str, float]:
+    """Compute variance statistics for a tensor (for stage tracking)."""
+    if tensor is None or tensor.numel() == 0:
+        return {}
+    with torch.no_grad():
+        flat = tensor.reshape(-1).float()
+        stats = {
+            f'{name}_mean': float(flat.mean().item()),
+            f'{name}_std': float(flat.std().item()),
+            f'{name}_var': float(flat.var().item()),
+            f'{name}_min': float(flat.min().item()),
+            f'{name}_max': float(flat.max().item()),
+        }
+        if tensor.dim() >= 2:
+            stats[f'{name}_norm_mean'] = float(tensor.float().norm(dim=-1).mean().item())
+        return stats
+
+
+SPECTRAL_CLS_NORMALIZATION_CONTRACT = "magnitude_preserving"
+_VALIDATION_MISSING = {"", "unknown", "none", "nan", "n/a", "na"}
+_PRIMARY_LABEL_KEYS = (
+    "perspective_tag",
+    "label",
+    "ground_truth_label",
+    "frame_label",
+    "viewpoint",
+    "ideology",
+)
+_SECONDARY_LABEL_KEYS = ("bias", "affiliation")
+_SOURCE_LABEL_KEYS = ("source", "publisher", "publication", "outlet")
+_TRACK_VALIDATION_ORDER = ("T1", "T2", "T1.5", "T3", "SYN")
+
+
+def _canonicalize_cls_per_bot_for_spectral(
+    cls_per_bot_entries: List[torch.Tensor],
+    normalize_features_flag: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]], Dict[str, Any]]:
+    """
+    Build canonical cls_per_bot tensor/list views for spectral tracks.
+
+    Contract:
+      - Track 1.5 spectral inputs are always magnitude-preserving.
+      - `normalize_features` does not apply to cls_per_bot here.
+      - Tensor and list views are generated from the same stacked tensor.
+    """
+    if not cls_per_bot_entries:
+        return None, None, {
+            "contract": SPECTRAL_CLS_NORMALIZATION_CONTRACT,
+            "requested_normalize_features": bool(normalize_features_flag),
+            "applied_l2_normalization": False,
+            "n_articles": 0,
+        }
+
+    stacked = torch.stack(cls_per_bot_entries, dim=0)
+    return stacked, list(stacked.unbind(0)), {
+        "contract": SPECTRAL_CLS_NORMALIZATION_CONTRACT,
+        "requested_normalize_features": bool(normalize_features_flag),
+        "applied_l2_normalization": False,
+        "n_articles": int(stacked.shape[0]),
+    }
+
+
+def _serialize_rks_basis_state(basis: Any) -> Optional[Dict[str, Any]]:
+    """Serialize the active SharedRKSBasis state needed for Track 4 replay."""
+    if basis is None:
+        return None
+
+    def _cpu_tensor(value: Any) -> Optional[torch.Tensor]:
+        if value is None or not torch.is_tensor(value):
+            return None
+        return value.detach().cpu()
+
+    sigma = getattr(basis, "_sigma", None)
+    sigma_value = float(sigma) if sigma is not None else None
+    return {
+        "omega": _cpu_tensor(getattr(basis, "omega", None)),
+        "b": _cpu_tensor(getattr(basis, "b", None)),
+        "input_dim": int(getattr(basis, "input_dim", 0) or 0),
+        "output_dim": int(getattr(basis, "output_dim", 0) or 0),
+        "seed": int(getattr(basis, "seed", 0) or 0),
+        "kernel_type": str(getattr(basis, "kernel_type", "rbf")),
+        "nu": float(getattr(basis, "nu", 1.5)),
+        "roughness": int(getattr(basis, "roughness", 3) or 3),
+        "sigma": sigma_value,
+        "hash": str(getattr(basis, "basis_hash", getattr(basis, "_hash", ""))),
+        "sigma_diagnostics": getattr(basis, "_sigma_diagnostics", {}),
+    }
+
+
+def _construct_spectral_poles(
+    cls_per_bot_tensor: torch.Tensor,
+    probe_magnitudes: torch.Tensor,
+    min_bucket_mass: float = 1e-8,
+) -> Dict[str, Any]:
+    """
+    Construct positive/negative pole embeddings with explicit degeneracy fallbacks.
+
+    Degeneracy handling:
+      - If one sign bucket is near-empty, replace that pole with extreme-probe fallback.
+      - If both buckets are near-empty (all near-zero projections), use probe[0]/probe[1].
+      - Emit per-article fallback state instead of relying on silent clamp floors.
+    """
+    G = cls_per_bot_tensor
+    mags = probe_magnitudes
+    N, n_probes, _ = G.shape
+
+    pos_mass = torch.clamp(mags, min=0.0).sum(dim=1)
+    neg_mass = torch.clamp(-mags, min=0.0).sum(dim=1)
+    missing_pos = pos_mass <= float(min_bucket_mass)
+    missing_neg = neg_mass <= float(min_bucket_mass)
+    both_missing = missing_pos & missing_neg
+
+    pos_weights = torch.clamp(mags, min=0.0).unsqueeze(-1)
+    neg_weights = torch.clamp(-mags, min=0.0).unsqueeze(-1)
+    pos_sum = pos_weights.sum(dim=1)
+    neg_sum = neg_weights.sum(dim=1)
+
+    emb_pos = (G * pos_weights).sum(dim=1) / torch.where(pos_sum > 0, pos_sum, torch.ones_like(pos_sum))
+    emb_neg = (G * neg_weights).sum(dim=1) / torch.where(neg_sum > 0, neg_sum, torch.ones_like(neg_sum))
+
+    row_idx = torch.arange(N, device=G.device)
+    max_idx = mags.argmax(dim=1)
+    min_idx = mags.argmin(dim=1)
+    emb_max = G[row_idx, max_idx, :]
+    emb_min = G[row_idx, min_idx, :]
+
+    if missing_pos.any():
+        emb_pos[missing_pos] = emb_max[missing_pos]
+    if missing_neg.any():
+        emb_neg[missing_neg] = emb_min[missing_neg]
+
+    if both_missing.any():
+        emb_pos[both_missing] = G[both_missing, 0, :]
+        fallback_neg_idx = 1 if n_probes > 1 else 0
+        emb_neg[both_missing] = G[both_missing, fallback_neg_idx, :]
+
+    fallback_used = missing_pos | missing_neg
+    fallback_state = []
+    for i in range(N):
+        if bool(both_missing[i].item()):
+            fallback_state.append("fallback_both_sign_buckets_empty")
+        elif bool(missing_pos[i].item()):
+            fallback_state.append("fallback_positive_sign_bucket_empty")
+        elif bool(missing_neg[i].item()):
+            fallback_state.append("fallback_negative_sign_bucket_empty")
+        else:
+            fallback_state.append("weighted_sign_buckets")
+
+    return {
+        "emb_pos": emb_pos,
+        "emb_neg": emb_neg,
+        "pos_mass": pos_mass,
+        "neg_mass": neg_mass,
+        "fallback_used": fallback_used,
+        "fallback_state": fallback_state,
+    }
+
+
+def _extract_validation_label_info(
+    articles_for_labels=None,
+    metadata_for_labels=None,
+    *,
+    allow_source_fallback: bool = False,
+):
+    def _try_records(records, keys, label_source):
+        if records is None:
+            return None
+        labels = []
+        for row in records:
+            if not isinstance(row, dict):
+                return None
+            value = None
+            for key in keys:
+                raw = row.get(key)
+                if raw is None:
+                    continue
+                text = str(raw).strip()
+                if text and text.lower() not in _VALIDATION_MISSING:
+                    value = text
+                    break
+            if value is None:
+                return None
+            labels.append(value)
+        unique = sorted(set(labels))
+        if len(unique) < 2:
+            return None
+        return {
+            "labels": labels,
+            "label_cardinality": int(len(unique)),
+            "label_source": label_source,
+        }
+
+    candidates = [
+        (articles_for_labels, _PRIMARY_LABEL_KEYS, "corpus_semantic_label"),
+        (metadata_for_labels, _PRIMARY_LABEL_KEYS, "article_metadata"),
+        (metadata_for_labels, _SECONDARY_LABEL_KEYS, "article_metadata"),
+    ]
+    if allow_source_fallback:
+        candidates.append((metadata_for_labels, _SOURCE_LABEL_KEYS, "source_fallback"))
+
+    for records, keys, label_source in candidates:
+        info = _try_records(records, keys, label_source)
+        if info is not None:
+            return info
+    return None
+
+
+def _compute_alignment_metrics(features_np, label_info):
+    """
+    Compute contract-grade clustering alignment metrics from final features
+    against explicit label information.
+    """
+    if features_np is None or label_info is None:
+        return None
+    X = np.asarray(features_np, dtype=np.float64)
+    if X.ndim != 2 or X.shape[0] < 3:
+        return None
+    labels = list(label_info.get("labels", []))
+    if len(labels) != X.shape[0]:
+        return None
+
+    unique = sorted(set(labels))
+    if len(unique) < 2:
+        return None
+    label_to_idx = {label: idx for idx, label in enumerate(unique)}
+    y = np.array([label_to_idx[v] for v in labels], dtype=np.int32)
+
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+        n_clusters = int(len(unique))
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        pred = km.fit_predict(X)
+        return {
+            "nmi": float(normalized_mutual_info_score(y, pred)),
+            "ari": float(adjusted_rand_score(y, pred)),
+            "n_clusters": n_clusters,
+            "label_cardinality": int(len(unique)),
+            "label_source": str(label_info.get("label_source", "unknown")),
+        }
+    except Exception:
+        return None
+
+
+def _load_track_feature_sets(run_dir: str, synthesis_features=None) -> Dict[str, np.ndarray]:
+    run_path = Path(run_dir)
+    checkpoint_dir = run_path / "checkpoints" / "batch"
+    track_features: Dict[str, np.ndarray] = {}
+
+    t0_path = checkpoint_dir / "T0_substrate.npy"
+    if t0_path.exists():
+        t0 = np.load(t0_path)
+        if t0.ndim > 2:
+            t0 = t0.reshape(t0.shape[0], -1)
+        track_features["T1"] = np.asarray(t0, dtype=np.float64)
+
+    t2_path = checkpoint_dir / "T2_kernel_projections.npz"
+    if t2_path.exists():
+        t2_data = np.load(t2_path, allow_pickle=True)
+        selected = None
+        for key in ("z_rbf", "z_matern", "z_laplacian", "z_imq"):
+            if key in t2_data.files:
+                selected = np.asarray(t2_data[key], dtype=np.float64)
+                break
+        if selected is None:
+            for key in t2_data.files:
+                if str(key).startswith("z_"):
+                    selected = np.asarray(t2_data[key], dtype=np.float64)
+                    break
+        if selected is not None and selected.ndim == 2:
+            track_features["T2"] = selected
+
+    t15_path = checkpoint_dir / "T1.5_spectral_state.npz"
+    if t15_path.exists():
+        t15_data = np.load(t15_path, allow_pickle=True)
+        if "probe_magnitudes" in t15_data.files:
+            probe_mags = np.asarray(t15_data["probe_magnitudes"], dtype=np.float64)
+            if probe_mags.ndim == 2:
+                track_features["T1.5"] = probe_mags
+
+    t3_std_path = run_path / "dirichlet_fused_std.npy"
+    if t3_std_path.exists():
+        t3_std = np.asarray(np.load(t3_std_path), dtype=np.float64)
+        if t3_std.ndim == 2:
+            track_features["T3"] = t3_std
+    else:
+        t3_path = checkpoint_dir / "T3_topology.npz"
+        if t3_path.exists():
+            t3_data = np.load(t3_path, allow_pickle=True)
+            if "dirichlet_fused_std" in t3_data.files:
+                candidate = np.asarray(t3_data["dirichlet_fused_std"], dtype=np.float64)
+                if candidate.ndim == 2:
+                    track_features["T3"] = candidate
+
+    if synthesis_features is not None:
+        syn = np.asarray(synthesis_features, dtype=np.float64)
+        if syn.ndim == 2:
+            track_features["SYN"] = syn
+    else:
+        features_path = run_path / "features.npy"
+        if features_path.exists():
+            syn = np.asarray(np.load(features_path), dtype=np.float64)
+            if syn.ndim == 2:
+                track_features["SYN"] = syn
+
+    return track_features
+
+
+def _compute_track_validation_metrics(
+    run_dir: str,
+    label_info,
+    synthesis_features=None,
+) -> Dict[str, Dict[str, Any]]:
+    track_metrics: Dict[str, Dict[str, Any]] = {}
+    for track_key, features_np in _load_track_feature_sets(run_dir, synthesis_features=synthesis_features).items():
+        metrics = _compute_alignment_metrics(features_np, label_info)
+        if metrics is not None:
+            track_metrics[track_key] = metrics
+    return track_metrics
+
+
+def _map_track4_state_to_track5_verdict(
+    state_name: str,
+    *,
+    phantom_ratio: Optional[float] = None,
+) -> str:
+    state = str(state_name or "").strip()
+    if state in {"trapped", "tautology", "Type 2 Rupture", "TRAPPED", "FAILED"}:
+        return "TAUTOLOGY"
+    if state in {"phantom", "rupture", "Type 1 Rupture", "BROKEN", "RUPTURE"}:
+        return "PHANTOM"
+    if state == "honest":
+        return "HONEST"
+
+    ratio = 1.0 if phantom_ratio is None else float(phantom_ratio)
+    if ratio > 2.0:
+        return "PHANTOM"
+    if ratio < 0.5:
+        return "TAUTOLOGY"
+    return "HONEST"
+
+
+def _classify_track5_semantic_verdicts(
+    work_arr: np.ndarray,
+    d_arr: np.ndarray,
+    walker_state_records: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Tri-state semantic classifier for Track 5.
+
+    Policy:
+    - TAUTOLOGY: true stalls / trapped anomalies / near-zero displacement
+    - PHANTOM: kinetic/pathology anomalies or high article-level delta
+    - HONEST: lower article-level delta among non-tautological, non-anomalous paths
+    """
+    from sklearn.cluster import KMeans
+
+    EPS = 1e-9
+    work_arr = np.asarray(work_arr, dtype=float)
+    d_arr = np.asarray(d_arr, dtype=float)
+    delta_arr = work_arr / np.maximum(d_arr, EPS)
+    verdicts = np.full(delta_arr.shape, "HONEST", dtype=object)
+
+    records = walker_state_records or []
+    tautology_mask = np.zeros(delta_arr.shape, dtype=bool)
+    anomaly_mask = np.zeros(delta_arr.shape, dtype=bool)
+    for i in range(len(delta_arr)):
+        rec = records[i] if i < len(records) else {}
+        raw_state = str(rec.get("raw_state", rec.get("label", ""))).strip().lower()
+        anomaly_kind = str(rec.get("anomaly_kind", "none")).strip().lower()
+        if raw_state in {"tautology", "trapped"} or anomaly_kind == "trapped_stall":
+            tautology_mask[i] = True
+        elif anomaly_kind in {"kinetic_break", "linalg_pathology"}:
+            anomaly_mask[i] = True
+
+    # Physical tautology safeguard: negligible displacement is still tautology.
+    tautology_mask |= d_arr < 1e-3
+    verdicts[tautology_mask] = "TAUTOLOGY"
+    verdicts[anomaly_mask] = "PHANTOM"
+
+    candidate_mask = ~(tautology_mask | anomaly_mask)
+    candidate_delta = delta_arr[candidate_mask]
+    honest_cutoff = float(np.median(delta_arr)) if delta_arr.size else 0.0
+    threshold_mode = "median_fallback"
+    if candidate_delta.size >= 8 and np.unique(np.round(candidate_delta, 8)).size >= 2:
+        km = KMeans(n_clusters=2, random_state=42, n_init=10).fit(candidate_delta.reshape(-1, 1))
+        centers = np.sort(km.cluster_centers_.flatten())
+        honest_cutoff = float(centers[0] + (centers[1] - centers[0]) / 2.0)
+        threshold_mode = "kmeans_2cluster"
+
+    verdicts[candidate_mask] = np.where(
+        candidate_delta <= honest_cutoff,
+        "HONEST",
+        "PHANTOM",
+    )
+    tautology_cutoff = None
+    if candidate_delta.size >= 12 and np.unique(np.round(candidate_delta, 8)).size >= 4:
+        lower_tail_cutoff = float(np.percentile(candidate_delta, 20.0))
+        tautology_cutoff = min(lower_tail_cutoff, honest_cutoff * 0.8)
+        if np.isfinite(tautology_cutoff):
+            candidate_indices = np.flatnonzero(candidate_mask)
+            low_tail_mask = candidate_delta <= tautology_cutoff
+            if np.any(low_tail_mask):
+                verdicts[candidate_indices[low_tail_mask]] = "TAUTOLOGY"
+    return verdicts, {
+        "tautology_cutoff": float(tautology_cutoff) if tautology_cutoff is not None else None,
+        "honest_cutoff": honest_cutoff,
+        "threshold_mode": threshold_mode,
+        "delta_min": float(delta_arr.min()) if delta_arr.size else 0.0,
+        "delta_mean": float(delta_arr.mean()) if delta_arr.size else 0.0,
+        "delta_max": float(delta_arr.max()) if delta_arr.size else 0.0,
+    }
+
+
+def _summarize_track_validation_records(
+    validation_records: List[Dict[str, Any]]
+) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    track_nmi_summary: Dict[str, float] = {}
+    track_metrics_summary: Dict[str, Dict[str, Any]] = {}
+    for track_key in _TRACK_VALIDATION_ORDER:
+        per_track = [
+            rec.get("track_metrics", {}).get(track_key)
+            for rec in validation_records
+            if isinstance(rec.get("track_metrics", {}).get(track_key), dict)
+        ]
+        nmis = [float(m["nmi"]) for m in per_track if isinstance(m.get("nmi"), (int, float))]
+        aris = [float(m["ari"]) for m in per_track if isinstance(m.get("ari"), (int, float))]
+        if not nmis:
+            continue
+        track_nmi_summary[track_key] = float(np.mean(nmis))
+        summary_payload = dict(per_track[0])
+        summary_payload["nmi"] = float(np.mean(nmis))
+        if aris:
+            summary_payload["ari"] = float(np.mean(aris))
+        track_metrics_summary[track_key] = summary_payload
+    return track_nmi_summary, track_metrics_summary
+
+
+class VarianceTracker:
+    """Track variance at each pipeline stage for information preservation."""
+    
+    def __init__(self):
+        self.stages = {}
+        self.metadata = {}
+    
+    def record_stage(self, name: str, tensor):
+        """Record variance stats for a pipeline stage. Accepts torch.Tensor or numpy.ndarray."""
+        if tensor is None:
+            return
+        # Handle both numpy arrays and torch tensors
+        if isinstance(tensor, np.ndarray):
+            if tensor.size > 0:
+                tensor_torch = torch.from_numpy(tensor)
+                self.stages[name] = compute_variance_stats(tensor_torch, name)
+                self.stages[name]['shape'] = list(tensor.shape)
+        elif hasattr(tensor, 'numel') and tensor.numel() > 0:
+            self.stages[name] = compute_variance_stats(tensor, name)
+            self.stages[name]['shape'] = list(tensor.shape)
+    
+    def record_metadata(self, key: str, value):
+        """Record arbitrary metadata."""
+        self.metadata[key] = value
+    
+    def to_dict(self) -> Dict:
+        """Export all tracked data."""
+        return {'stages': self.stages, 'metadata': self.metadata}
+
+
+# --------------------------------------------------------------------------------------
+# Constitutional Contract Enforcement
+# --------------------------------------------------------------------------------------
+
+def _get_channel_rep_kind(channel_name: str, use_cls_tokens: bool) -> RepKind:
+    """
+    Determine RepKind for a given channel.
+    
+    Rules:
+    - 'logits' channel -> LOGITS_RAW (never kernelized)
+    - 'cls' or 'main' with use_cls_tokens -> CLS_VIEWS
+    - 'main' without use_cls_tokens -> LOGITS_RAW
+    """
+    channel_lower = channel_name.lower()
+    if channel_lower == "logits":
+        return RepKind.LOGITS_RAW
+    elif use_cls_tokens:
+        return RepKind.CLS_VIEWS
+    else:
+        return RepKind.LOGITS_RAW
+
+
+def _check_operation_allowed(rep_kind: RepKind, operation: str, warn_only: bool = False) -> bool:
+    """
+    Check if an operation is allowed for a rep_kind.
+
+    Args:
+        rep_kind: The representation kind
+        operation: Operation name (e.g., 'rks', 'pca_removal', 'procrustes')
+        warn_only: If True, just warn; if False, return False for forbidden ops
+
+    Returns:
+        True if operation should proceed, False if it should be skipped
+    """
+    try:
+        if validate_operation(rep_kind, operation):
+            return True
+    except ValueError as e:
+        msg = f"[CONSTITUTIONAL CONTRACT] Skipping '{operation}' for {rep_kind.value}: {e}"
+        print(f"WARNING: {msg}")
+        return False
+
+    msg = f"[CONSTITUTIONAL CONTRACT] Skipping '{operation}' for {rep_kind.value} (forbidden operation)"
+    print(f"WARNING: {msg}")
+    return False
+# --------------------------------------------------------------------------------------
+
+_TS_KEYS_PRIORITY = ("published_at", "timestamp", "date", "created_at", "updated_at")
+
+
+def _safe_str(x) -> str:
+    try:
+        return "" if x is None else str(x)
+    except Exception:
+        return ""
+
+
+def parse_timestamp_to_utc(value):
+    """
+    Parse a timestamp-like value into:
+      - dt_utc: timezone-aware datetime in UTC (or None)
+      - epoch_s: int seconds since epoch (or None)
+      - iso_utc: ISO 8601 string in UTC with 'Z' suffix (or None)
+
+    Accepts:
+      - int/float epoch (seconds or milliseconds)
+      - ISO 8601 strings (with or without timezone)
+      - RFC 2822 / HTTP-date strings (via email.utils)
+      - date-only strings YYYY-MM-DD
+
+    Never raises: returns (None, None, None) if parsing fails.
+    """
+    if value is None:
+        return None, None, None
+
+    # Epoch numeric
+    if isinstance(value, (int, float)):
+        try:
+            v = float(value)
+            # Heuristic: > 1e12 implies milliseconds
+            if v > 1e12:
+                v = v / 1000.0
+            dt = datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+            epoch_s = int(dt.timestamp())
+            iso = dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            return dt, epoch_s, iso
+        except Exception:
+            return None, None, None
+
+    s = _safe_str(value).strip()
+    if not s:
+        return None, None, None
+
+    # Pure digits
+    if s.isdigit():
+        try:
+            v = float(s)
+            if v > 1e12:
+                v = v / 1000.0
+            dt = datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+            epoch_s = int(dt.timestamp())
+            iso = dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            return dt, epoch_s, iso
+        except Exception:
+            pass
+
+    # ISO-ish
+    try:
+        s_iso = s.replace("Z", "+00:00")  # fromisoformat can't read 'Z'
+        dt = datetime.datetime.fromisoformat(s_iso)
+        if dt.tzinfo is None:
+            # Treat naive timestamps as UTC (document this in thesis!)
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt_utc = dt.astimezone(datetime.timezone.utc)
+        epoch_s = int(dt_utc.timestamp())
+        iso = dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return dt_utc, epoch_s, iso
+    except Exception:
+        pass
+
+    # Date-only
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            dt = datetime.datetime.fromisoformat(s).replace(tzinfo=datetime.timezone.utc)
+            epoch_s = int(dt.timestamp())
+            iso = dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            return dt, epoch_s, iso
+    except Exception:
+        pass
+
+    # RFC 2822 / HTTP-date
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt_utc = dt.astimezone(datetime.timezone.utc)
+        epoch_s = int(dt_utc.timestamp())
+        iso = dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return dt_utc, epoch_s, iso
+    except Exception:
+        return None, None, None
+
+
+def extract_article_timestamp(article: dict):
+    """
+    Return:
+      (source_key, raw_value, dt_utc, epoch_s, iso_utc)
+
+    Where source_key is the field name we chose from _TS_KEYS_PRIORITY.
+    """
+    for k in _TS_KEYS_PRIORITY:
+        if k in article and article.get(k) is not None:
+            raw = article.get(k)
+            dt, epoch_s, iso = parse_timestamp_to_utc(raw)
+            return k, raw, dt, epoch_s, iso
+    return None, None, None, None, None
+
+
+def _build_article_metadata_row(
+    article: dict,
+    index: int,
+    bt_uid: Optional[str],
+    timestamp_field: Optional[str],
+    timestamp_raw: Any,
+    timestamp_epoch_s: Optional[int],
+    timestamp_iso_utc: Optional[str],
+) -> Dict[str, Any]:
+    source_val = article.get("source", None) if isinstance(article, dict) else None
+    publication_val = None
+    if isinstance(article, dict):
+        publication_val = (
+            article.get("publication")
+            or article.get("publisher")
+            or article.get("outlet")
+        )
+        source_val = source_val or publication_val
+
+    affiliation_val = article.get("affiliation", None) if isinstance(article, dict) else None
+    if isinstance(article, dict):
+        affiliation_val = affiliation_val or article.get("outlet_affiliation") or article.get("publisher_affiliation")
+
+    bias_val = article.get("bias", None) if isinstance(article, dict) else None
+    if isinstance(article, dict):
+        bias_val = bias_val or article.get("political_bias") or article.get("ideology") or article.get("lean")
+
+    summary_val = None
+    snippet_val = None
+    content_preview_val = None
+    if isinstance(article, dict):
+        summary_val = article.get("summary") or article.get("abstract")
+        snippet_val = article.get("snippet") or summary_val or article.get("content")
+        if isinstance(snippet_val, str):
+            snippet_val = snippet_val[:280]
+        content_preview_val = article.get("content") or summary_val or article.get("snippet")
+        if isinstance(content_preview_val, str):
+            content_preview_val = content_preview_val[:200]
+
+    published_at_val = None
+    if isinstance(article, dict):
+        published_at_val = article.get("published_at", None)
+    published_at_val = published_at_val if published_at_val is not None else timestamp_raw
+
+    return {
+        "index": index,
+        "bt_uid": bt_uid,
+        "published_at": published_at_val,
+        "source": source_val,
+        "publication": publication_val or source_val,
+        "author": article.get("author", None) if isinstance(article, dict) else None,
+        "url": article.get("url", article.get("link", None)) if isinstance(article, dict) else None,
+        "affiliation": affiliation_val,
+        "bias": bias_val,
+        "perspective_tag": article.get("perspective_tag", None) if isinstance(article, dict) else None,
+        "perspective_type": article.get("perspective_type", None) if isinstance(article, dict) else None,
+        "label": article.get("label", None) if isinstance(article, dict) else None,
+        "title": article.get("title", article.get("headline", None)) if isinstance(article, dict) else None,
+        "event_id": article.get("event_id", None) if isinstance(article, dict) else None,
+        "timestamp_field": timestamp_field,
+        "timestamp_raw": timestamp_raw,
+        "timestamp_epoch_s": timestamp_epoch_s,
+        "timestamp_iso_utc": timestamp_iso_utc,
+        "summary": summary_val,
+        "snippet": snippet_val,
+        "content_preview": content_preview_val,
+    }
+
+
+def stable_article_uid(article: dict, fallback_index: int, _collision_counter: dict):
+    """
+    Produce a stable per-article identifier.
+
+    Strategy:
+      1) Prefer explicit IDs if present (id/uid/guid/doc_id/article_id).
+      2) Else hash a canonical string built from URL + title + source + timestamp.
+      3) If collisions occur (exact duplicates), append a deterministic suffix _{n}.
+
+    This ensures downstream joins do NOT depend on list ordering.
+    """
+    for k in ("bt_uid", "uid", "id", "guid", "doc_id", "article_id"):
+        v = article.get(k)
+        if v:
+            base = _safe_str(v)
+            break
+    else:
+        url = article.get("url") or article.get("link") or ""
+        title = article.get("title") or article.get("headline") or ""
+        source = article.get("source") or article.get("publisher") or ""
+        _, raw_ts, _, _, _ = extract_article_timestamp(article)
+        ts = _safe_str(raw_ts)
+        base_str = f"url={url}|title={title}|source={source}|ts={ts}"
+        base = hashlib.sha1(base_str.encode("utf-8", "ignore")).hexdigest()[:16]
+
+    # Collision handling: preserve duplicates, but make them joinable deterministically
+    n = _collision_counter.get(base, 0)
+    _collision_counter[base] = n + 1
+    return base if n == 0 else f"{base}_{n}"
+
+
+class MetricTracker:
+    """Track metrics with mean/std/min/max aggregation."""
+    def __init__(self):
+        self.metrics = {}
+
+    def add_metric(self, name, value):
+        if name not in self.metrics:
+            self.metrics[name] = []
+        self.metrics[name].append(float(value))
+
+    def summary(self):
+        summary = {}
+        for name, values in self.metrics.items():
+            if values:
+                summary[name] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "min": float(np.min(values)),
+                    "max": float(np.max(values)),
+                    "n": len(values),
+                }
+        return summary
+
+
+
+# --------------------------------------------------------------------------------------
+# Kernel geometry helpers ("adult mode"): exact kernel PCA + Nystrm approximation
+# --------------------------------------------------------------------------------------
+
+def _pairwise_sq_dists(X: torch.Tensor) -> torch.Tensor:
+    """Return NxN matrix of squared Euclidean distances."""
+    # torch.cdist returns Euclidean distances; square it
+    return torch.cdist(X, X, p=2) ** 2
+
+
+def _pairwise_l1_dists(X: torch.Tensor) -> torch.Tensor:
+    """Return NxN matrix of L1 distances."""
+    # Use built-in cdist for p=1 (L1) to avoid OOM on moderate N
+    return torch.cdist(X, X, p=1)
+
+
+def _median_heuristic_sigma_from_d2(d2: torch.Tensor) -> float:
+    """Median heuristic for RBF sigma using squared distances."""
+    # Use upper triangle (excluding diagonal) to avoid zeros dominating
+    n = d2.shape[0]
+    if n < 2:
+        return 1.0
+    tri = d2[torch.triu(torch.ones_like(d2, dtype=torch.bool), diagonal=1)]
+    if tri.numel() == 0:
+        return 1.0
+    med = torch.median(tri).item()
+    # For RBF: exp(-d^2/(2*sigma^2)); using median(d) is typical. Here we have median(d^2).
+    sigma = max(1e-6, math.sqrt(max(1e-12, med)) / math.sqrt(2.0))
+    return float(sigma)
+
+
+def _compute_kernel_matrix(
+    X: torch.Tensor,
+    kernel_type: str = "rbf",
+    gamma: float = 1.0,
+    sigma: Optional[float] = None,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
+) -> torch.Tensor:
+    """
+    Compute an NxN kernel matrix K for features X.
+    
+    If observer_axis is provided, warps the distance matrix by the observer's
+    phenomenological penalty (Track 1.5 Relativity).
+    """
+    kt = (kernel_type or "rbf").lower().strip()
+    
+    # 1. Compute Base Distances
+    if kt == "laplacian":
+        d_base = _pairwise_l1_dists(X)
+    else:
+        d_base_sq = _pairwise_sq_dists(X)
+        d_base = torch.sqrt(d_base_sq.clamp(min=1e-12))
+
+    # 2. Apply Observer Warp (Track 1.5 ROOT RELATIVITY)
+    if observer_axis is not None and observer_cost_strength > 0.0:
+        # Calculate similarity of each article to the observer's worldview
+        # X: [N, D], observer_axis: [D]
+        norm_x = torch.norm(X, p=2, dim=-1).clamp(min=1e-12)
+        norm_obs = torch.norm(observer_axis, p=2).clamp(min=1e-12)
+        similarity = (X * observer_axis).sum(dim=-1) / (norm_x * norm_obs)
+        similarity = torch.clamp(similarity, min=-1.0, max=1.0)
+        
+        # Penalty increases as articles diverge from observer's perspective
+        penalty = 1.0 + observer_cost_strength * torch.clamp(1.0 - similarity, min=0.0)
+        
+        # Conformal warp: D_rel(i, j) = D_base(i, j) * sqrt(P(i) * P(j))
+        # This preserves symmetry while stretching the space where the observer feels 'stress'.
+        penalty_matrix = torch.sqrt(torch.outer(penalty, penalty))
+        d_rel = d_base * penalty_matrix
+    else:
+        d_rel = d_base
+
+    # 3. Compute Kernel from Relativistic Distances
+    if kt == "laplacian":
+        if sigma is None:
+            n = d_rel.shape[0]
+            tri = d_rel[torch.triu(torch.ones_like(d_rel, dtype=torch.bool), diagonal=1)]
+            med = torch.median(tri).item() if tri.numel() else 1.0
+            sigma = float(max(1e-6, med))
+        K = torch.exp(-d_rel / float(sigma))
+        return K
+
+    d2 = d_rel ** 2
+
+    if kt == "rbf":
+        if sigma is None:
+            sigma = _median_heuristic_sigma_from_d2(d2)
+        K = torch.exp(-d2 / (2.0 * (float(sigma) ** 2)))
+        return K
+
+    if kt == "rq":
+        alpha = float(max(1e-6, gamma))
+        if sigma is None:
+            sigma = _median_heuristic_sigma_from_d2(d2)
+        K = (1.0 + d2 / (2.0 * alpha * (float(sigma) ** 2))).pow(-alpha)
+        return K
+
+    if kt == "imq":
+        if sigma is None:
+            sigma = _median_heuristic_sigma_from_d2(d2)
+        K = (1.0 + d2 / (float(sigma) ** 2)).pow(-0.5)
+        return K
+
+    # Fallback: treat as RBF
+    if sigma is None:
+        sigma = _median_heuristic_sigma_from_d2(d2)
+    return torch.exp(-d2 / (2.0 * (float(sigma) ** 2)))
+
+
+def _center_kernel(K: torch.Tensor) -> torch.Tensor:
+    """Double-center kernel matrix."""
+    n = K.shape[0]
+    if n < 2:
+        return K
+    one_n = torch.ones((n, n), device=K.device, dtype=K.dtype) / float(n)
+    return K - one_n @ K - K @ one_n + one_n @ K @ one_n
+
+
+def _kernel_pca_from_kernel(K: torch.Tensor, n_components: int) -> torch.Tensor:
+    """
+    Kernel PCA embedding from centered kernel matrix.
+
+    Returns Y: [N, n_components] with coordinates sqrt(lambda)*v.
+    """
+    n = K.shape[0]
+    if n == 0:
+        return K
+    # eigh for symmetric matrices; returns ascending eigenvalues
+    evals, evecs = torch.linalg.eigh(K)
+    # take top components
+    k = int(min(n_components, n - 1, evals.numel()))
+    if k <= 0:
+        return torch.zeros((n, 1), device=K.device, dtype=K.dtype)
+    idx = torch.argsort(evals, descending=True)[:k]
+    L = evals[idx].clamp_min(0)
+    V = evecs[:, idx]
+    Y = V * torch.sqrt(L).unsqueeze(0)
+    return Y
+
+
+def kernel_pca_embed(
+    X: torch.Tensor,
+    kernel_type: str = "rbf",
+    gamma: float = 1.0,
+    sigma: Optional[float] = None,
+    n_components: int = 128,
+    center: bool = True,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
+) -> torch.Tensor:
+    """Convenience: compute K then (optionally) center then kernel PCA."""
+    K = _compute_kernel_matrix(
+        X, 
+        kernel_type=kernel_type, 
+        gamma=gamma, 
+        sigma=sigma,
+        observer_axis=observer_axis,
+        observer_cost_strength=observer_cost_strength
+    )
+    if center:
+        K = _center_kernel(K)
+    return _kernel_pca_from_kernel(K, n_components=n_components)
+
+
+def nystrom_kernel_pca_embed(
+    X: torch.Tensor,
+    kernel_type: str = "rbf",
+    gamma: float = 1.0,
+    sigma: Optional[float] = None,
+    n_components: int = 128,
+    m_landmarks: int = 256,
+    center: bool = True,
+    seed: int = 0,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
+) -> torch.Tensor:
+    """
+    Nystrm approximation for kernel PCA.
+
+    Strategy:
+      - sample m landmark indices (uniform)
+      - compute C = K(X, landmarks) [N,m]
+      - compute W = K(landmarks, landmarks) [m,m]
+      - approximate K  C W^{-1} C^T (optionally centered approximately by centering the implicit K)
+
+    For the embedding, we compute the eigendecomposition of W and project.
+
+    Note: This is a pragmatic implementation for moderate N. For very large N, you'd want
+    more careful centering + numerical stabilization.
+    """
+    n = X.shape[0]
+    m = int(min(max(1, m_landmarks), n))
+    if n == 0:
+        return torch.zeros((0, n_components), device=X.device, dtype=X.dtype)
+
+    # Sample landmarks deterministically
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    perm = torch.randperm(n, generator=gen)[:m]
+    perm = perm.to(X.device)
+
+    X_l = X[perm]
+
+    # Compute C and W
+    # Compute full pairwise between X and X_l by concatenating and slicing would be expensive.
+    # We'll compute squared distances explicitly for RBF-like kernels.
+    kt = (kernel_type or "rbf").lower().strip()
+
+    # For simplicity, reuse kernel computations by building pairwise with cdist.
+    if kt == "laplacian":
+        # L1 distances between all points and landmarks
+        diff = X.unsqueeze(1) - X_l.unsqueeze(0)  # [N,m,D]
+        d1 = diff.abs().sum(dim=-1)
+        if sigma is None:
+            # estimate sigma on landmarks
+            d1_ll = _pairwise_l1_dists(X_l)
+            tri = d1_ll[torch.triu(torch.ones_like(d1_ll, dtype=torch.bool), diagonal=1)]
+            med = torch.median(tri).item() if tri.numel() else 1.0
+            sigma = float(max(1e-6, med))
+        C = torch.exp(-d1 / float(sigma))
+        W = _compute_kernel_matrix(X_l, kernel_type="laplacian", gamma=gamma, sigma=sigma)
+    else:
+        d2 = torch.cdist(X, X_l, p=2) ** 2  # [N,m]
+        if sigma is None:
+            # estimate sigma from landmark-landmark distances
+            d2_ll = _pairwise_sq_dists(X_l)
+            sigma = _median_heuristic_sigma_from_d2(d2_ll)
+        if kt == "rbf":
+            C = torch.exp(-d2 / (2.0 * (float(sigma) ** 2)))
+        elif kt == "rq":
+            alpha = float(max(1e-6, gamma))
+            C = (1.0 + d2 / (2.0 * alpha * (float(sigma) ** 2))).pow(-alpha)
+        elif kt == "imq":
+            C = (1.0 + d2 / (float(sigma) ** 2)).pow(-0.5)
+        else:
+            C = torch.exp(-d2 / (2.0 * (float(sigma) ** 2)))
+        W = _compute_kernel_matrix(X_l, kernel_type=kt, gamma=gamma, sigma=sigma)
+
+    # Stabilize W
+    eps = 1e-6
+    W = (W + W.T) * 0.5
+    W = W + eps * torch.eye(m, device=W.device, dtype=W.dtype)
+
+    # Approximate centered K by centering C and W (approx)
+    if center:
+        # Center using landmark means as a proxy
+        one_n = torch.ones((n, 1), device=C.device, dtype=C.dtype) / float(n)
+        one_m = torch.ones((m, 1), device=C.device, dtype=C.dtype) / float(m)
+
+        C_mean_row = (one_n.T @ C)  # [1,m]
+        C = C - one_n @ C_mean_row  # center rows
+
+        W_mean_row = (one_m.T @ W)  # [1,m]
+        W_mean_col = (W @ one_m)    # [m,1]
+        W_mean_all = (one_m.T @ W @ one_m)  # [1,1]
+        W = W - one_m @ W_mean_row - W_mean_col @ one_m.T + one_m @ W_mean_all @ one_m.T
+
+    # Eigendecompose W
+    evals, evecs = torch.linalg.eigh(W)
+    idx = torch.argsort(evals, descending=True)
+
+    # Keep positive components
+    evals = evals[idx].clamp_min(1e-12)
+    evecs = evecs[:, idx]
+
+    k = int(min(n_components, m, evals.numel()))
+    evals_k = evals[:k]
+    evecs_k = evecs[:, :k]
+
+    # Nystrm feature map: Phi = C * evecs_k * diag(1/sqrt(evals_k))
+    Phi = C @ (evecs_k / torch.sqrt(evals_k).unsqueeze(0))
+    # Then embed like PCA coordinates: multiply by sqrt(evals_k)
+    Y = Phi * torch.sqrt(evals_k).unsqueeze(0)
+    return Y
+
+def initialize_full_pipeline(
+    random_seed: int = 42,
+    device: str = "cuda",
+    embedding_dim: int = 24,
+    hidden_dim: int = 256,
+    output_dim: int = 2048,
+    use_gru: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_gru,
+    use_rks: bool = True,
+    use_attention: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_attention,
+    use_contrastive: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_contrastive,
+    use_cls_tokens: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.use_cls_tokens,
+    normalize_features: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features,
+    pca_remove: bool = True,
+    global_pca_component: bool = True,
+    # New (no CLI sprawl): geometry + comparison modes
+    geometry_mode: str = DEFAULT_PIPELINE_RUNTIME_CONFIG.geometry_mode,  # "rks" | "kernel_pca" | "nystrom" | "none"
+    adult_kernel: str = "rbf",
+    adult_gamma: float = 1.0,
+    adult_sigma: Optional[float] = None,
+    adult_center: bool = True,
+    adult_nystrom_m: int = 256,
+    # NEW: Dirichlet fusion parameters
+    use_dirichlet_fusion: bool = False,
+    dirichlet_alpha: float = 1.0,
+    dirichlet_n_observers: int = 50,
+    dirichlet_rks_dim: int = 2048,
+    dirichlet_basis_path: Optional[str] = None,
+    dirichlet_weights_path: Optional[str] = None,
+    dirichlet_basis_seed: int = 42,
+    dirichlet_crn_seed: int = 12345,
+    dirichlet_hidden_dim: int = 1536,  # Must match NLI model hidden size (DeBERTa-large=1536)
+    # NEW: Force logits-raw mode (constitutional contract)
+    force_logits_raw: bool = False,
+    compare_logits_vs_cli: bool = False,
+    rks_output_dim: Optional[int] = None,
+    # NEW: KernelContext integration (Phase 1)
+    kernel_ctx: Optional[Any] = None,  # KernelContext instance
+    kernel_type: str = DEFAULT_PIPELINE_RUNTIME_CONFIG.kernel_type,          # Fallback if no kernel_ctx
+    kernel_bandwidth: Optional[float] = None,  # Fallback sigma
+    kernel_nu: float = 1.5,
+    kernel_roughness: int = 3,
+    mix_in_rkhs: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs,         # Mode B for Dirichlet fusion
+):
+    """
+    Initialize the full belief transformer pipeline components.
+
+    This is the "module factory"  it builds the objects that `BeliefTransformerPipeline`
+    uses in `process_month()`.
+
+    Parameters
+    ----------
+    random_seed : int
+        Controls torch/NumPy RNG for reproducibility inside this observer instance.
+    device : str
+        Torch device string, e.g. 'cuda' or 'cpu'.
+    embedding_dim : int
+        Dimension of base embeddings (e.g., DeBERTa pooled size).
+    hidden_dim : int
+        Hidden size for the TemporalGRU (if enabled).
+    output_dim : int
+        Final representation dim after the temporal stage.
+    use_gru : bool
+        If True, run TemporalGRU over the corpus in timestamp order (then restore original order).
+    use_rks : bool
+        If True, apply Random Kitchen Sinks feature map over the (optionally temporal) features.
+    use_attention : bool
+        If True, run cross-article attention aggregation on top of RKS features.
+    use_contrastive : bool
+        If True, enable contrastive normalization in attention/RKS stages where supported.
+    use_cls_tokens : bool
+        If True, use CLS+logits stacking mode (8192D output from NLI, PCA applied to CLS during extraction).
+    normalize_features : bool
+        If True, L2-normalize features at key boundaries to stabilize geometry metrics.
+    pca_remove : bool
+        If True, remove top principal component(s). Disabled automatically if use_cls_tokens=True.
+    global_pca_component : bool
+        If True, compute the PCA component globally (across the month) rather than per-batch.
+
+    Returns
+    -------
+    dict
+        Dictionary of initialized components.
+    """
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+
+    # PCA rule (hard invariant): never PCA logits in the pipeline.
+    # CLS PCA (if enabled) happens inside the NLI extractor, and only touches CLS-derived features.
+    # [FIX] Overrides removed to allow manual control.
+    # if not use_cls_tokens:
+    #     pca_remove = False
+
+    nli_extractor = None
+    # NLI extractor wiring: filter kwargs so older extractor versions don't crash.
+    import inspect
+
+    nli_kwargs = {
+        "device": device,
+        # Paragraph awareness is a hard invariant for this project.
+        "paragraph_aware": True,
+        "paragraph_weights": [0.5, 0.3, 0.2],
+    }
+
+    # Dual-mode extraction: compute BOTH logits and CLI for later side-by-side pipelines.
+    if compare_logits_vs_cli:
+        nli_kwargs["extract_cli"] = True
+        nli_kwargs["cli_mode"] = "contrastive"
+
+    # CLS channel regime (only if NLIExtractor version supports it)
+    if use_cls_tokens:
+        nli_kwargs.update({
+            "use_cls_tokens": True,
+            "projection_dim": 256,
+            "apply_pca_to_cls": False,  # Jagged Truth: external backdrop only
+            "normalize_before_projection": True,
+        })
+
+    sig = inspect.signature(NLIExtractor.__init__)
+    filtered = {k: v for k, v in nli_kwargs.items() if k in sig.parameters}
+    missing = [k for k in nli_kwargs.keys() if k not in filtered]
+    if missing:
+        # Don't hard fail; just document the downgrade.
+        if use_cls_tokens and any(k in missing for k in ("use_cls_tokens", "projection_dim", "apply_pca_to_cls")):
+            print("WARNING: NLIExtractor.__init__ does not accept CLS channel args; falling back to legacy extraction.")
+        if compare_logits_vs_cli and "extract_cli" in missing:
+            print("WARNING: NLIExtractor.__init__ does not accept extract_cli; logits/CLI comparison disabled.")
+
+    nli_extractor = NLIExtractor(**filtered)
+
+    # If CLS channel is active, infer embedding_dim from extractor output.
+    # This prevents GRU/RKS dim mismatches and avoids any implicit CLS+logits stacking assumptions.
+    if use_cls_tokens:
+        try:
+            # ROBUST FIX: Try multiple paths to get CLS dimension
+            # Priority: nli_extractor.output_dim > nli_extractor.extractor.cls_dim > fallback
+            inferred_dim = None
+
+            # Path 1: NLIExtractor.output_dim (should be cls_dim when use_cls_tokens=True)
+            if hasattr(nli_extractor, 'output_dim'):
+                inferred_dim = int(nli_extractor.output_dim)
+
+            # Path 2: Directly access UnifiedNLIExtractor.cls_dim
+            if inferred_dim is None or inferred_dim <= 24:  # 24 = logits_dim, means wrong path
+                inner = getattr(nli_extractor, 'extractor', None)
+                if inner and hasattr(inner, 'cls_dim'):
+                    inferred_dim = int(inner.cls_dim)
+
+            # Path 3: Compute from hidden_size * n_bots
+            if inferred_dim is None or inferred_dim <= 24:
+                inner = getattr(nli_extractor, 'extractor', None)
+                if inner:
+                    h = getattr(inner, 'hidden_size', 1536)
+                    b = getattr(inner, 'n_bots', 8)
+                    inferred_dim = h * b
+
+            if inferred_dim and inferred_dim > 24:
+                embedding_dim = inferred_dim
+                print(f"[FIX] CLS embedding_dim correctly inferred as {embedding_dim}")
+            else:
+                print(f"[WARNING] Could not infer CLS dim, falling back to {embedding_dim}")
+        except Exception as e:
+            print(f"[WARNING] embedding_dim inference failed: {e}")
+
+        print(f"CLS-only channel enabled: embedding_dim = {embedding_dim}. (Logits are not concatenated.)")
+
+
+    gru_model = None
+    if use_gru:
+        if _GRU_HARD_DISABLED:
+            print("[GRU] Hard disabled via _GRU_HARD_DISABLED flag - skipping initialization")
+        else:
+            gru_model = TemporalGRU(
+                feature_dim=embedding_dim,
+                hidden_dim=hidden_dim,
+                seed=random_seed,
+            )
+
+    # Effective output dimension for representation stage.
+    # - If geometry_mode == "rks": final_dim is the RKS output dim.
+    # - If geometry_mode != "rks": final_dim starts as output_dim, but may be capped at runtime (<= N-1 for exact kernel PCA).
+    final_dim = int(rks_output_dim or output_dim)
+
+    geometry_mode = (geometry_mode or "rks").lower().strip()
+    if geometry_mode not in ("rks", "kernel_pca", "nystrom"):
+        print(f"WARNING: Unknown geometry_mode={geometry_mode!r}; defaulting to 'rks'")
+        geometry_mode = "rks"
+
+    rks_map = None
+    if use_rks and geometry_mode == "rks":
+        # Random Kitchen Sinks feature map (explicit finite-dimensional kernel approximation)
+        # FIX: Check if GRU was actually created, not just requested (GRU may be hard-disabled)
+        rks_map = RKSFeatureMap(
+            input_dim=output_dim if gru_model is not None else embedding_dim,
+            output_dim=final_dim,
+            kernel_type=kernel_type,
+            gamma=1.0,
+            random_seed=random_seed,
+            device=device,
+        )
+
+    # NEW: Build or use provided KernelContext
+    built_kernel_ctx = kernel_ctx
+    if built_kernel_ctx is None and use_cls_tokens:
+        # Build KernelContext from parameters for CLS channel
+        try:
+            from .kernel_context import KernelContext
+            # Use dirichlet_hidden_dim (1536 for DeBERTa-large), NOT hardcoded 768
+            cls_hidden_dim = dirichlet_hidden_dim  # 1536 for DeBERTa-large
+            if kernel_type.lower() == 'rbf':
+                built_kernel_ctx = KernelContext(
+                    kernel_type=kernel_type.lower(),
+                    input_dim=cls_hidden_dim,  # Use actual hidden dim, not 768
+                    rks_dim=dirichlet_rks_dim,
+                    seed=dirichlet_basis_seed,
+                    bandwidth=kernel_bandwidth or adult_sigma or 1.0,
+                )
+            elif kernel_type.lower() in ('cosine', 'linear'):
+                built_kernel_ctx = KernelContext(
+                    kernel_type=kernel_type.lower(),
+                    input_dim=cls_hidden_dim,  # Use actual hidden dim, not 768
+                    seed=dirichlet_basis_seed,
+                )
+            if built_kernel_ctx is not None:
+                built_kernel_ctx.validate()
+                print(f"[PIPELINE] KernelContext: {built_kernel_ctx.canonical_id()}")
+        except ImportError:
+            print("WARNING: kernel_context.py not found, skipping KernelContext")
+        except Exception as e:
+            print(f"WARNING: Failed to build KernelContext: {e}")
+
+    # NEW: Initialize Dirichlet fusion for CLS views
+    dirichlet_fusion = None
+    dirichlet_config = None
+    if use_dirichlet_fusion and HAS_DIRICHLET_FUSION:
+        if not use_cls_tokens:
+            print("WARNING: Dirichlet fusion requires use_cls_tokens=True. Enabling CLS mode.")
+            use_cls_tokens = True
+        
+        dirichlet_config = DirichletFusionConfig(
+            n_bots=8,
+            hidden_dim=dirichlet_hidden_dim,
+            rks_dim=dirichlet_rks_dim,
+            n_observers=dirichlet_n_observers,
+            alpha=dirichlet_alpha,
+            kernel_type=kernel_type,
+            nu=float(kernel_nu),
+            roughness=int(kernel_roughness),
+            basis_seed=dirichlet_basis_seed,
+            basis_path=dirichlet_basis_path,
+            crn_enabled=True,
+            locked_dirichlet_weights=dirichlet_weights_path,
+            crn_seed=dirichlet_crn_seed,
+            mix_in_rkhs=mix_in_rkhs,  # NEW: Mode A vs Mode B
+            kernel_ctx=built_kernel_ctx,  # NEW: Pass kernel context
+            # Track 3 thermodynamics: hot stages stay close to the prior barycenter;
+            # cold stages progressively release that constraint and expose separation.
+            use_annealing=True,
+            annealing_schedule=[10.0, 5.0, 2.0, 1.0, 0.5, 0.1],
+            use_sequential_cooling=False,
+            remove_consensus=False,
+        )
+        dirichlet_fusion = DirichletFusion(dirichlet_config)
+        mode_str = "Mode B (map-then-mix)" if mix_in_rkhs else "Mode A (mix-then-map)"
+        print(
+            f"[PIPELINE] Dirichlet fusion initialized: {mode_str}, alpha={dirichlet_alpha}, "
+            f"K={dirichlet_n_observers}, annealing=ENABLED, consensus_removal=OFF, "
+            f"sequential_cooling=OFF"
+        )
+    elif use_dirichlet_fusion and not HAS_DIRICHLET_FUSION:
+        print("WARNING: Dirichlet fusion requested but dirichlet_fusion.py not found. Skipping.")
+
+    # Determine primary rep_kind for contract enforcement
+    if force_logits_raw:
+        primary_rep_kind = RepKind.LOGITS_RAW
+        # Enforce constitutional constraints
+        use_rks = False
+        pca_remove = False
+        geometry_mode = "none"
+        print("[CONSTITUTIONAL CONTRACT] force_logits_raw=True: RKS, PCA, geometry disabled")
+    elif use_cls_tokens:
+        primary_rep_kind = RepKind.CLS_VIEWS
+    else:
+        primary_rep_kind = RepKind.LOGITS_RAW
+
+    attention_model = None
+    if use_attention:
+        attention_model = CrossArticleAttention(
+            feature_dim=final_dim,
+            num_heads=8,
+        )
+
+    recorder = AttentionRecorder()
+
+    return {
+        "nli_extractor": nli_extractor,
+        "gru_model": gru_model,
+        "rks_map": rks_map,
+        "attention_model": attention_model,
+        "recorder": recorder,
+        "normalize_features": normalize_features,
+        "pca_remove": pca_remove,
+        "global_pca_component": global_pca_component,
+        "use_cls_tokens": use_cls_tokens,
+        "compare_logits_vs_cli": compare_logits_vs_cli,
+        "geometry_mode": geometry_mode,
+        "adult_kernel": adult_kernel,
+        "adult_gamma": adult_gamma,
+        "adult_sigma": adult_sigma,
+        "adult_center": adult_center,
+        "adult_nystrom_m": adult_nystrom_m,
+        "final_dim": final_dim,
+        # NEW: Dirichlet fusion components
+        "dirichlet_fusion": dirichlet_fusion,
+        "dirichlet_config": dirichlet_config,
+        # NEW: Rep kind for contract enforcement
+        "primary_rep_kind": primary_rep_kind,
+        "force_logits_raw": force_logits_raw,
+        # NEW: KernelContext for provenance
+        "kernel_ctx": built_kernel_ctx,
+        "kernel_nu": float(kernel_nu),
+        "kernel_roughness": int(kernel_roughness),
+        "mix_in_rkhs": mix_in_rkhs,
+    }
+
+
+class BeliefTransformerPipeline:
+    """
+    Main pipeline class for multi-step bias geometry processing.
+
+    This class is instantiated per "observer" seed  meaning each run can have its own
+    kernel random features and any seeded stochasticity.
+
+    IMPORTANT: `process_month()` returns arrays AND traceable sidecars:
+      - `timeline` (per-article timestamps, normalized)
+      - `bt_uid_list` (stable IDs for joins)
+
+    That is what keeps downstream map-making + polygon matching from breaking when list
+    order changes (or duplicates exist).
+
+    Parameters
+    ----------
+    components : dict
+        Output of `initialize_full_pipeline()`.
+    random_seed : int
+        Seed for any internal randomness (RKS, dropout-like ops, etc.).
+    enable_provenance : bool
+        Whether to write provenance entries for each pipeline stage.
+    provenance_dir : str | Path | None
+        If set, provenance JSON entries will be saved here.
+    """
+
+    def __init__(
+        self,
+        components: Dict[str, Any],
+        random_seed: int = 42,
+        enable_provenance: bool = True,
+        provenance_dir: Optional[str] = None,
+    ):
+        self.components = components
+        self.random_seed = random_seed
+
+        self.nli_extractor = components["nli_extractor"]
+        self.gru_model = components["gru_model"]
+        self.rks_map = components["rks_map"]
+        self.attention_model = components["attention_model"]
+        self.recorder = components["recorder"]
+
+        self.normalize_features = components.get(
+            "normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features
+        )
+        self.pca_remove = components.get("pca_remove", True)
+        self.global_pca_component = components.get("global_pca_component", True)
+        self.use_cls_tokens = components.get("use_cls_tokens", False)
+
+        self.compare_logits_vs_cli = components.get("compare_logits_vs_cli", False)
+
+        # Geometry mode: "rks" (Random Kitchen Sinks) or "kernel_pca"/"nystrom" (kernel trick / spectral) or "none"
+        self.geometry_mode = (components.get("geometry_mode", "rks") or "rks").lower().strip()
+        self.adult_kernel = components.get("adult_kernel", "rbf")
+        self.adult_gamma = float(components.get("adult_gamma", 1.0))
+        self.adult_sigma = components.get("adult_sigma", None)
+        self.adult_center = bool(components.get("adult_center", True))
+        self.adult_nystrom_m = int(components.get("adult_nystrom_m", 256))
+
+        # Nominal representation dim (may be capped at runtime for exact kernel PCA).
+        self.final_dim = int(components.get("final_dim", 0) or 0)
+
+        # NEW: Dirichlet fusion components
+        self.dirichlet_fusion = components.get("dirichlet_fusion", None)
+        self.dirichlet_config = components.get("dirichlet_config", None)
+        
+        # NEW: Rep kind for contract enforcement
+        self.primary_rep_kind = components.get("primary_rep_kind", RepKind.LOGITS_RAW)
+        self.force_logits_raw = components.get("force_logits_raw", False)
+        
+        # NEW: KernelContext for provenance
+        self.kernel_ctx = components.get("kernel_ctx", None)
+        self.mix_in_rkhs = components.get("mix_in_rkhs", False)
+
+        self.enable_provenance = enable_provenance
+        self.provenance_dir = provenance_dir
+        self.provenance_tracker = None
+        if enable_provenance:
+            self.provenance_tracker = ProvenanceTracker()
+
+        self._nli_cache = None  # optional cache for repeated runs
+
+    def _sort_by_timestamp(self, articles, bt_uids=None, ts_epoch_s=None):
+        """
+        Deterministically compute a chronological permutation for the TemporalGRU stage.
+
+        Parameters
+        ----------
+        articles : list[dict]
+            Raw article records.
+        bt_uids : list[str] | None
+            Stable UIDs (if already computed). If None, they will be computed.
+        ts_epoch_s : list[int|None] | None
+            Parsed epoch seconds (if already computed). If None, they will be computed.
+
+        Returns
+        -------
+        sorted_indices : list[int]
+            Indices into the original `articles` list that produce chronological order.
+        inverse_indices : list[int]
+            A list of length N where:
+                inverse_indices[orig_idx] = sorted_position
+            so that you can restore original order via:
+                restored = sorted_tensor[inverse_indices]
+        """
+        n = len(articles)
+        collision_counter = {}
+
+        if bt_uids is None:
+            bt_uids = []
+            for i, a in enumerate(articles):
+                bt_uids.append(stable_article_uid(a, i, collision_counter))
+        else:
+            # still count collisions for diagnostics parity if caller didn't provide
+            for uid in bt_uids:
+                collision_counter[uid] = collision_counter.get(uid, 0) + 1
+
+        if ts_epoch_s is None:
+            ts_epoch_s = []
+            for a in articles:
+                _k, _raw, _dt, epoch_s, _iso = extract_article_timestamp(a)
+                ts_epoch_s.append(epoch_s)
+
+        # Build sortable tuples (has_ts, epoch_key, uid, orig_idx)
+        items = []
+        for i in range(n):
+            epoch_s = ts_epoch_s[i]
+            has_ts = 0 if epoch_s is None else 1
+            epoch_key = epoch_s if epoch_s is not None else 2**63 - 1
+            items.append((has_ts, epoch_key, bt_uids[i], i))
+
+        items.sort(key=lambda t: (-t[0], t[1], t[2], t[3]))
+        sorted_indices = [t[3] for t in items]
+
+        inverse_indices = [0] * n
+        for sorted_pos, orig_idx in enumerate(sorted_indices):
+            inverse_indices[orig_idx] = sorted_pos
+
+        return sorted_indices, inverse_indices
+
+    def process_month(
+        self, 
+        articles: List[Dict], 
+        month_name: str = "unknown", 
+        config: Optional[Dict] = None,
+        observer_idx: Optional[int] = None,
+    ) -> Dict:
+        """
+        Process a month of articles through the full pipeline.
+
+        Args:
+            articles: List of article dictionaries
+            month_name: Name identifier for this processing run
+            config: Optional configuration dict
+            observer_idx: Optional index of the article acting as the active observer.
+                         If set, the entire DAG (Tracks 1.5-4) is warped by this observer's worldview.
+        """
+
+        # ------------------------------------------------------------------
+        # Initialize optional track outputs (prevent UnboundLocalError)
+        # ------------------------------------------------------------------
+        logits_t1 = None
+        logit_confidence_t1 = None
+        spectral_results = None
+        walker_results = None
+        phantom_verdicts = None
+        hott_proofs = None
+        phase_space_results = None
+        d_spectral = None
+        dirichlet_results = None
+        cls_per_bot_list = None
+        cls_per_bot_tensor = None
+        cls_per_bot_contract = None
+        spectral_pole_diagnostics = None
+
+        # ------------------------------------------------------------------
+        # Stable IDs + timestamp normalization (thesis-ready joins)
+        # ------------------------------------------------------------------
+        _uid_collision_counter = {}
+        bt_uids = []
+        ts_source_keys = []
+        ts_raw_values = []
+        ts_epoch_s = []
+        ts_iso_utc = []
+
+        for i, art in enumerate(articles):
+            uid = stable_article_uid(art, i, _uid_collision_counter)
+            bt_uids.append(uid)
+
+            src_key, raw_ts, _dt, epoch_s, iso_utc = extract_article_timestamp(art)
+            ts_source_keys.append(src_key)
+            ts_raw_values.append(raw_ts)
+            ts_epoch_s.append(epoch_s)
+            ts_iso_utc.append(iso_utc)
+
+        n_with_epoch = sum(1 for x in ts_epoch_s if x is not None)
+        timestamp_coverage = {
+            "total": len(articles),
+            "parseable": n_with_epoch,
+            "parseable_fraction": float(n_with_epoch / max(1, len(articles))),
+            "fields_seen": sorted({k for k in ts_source_keys if k}),
+        }
+        uid_collision_stats = {
+            "unique_bases": len(_uid_collision_counter),
+            "total_records": len(articles),
+            "max_collision_count": max(_uid_collision_counter.values()) if _uid_collision_counter else 0,
+        }
+
+        # A single, joinable timeline table: index-safe and plot-safe
+        timeline = []
+        for i in range(len(articles)):
+            timeline.append({
+                "bt_uid": bt_uids[i],
+                "original_index": i,
+                "sorted_position": i,
+                "timestamp_field": ts_source_keys[i],
+                "timestamp_raw": ts_raw_values[i],
+                "timestamp_epoch_s": ts_epoch_s[i],
+                "timestamp_iso_utc": ts_iso_utc[i],
+            })
+
+        # Store article metadata for provenance
+        if self.enable_provenance and self.provenance_tracker:
+            provenance_metadata = {
+                "month": month_name,
+                "n_articles": len(articles),
+                "observer_idx": observer_idx,
+                "articles": {
+                    i: {
+                        "bt_uid": bt_uids[i],
+                        "id": art.get("id", art.get("url", f"article_{i}")),
+                        "source": (
+                            art.get("source")
+                            or art.get("publisher")
+                            or art.get("publication")
+                            or art.get("outlet")
+                            or "unknown"
+                        ),
+                        "affiliation": (
+                            art.get("affiliation")
+                            or art.get("outlet_affiliation")
+                            or art.get("publisher_affiliation")
+                            or "unknown"
+                        ),
+                        "bias": (
+                            art.get("bias")
+                            or art.get("political_bias")
+                            or art.get("ideology")
+                            or art.get("lean")
+                            or "unknown"
+                        ),
+                        "url": art.get("url", ""),
+                        "timestamp_field": ts_source_keys[i],
+                        "timestamp_raw": ts_raw_values[i],
+                        "timestamp_epoch_s": ts_epoch_s[i],
+                        "timestamp_iso_utc": ts_iso_utc[i],
+                        "title": art.get("title", ""),
+                        "content_preview": art.get("content", "")[:200] if art.get("content") else "",
+                    }
+                    for i, art in enumerate(articles)
+                },
+            }
+
+        # Diagnostic tracking
+        diagnostics = {
+            "month": month_name,
+            "n_articles": len(articles),
+            "observer_idx": observer_idx,
+            "use_gru": self.gru_model is not None,
+            "use_rks": self.rks_map is not None,
+            "use_attention": self.attention_model is not None,
+            "pca_remove": self.pca_remove,
+            "steps": [],
+            "timing": {},
+            "variance": {},
+        }
+
+        diagnostics["timestamp_coverage"] = timestamp_coverage
+        diagnostics["uid_collision_bases"] = uid_collision_stats
+
+        start_total = time.time()
+
+        # Step 1: NLI extraction
+        step_start = time.time()
+        if self._nli_cache is not None and len(self._nli_cache) == len(articles):
+            nli_pairs = self._nli_cache
+            diagnostics["steps"].append("nli_extraction_cached")
+        else:
+            nli_pairs = self.nli_extractor.extract_nli_pairs(articles)
+            self._nli_cache = nli_pairs
+            diagnostics["steps"].append("nli_extraction")
+
+        diagnostics["timing"]["nli_extraction"] = time.time() - step_start
+
+        # Convert to tensor(s)
+        base_by_channel: Dict[str, torch.Tensor] = {}
+
+        if self.compare_logits_vs_cli:
+            logits_t = torch.stack([pair.get("embedding_logits", pair["embedding"]) for pair in nli_pairs], dim=0)
+            cli_t = torch.stack([pair.get("embedding_cli", pair["embedding"]) for pair in nli_pairs], dim=0)
+            base_by_channel["logits"] = logits_t
+            base_by_channel["cli"] = cli_t
+            diagnostics["steps"].append("dual_channel_logits_cli")
+        else:
+            base_by_channel["main"] = torch.stack([pair["embedding"] for pair in nli_pairs], dim=0)
+
+        def _maybe_l2_normalize_rows(t: torch.Tensor) -> torch.Tensor:
+            if not self.normalize_features:
+                return t
+            if t is None:
+                return t
+            if not torch.is_tensor(t):
+                return t
+            if t.dim() == 1:
+                return F.normalize(t.unsqueeze(0), p=2, dim=-1, eps=1e-12).squeeze(0)
+            return F.normalize(t, p=2, dim=-1, eps=1e-12)
+
+        # Normalize each channel independently when requested by runtime config.
+        # This preserves the behavior contract of `normalize_features`.
+        for k in list(base_by_channel.keys()):
+            base_by_channel[k] = _maybe_l2_normalize_rows(base_by_channel[k])
+        if self.normalize_features:
+            diagnostics["steps"].append("normalize_features:input_channels")
+
+        diagnostics.setdefault("channels", {})
+        for k, Xk in base_by_channel.items():
+            diagnostics["channels"].setdefault(k, {})
+            diagnostics["channels"][k]["embedding_variance"] = float(Xk.var().item())
+
+        # ------------------------------------------------------------------
+        # Temporal ordering (computed once, shared across channels)
+        # ------------------------------------------------------------------
+        sorted_indices = None
+        inverse_indices = None
+        if self.gru_model is not None:
+            sorted_indices, inverse_indices = self._sort_by_timestamp(
+                articles, bt_uids=bt_uids, ts_epoch_s=ts_epoch_s
+            )
+
+            # Update timeline with the actual temporal permutation used for GRU
+            for entry in timeline:
+                orig_i = entry["original_index"]
+                entry["sorted_position"] = inverse_indices[orig_i]
+
+            diagnostics["steps"].append("temporal_sort_applied")
+            diagnostics["temporal_sort_indices"] = sorted_indices
+
+        # ------------------------------------------------------------------
+        # Observer Extraction (ASTER v3.2 ROOT RELATIVITY)
+        # ------------------------------------------------------------------
+        observer_axis = None
+        observer_cost = float((config or {}).get("observer_cost_strength", 1.0))
+        
+        # We need the base embeddings to find the observer's vector
+        if base_by_channel:
+            first_X = next(iter(base_by_channel.values()))
+            if observer_idx is not None and 0 <= observer_idx < first_X.shape[0]:
+                observer_axis = first_X[observer_idx].detach().clone()
+                diagnostics["active_observer_idx"] = observer_idx
+                diagnostics["observer_cost_strength"] = observer_cost
+
+        # ------------------------------------------------------------------
+        # Shared downstream runner (GRU -> geometry -> attention -> (optional) PCA)
+        # ------------------------------------------------------------------
+        def _run_channel(channel_name: str, X_in: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+            ch_diag = diagnostics["channels"].setdefault(channel_name, {})
+            t0 = time.time()
+            
+            # NEW: Determine rep_kind for this channel and track it
+            channel_rep_kind = _get_channel_rep_kind(channel_name, self.use_cls_tokens)
+            ch_diag["rep_kind"] = channel_rep_kind.value
+            
+            # NEW: Additional outputs for Dirichlet fusion
+            channel_extras = {
+                "rep_kind": channel_rep_kind,
+                "cls_per_bot": None,  # Will be set if CLS_VIEWS
+                "curvature": None,    # Will be set if Dirichlet fusion runs
+                "provenance": {},
+            }
+
+            # Step 2: Optional temporal GRU
+            X = X_in
+            if self.gru_model is not None:
+                t_gru = time.time()
+                # Reorder for GRU
+                sorted_tensor = X[sorted_indices]
+
+                # TemporalGRU expects [N, D]. If extra structure sneaks in (e.g., [N, B, D]),
+                # flatten everything after the article axis to preserve a well-defined feature vector.
+                if sorted_tensor.dim() != 2:
+                    sorted_tensor = sorted_tensor.reshape(sorted_tensor.shape[0], -1)
+
+                # TemporalGRU.forward() already unsqueezes to [N, 1, D]
+                temporal_out = self.gru_model(sorted_tensor)  # (N, D)
+
+                # Defensive: if an older TemporalGRU returns a leading batch axis, remove it.
+                if temporal_out.dim() == 3 and temporal_out.shape[0] == 1:
+                    temporal_out = temporal_out.squeeze(0)  # (N, D)
+
+                # Restore original order
+                inv = torch.tensor(inverse_indices, dtype=torch.long, device=temporal_out.device)
+                X = temporal_out[inv]
+
+                ch_diag["timing_temporal_gru"] = time.time() - t_gru
+                ch_diag["temporal_variance"] = float(X.var().item())
+
+            # Step 3: Geometry stage (ASTER v3.2: ROOT RELATIVITY)
+            t_geom = time.time()
+            Z = X
+            
+            # NEW: Divisibility check for MultiheadAttention (heads=8)
+            def _ensure_8_divisible(n: int, max_val: int) -> int:
+                # MultiheadAttention REQUIRES embed_dim divisible by num_heads (8)
+                if n % 8 != 0:
+                    # Try rounding UP first
+                    candidate = int(((n + 7) // 8) * 8)
+                    if candidate > max_val:
+                        # Round DOWN if UP exceeds rank
+                        candidate = int((n // 8) * 8)
+                    return max(8, candidate)
+                return max(1, n)
+
+            # Extract observer axis if index provided
+            observer_axis = None
+            observer_cost = float((config or {}).get("observer_cost_strength", 1.0))
+            if observer_idx is not None and 0 <= observer_idx < X.shape[0]:
+                observer_axis = X[observer_idx].detach().clone()
+                ch_diag["active_observer_idx"] = observer_idx
+                ch_diag["observer_cost_strength"] = observer_cost
+
+            # NEW: Constitutional contract check before RKS
+            rks_allowed = _check_operation_allowed(channel_rep_kind, 'rks', warn_only=True)
+            
+            if self.geometry_mode == "rks" and self.rks_map is not None and rks_allowed:
+                # IMPORTANT: RKS assumes kernel stationarity. Root warping requires 
+                # explicit kernel matrix computation (Adult Mode).
+                if observer_axis is not None:
+                    print(f"WARNING: geometry_mode='rks' detected with active observer. "
+                          f"Falling back to 'kernel_pca' to enable non-stationary root warping.")
+                    self.geometry_mode = "kernel_pca"
+                else:
+                    # Standard RKS path (Global Mean)
+                    if not hasattr(self, "_rks_map_cache"):
+                        self._rks_map_cache = {}
+                    in_dim = int(X.shape[-1])
+                    kernel_name = getattr(self.rks_map, "kernel_type", "rbf")
+                    tmpl_cfg = getattr(self.rks_map, "cfg", None)
+                    try:
+                        seed = int(getattr(tmpl_cfg, "random_seed", 0) if tmpl_cfg is not None else 0)
+                    except Exception:
+                        seed = 0
+                    key = (channel_name, in_dim, kernel_name, seed)
+                    if key not in self._rks_map_cache:
+                        n_f = int(getattr(tmpl_cfg, "n_framings", 8) if tmpl_cfg is not None else 8)
+                        base_out = int(getattr(tmpl_cfg, "output_dim", getattr(self, "final_dim", 512)) if tmpl_cfg is not None else getattr(self, "final_dim", 512))
+                        if channel_name.lower() == "logits":
+                            out_dim = int(getattr(self, "rks_output_dim_logits", min(base_out, 512)))
+                        else:
+                            out_dim = int(getattr(self, "rks_output_dim_cls", base_out))
+                        # RKS is an expansion, max_val is just a safety cap (e.g. 8192)
+                        out_dim = _ensure_8_divisible(out_dim, 8192)
+                        device_str = str(X.device)
+                        self._rks_map_cache[key] = RKSFeatureMap(
+                            input_dim=in_dim,
+                            output_dim=out_dim,
+                            kernel_type=kernel_name,
+                            gamma=getattr(tmpl_cfg, "gamma", None) if tmpl_cfg is not None else None,
+                            sigma=getattr(tmpl_cfg, "sigma", None) if tmpl_cfg is not None else None,
+                            n_framings=n_f,
+                            random_seed=int(getattr(tmpl_cfg, "random_seed", 42) if tmpl_cfg is not None else 42),
+                            device=device_str,
+                            kernel_params=getattr(tmpl_cfg, "kernel_params", None) if tmpl_cfg is not None else None,
+                            auto_sigma=bool(getattr(tmpl_cfg, "auto_sigma", False) if tmpl_cfg is not None else False),
+                            verbose=bool(getattr(tmpl_cfg, "verbose", False) if tmpl_cfg is not None else False),
+                        )
+                    Z = self._rks_map_cache[key].transform(X)
+                    diagnostics["steps"].append(f"rks_feature_map:{channel_name}")
+
+            # Re-check mode (it may have been switched above)
+            if self.geometry_mode == "kernel_pca" and _check_operation_allowed(channel_rep_kind, 'kernel_pca', warn_only=True):
+                # Exact kernel trick (O(N^2) memory/time) - supports non-stationary warping
+                n_components = _ensure_8_divisible(int(self.final_dim or X.shape[0] - 1 or 1), X.shape[0] - 1)
+                Z = kernel_pca_embed(
+                    X,
+                    kernel_type=self.adult_kernel,
+                    gamma=self.adult_gamma,
+                    sigma=self.adult_sigma,
+                    n_components=n_components,
+                    center=self.adult_center,
+                    observer_axis=observer_axis,
+                    observer_cost_strength=observer_cost if observer_axis is not None else 0.0,
+                )
+                diagnostics["steps"].append(f"kernel_pca:{channel_name}")
+            elif self.geometry_mode == "nystrom" and _check_operation_allowed(channel_rep_kind, 'nystrom', warn_only=True):
+                # Nystrom approximation (sub-quadratic in N for large N)
+                n_components = _ensure_8_divisible(int(self.final_dim or min(256, X.shape[0] - 1) or 1), X.shape[0] - 1)
+                Z = nystrom_kernel_pca_embed(
+                    X,
+                    kernel_type=self.adult_kernel,
+                    gamma=self.adult_gamma,
+                    sigma=self.adult_sigma,
+                    n_components=n_components,
+                    m_landmarks=self.adult_nystrom_m,
+                    center=self.adult_center,
+                    seed=self.random_seed,
+                    observer_axis=observer_axis,
+                    observer_cost_strength=observer_cost if observer_axis is not None else 0.0,
+                )
+                diagnostics["steps"].append(f"nystrom_kernel_pca:{channel_name}")
+            elif self.geometry_mode == "none":
+                Z = X
+                diagnostics["steps"].append(f"geometry_none:{channel_name}")
+                ch_diag["contract_note"] = "geometry_mode=none, no kernel mapping applied"
+
+            if self.normalize_features:
+                Z = _maybe_l2_normalize_rows(Z)
+                diagnostics["steps"].append(f"normalize_features:geometry:{channel_name}")
+
+            ch_diag["timing_geometry"] = time.time() - t_geom
+            ch_diag["geometry_variance"] = float(Z.var().item())
+            ch_diag["geometry_dim"] = int(Z.shape[1])
+
+            # Step 4: Optional attention aggregation
+            A = Z
+            if self.attention_model is not None:
+                t_attn = time.time()
+                current_attn = self.attention_model
+                attn_num_heads = int(getattr(current_attn, "num_heads", 8) or 8)
+                
+                if A.dim() == 2:
+                    cur_d = int(A.shape[1])
+                    if cur_d <= 0 or cur_d < attn_num_heads:
+                        diagnostics["steps"].append(f"attention_skipped_small_dim:{channel_name}")
+                        ch_diag["attention_skipped_reason"] = f"feature_dim={cur_d} < num_heads={attn_num_heads}"
+                        ch_diag["timing_attention"] = time.time() - t_attn
+                        ch_diag["attention_variance"] = float(A.var().item()) if A.numel() > 0 else 0.0
+                        return A, channel_extras
+                    # ASTER v3.2: Rebuild attention if dim changed (common in N-Universe warping)
+                    need_rebuild = False
+                    if hasattr(current_attn, "feature_dim"):
+                        if int(current_attn.feature_dim) != cur_d:
+                            need_rebuild = True
+                    
+                    if need_rebuild:
+                        # MultiheadAttention REQUIRES divisibility by num_heads (8)
+                        safe_cur_d = _ensure_8_divisible(cur_d, cur_d)
+                        print(f"      [DAG] Rebuilding attention for warped dim={cur_d} -> safe_dim={safe_cur_d} (heads=8)")
+                        current_attn = CrossArticleAttention(
+                            feature_dim=safe_cur_d,
+                            num_heads=attn_num_heads,
+                        ).to(A.device)
+
+                # Final contract check: MultiheadAttention REQUIRES divisibility by num_heads
+                if int(A.shape[1]) % attn_num_heads != 0:
+                    print(f"      [DAG] WARNING: Attn feature_dim={A.shape[1]} not divisible by {attn_num_heads}. Truncating to nearest multiple.")
+                    safe_d = (int(A.shape[1]) // attn_num_heads) * attn_num_heads
+                    if safe_d < attn_num_heads:
+                        diagnostics["steps"].append(f"attention_skipped_nondivisible_small_dim:{channel_name}")
+                        ch_diag["attention_skipped_reason"] = f"truncated_feature_dim={safe_d} < num_heads={attn_num_heads}"
+                        ch_diag["timing_attention"] = time.time() - t_attn
+                        ch_diag["attention_variance"] = float(A.var().item()) if A.numel() > 0 else 0.0
+                        return A, channel_extras
+                    A = A[:, :safe_d]
+                    # Need to rebuild again for this truncated A
+                    current_attn = CrossArticleAttention(
+                        feature_dim=safe_d,
+                        num_heads=attn_num_heads,
+                    ).to(A.device)
+                
+                attn_res = current_attn(A)
+                attn_out = None
+                attn_weights = None
+
+                if isinstance(attn_res, tuple):
+                    if len(attn_res) >= 2:
+                        attn_out, attn_weights = attn_res[0], attn_res[1]
+                    elif len(attn_res) == 1:
+                        attn_weights = attn_res[0]
+                else:
+                    if torch.is_tensor(attn_res):
+                        if attn_res.dim() == 2 and attn_res.shape[0] == A.shape[0] and attn_res.shape[1] == A.shape[0]:
+                            attn_weights = attn_res
+                        else:
+                            attn_out = attn_res
+                    else:
+                        attn_out = attn_res
+
+                if attn_out is None:
+                    if attn_weights is None:
+                        raise ValueError(f"Attention module returned unsupported value: {type(attn_res)}")
+                    attn_out = attn_weights @ A
+
+                if attn_weights is not None:
+                    self.recorder.record(f"{month_name}:{channel_name}", attn_weights)
+
+                A = attn_out
+                if self.normalize_features:
+                    A = _maybe_l2_normalize_rows(A)
+                    diagnostics["steps"].append(f"normalize_features:attention:{channel_name}")
+
+                ch_diag["timing_attention"] = time.time() - t_attn
+                ch_diag["attention_variance"] = float(A.var().item())
+
+            # Step 5: Optional PCA removal
+            F_out = A
+            pca_allowed = _check_operation_allowed(channel_rep_kind, 'pca_removal', warn_only=True)
+            
+            if self.compare_logits_vs_cli:
+                diagnostics["steps"].append(f"pca_skipped_compare_mode:{channel_name}")
+            elif self.use_cls_tokens:
+                diagnostics["steps"].append(f"pca_skipped_cls_mode:{channel_name}")
+            elif self.pca_remove and pca_allowed:
+                t_pca = time.time()
+                F_out = remove_top_pca_component(
+                    F_out,
+                    global_component=self.global_pca_component,
+                )
+                if self.normalize_features:
+                    F_out = _maybe_l2_normalize_rows(F_out)
+                    diagnostics["steps"].append(f"normalize_features:pca:{channel_name}")
+                ch_diag["timing_pca_removal"] = time.time() - t_pca
+                ch_diag["final_variance"] = float(F_out.var().item())
+                diagnostics["steps"].append(f"pca_removal:{channel_name}")
+            elif self.pca_remove and not pca_allowed:
+                diagnostics["steps"].append(f"pca_skipped_contract:{channel_name}")
+                ch_diag["contract_violation_avoided"] = "pca_removal"
+            else:
+                ch_diag["final_variance"] = float(F_out.var().item())
+
+            ch_diag["timing_total_channel"] = time.time() - t0
+            channel_extras["provenance"]["rep_kind"] = channel_rep_kind.value
+            channel_extras["provenance"]["geometry_mode"] = self.geometry_mode
+            channel_extras["provenance"]["final_dim"] = int(F_out.shape[-1]) if F_out is not None else 0
+            
+            return F_out, channel_extras
+
+        # Run all channels
+        out_by_channel: Dict[str, torch.Tensor] = {}
+        extras_by_channel: Dict[str, Dict[str, Any]] = {}
+        for ch, Xch in base_by_channel.items():
+            out_by_channel[ch], extras_by_channel[ch] = _run_channel(ch, Xch)
+        
+        # NEW: Run Dirichlet fusion if enabled and we have CLS views
+        # HOLOGRAPHIC LOOP (Axiom 3): whiten  project  sum (per paragraph)
+        # Instead of ( wv), we compute  w (Wv)  isomorphic superposition.
+        dirichlet_results = None
+        if self.dirichlet_fusion is not None and self.use_cls_tokens:
+            t_fusion = time.time()
+
+            # Try holographic path first (cls_paragraphs available from Jagged Truth)
+            has_paragraphs = any(
+                pair.get("cls_paragraphs") is not None for pair in nli_pairs
+            )
+
+            if has_paragraphs:
+                #  Holographic Loop: whiten each paragraph, project, weighted-sum 
+                # Collect a sample for ZCA fitting (first pass)
+                all_para_vecs = []
+                for pair in nli_pairs:
+                    cp = pair.get("cls_paragraphs")  # [n_paras, n_bots, hidden]
+                    if cp is not None:
+                        all_para_vecs.append(cp.reshape(-1, cp.shape[-1]))
+                if all_para_vecs:
+                    sample_for_zca = torch.cat(all_para_vecs, dim=0)  # [total, hidden]
+                    # Subsample if too large (ZCA only needs ~5000)
+                    if sample_for_zca.shape[0] > 5000:
+                        idx = torch.randperm(sample_for_zca.shape[0])[:5000]
+                        sample_for_zca = sample_for_zca[idx]
+                    zca_fit = fit_whitening_matrix(sample_for_zca)
+                    zca_mu = zca_fit['mu']
+                    zca_W = zca_fit['whitening_matrix']
+                else:
+                    zca_mu, zca_W = None, None
+
+                # Second pass: whiten  project(RKS via fusion)  weighted sum
+                fused_per_article = []
+                for pair in nli_pairs:
+                    cp = pair.get("cls_paragraphs")   # [n_paras, n_bots, hidden]
+                    pw = pair.get("paragraph_weights") # [n_paras]
+                    if cp is None:
+                        # Fallback: use pre-aggregated cls_per_bot
+                        cpb = pair.get("cls_per_bot")
+                        if cpb is not None:
+                            fused_per_article.append(cpb)  # [n_bots, hidden]
+                        continue
+
+                    n_paras, n_bots, hidden = cp.shape
+                    if pw is None:
+                        pw = torch.ones(n_paras) / n_paras
+                    pw = pw.to(cp.device)
+
+                    # Whiten each paragraph's bot vectors
+                    if zca_mu is not None and zca_W is not None:
+                        cp_whitened = apply_whitening_fixed(
+                            cp.reshape(n_paras * n_bots, hidden),
+                            zca_mu, zca_W,
+                        ).reshape(n_paras, n_bots, hidden)
+                    else:
+                        cp_whitened = cp
+
+                    # Preserve geometric magnitude for downstream manifold projection.
+
+                    # Project each paragraph through Dirichlet fusion, then weighted-sum
+                    para_fused = []
+                    for p_idx in range(n_paras):
+                        # [1, n_bots, hidden]  fusion  [1, rks_dim]
+                        p_out = self.dirichlet_fusion(
+                            cp_whitened[p_idx].unsqueeze(0),
+                            compute_curvature=False,
+                        )
+                        para_fused.append(p_out["fused"].squeeze(0))  # [rks_dim]
+
+                    # Weighted sum:  w  (Wv)
+                    stacked = torch.stack(para_fused, dim=0)  # [n_paras, rks_dim]
+                    holographic = torch.einsum('p,pd->d', pw, stacked)  # [rks_dim]
+                    fused_per_article.append(holographic)
+
+                if fused_per_article:
+                    fused_tensor = torch.stack(fused_per_article, dim=0)  # [N, rks_dim]
+                    # Run one final curvature computation on the aggregated result
+                    # (use the pre-aggregated path for curvature stats)
+                    cls_per_bot_list = [pair.get("cls_per_bot") for pair in nli_pairs if pair.get("cls_per_bot") is not None]
+                    if cls_per_bot_list:
+                        cls_per_bot_tensor, cls_per_bot_list, cls_per_bot_contract = _canonicalize_cls_per_bot_for_spectral(
+                            cls_per_bot_list,
+                            normalize_features_flag=self.normalize_features,
+                        )
+                        cls_per_bot = cls_per_bot_tensor
+                        curv_out = self.dirichlet_fusion(cls_per_bot, compute_curvature=True)
+                        curvature_stats = curv_out["curvature"]
+                    else:
+                        curvature_stats = None
+
+                    # Compute per-article std: use std across feature dims as proxy
+                    # for observer variance (since holographic path doesn't have explicit samples)
+                    # Shape: [N, D] where each row has the article's feature spread
+                    per_article_std = fused_tensor.std(dim=1, keepdim=True).expand_as(fused_tensor)
+
+                    dirichlet_results = {
+                        "fused": fused_tensor,
+                        "fused_std": per_article_std,  # [N, D] - proper 2D shape
+                        "curvature": {
+                            "participation_ratio": curvature_stats["participation_ratio"].tolist() if curvature_stats else [],
+                            "effective_rank_90": curvature_stats["effective_rank_90"].tolist() if curvature_stats else [],
+                            "lambda1_lambda2": curvature_stats["lambda1_lambda2"].tolist() if curvature_stats else [],
+                        } if curvature_stats else {},
+                        "provenance": {
+                            "path": "holographic_loop",
+                            "zca_samples": int(sample_for_zca.shape[0]) if all_para_vecs else 0,
+                        },
+                    }
+                    diagnostics["steps"].append("holographic_fusion")
+                    diagnostics["dirichlet"] = {
+                        "alpha": self.dirichlet_config.alpha if self.dirichlet_config else None,
+                        "n_observers": self.dirichlet_config.n_observers if self.dirichlet_config else None,
+                        "holographic": True,
+                    }
+            else:
+                # Legacy fallback: pre-aggregated cls_per_bot (no paragraph data)
+                cls_per_bot_list = [pair.get("cls_per_bot") for pair in nli_pairs if pair.get("cls_per_bot") is not None]
+                if cls_per_bot_list:
+                    cls_per_bot_tensor, cls_per_bot_list, cls_per_bot_contract = _canonicalize_cls_per_bot_for_spectral(
+                        cls_per_bot_list,
+                        normalize_features_flag=self.normalize_features,
+                    )
+                    cls_per_bot = cls_per_bot_tensor  # [N, 8, hidden]
+
+                    # ASTER v3.2: Use Sequential Annealing if enabled
+                    if hasattr(self.dirichlet_fusion, 'config') and getattr(self.dirichlet_fusion.config, 'use_annealing', False):
+                        fusion_out = self.dirichlet_fusion.forward_annealing(cls_per_bot, compute_curvature=True)
+                        dirichlet_results = {
+                            "fused": fusion_out["fused"],
+                            "fused_std": fusion_out["fused_std"],
+                            "consensus_embedding": fusion_out.get("consensus_embedding"),
+                            "stability_mask": fusion_out.get("stability_mask"),
+                            "atmospheric_alpha": fusion_out.get("atmospheric_alpha"),
+                            "adaptive_work": fusion_out.get("adaptive_work"),
+                            "curvature": {
+                                "participation_ratio": fusion_out["curvature"]["participation_ratio"].tolist(),
+                                "effective_rank_90": fusion_out["curvature"]["effective_rank_90"].tolist(),
+                                "lambda1_lambda2": fusion_out["curvature"]["lambda1_lambda2"].tolist(),
+                            },
+                            "provenance": fusion_out["provenance"],
+                        }
+                        diagnostics["steps"].append("dirichlet_annealing")
+                    else:
+                        fusion_out = self.dirichlet_fusion(cls_per_bot, compute_curvature=True)
+                        dirichlet_results = {
+                            "fused": fusion_out["fused"],
+                            "fused_std": fusion_out["fused_std"],
+                            "curvature": {
+                                "participation_ratio": fusion_out["curvature"]["participation_ratio"].tolist(),
+                                "effective_rank_90": fusion_out["curvature"]["effective_rank_90"].tolist(),
+                                "lambda1_lambda2": fusion_out["curvature"]["lambda1_lambda2"].tolist(),
+                            },
+                            "provenance": fusion_out["provenance"],
+                        }
+                        diagnostics["steps"].append("dirichlet_fusion")
+
+                    diagnostics["dirichlet"] = {
+                        "alpha": self.dirichlet_config.alpha if self.dirichlet_config else None,
+                        "n_observers": self.dirichlet_config.n_observers if self.dirichlet_config else None,
+                        "curvature_mean_pr": float(fusion_out["curvature"]["participation_ratio"].mean().item()),
+                        "annealing_enabled": getattr(self.dirichlet_fusion.config, 'use_annealing', False) if hasattr(self.dirichlet_fusion, 'config') else False,
+                    }
+
+            diagnostics["timing"]["dirichlet_fusion"] = time.time() - t_fusion
+
+        # choose the canonical "features" output for backward compatibility.
+        if self.compare_logits_vs_cli:
+            final_features = out_by_channel["logits"]
+        else:
+            final_features = out_by_channel["main"]
+
+        diagnostics["variance"]["final_variance"] = float(final_features.var().item())
+        diagnostics["timing"]["total"] = time.time() - start_total
+
+        # Expose comparison outputs (if present)
+        features_cli = out_by_channel.get("cli", None)
+
+        # NEW: Ensure intermediate states are in the output for iterative runners
+        # (Populated after all tracks are computed)
+        pipeline_checkpoints = {}
+        if logits_t1 is not None:
+            pipeline_checkpoints['T0_substrate'] = logits_t1.view(-1, 8, 3)
+        if final_features is not None:
+            pipeline_checkpoints['T1_embeddings'] = final_features
+        if dirichlet_results is not None and "fused" in dirichlet_results:
+            pipeline_checkpoints['T2_kernels'] = dirichlet_results["fused"]
+        
+        # T3 is social_texture (populated below if enabled)
+
+        # ====================================================================
+        # WATERFALL CHECKPOINT SYSTEM (Data Lineage)
+        # ====================================================================
+        # Initialize checkpoint manager if output_dir is available
+        waterfall_ckpt = None
+        if config and config.get("enable_checkpoints", False):
+            try:
+                from .waterfall_checkpoints import WaterfallCheckpoint
+                ckpt_dir = config.get("checkpoint_dir", config.get("output_dir", "."))
+                waterfall_ckpt = WaterfallCheckpoint(ckpt_dir, run_id=month_name)
+
+                # T1: Save semantic embeddings (pre-kernel)
+                if final_features is not None:
+                    embeddings_per_bot = None
+                    if cls_per_bot_tensor is not None:
+                        embeddings_per_bot = cls_per_bot_tensor.detach().cpu().numpy()
+                    waterfall_ckpt.save_t1_embeddings(
+                        embeddings=final_features.detach().cpu().numpy(),
+                        embeddings_per_bot=embeddings_per_bot,
+                        extraction_method="cls_token" if self.use_cls_tokens else "mean_pool",
+                    )
+
+                # T2: Save kernel projections
+                if dirichlet_results is not None and "fused" in dirichlet_results:
+                    fused = dirichlet_results["fused"]
+                    # Safely get sigma from basis (may be SharedRKSBasis or MultiFramingRKS)
+                    try:
+                        if hasattr(self.dirichlet_fusion, 'basis'):
+                            basis = self.dirichlet_fusion.basis
+                            if hasattr(basis, 'sigma'):
+                                rbf_sigma = float(basis.sigma) if not isinstance(basis.sigma, (list, tuple)) else basis.sigma[0]
+                            elif hasattr(basis, 'sigmas'):
+                                rbf_sigma = float(basis.sigmas[0]) if basis.sigmas else 1.0
+                            elif hasattr(basis, 'kernels') and basis.kernels:
+                                # MultiFramingRKS: get sigma from first kernel
+                                first_kernel = basis.kernels[0]
+                                rbf_sigma = float(getattr(first_kernel, 'sigma', 1.0))
+                            else:
+                                rbf_sigma = 1.0
+                        else:
+                            rbf_sigma = 1.0
+                    except Exception:
+                        rbf_sigma = 1.0
+
+                    waterfall_ckpt.save_t2_kernel_projections(
+                        z_rbf=fused.detach().cpu().numpy(),
+                        rbf_sigma=rbf_sigma,
+                        rks_dim=fused.shape[-1],
+                        random_seed=self.random_seed,
+                    )
+            except Exception as e:
+                print(f"[Checkpoint] Warning: Failed to initialize checkpoints: {e}")
+                import traceback
+                traceback.print_exc()
+                waterfall_ckpt = None
+
+        # ====================================================================
+        # TRACK 5: PHASE-SPACE INTEGRATION (The Final Exit Gate)
+        # ====================================================================
+        # Fuses all 6 tracks into a single unit-sphere particle per article.
+        # Only runs if we have the necessary track outputs.
+        phase_space_results = None
+        spectral_results = None  # Track 1.5 spectral polarity (populated below)
+        social_texture_results = None  # Track 3 extended
+        walker_work_integrals = []  # Track 4 work integrals
+        walker_states = []  # Track 4 mechanical closure states
+        walker_state_records = []  # Track 4 persisted physics metadata
+        walker_path_records = []  # Track 4 persisted trajectories (article_idx/bt_uid -> path_xyz)
+        walker_step_diagnostics = []  # Track 4 per-step diagnostics per article
+        last_hysteresis_memory_matrix = None  # Track 4 per-article memory (no cross-article chaining)
+        hysteresis_stats_last = None
+        walker_n_steps = int((config or {}).get("walker_n_steps", 150))
+        if HAS_PHASE_SPACE and dirichlet_results is not None:
+            t_phase = time.time()
+            try:
+                # Collect track outputs
+                # Track 1: Logits - flatten to [N, 24] if needed
+                logits_list = []
+                for pair in nli_pairs:
+                    lr = pair.get("logits_raw", pair.get("embedding"))
+                    if lr is not None:
+                        if lr.dim() == 2:  # [8, 3] -> [24]
+                            lr = lr.flatten()
+                        elif lr.dim() == 1 and lr.shape[0] != 24:
+                            lr = lr[:24] if lr.shape[0] > 24 else torch.cat([lr, torch.zeros(24 - lr.shape[0])])
+                        logits_list.append(lr)
+                logits_t1 = torch.stack(logits_list, dim=0) if logits_list else None
+
+                # T0: Save logit substrate checkpoint
+                if waterfall_ckpt is not None and logits_t1 is not None:
+                    try:
+                        # Reshape to (N, 8, 3) for checkpoint format
+                        logits_reshaped = logits_t1.view(-1, 8, 3).detach().cpu().numpy()
+                        waterfall_ckpt.save_t0_substrate(logits_reshaped)
+                    except Exception as e:
+                        print(f"[Checkpoint T0] Warning: Failed to save substrate: {e}")
+
+                # Track 1: Logit Confidence (max softmax probability per probe, averaged)
+                logit_confidence_t1 = None
+                if logits_t1 is not None:
+                    try:
+                        # Reshape to [N, 8, 3] (8 probes  3 NLI classes)
+                        logits_reshaped = logits_t1.view(-1, 8, 3)
+                        # Softmax over class dimension
+                        probs = torch.softmax(logits_reshaped, dim=-1)  # [N, 8, 3]
+                        # Max probability per probe (confidence = how sure is the model?)
+                        max_probs = probs.max(dim=-1).values  # [N, 8]
+                        # Average confidence across probes
+                        logit_confidence_t1 = max_probs.mean(dim=-1)  # [N]
+                        print(f"[Track 1] Logit confidence: mean={logit_confidence_t1.mean():.3f}")
+                    except Exception as e:
+                        print(f"[Track 1] Logit confidence computation failed: {e}")
+
+                # Track 2: Hologram (fused embeddings after ZCA)
+                hologram_t2 = dirichlet_results.get("fused")
+
+                # Track 3: Blinker (Dirichlet variance)
+                blinker_t3 = dirichlet_results.get("fused_std")
+                if isinstance(blinker_t3, np.ndarray):
+                    blinker_t3 = torch.from_numpy(blinker_t3)
+
+                # Track 3 Extended: Social Texture (alpha sweep crack/bond topology)
+                # This is computationally expensive, so optional via config
+                run_social_texture = config.get("run_social_texture", False) if config else False
+                if run_social_texture and cls_per_bot_list and hasattr(self, 'dirichlet_fusion'):
+                    try:
+                        from .dirichlet_fusion import AtmosphericAnnealer
+                        cls_stacked = cls_per_bot_tensor if cls_per_bot_tensor is not None else torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
+                        annealer = AtmosphericAnnealer(
+                            fusion=self.dirichlet_fusion,
+                            alphas=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+                            n_observers_per_alpha=30,  # Reduced for speed
+                            device=str(self.device),
+                        )
+                        social_texture_results = annealer.analyze(
+                            cls_per_bot=cls_stacked,
+                            corpus_name=month_name,
+                            article_ids=bt_uids,
+                            top_k=20,
+                            store_full_matrices=False,  # Save memory
+                            verbose=True,
+                        )
+                        print(f"[Track 3] Social texture: {social_texture_results.n_cracks} cracks, "
+                              f"{social_texture_results.n_bonds} bonds, "
+                              f"{social_texture_results.n_contested} contested "
+                              f"(crack_frac={social_texture_results.crack_fraction:.3f})")
+                    except Exception as e:
+                        import traceback
+                        print(f"[Track 3] Social texture failed: {e}")
+                        traceback.print_exc()
+
+                # Track 1.5: Spectral Polarity (PCA compass on gradient matrix)
+                antagonism_t15 = None
+                if cls_per_bot_list and hasattr(self, 'dirichlet_fusion') and self.dirichlet_fusion is not None:
+                    try:
+                        from .spectral_polarity import SpectralPolarity, SpectralPolarityConfig
+                        sp = SpectralPolarity(SpectralPolarityConfig(multi_scale_enabled=True))
+                        spectral_results = sp.compute_batch(cls_per_bot_list)
+                        if cls_per_bot_contract is not None:
+                            diagnostics["spectral_cls_per_bot_contract"] = cls_per_bot_contract
+                        # Project directional antagonism through shared RKS basis
+                        if hasattr(self.dirichlet_fusion, 'basis') and self.dirichlet_fusion.basis is not None:
+                            antagonism_t15 = self.dirichlet_fusion.basis(spectral_results.antagonism)  # [N, D]
+                            n_valid = spectral_results.dipole_valid.sum().item()
+                            n_total = len(cls_per_bot_list)
+                            mean_persist = spectral_results.n_persistent_scales.float().mean().item()
+                            print(f"[Track 1.5] Spectral polarity ({spectral_results.dipole_state}): "
+                                  f"{antagonism_t15.shape}, EVR={spectral_results.evr.mean():.3f}, "
+                                  f"persist={mean_persist:.1f} scales, valid={n_valid}/{n_total}")
+
+                            # T1.5: Save spectral state checkpoint
+                            if waterfall_ckpt is not None:
+                                waterfall_ckpt.save_t15_spectral(
+                                    u_axis=spectral_results.u_axis.detach().cpu().numpy(),
+                                    evr=float(spectral_results.evr.mean().item()),
+                                    singular_values=spectral_results.singular_values.detach().cpu().numpy() if hasattr(spectral_results, 'singular_values') else np.zeros((1, 8)),
+                                    probe_magnitudes=spectral_results.probe_magnitudes.detach().cpu().numpy(),
+                                    dipole_valid=spectral_results.dipole_valid.detach().cpu().numpy(),
+                                    n_persistent_scales=int(spectral_results.n_persistent_scales.float().mean().item()),
+                                )
+                    except Exception as e:
+                        import traceback
+                        print(f"[Track 1.5] Spectral polarity failed: {e}")
+                        traceback.print_exc()
+
+                # Track 3 Gate: Skip walker on Fog regions (high variance)
+                # Use percentile-based fog detection: only top 10% variance = FOG
+                FOG_PERCENTILE = 0.90  # Only top 10% get FOG
+                fog_mask = torch.zeros(len(cls_per_bot_list), dtype=torch.bool) if cls_per_bot_list else torch.zeros(0, dtype=torch.bool)
+                track3_density_rho = None
+                if blinker_t3 is not None and len(cls_per_bot_list) > 0:
+                    from .hadamard_fusion import ConformalMetric
+
+                    track3_density_rho = ConformalMetric().compute_density(blinker_t3.to(dtype=torch.float32))
+                    blinker_magnitude = blinker_t3.norm(dim=-1)
+                    fog_threshold = torch.quantile(blinker_magnitude, FOG_PERCENTILE).clamp(min=1e-9)
+                    fog_mask = blinker_magnitude > fog_threshold
+
+                # Compute WEIGHTED spectral distance for Phantom Differential (ASTER v3.2)
+                # Uses signal-weighted subspace instead of flat Euclidean
+                d_spectral = None
+                if spectral_results is not None and cls_per_bot_list:
+                    from .spectral_polarity import SpectralPolarity, SpectralPolarityConfig
+                    sp = SpectralPolarity(SpectralPolarityConfig())
+
+                    # Build positive/negative poles from sign buckets with explicit
+                    # degeneracy fallback state (no silent clamp-floor behavior).
+                    G = cls_per_bot_tensor if cls_per_bot_tensor is not None else torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
+                    probe_mags = spectral_results.probe_magnitudes  # [N, 8]
+                    spectral_pole_diagnostics = _construct_spectral_poles(G, probe_mags)
+                    emb_pos = spectral_pole_diagnostics["emb_pos"]  # [N, H]
+                    emb_neg = spectral_pole_diagnostics["emb_neg"]  # [N, H]
+
+                    # Compute weighted spectral distance using dynamic K
+                    d_spectral = sp.compute_weighted_spectral_distance(
+                        emb_a=emb_pos,
+                        emb_b=emb_neg,
+                        singular_values=spectral_results.singular_values,
+                        Vt=spectral_results.u_basis,
+                        dynamic_k=spectral_results.dynamic_k,
+                    )
+                    
+                    # 3+2+1 OVERHAUL: Compute WHITENED distance and PHANTOM RATIO
+                    d_whitened = sp.compute_whitened_spectral_distance(
+                        emb_a=emb_pos,
+                        emb_b=emb_neg,
+                        singular_values=spectral_results.singular_values,
+                        Vt=spectral_results.u_basis,
+                        dynamic_k=spectral_results.dynamic_k,
+                    )
+                    phantom_ratio = d_whitened / d_spectral.clamp(min=1e-9)
+
+                    # Log dynamic K statistics
+                    mean_k = spectral_results.dynamic_k.float().mean().item()
+                    n_fallback = int(spectral_pole_diagnostics["fallback_used"].sum().item()) if spectral_pole_diagnostics is not None else 0
+                    print(f"[Track 1.5] Weighted spectral distance: mean_d={d_spectral.mean():.3f}, "
+                          f"dynamic_K={mean_k:.1f}, pole_fallback={n_fallback}/{len(G)}")
+
+                # Track 4: corpus-level article walker on Track 2 geometry
+                walker_t4 = None
+
+                # Persist run-level artifacts needed by downstream visualizers/loaders.
+                run_output_dir = None
+                if config is not None:
+                    run_output_dir = Path(config.get("output_dir", config.get("checkpoint_dir", "")))
+                if run_output_dir:
+                    try:
+                        run_output_dir.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        run_output_dir = None
+
+                if hologram_t2 is not None and hasattr(self, 'dirichlet_fusion') and self.dirichlet_fusion is not None:
+                    try:
+                        from sklearn.decomposition import PCA
+                        from .physarum_walk import compute_corpus_walker_resistance
+
+                        track4_embeddings = hologram_t2
+                        if isinstance(track4_embeddings, np.ndarray):
+                            track4_embeddings = torch.from_numpy(track4_embeddings)
+                        track4_embeddings = track4_embeddings.to(dtype=torch.float32)
+
+                        coords_2d = torch.as_tensor(
+                            PCA(n_components=2, random_state=42).fit_transform(track4_embeddings.detach().cpu().numpy()),
+                            device=track4_embeddings.device,
+                            dtype=torch.float32,
+                        )
+
+                        walker_seed = int((config or {}).get("walker_seed", getattr(self, "random_seed", 0)))
+                        walker_n_walkers = int((config or {}).get("walker_n_walkers", 10))
+                        walker_gamma = float((config or {}).get("walker_gamma", 5.0))
+                        walker_k_neighbors = int((config or {}).get("walker_k_neighbors", 10))
+
+                        result_t4 = compute_corpus_walker_resistance(
+                            embeddings=track4_embeddings,
+                            rks_basis=self.dirichlet_fusion.basis,
+                            track3_density=track3_density_rho if track3_density_rho is not None else blinker_t3,
+                            z_coordinates=d_spectral if d_spectral is not None else None,
+                            metric_stress=d_spectral if d_spectral is not None else None,
+                            article_coords_2d=coords_2d,
+                            article_ids=bt_uids,
+                            temperature=0.5,
+                            n_walkers=walker_n_walkers,
+                            max_steps=walker_n_steps,
+                            gamma=walker_gamma,
+                            k_neighbors=walker_k_neighbors,
+                            hot_temperature_multiplier=5.0,
+                            thermo_config=getattr(self, "thermo_config", None),
+                            start_seed=walker_seed,
+                            output_dir=str(run_output_dir) if run_output_dir is not None else None,
+                        )
+
+                        walker_t4 = result_t4.get("walker_output")
+                        walker_work_integrals.extend(result_t4.get("work_integrals", []))
+                        walker_states.extend(result_t4.get("states", []))
+                        walker_state_records.extend(result_t4.get("state_records", []))
+                        walker_path_records.extend(result_t4.get("path_records", []))
+                        walker_step_diagnostics.extend(result_t4.get("step_diagnostics", []))
+
+                        if walker_states:
+                            n_closed = sum(1 for s in walker_states if s == "closed_loop")
+                            n_open = sum(1 for s in walker_states if s == "open_loop")
+                            mean_work = float(np.mean(walker_work_integrals)) if walker_work_integrals else 0.0
+                            print(
+                                f"[Track 4] Corpus walker: W={mean_work:.3f}, "
+                                f"closure={{closed:{n_closed}, open:{n_open}}}"
+                            )
+                    except Exception as e:
+                        import traceback
+                        print(f"[Track 4] Corpus walker computation failed: {e}")
+                        traceback.print_exc()
+
+                # Compute Phantom Differential verdicts (Panic Function)
+                phantom_verdicts = []
+                if d_spectral is not None and walker_work_integrals:
+                    from .phase_space_integrator import PhaseSpaceIntegrator, IntegratorConfig
+                    # Default behavior: bypass panic-function verdict override and preserve
+                    # native Track 4 walker states as Track 5 verdicts.
+                    use_panic_differential = os.environ.get("BT_USE_PANIC_DIFFERENTIAL", "0").strip() == "1"
+                    if use_panic_differential:
+                        if not hasattr(self, '_phase_integrator') or self._phase_integrator is None:
+                            self._phase_integrator = PhaseSpaceIntegrator(IntegratorConfig())
+
+                        # Compute blinker variance per article for terrain classification
+                        blinker_variance = None
+                        if blinker_t3 is not None:
+                            # blinker_t3 is [N, D] fused_std - compute magnitude per article
+                            blinker_variance = blinker_t3.norm(dim=-1).tolist()  # List[float]
+
+                        phantom_verdicts = self._phase_integrator.compute_phantom_differential(
+                            d_spectral, walker_work_integrals, walker_states,
+                            blinker_variance=blinker_variance
+                        )
+                        for i, verdict_payload in enumerate(phantom_verdicts):
+                            verdict_payload["verdict"] = _map_track4_state_to_track5_verdict(
+                                verdict_payload.get("verdict"),
+                            )
+                            if i < len(walker_state_records):
+                                verdict_payload["anomaly_flag"] = bool(
+                                    walker_state_records[i].get("anomaly_flag", False)
+                                )
+                                verdict_payload["anomaly_kind"] = walker_state_records[i].get(
+                                    "anomaly_kind",
+                                    "none",
+                                )
+                        # Log verdict summary with TAUTOLOGY
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0}
+                        for v in phantom_verdicts:
+                            verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
+                        print(f"[Panic Function] Verdicts: T={verdict_counts['TAUTOLOGY']}, "
+                              f"H={verdict_counts['HONEST']}, P={verdict_counts['PHANTOM']}, "
+                              f"A={sum(1 for rec in walker_state_records if rec.get('anomaly_flag'))}")
+                    else:
+                        EPS = 1e-9
+                        work_arr = np.array(walker_work_integrals, dtype=float)
+                        d_arr = np.array([float(d_spectral[i]) if i < len(d_spectral) else 0.0
+                                          for i in range(len(walker_work_integrals))], dtype=float)
+                        delta_arr = work_arr / np.maximum(d_arr, EPS)
+                        semantic_verdicts, semantic_stats = _classify_track5_semantic_verdicts(
+                            work_arr,
+                            d_arr,
+                            walker_state_records=walker_state_records,
+                        )
+                        for i, (w, s) in enumerate(zip(walker_work_integrals, walker_states)):
+                            verdict = str(semantic_verdicts[i])
+
+                            phantom_verdicts.append({
+                                "verdict": verdict,
+                                "delta": float(delta_arr[i]),
+                                "d_spectral": float(d_arr[i]),
+                                "w_actual": float(w),
+                                "confidence": 1.0,
+                                "walker_state": s,
+                                "anomaly_flag": bool(
+                                    walker_state_records[i].get("anomaly_flag", False)
+                                ) if i < len(walker_state_records) else False,
+                                "anomaly_kind": (
+                                    walker_state_records[i].get("anomaly_kind", "none")
+                                ) if i < len(walker_state_records) else "none",
+                            })
+                        verdict_counts = {"TAUTOLOGY": 0, "HONEST": 0, "PHANTOM": 0}
+                        for v in phantom_verdicts:
+                            verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
+                        print(f"[Track 5] Using Track 4 states (panic bypass): "
+                              f"T={verdict_counts['TAUTOLOGY']}, H={verdict_counts['HONEST']}, "
+                              f"P={verdict_counts['PHANTOM']}, "
+                              f"A={sum(1 for rec in walker_state_records if rec.get('anomaly_flag'))}, "
+                              f"cut={semantic_stats['honest_cutoff']:.4f} ({semantic_stats['threshold_mode']})")
+
+                # Bind per-article terrain class to walker state records for waterfall persistence.
+                if walker_state_records and phantom_verdicts and len(walker_state_records) == len(phantom_verdicts):
+                    for i, rec in enumerate(walker_state_records):
+                        rec["terrain_state"] = phantom_verdicts[i].get("terrain_state")
+
+                # Create or use cached integrator
+                # ASTER v3.2: Also refit if is_fit=False (may have failed previously)
+                needs_fit = (
+                    not hasattr(self, '_phase_integrator') or
+                    self._phase_integrator is None or
+                    not self._phase_integrator.is_fit
+                )
+                if needs_fit:
+                    integrator_config = IntegratorConfig()
+                    self._phase_integrator = PhaseSpaceIntegrator(integrator_config)
+
+                    # Fit on current batch (in production, fit on 5k sample corpus)
+                    track_samples = {}
+                    if logits_t1 is not None:
+                        track_samples['logits'] = logits_t1
+                    if hologram_t2 is not None:
+                        track_samples['hologram'] = hologram_t2
+                    if blinker_t3 is not None:
+                        track_samples['blinker'] = blinker_t3
+
+                    if track_samples:
+                        self._phase_integrator.fit(track_samples)
+
+                # Integrate particles (ASTER v3.2: Hadamard fusion enabled)
+                print(f"[Track 5] Integrator is_fit={self._phase_integrator.is_fit}, "
+                      f"hologram={hologram_t2 is not None}, antagonism={antagonism_t15 is not None}, "
+                      f"blinker={blinker_t3 is not None}")
+                if self._phase_integrator.is_fit:
+                    particles = self._phase_integrator.integrate(
+                        logits=logits_t1,
+                        antagonism=antagonism_t15,
+                        hologram=hologram_t2,
+                        blinker=blinker_t3,
+                        walker=walker_t4,
+                        article_ids=bt_uids,
+                        use_hadamard_fusion=True,  # ASTER v3.2: K_final = K_rks * K_spectral
+                    )
+
+                    if particles:
+                        # Attach phantom verdicts to particles if available
+                        if phantom_verdicts and len(phantom_verdicts) == len(particles):
+                            for i, p in enumerate(particles):
+                                v = phantom_verdicts[i]
+                                p.phantom_verdict = v["verdict"]
+                                p.phantom_delta = v["delta"]
+                                p.d_spectral = v.get("d_spectral", v.get("d", 0.0))
+                                p.w_actual = v.get("w_actual", v.get("w", 0.0))
+                                p.phantom_confidence = v.get("confidence", 0.0)
+                                p.walker_state = v.get("walker_state", "unknown")
+
+                        # Stack integrated vectors
+                        integrated_vectors = torch.stack([p.vector for p in particles], dim=0)
+
+                        # Compute phantom verdict counts (ASTER v3.2: includes TAUTOLOGY)
+                        phantom_counts = {
+                            "TAUTOLOGY": sum(1 for p in particles if p.phantom_verdict == "TAUTOLOGY"),
+                            "HONEST": sum(1 for p in particles if p.phantom_verdict == "HONEST"),
+                            "PHANTOM": sum(1 for p in particles if p.phantom_verdict == "PHANTOM"),
+                        }
+
+                        phase_space_results = {
+                            "integrated_vectors": integrated_vectors,
+                            "particles": particles,
+                            "singularity_counts": {
+                                "structural_singularity": sum(1 for p in particles if p.singularity_type == "structural_singularity"),
+                                "noise": sum(1 for p in particles if p.singularity_type == "noise"),
+                                "ideological_barrier": sum(1 for p in particles if p.singularity_type == "ideological_barrier"),
+                                "consensus": sum(1 for p in particles if p.singularity_type == "consensus"),
+                            },
+                            "phantom_counts": phantom_counts,
+                            "mean_liar_score": float(np.mean([p.liar_score for p in particles])),
+                            "n_liars": sum(1 for p in particles if p.liar_score > 0.5),
+                        }
+                        diagnostics["steps"].append("phase_space_integration")
+                        diagnostics["phase_space"] = {
+                            "n_particles": len(particles),
+                            "integrated_dim": int(integrated_vectors.shape[-1]),
+                            "singularity_counts": phase_space_results["singularity_counts"],
+                            "phantom_counts": phantom_counts,
+                        }
+
+                        # ASTER v3.2: Hadamard fusion diagnostics
+                        if particles and particles[0].hadamard_diagnostics is not None:
+                            diagnostics["phase_space"]["hadamard_fusion"] = particles[0].hadamard_diagnostics
+
+            except Exception as e:
+                diagnostics.setdefault("warnings", []).append(f"phase_space_error: {e}")
+
+            diagnostics["timing"]["phase_space"] = time.time() - t_phase
+
+        # Provenance log (optional)
+        provenance_entries = []
+        if self.enable_provenance and self.provenance_tracker is not None:
+            # Record the "canonical" channel as the primary artifact.
+            try:
+                prov_entry = PipelineProvenanceEntry(
+                    month=month_name,
+                    seed=self.random_seed,
+                    mode=self.geometry_mode, # [FIX] Use geometry_mode, not mode
+                    embedding_type=("logits" if self.compare_logits_vs_cli else "main"),
+                    n_articles=int(final_features.shape[0]),
+                    dim=int(final_features.shape[1]),
+                    pipeline_steps=list(diagnostics.get("steps", [])),
+                    timings=dict(diagnostics.get("timing", {})),
+                    variance=dict(diagnostics.get("variance", {})),
+                    metadata=provenance_metadata,
+                    timestamp=time.time(),
+                )
+                self.provenance_tracker.add_entry(prov_entry)
+                provenance_entries = [prov_entry.to_dict()]
+                if self.provenance_dir:
+                    self.provenance_tracker.save(
+                        self.provenance_dir,
+                        filename=f"{month_name}_seed{self.random_seed}_provenance.json",
+                    )
+            except Exception as e:
+                # Don't crash runs due to provenance bookkeeping
+                diagnostics.setdefault("warnings", []).append(f"provenance_error: {e}")
+
+        # Article metadata (index-stable)
+        metadata = []
+        for i, art in enumerate(articles):
+            metadata.append(
+                _build_article_metadata_row(
+                    article=art,
+                    index=i,
+                    bt_uid=bt_uids[i] if bt_uids is not None else None,
+                    timestamp_field=ts_source_keys[i],
+                    timestamp_raw=ts_raw_values[i],
+                    timestamp_epoch_s=ts_epoch_s[i],
+                    timestamp_iso_utc=ts_iso_utc[i],
+                )
+            )
+
+        out = {
+            "month": month_name,
+            "features": final_features.detach().cpu().numpy(),
+            # Compatibility alias (older runners saved result['embeddings'])
+            "embeddings": final_features.detach().cpu().numpy(),
+            "diagnostics": diagnostics,
+            "provenance": provenance_entries,
+            "article_metadata": metadata,
+            "timeline": timeline,
+            "bt_uid_list": bt_uids,
+            # NEW: Channel extras with rep_kind and provenance
+            "channel_extras": extras_by_channel,
+            # NEW: Primary rep_kind for downstream contract checks
+            "rep_kind": self.primary_rep_kind.value,
+            # NEW: Pipeline intermediate states for checkpointing
+            "checkpoints": pipeline_checkpoints,
+        }
+
+        if features_cli is not None:
+            out["features_cli"] = features_cli.detach().cpu().numpy()
+            out["embeddings_cli"] = features_cli.detach().cpu().numpy()
+        
+        # NEW: Include Dirichlet fusion results if computed
+        if dirichlet_results is not None:
+            out["dirichlet_fused"] = dirichlet_results["fused"].detach().cpu().numpy()
+            out["dirichlet_fused_std"] = dirichlet_results["fused_std"].detach().cpu().numpy()
+            out["dirichlet_curvature"] = dirichlet_results["curvature"]
+            out["dirichlet_provenance"] = dirichlet_results["provenance"]
+            if 'track3_density_rho' in locals() and track3_density_rho is not None:
+                out["track3_density_rho"] = track3_density_rho.detach().cpu().numpy()
+
+        # NEW: Include Phase-Space Integration results (Track 5)
+        if phase_space_results is not None:
+            out["integrated_vectors"] = phase_space_results["integrated_vectors"].detach().cpu().numpy()
+            out["singularity_counts"] = phase_space_results["singularity_counts"]
+            out["phantom_counts"] = phase_space_results.get("phantom_counts", {})
+            out["mean_liar_score"] = phase_space_results["mean_liar_score"]
+            out["n_liars"] = phase_space_results["n_liars"]
+            # Serialize particles for downstream use
+            out["particles"] = [p.to_dict() for p in phase_space_results["particles"]]
+
+        # NEW: Include Track 1 Logit Confidence
+        if logit_confidence_t1 is not None:
+            out["logit_confidence"] = logit_confidence_t1.detach().cpu().numpy()
+
+        # NEW: Include Spectral Polarity results (Track 1.5 compass)
+        if spectral_results is not None:
+            out["spectral_evr"] = spectral_results.evr.detach().cpu().numpy()
+            out["spectral_probe_magnitudes"] = spectral_results.probe_magnitudes.detach().cpu().numpy()
+            out["spectral_dipole_valid"] = spectral_results.dipole_valid.detach().cpu().numpy()
+            out["spectral_n_persistent_scales"] = spectral_results.n_persistent_scales.detach().cpu().numpy()
+            out["spectral_evr_per_scale"] = spectral_results.evr_per_scale.detach().cpu().numpy()
+            out["spectral_dipole_state"] = spectral_results.dipole_state
+            out["spectral_cls_normalization_contract"] = SPECTRAL_CLS_NORMALIZATION_CONTRACT
+            # Contract: spectral_u_axis must remain the directional axis.
+            # Expose scaled force separately to avoid semantic ambiguity.
+            out["spectral_u_axis"] = spectral_results.u_axis.detach().cpu().numpy()
+            out["spectral_antagonism"] = spectral_results.antagonism.detach().cpu().numpy()
+            pipeline_checkpoints["T1.5_spectral"] = {
+                "u_axis": spectral_results.u_axis,
+                "evr": spectral_results.evr,
+                "probe_magnitudes": spectral_results.probe_magnitudes,
+                "antagonism": spectral_results.antagonism,
+            }
+
+        if cls_per_bot_tensor is not None:
+            out["cls_per_bot"] = cls_per_bot_tensor.detach().cpu().numpy()
+        if cls_per_bot_contract is not None:
+            out["cls_per_bot_contract"] = cls_per_bot_contract
+        if hasattr(self, "dirichlet_fusion") and self.dirichlet_fusion is not None:
+            basis_state = _serialize_rks_basis_state(getattr(self.dirichlet_fusion, "basis", None))
+            if basis_state is not None:
+                out["rks_basis_state"] = basis_state
+
+        # NEW: Include Walker (Track 4) work integrals and states
+        if walker_work_integrals:
+            out["walker_work_integrals"] = np.array(walker_work_integrals)
+            # Flight-data-recorder schema: persist mechanical Track 4 closure/work metadata.
+            out["walker_states"] = walker_state_records if walker_state_records else walker_states
+        if walker_path_records:
+            out["walker_paths"] = walker_path_records
+        if last_hysteresis_memory_matrix is not None:
+            out["hysteresis_memory"] = (
+                last_hysteresis_memory_matrix.detach().cpu().numpy()
+                if torch.is_tensor(last_hysteresis_memory_matrix)
+                else np.asarray(last_hysteresis_memory_matrix)
+            )
+        if hysteresis_stats_last is not None:
+            out["hysteresis_stats"] = hysteresis_stats_last
+        if walker_step_diagnostics:
+            out["walker_step_diagnostics"] = walker_step_diagnostics
+
+        # Persist run-level artifacts needed by downstream visualizers/loaders.
+        run_output_dir = None
+        if config is not None:
+            run_output_dir = Path(config.get("output_dir", config.get("checkpoint_dir", "")))
+        if run_output_dir:
+            try:
+                run_output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                run_output_dir = None
+
+        if run_output_dir is not None and spectral_results is not None:
+            spectral_root_artifacts = {
+                "spectral_evr.npy": spectral_results.evr.detach().cpu().numpy(),
+                "spectral_probe_magnitudes.npy": spectral_results.probe_magnitudes.detach().cpu().numpy(),
+                "spectral_dipole_valid.npy": spectral_results.dipole_valid.detach().cpu().numpy(),
+                "spectral_n_persistent_scales.npy": spectral_results.n_persistent_scales.detach().cpu().numpy(),
+                "spectral_evr_per_scale.npy": spectral_results.evr_per_scale.detach().cpu().numpy(),
+                "spectral_u_axis.npy": spectral_results.u_axis.detach().cpu().numpy(),
+                "spectral_antagonism.npy": spectral_results.antagonism.detach().cpu().numpy(),
+                "d_spectral.npy": d_spectral.detach().cpu().numpy() if d_spectral is not None else None,
+            }
+            for artifact_name, artifact_value in spectral_root_artifacts.items():
+                try:
+                    np.save(run_output_dir / artifact_name, artifact_value)
+                except Exception as e:
+                    print(f"[Track 1.5] Warning: failed to persist {artifact_name}: {e}")
+
+        if run_output_dir is not None and walker_path_records:
+            try:
+                path_arrays = [np.asarray(r["path_xyz"], dtype=np.float32) for r in walker_path_records]
+                if not path_arrays:
+                    raise RuntimeError("walker_path_records was non-empty but path arrays resolved empty.")
+                same_shape = len({tuple(p.shape) for p in path_arrays}) == 1
+                if same_shape:
+                    path_xyz_payload = np.stack(path_arrays, axis=0)
+                else:
+                    # Support variable-length trajectories without dropping the artifact.
+                    path_xyz_payload = np.array(path_arrays, dtype=object)
+
+                def _pack_step_field(
+                    field_name: str,
+                    dtype,
+                    *,
+                    source_key: Optional[str] = None,
+                ):
+                    packed = []
+                    for record, path_xyz in zip(walker_path_records, path_arrays):
+                        step_diag = record.get("step_diagnostics", []) or []
+                        values = [step.get(source_key or field_name) for step in step_diag]
+                        arr = np.asarray(values, dtype=dtype)
+                        max_segments = max(int(path_xyz.shape[0]) - 1, 0)
+                        if arr.ndim == 0:
+                            arr = arr.reshape(1)
+                        if max_segments > 0:
+                            arr = arr[:max_segments]
+                        packed.append(arr)
+                    if not packed:
+                        return np.array([], dtype=object)
+                    if len({tuple(np.asarray(v).shape) for v in packed}) == 1:
+                        return np.stack(packed, axis=0)
+                    return np.array(packed, dtype=object)
+
+                np.savez_compressed(
+                    run_output_dir / "walker_paths.npz",
+                    article_idx=np.array([int(r["article_idx"]) for r in walker_path_records], dtype=np.int32),
+                    bt_uid=np.array([str(r["bt_uid"]) for r in walker_path_records]),
+                    path_space=np.array(["embedding"], dtype="<U16"),
+                    path_contract_version=np.array([2], dtype=np.int32),
+                    path_xyz=path_xyz_payload,
+                    step_axis_idx=_pack_step_field("step_axis_idx", np.int32),
+                    step_axis_vectors=_pack_step_field("step_axis_vectors", np.float32, source_key="step_axis_vector"),
+                    step_local_friction=_pack_step_field("step_local_friction", np.float32, source_key="local_friction"),
+                    step_work=_pack_step_field("step_work", np.float32),
+                    step_cumulative_work=_pack_step_field("step_cumulative_work", np.float32, source_key="cumulative_work"),
+                    step_debt_axis=_pack_step_field("step_debt_axis", np.float32, source_key="debt_axis"),
+                    step_memory_integral=_pack_step_field("step_memory_integral", np.float32, source_key="memory_integral"),
+                    step_event_mask=_pack_step_field("step_event_mask", np.bool_, source_key="event_active"),
+                    step_event_severity=_pack_step_field("step_event_severity", np.float32, source_key="event_severity"),
+                )
+            except Exception as e:
+                raise RuntimeError(f"[Track 4] Failed to persist walker_paths.npz: {e}") from e
+        if run_output_dir is not None and "hysteresis_memory" in out:
+            try:
+                np.save(
+                    run_output_dir / "hysteresis_memory.npy",
+                    np.asarray(out["hysteresis_memory"], dtype=np.float32),
+                )
+            except Exception as e:
+                print(f"[Track 4] Warning: failed to persist hysteresis_memory.npy: {e}")
+        if run_output_dir is not None and "hysteresis_stats" in out:
+            try:
+                with open(run_output_dir / "hysteresis_stats.json", "w", encoding="utf-8") as f:
+                    json.dump(out["hysteresis_stats"], f, indent=2)
+            except Exception as e:
+                print(f"[Track 4] Warning: failed to persist hysteresis_stats.json: {e}")
+
+        # NEW: Include Phantom Differential verdicts (ASTER v3.2)
+        if phantom_verdicts:
+            out["phantom_verdicts"] = phantom_verdicts
+        if d_spectral is not None:
+            out["d_spectral"] = d_spectral.detach().cpu().numpy()
+        if spectral_pole_diagnostics is not None:
+            out["spectral_pole_fallback_used"] = spectral_pole_diagnostics["fallback_used"].detach().cpu().numpy()
+            out["spectral_pole_fallback_state"] = list(spectral_pole_diagnostics["fallback_state"])
+            out["spectral_pole_pos_mass"] = spectral_pole_diagnostics["pos_mass"].detach().cpu().numpy()
+            out["spectral_pole_neg_mass"] = spectral_pole_diagnostics["neg_mass"].detach().cpu().numpy()
+
+        # NEW: Include Social Texture (Track 3 extended) crack/bond topology
+        if social_texture_results is not None:
+            out["social_texture"] = {
+                "n_cracks": social_texture_results.n_cracks,
+                "n_bonds": social_texture_results.n_bonds,
+                "n_contested": social_texture_results.n_contested,
+                "crack_fraction": social_texture_results.crack_fraction,
+                "bond_fraction": social_texture_results.bond_fraction,
+                "mean_crack_score": social_texture_results.mean_crack_score,
+                "mean_bond_score": social_texture_results.mean_bond_score,
+                "alphas_tested": social_texture_results.alphas_tested,
+            }
+
+        # T3: Save topology checkpoint (bonds, cracks, ruptures)
+        if waterfall_ckpt is not None:
+            try:
+                # Compute bond/crack matrices from Dirichlet results if available
+                n_articles = final_features.shape[0]
+                bond_matrix = np.eye(n_articles)  # Default: self-bonds only
+                crack_matrix = np.zeros((n_articles, n_articles))
+                rupture_pairs = []
+
+                # Extract from social texture if available
+                if social_texture_results is not None:
+                    # Use social texture crack/bond info
+                    pass  # social_texture_results has aggregated stats, not full matrices
+
+                # Track 4 is now mechanical only; rupture labeling belongs downstream.
+
+                nmi_score = 0.0
+                ari_score = 0.0
+
+                # NEW: Capture T3 state for pipeline return
+                dirichlet_fused_std = (
+                    dirichlet_results["fused_std"].detach().cpu().numpy()
+                    if dirichlet_results and "fused_std" in dirichlet_results
+                    else None
+                )
+
+                pipeline_checkpoints['T3_topology'] = {
+                    'bond_matrix': bond_matrix,
+                    'crack_matrix': crack_matrix,
+                    'rupture_pairs': rupture_pairs,
+                    'nmi_score': nmi_score,
+                    'ari_score': ari_score,
+                    'dirichlet_fused_std': dirichlet_fused_std,
+                }
+
+                waterfall_ckpt.save_t3_topology(
+                    bond_matrix=bond_matrix,
+                    crack_matrix=crack_matrix,
+                    rupture_pairs=rupture_pairs,
+                    dirichlet_fused=dirichlet_results["fused"].detach().cpu().numpy() if dirichlet_results else None,
+                    dirichlet_fused_std=dirichlet_fused_std,
+                    walker_work=np.array(walker_work_integrals) if walker_work_integrals else None,
+                    nmi_score=nmi_score,
+                    ari_score=ari_score,
+                )
+            except Exception as e:
+                print(f"[Checkpoint T3] Warning: Failed to save topology: {e}")
+
+        # ====================================================================
+        # TRACK 6: HOTT SIDECAR (The Proof Engine)
+        # ====================================================================
+        # Converts geometric features into formal HoTT proofs.
+        # Vertical constraint: read-only, no feedback to lower tracks.
+        run_hott_proofs = True  # Always run HoTT proofs when spectral data is available
+        if run_hott_proofs and 'spectral_evr' in out:
+            try:
+                from .hott_sidecar import prove_from_pipeline_results
+                hott_proofs, hott_summary = prove_from_pipeline_results(out)
+                out["hott_proofs"] = [p.to_dict() for p in hott_proofs]
+                out["hott_summary"] = hott_summary
+
+                # Print summary
+                print(f"[Track 6] HoTT Sidecar: {hott_summary['n_proofs']} proofs generated")
+                print(f"  Equivalence: {hott_summary['equivalence_rate']*100:.1f}%, "
+                      f"Non-equiv: {hott_summary['non_equivalence_rate']*100:.1f}%, "
+                      f"Obstruction: {hott_summary['obstruction_rate']*100:.1f}%, "
+                      f"Undecidable: {hott_summary['undecidable_rate']*100:.1f}%")
+                print(f"  Topological ruptures: {hott_summary['topological_ruptures']}, "
+                      f"Energetic barriers: {hott_summary['energetic_barriers']}")
+                print(f"  Mean proof confidence: {hott_summary['mean_confidence']:.3f}")
+            except Exception as e:
+                import traceback
+                print(f"[Track 6] HoTT Sidecar failed: {e}")
+                traceback.print_exc()
+
+        # Finalize waterfall checkpoint manifest
+        if waterfall_ckpt is not None:
+            try:
+                waterfall_ckpt.save_manifest()
+                out["waterfall_checkpoint_dir"] = str(waterfall_ckpt.checkpoint_dir)
+            except Exception as e:
+                print(f"[Checkpoint] Warning: Failed to save manifest: {e}")
+
+        return out
+
+
+def run_multi_observer_experiment(
+    corpus_name: str,
+    months_data: Dict[str, List[Dict]],
+    output_dir: str,
+    seeds: List[int] = [42, 43, 44, 45, 46],
+    kernels: List[str] = ["rbf", "laplacian", "rq", "imq"],
+    device: str = "cuda",
+    record_attention: bool = True,
+    config: Optional[Dict] = None,
+):
+    """
+    Run a full multi-observer experiment suite.
+
+    For each kernel and each observer seed:
+      - initialize pipeline
+      - run `process_month()` for each month
+      - save outputs in a structured directory
+
+    This function is intentionally "outer-loop glue"  it doesnt decide your science;
+    it ensures outputs are organized and reproducible.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    all_results = {}
+
+    for kernel in kernels:
+        print(f"\n=== Running kernel: {kernel} ===")
+        all_results[kernel] = {}
+
+        for seed in seeds:
+            print(f"  -> Observer seed: {seed}")
+            run_dir = os.path.join(output_dir, corpus_name, kernel, f"seed_{seed}")
+            os.makedirs(run_dir, exist_ok=True)
+
+            # Allow config dict to override pipeline knobs WITHOUT adding CLI sprawl.
+            cfg = config or {}
+            import inspect as _inspect
+            sig = _inspect.signature(initialize_full_pipeline)
+            filtered_cfg = {k: v for k, v in cfg.items() if k in sig.parameters}
+            components = initialize_full_pipeline(
+                random_seed=seed,
+                device=device,
+                **filtered_cfg,
+            )
+
+            # Set kernel type (RKS)
+            if components["rks_map"] is not None:
+                components["rks_map"].rebuild(kernel_type=kernel)
+
+            provenance_dir = os.path.join(run_dir, "provenance")
+            pipeline = BeliefTransformerPipeline(
+                components=components,
+                random_seed=seed,
+                enable_provenance=True,
+                provenance_dir=provenance_dir,
+            )
+
+            run_results = {}
+            validation_records = []
+            for month_name, articles in months_data.items():
+                month_out = pipeline.process_month(articles, month_name=month_name)
+
+                # Persist artifacts
+                month_path = os.path.join(run_dir, f"{month_name}.npz")
+                np.savez_compressed(
+                    month_path,
+                    features=month_out["features"],
+                    **({"features_cli": month_out["features_cli"]} if "features_cli" in month_out else {}),
+                )
+
+                # Metadata sidecar (includes timestamps + bt_uid)
+                meta_path = os.path.join(run_dir, f"{month_name}_metadata.json")
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "month": month_name,
+                            "corpus": corpus_name,
+                            "kernel": kernel,
+                            "seed": seed,
+                            "diagnostics": month_out.get("diagnostics", {}),
+                            "article_metadata": month_out.get("article_metadata", []),
+                            "timeline": month_out.get("timeline", []),
+                            "bt_uid_list": month_out.get("bt_uid_list", []),
+                            "provenance": month_out.get("provenance", []),
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                label_info = _extract_validation_label_info(
+                    articles_for_labels=articles,
+                    metadata_for_labels=month_out.get("article_metadata"),
+                )
+                metrics = _compute_alignment_metrics(
+                    month_out.get("features"),
+                    label_info,
+                )
+                track_metrics = _compute_track_validation_metrics(
+                    run_dir,
+                    label_info,
+                    synthesis_features=month_out.get("features"),
+                )
+                validation_payload = {
+                    "schema_version": "1.0",
+                    "seed": int(seed),
+                    "kernel": str(kernel),
+                    "corpus": str(corpus_name),
+                    "month": str(month_name),
+                    "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                    "nmi": metrics.get("nmi") if metrics else None,
+                    "ari": metrics.get("ari") if metrics else None,
+                    "metric_source": "kmeans_on_final_features" if metrics else "unavailable",
+                    "label_source": metrics.get("label_source") if metrics else "unavailable",
+                    "label_cardinality": metrics.get("label_cardinality") if metrics else None,
+                    "n_clusters": metrics.get("n_clusters") if metrics else None,
+                    "track_nmi": {
+                        k: float(v["nmi"])
+                        for k, v in track_metrics.items()
+                        if isinstance(v.get("nmi"), (int, float))
+                    },
+                    "track_metrics": track_metrics,
+                    "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
+                }
+                validation_records.append(validation_payload)
+
+                run_results[month_name] = {
+                    "features_path": month_path,
+                    "metadata_path": meta_path,
+                    "n_articles": len(articles),
+                }
+
+            available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
+            available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
+            track_nmi_summary, track_metrics_summary = _summarize_track_validation_records(validation_records)
+            aggregate_validation = {
+                "schema_version": "1.0",
+                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                "corpus": str(corpus_name),
+                "kernel": str(kernel),
+                "seed": int(seed),
+                "n_months": int(len(validation_records)),
+                "nmi": float(np.mean(available_nmi)) if available_nmi else None,
+                "ari": float(np.mean(available_ari)) if available_ari else None,
+                "nmi_std": float(np.std(available_nmi)) if available_nmi else None,
+                "ari_std": float(np.std(available_ari)) if available_ari else None,
+                "metric_source": "kmeans_on_final_features",
+                "track_nmi": track_nmi_summary,
+                "track_metrics": track_metrics_summary,
+                "per_month": validation_records,
+                "trust_level": "MEASURED" if available_nmi else "UNAVAILABLE",
+            }
+            validation_path = os.path.join(run_dir, "validation.json")
+            with open(validation_path, "w", encoding="utf-8") as f:
+                json.dump(aggregate_validation, f, indent=2)
+
+            # Save attention if requested
+            if record_attention and components.get("recorder") is not None:
+                attn_out_path = os.path.join(run_dir, "attention_records.json")
+                with open(attn_out_path, "w", encoding="utf-8") as f:
+                    json.dump(components["recorder"].to_dict(), f, indent=2)
+
+            all_results[kernel][seed] = run_results
+
+    # Save summary index
+    index_path = os.path.join(output_dir, corpus_name, "index.json")
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2)
+
+    return all_results
+
+
+# ============================================================================
+# COMPATIBILITY WRAPPER FOR run_experiments.py
+# ============================================================================
+
+def run_multi_observer_experiment_simple(
+    articles: list,
+    seeds: list,
+    use_contrastive: bool = True,
+    use_pca_removal: bool = False,
+    use_cls_tokens: bool = False,
+    shared_pca: bool = False,
+    kernel_type: str = 'rbf',
+    kernel_types = None,
+    kernel_params = None,
+    use_gru: bool = True,
+    use_multi_framing_rks: bool = True,
+    device: str = 'cuda',
+    track_variance: bool = True,
+    output_dir = Path('outputs'),
+    rks_sigma = None,
+    corpus_name: str = 'unknown',
+    nli_cache_path: str = None,
+    emit_label_validation: bool = True,
+    **kwargs
+):
+    """
+    Compatibility wrapper for run_experiments.py
+    
+    Now saves complete metadata for downstream analysis:
+    - bt_uid_list: stable article IDs for cross-observer alignment
+    - article_metadata: per-article provenance info
+    - meta: experiment configuration (kernel, channel, seed, corpus)
+    
+    Optimization: If nli_cache_path is provided, NLI embeddings are cached to disk
+    and reused across different kernel types (4x speedup for full matrix).
+    """
+    import torch
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Determine channel from config
+    channel = 'cls' if use_cls_tokens else 'logits'
+    
+    # Load or create shared NLI cache for all seeds (since NLI doesn't depend on seed)
+    shared_nli_cache = None
+    if nli_cache_path:
+        nli_cache_file = Path(nli_cache_path)
+        if nli_cache_file.exists():
+            try:
+                cached_data = torch.load(nli_cache_file, map_location='cpu', weights_only=False)
+                if cached_data.get('n_articles') == len(articles) and cached_data.get('channel') == channel:
+                    shared_nli_cache = cached_data['nli_pairs']
+                    print(f"  [CACHE HIT] Loaded NLI embeddings from {nli_cache_file}")
+                else:
+                    print(f"  [CACHE MISS] Cache mismatch (articles: {cached_data.get('n_articles')} vs {len(articles)}, channel: {cached_data.get('channel')} vs {channel})")
+            except Exception as e:
+                print(f"  [CACHE ERROR] Could not load {nli_cache_file}: {e}")
+    
+    results = {}
+    validation_records = []
+    kernel_params = dict(kernel_params or {})
+    kernel_nu = float(kernel_params.get("nu", kwargs.get("kernel_nu", 1.5)))
+    kernel_roughness = int(kernel_params.get("roughness", kwargs.get("kernel_roughness", 3)))
+    
+    for seed in seeds:
+        print(f"\n{'='*70}")
+        print(f"Observer {seed} | kernel={kernel_type} | channel={channel}")
+        print(f"{'='*70}")
+        runtime_cfg = PipelineRuntimeConfig(
+            use_contrastive=use_contrastive,
+            use_pca_removal=use_pca_removal,
+            use_cls_tokens=use_cls_tokens,
+            use_gru=use_gru,
+            use_multi_framing_rks=use_multi_framing_rks,
+            use_attention=bool(kwargs.get("use_attention", DEFAULT_PIPELINE_RUNTIME_CONFIG.use_attention)),
+            use_dirichlet_fusion=bool(
+                kwargs.get("use_dirichlet_fusion", DEFAULT_PIPELINE_RUNTIME_CONFIG.use_dirichlet_fusion)
+            ),
+            normalize_features=bool(
+                kwargs.get("normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features)
+            ),
+            geometry_mode=str(kwargs.get("geometry_mode", DEFAULT_PIPELINE_RUNTIME_CONFIG.geometry_mode)),
+            kernel_type=kernel_type,
+            mix_in_rkhs=bool(kwargs.get("mix_in_rkhs", DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs)),
+            dirichlet_rks_dim=int(kwargs.get("dirichlet_rks_dim", 2048)),
+            dirichlet_n_observers=int(kwargs.get("dirichlet_n_observers", 50)),
+            dirichlet_alpha=float(kwargs.get("dirichlet_alpha", 1.0)),
+            dirichlet_hidden_dim=int(kwargs.get("dirichlet_hidden_dim", 1536)),
+        )
+
+        components = initialize_full_pipeline(
+            random_seed=seed,
+            device=device,
+            **runtime_cfg.to_initialize_kwargs(),
+            global_pca_component=shared_pca,
+            # Increase dimensionality by default (can be overridden via kwargs)
+            output_dim=int(kwargs.get("output_dim", 2048)),
+            rks_output_dim=kwargs.get("rks_output_dim", None),
+            compare_logits_vs_cli=bool(kwargs.get("compare_logits_vs_cli", False)),
+            adult_kernel=kwargs.get("adult_kernel", "rbf"),
+            adult_gamma=float(kwargs.get("adult_gamma", 1.0)),
+            adult_sigma=kwargs.get("adult_sigma", rks_sigma),
+            adult_center=bool(kwargs.get("adult_center", True)),
+            adult_nystrom_m=int(kwargs.get("adult_nystrom_m", 256)),
+            kernel_nu=kernel_nu,
+            kernel_roughness=kernel_roughness,
+            embedding_dim=24 if not use_cls_tokens else 8192,
+        )
+        
+        pipeline = BeliefTransformerPipeline(
+            components=components,
+            random_seed=seed,
+        )
+        
+        # Inject shared NLI cache if available (avoids re-running DeBERTa)
+        if shared_nli_cache is not None:
+            pipeline._nli_cache = shared_nli_cache
+        
+        # NEW: Enable checkpoint system if requested via kwargs
+        pipeline_config = {
+            "enable_checkpoints": bool(kwargs.get("enable_checkpoints", False)),
+            "output_dir": str(output_dir) if output_dir else "outputs",
+            "checkpoint_dir": str(output_dir) if output_dir else "outputs",
+        }
+        
+        result = pipeline.process_month(articles, month_name="batch", config=pipeline_config)
+        
+        # Save NLI cache after first extraction (for reuse across kernels)
+        if shared_nli_cache is None and nli_cache_path and pipeline._nli_cache is not None:
+            nli_cache_file = Path(nli_cache_path)
+            nli_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                torch.save({
+                    'nli_pairs': pipeline._nli_cache,
+                    'n_articles': len(articles),
+                    'channel': channel,
+                }, nli_cache_file)
+                shared_nli_cache = pipeline._nli_cache  # Use for subsequent seeds
+                print(f"  [CACHE SAVED] NLI embeddings to {nli_cache_file}")
+            except Exception as e:
+                print(f"  [CACHE WARN] Could not save cache: {e}")
+        
+        # Build comprehensive output artifact with FULL INFORMATION PRESERVATION
+        
+        # Compute variance tracking for this observer
+        variance_tracker = VarianceTracker()
+        if result.get('embeddings') is not None:
+            variance_tracker.record_stage('final_embeddings', result['embeddings'])
+        if result.get('features') is not None:
+            variance_tracker.record_stage('final_features', result['features'])
+        if result.get('embeddings_cli') is not None:
+            variance_tracker.record_stage('logits_embeddings', result['embeddings_cli'])
+        
+        # Get git info for reproducibility
+        git_hash = get_git_hash()
+        git_dirty = get_git_dirty()
+        timestamp = datetime.datetime.now().isoformat()
+        
+        output_artifact = {
+            # Primary features (backward compatible)
+            'embeddings': result['embeddings'],
+            'features': result.get('features'),
+            'embeddings_cli': result.get('embeddings_cli'),
+            'features_cli': result.get('features_cli'),
+            
+            # Legacy fields (backward compatible)
+            'seed': seed,
+            'n_articles': len(articles),
+            
+            # Stable IDs for cross-observer alignment (CRITICAL)
+            'ids': result.get('bt_uid_list', []),
+            'bt_uid_list': result.get('bt_uid_list', []),
+            
+            # Per-article metadata for provenance
+            'article_metadata': result.get('article_metadata', []),
+            
+            # Comprehensive experiment metadata
+            'meta': {
+                'kernel': kernel_type,
+                'channel': channel,
+                'seed': seed,
+                'corpus': corpus_name,
+                'use_contrastive': use_contrastive,
+                'use_pca_removal': use_pca_removal,
+                'use_gru': use_gru,
+                'shared_pca': shared_pca,
+                'rks_sigma': rks_sigma,
+                'kernel_params': kernel_params or {},
+                'kernel_nu': kernel_nu,
+                'kernel_roughness': kernel_roughness,
+                # NEW: Reproducibility info
+                'git_hash': git_hash,
+                'git_dirty': git_dirty,
+                'timestamp': timestamp,
+                'n_articles': len(articles),
+            },
+            
+            # NEW: Stage-by-stage variance tracking
+            'variance_tracking': variance_tracker.to_dict(),
+            
+            # NEW: Article provenance summary
+            'provenance': {
+                'canonical_ids': result.get('bt_uid_list', []),
+                'titles': [a.get('title', '')[:100] for a in articles],
+                'sources': [a.get('source', a.get('publisher', 'unknown')) for a in articles],
+                'urls': [a.get('url', '') for a in articles],
+            },
+        }
+        
+        # --- PHASE 3 PAYLOAD FIX ---
+        physics_keys = [
+            'walker_states', 'walker_work_integrals', 
+            'spectral_evr', 'spectral_u_axis', 'spectral_antagonism', 'spectral_probe_magnitudes',
+            'article_metadata', 'phantom_verdicts', 'walker_paths',
+            'T0_substrate', 'T1_embeddings', 'T1.5_spectral', 'T2_kernels', 'T3_topology',
+            'cls_per_bot', 'cls_per_bot_contract', 'rks_basis_state'
+        ]
+        
+        # Unpack from result or its internal 'checkpoints' dict
+        pipeline_checkpoints = result.get('checkpoints', {})
+        
+        for k in physics_keys:
+            if k in result:
+                val = result[k]
+                output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
+            elif k in pipeline_checkpoints:
+                val = pipeline_checkpoints[k]
+                output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
+                
+        # Save directly to output_dir (caller already creates structured path)
+        # NOTE: Do NOT use build_structured_output_path here - that causes double-nesting
+        # when run_full_experiment_suite already passes kernel/channel/corpus path
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"observer_{seed}.pt"
+        torch.save(output_artifact, output_file)
+
+        if emit_label_validation:
+            label_info = _extract_validation_label_info(
+                articles_for_labels=articles,
+                metadata_for_labels=output_artifact.get("article_metadata"),
+            )
+            metrics = _compute_alignment_metrics(
+                output_artifact.get("features"),
+                label_info,
+            )
+            track_metrics = _compute_track_validation_metrics(
+                output_dir,
+                label_info,
+                synthesis_features=output_artifact.get("features"),
+            )
+            validation_payload = {
+                "schema_version": "1.0",
+                "seed": int(seed),
+                "kernel": str(kernel_type),
+                "channel": str(channel),
+                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+                "nmi": metrics.get("nmi") if metrics else None,
+                "ari": metrics.get("ari") if metrics else None,
+                "metric_source": "kmeans_on_final_features" if metrics else "unavailable",
+                "label_source": metrics.get("label_source") if metrics else "unavailable",
+                "label_cardinality": metrics.get("label_cardinality") if metrics else None,
+                "n_clusters": metrics.get("n_clusters") if metrics else None,
+                "track_nmi": {
+                    k: float(v["nmi"])
+                    for k, v in track_metrics.items()
+                    if isinstance(v.get("nmi"), (int, float))
+                },
+                "track_metrics": track_metrics,
+                "trust_level": "MEASURED" if metrics else "UNAVAILABLE",
+            }
+            with open(output_dir / f"validation_seed{seed}.json", "w", encoding="utf-8") as f:
+                json.dump(validation_payload, f, indent=2)
+            validation_records.append(validation_payload)
+        
+        print(f"[OK] Saved: {output_file}")
+        print(f"  -> {len(result.get('bt_uid_list', []))} articles with stable IDs")
+        results[seed] = result
+
+    if emit_label_validation and validation_records:
+        available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]
+        available_ari = [float(v["ari"]) for v in validation_records if isinstance(v.get("ari"), (int, float))]
+        track_nmi_summary, track_metrics_summary = _summarize_track_validation_records(validation_records)
+        aggregate_validation = {
+            "schema_version": "1.0",
+            "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "n_observers": int(len(validation_records)),
+            "nmi": float(np.mean(available_nmi)) if available_nmi else None,
+            "ari": float(np.mean(available_ari)) if available_ari else None,
+            "nmi_std": float(np.std(available_nmi)) if available_nmi else None,
+            "ari_std": float(np.std(available_ari)) if available_ari else None,
+            "metric_source": "kmeans_on_final_features",
+            "track_nmi": track_nmi_summary,
+            "track_metrics": track_metrics_summary,
+            "per_seed": validation_records,
+            "trust_level": "MEASURED" if available_nmi else "UNAVAILABLE",
+        }
+        with open(output_dir / "validation.json", "w", encoding="utf-8") as f:
+            json.dump(aggregate_validation, f, indent=2)
+
+    return results
+
+
+_original_run_multi_observer = run_multi_observer_experiment
+
+def run_multi_observer_experiment(*args, articles=None, **kwargs):
+    if articles is not None:
+        return run_multi_observer_experiment_simple(articles=articles, **kwargs)
+    else:
+        return _original_run_multi_observer(*args, **kwargs)

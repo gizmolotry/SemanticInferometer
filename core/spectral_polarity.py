@@ -1,0 +1,696 @@
+"""
+Track 1.5: Spectral Polarity — The Endogenous Compass
+
+Performs PCA (via SVD) on the gradient matrix G formed by the 8 probe-pair
+deltas (cls_per_bot). Extracts:
+  - u_axis:  PC1, the direction of maximum semantic stress
+  - EVR:     explained variance ratio (dipole validity gate)
+  - probe_magnitudes:  signed projections of each probe onto u_axis
+  - antagonism:  u_axis scaled by dominant singular value (directional force)
+
+Multi-Scale Persistence (ASTER v3.2):
+  - Sweep across bandwidths σ = [0.5, 1.0, 2.0] (or adaptive)
+  - Compute u_axis(σ), EVR(σ) at each scale
+  - Valid if EVR >= τ in at least min_persistent_scales (default 2)
+  - Final u_axis = normalized mean over valid scales
+
+Gauge fixing ensures consistent orientation across articles by projecting
+a reference probe onto u_axis and flipping if negative.
+
+References:
+  ASTER Protocol v3.2, Section I (Track 1.5: Gradient Metrics / Compass)
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+import torch
+import numpy as np
+
+
+@dataclass
+class SpectralPolarityConfig:
+    """Configuration for spectral polarity decomposition."""
+    # Index of the reference probe for gauge fixing (0 = first pair in framing_queries.yaml)
+    reference_probe_idx: int = 0
+    # EVR threshold for dipole validity (tau). Below this, the compass is unreliable.
+    evr_threshold: float = 0.5
+    # Multi-scale bandwidth values (sigma sweep)
+    sigma_values: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    # Minimum number of scales that must pass EVR threshold for persistence
+    min_persistent_scales: int = 2
+    # Whether to use adaptive bandwidth (median heuristic) as one of the scales
+    use_adaptive_sigma: bool = True
+    # Whether to enable multi-scale mode (False = single-scale legacy mode)
+    multi_scale_enabled: bool = True
+    # Adaptive sigma sampling cap for median-heuristic pairwise distances.
+    adaptive_sigma_max_samples: int = 1000
+    # Lower bound clamp for adaptive sigma before any downstream scaling/division.
+    adaptive_sigma_min: float = 1e-6
+    # Floor for all sigma divisions in G / sigma conditioning paths.
+    sigma_scale_epsilon: float = 1e-6
+    # Shared numerical floor for variance/weight normalization.
+    normalization_epsilon: float = 1e-12
+    # Dynamic-K component threshold ratio (sigma_i > ratio * sigma_1).
+    dynamic_k_threshold_ratio: float = 0.1
+    # Explicit spectral weighting mode:
+    # - "sigma": legacy sigma * delta^2
+    # - "sigma_squared": sigma^2 * delta^2 (default)
+    weighted_sigma_mode: str = "sigma_squared"
+    # Explicit whitened weighting mode:
+    # - "sigma": legacy (delta / sigma)^2
+    # - "sigma_squared": (delta / sigma^2)^2
+    whitened_sigma_mode: str = "sigma"
+    # Floor for whitened sigma term before inverse weighting.
+    whitened_sigma_epsilon: float = 1e-6
+
+
+@dataclass
+class SpectralPolarityResult:
+    """Per-batch results from spectral polarity decomposition."""
+    # [N, H] — first right singular vector (compass direction) per article
+    u_axis: torch.Tensor
+    # [N] — explained variance ratio of PC1 (aggregated across valid scales)
+    evr: torch.Tensor
+    # [N] — boolean mask: True where EVR >= threshold (valid dipole)
+    dipole_valid: torch.Tensor
+    # [N, 8] — signed projection of each probe gradient onto u_axis
+    probe_magnitudes: torch.Tensor
+    # [N, 8] — full singular value spectrum per article (from dominant scale)
+    singular_values: torch.Tensor
+    # [N, H] — directional antagonism vector = u_axis * S[0]
+    antagonism: torch.Tensor
+    # [N] — number of scales where EVR >= threshold (persistence count)
+    n_persistent_scales: torch.Tensor
+    # [N, n_scales] — EVR at each scale (for diagnostics)
+    evr_per_scale: torch.Tensor
+    # Dipole state string: "DIPOLE_STATE" or "BLINKER_STATE"
+    dipole_state: str = "DIPOLE_STATE"
+    # [N] — dynamic K: number of significant components per article
+    dynamic_k: Optional[torch.Tensor] = None
+    # [N, K, H] — top-K right singular vectors (u_basis) for weighted distance
+    u_basis: Optional[torch.Tensor] = None
+
+
+class SpectralPolarity:
+    """
+    Spectral decomposition of the probe-pair gradient matrix.
+
+    Given G = [8, H] per article (the 8 mean-pool deltas from NLI extraction),
+    computes the SVD to find the principal axis of semantic stress (u_axis),
+    gauge-fixes for sign consistency, and produces a directional antagonism
+    vector for downstream Track 5 fusion.
+
+    Multi-Scale Persistence:
+    Sweeps across multiple bandwidths to ensure the detected dipole is not
+    a scale-dependent artifact. Only dipoles that persist across multiple
+    scales are considered valid.
+    """
+
+    def __init__(self, config: Optional[SpectralPolarityConfig] = None):
+        self.config = config or SpectralPolarityConfig()
+
+    def _sanitize_sigma(self, sigma: float, min_sigma: float) -> float:
+        """Clamp sigma to a finite positive floor for stable scaling."""
+        sigma_value = float(sigma)
+        if not np.isfinite(sigma_value):
+            return float(min_sigma)
+        return float(max(sigma_value, min_sigma))
+
+    def _sigma_weight_term(self, sigma: torch.Tensor, mode: str) -> torch.Tensor:
+        """Convert singular values into explicit sigma weighting semantics."""
+        if mode == "sigma":
+            return sigma
+        if mode == "sigma_squared":
+            return sigma ** 2
+        raise ValueError(f"Unknown sigma weighting mode: {mode}")
+
+    def _compute_adaptive_sigma(self, G: torch.Tensor) -> float:
+        """
+        Compute adaptive bandwidth using median heuristic.
+
+        σ = median of pairwise distances between probe gradients.
+        This adapts to the local density of the gradient manifold.
+        """
+        N, n_probes, H = G.shape
+        # Flatten to [N*n_probes, H] for pairwise distance
+        G_flat = G.reshape(-1, H)
+        # Sample if too large (avoid O(n^2) explosion)
+        max_samples = max(int(self.config.adaptive_sigma_max_samples), 1)
+        if G_flat.shape[0] > max_samples:
+            idx = torch.randperm(G_flat.shape[0])[:max_samples]
+            G_sample = G_flat[idx]
+        else:
+            G_sample = G_flat
+        # Pairwise L2 distances
+        dists = torch.cdist(G_sample, G_sample, p=2)
+        # Median of non-zero distances
+        mask = dists > 0
+        if mask.sum() > 0:
+            median_dist = dists[mask].median().item()
+        else:
+            median_dist = 1.0
+        return self._sanitize_sigma(median_dist, self.config.adaptive_sigma_min)
+
+    def _compute_single_scale(
+        self,
+        G: torch.Tensor,
+        sigma: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute SVD at a single bandwidth scale.
+
+        Args:
+            G: [N, 8, H] gradient matrix
+            sigma: bandwidth scaling factor
+
+        Returns:
+            u_axis: [N, H] principal direction
+            evr: [N] explained variance ratio
+            S: [N, 8] singular values
+        """
+        # Scale the gradient matrix by bandwidth.
+        safe_sigma = self._sanitize_sigma(sigma, self.config.sigma_scale_epsilon)
+        G_scaled = torch.nan_to_num(
+            G / safe_sigma, nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        # SVD: G = U S Vt
+        U, S, Vt = torch.linalg.svd(G_scaled, full_matrices=False)
+
+        # PC1: direction of maximum gradient variance
+        u_axis = Vt[:, 0, :]  # [N, H]
+
+        # EVR = S[0]^2 / sum(S^2)
+        S_sq = S ** 2
+        total_var = S_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
+        evr = S_sq[:, 0] / total_var
+
+        return u_axis, evr, S
+
+    def _gauge_fix(
+        self,
+        u_axis: torch.Tensor,
+        G: torch.Tensor,
+        ref_idx: int,
+    ) -> torch.Tensor:
+        """
+        Apply gauge fixing to ensure consistent orientation.
+
+        Projects reference probe gradient onto u_axis and flips if negative.
+        """
+        ref_gradient = G[:, ref_idx, :]  # [N, H]
+        dot = (ref_gradient * u_axis).sum(dim=1)  # [N]
+        sign = torch.sign(dot)
+        # Handle zero dot products: default to +1
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        return u_axis * sign.unsqueeze(1)
+
+    def compute_batch(
+        self,
+        cls_per_bot_list: List[torch.Tensor],
+    ) -> SpectralPolarityResult:
+        """
+        Compute spectral polarity for a batch of articles.
+
+        Args:
+            cls_per_bot_list: List of [8, H] tensors, one per article.
+                Each row is the mean-pool delta (hypothesis_A - hypothesis_B)
+                for one of the 8 framing probe pairs.
+
+        Returns:
+            SpectralPolarityResult with all per-article spectral diagnostics.
+        """
+        device = cls_per_bot_list[0].device
+        dtype = cls_per_bot_list[0].dtype
+
+        # Stack into [N, 8, H]
+        G = torch.stack(cls_per_bot_list, dim=0).to(dtype=torch.float32)
+        N, n_probes, H = G.shape
+
+        if not self.config.multi_scale_enabled:
+            # Legacy single-scale mode
+            return self._compute_single_scale_legacy(G, dtype)
+
+        # --- Multi-Scale Sigma Sweep ---
+        sigma_list = list(self.config.sigma_values)
+
+        # Add adaptive sigma if enabled
+        if self.config.use_adaptive_sigma:
+            adaptive_sigma = self._compute_adaptive_sigma(G)
+            if adaptive_sigma not in sigma_list:
+                sigma_list.append(adaptive_sigma)
+        sigma_list = [
+            self._sanitize_sigma(sigma, self.config.sigma_scale_epsilon)
+            for sigma in sigma_list
+        ]
+
+        n_scales = len(sigma_list)
+
+        # Storage for per-scale results
+        u_axes_per_scale = []  # List of [N, H]
+        evr_per_scale = []     # List of [N]
+        S_per_scale = []       # List of [N, 8]
+        master_u_axis = None
+
+        for i, sigma in enumerate(sigma_list):
+            u_axis_s, evr_s, S_s = self._compute_single_scale(G, sigma)
+            # Align per-scale u-axis sign to avoid cancellation when aggregating.
+            if master_u_axis is None:
+                master_u_axis = u_axis_s.clone()
+            if i > 0:
+                sign_flip = (master_u_axis * u_axis_s).sum(dim=1) < 0
+                u_axis_s = torch.where(sign_flip.unsqueeze(1), -u_axis_s, u_axis_s)
+                # Maintain a running master direction so each scale aligns to the
+                # accumulated axis, not only the first scale.
+                master_u_axis = master_u_axis + u_axis_s
+                # Preserve magnitude; do not L2-normalize away thermodynamic scale.
+                master_u_axis = master_u_axis
+            u_axes_per_scale.append(u_axis_s)
+            evr_per_scale.append(evr_s)
+            S_per_scale.append(S_s)
+
+        # Stack for analysis: [N, n_scales, ...]
+        evr_stacked = torch.stack(evr_per_scale, dim=1)  # [N, n_scales]
+        u_axes_stacked = torch.stack(u_axes_per_scale, dim=1)  # [N, n_scales, H]
+
+        # --- Persistence Check ---
+        # Count how many scales pass EVR threshold per article
+        scale_valid = evr_stacked >= self.config.evr_threshold  # [N, n_scales]
+        n_persistent = scale_valid.sum(dim=1)  # [N]
+
+        # Dipole is valid if it persists across min_persistent_scales
+        dipole_valid = n_persistent >= self.config.min_persistent_scales  # [N]
+
+        # --- Aggregate u_axis across valid scales ---
+        # Mask invalid scales, compute weighted mean by EVR
+        evr_masked = evr_stacked * scale_valid.float()  # Zero out invalid
+        evr_weights = evr_masked / evr_masked.sum(dim=1, keepdim=True).clamp(
+            min=self.config.normalization_epsilon
+        )  # [N, n_scales]
+
+        # Weighted sum of u_axes
+        # [N, n_scales, H] * [N, n_scales, 1] -> sum over scales -> [N, H]
+        u_axis_aggregated = (u_axes_stacked * evr_weights.unsqueeze(2)).sum(dim=1)
+
+        # L2 normalize the aggregated direction
+        # Preserve magnitude; do not L2-normalize away thermodynamic scale.
+        u_axis_aggregated = u_axis_aggregated
+
+        # For articles with no valid scales, fall back to scale with highest EVR
+        no_valid_mask = n_persistent == 0
+        if no_valid_mask.any():
+            best_scale_idx = evr_stacked.argmax(dim=1)  # [N]
+            for i in range(N):
+                if no_valid_mask[i]:
+                    u_axis_aggregated[i] = u_axes_stacked[i, best_scale_idx[i]]
+
+        # --- Gauge Fixing on aggregated u_axis ---
+        u_axis_fixed = self._gauge_fix(u_axis_aggregated, G, self.config.reference_probe_idx)
+
+        # --- Aggregated EVR ---
+        # Mean EVR across valid scales (or max EVR if none valid)
+        evr_aggregated = torch.where(
+            n_persistent > 0,
+            (evr_stacked * scale_valid.float()).sum(dim=1) / n_persistent.clamp(min=1),
+            evr_stacked.max(dim=1).values
+        )
+
+        # --- Probe Magnitudes ---
+        probe_magnitudes = torch.bmm(
+            G, u_axis_fixed.unsqueeze(2)
+        ).squeeze(2)  # [N, 8]
+
+        # --- Singular Values (from scale=1.0 or first valid) ---
+        # Use sigma=1.0 as reference, or find it in list
+        if 1.0 in sigma_list:
+            ref_scale_idx = sigma_list.index(1.0)
+        else:
+            ref_scale_idx = 0
+        S_reference = S_per_scale[ref_scale_idx]
+
+        # --- Dynamic K: Significant Components ---
+        # σ_i > 0.1 × σ_1 determines which components carry signal
+        dynamic_k = self.determine_dynamic_k(
+            S_reference,
+            threshold_ratio=self.config.dynamic_k_threshold_ratio,
+        )
+
+        # --- U_basis: Top-K Right Singular Vectors ---
+        # Re-compute SVD at reference scale to get full Vt for weighted distance
+        ref_sigma = self._sanitize_sigma(
+            sigma_list[ref_scale_idx], self.config.sigma_scale_epsilon
+        )
+        G_ref_scaled = torch.nan_to_num(
+            G / ref_sigma, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        _, _, Vt_ref = torch.linalg.svd(G_ref_scaled, full_matrices=False)
+        # Gauge-fix each component consistently
+        u_basis = Vt_ref  # [N, 8, H] — full basis, caller uses dynamic_k to slice
+
+        # --- Directional Antagonism ---
+        # Scale by the dominant singular value from reference scale
+        antagonism = u_axis_fixed * S_reference[:, 0:1]
+
+        # --- Dipole State ---
+        n_valid_articles = dipole_valid.sum().item()
+        if n_valid_articles > N / 2:
+            dipole_state = "DIPOLE_STATE"
+        else:
+            dipole_state = "BLINKER_STATE"
+
+        return SpectralPolarityResult(
+            u_axis=u_axis_fixed.to(dtype=dtype),
+            evr=evr_aggregated.to(dtype=dtype),
+            dipole_valid=dipole_valid,
+            probe_magnitudes=probe_magnitudes.to(dtype=dtype),
+            singular_values=S_reference.to(dtype=dtype),
+            antagonism=antagonism.to(dtype=dtype),
+            n_persistent_scales=n_persistent,
+            evr_per_scale=evr_stacked.to(dtype=dtype),
+            dipole_state=dipole_state,
+            dynamic_k=dynamic_k,
+            u_basis=u_basis.to(dtype=dtype),
+        )
+
+    def compute_spectral_distance(
+        self,
+        cls_per_bot_list: List[torch.Tensor],
+        u_axis: torch.Tensor,  # [N, H]
+    ) -> torch.Tensor:
+        """Compute Euclidean distance between poles along u_axis. Returns [N].
+
+        DEPRECATED: Use compute_weighted_spectral_distance for signal-weighted subspace.
+        """
+        G = torch.stack(cls_per_bot_list, dim=0)  # [N, 8, H]
+        projs = torch.bmm(G, u_axis.unsqueeze(-1)).squeeze(-1)  # [N, 8]
+        proj_pos = projs.max(dim=1).values
+        proj_neg = projs.min(dim=1).values
+        return (proj_pos - proj_neg).abs()
+
+    def determine_dynamic_k(
+        self,
+        singular_values: torch.Tensor,  # [N, 8]
+        threshold_ratio: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Determine dynamic K: number of significant spectral components per article.
+
+        A component is significant if σ_i > threshold_ratio × σ_1 (the dominant).
+        This avoids hardcoding k=3 and adapts to each article's spectral structure.
+
+        Args:
+            singular_values: [N, 8] singular value spectrum per article
+            threshold_ratio: fraction of σ_1 below which components are noise (default 0.1)
+
+        Returns:
+            [N] tensor of integers: dynamic K per article (minimum 1)
+        """
+        # σ_1 is the largest singular value
+        sigma_1 = singular_values[:, 0:1]  # [N, 1]
+        threshold = threshold_ratio * sigma_1  # [N, 1]
+
+        # Count how many components exceed the threshold
+        significant = singular_values > threshold  # [N, 8] bool
+        k_per_article = significant.sum(dim=1).clamp(min=1)  # [N], at least 1
+
+        return k_per_article
+
+    def compute_weighted_spectral_distance(
+        self,
+        emb_a: torch.Tensor,  # [N, H] or [H]
+        emb_b: torch.Tensor,  # [N, H] or [H]
+        singular_values: torch.Tensor,  # [N, 8] or [N, K]
+        Vt: torch.Tensor,  # [N, 8, H] or [N, K, H] — right singular vectors
+        dynamic_k: Optional[torch.Tensor] = None,  # [N] — if None, use all components
+    ) -> torch.Tensor:
+        """
+        Compute signal-weighted spectral distance between two embeddings.
+
+        d_spectral = sqrt( sum_i( σ_i × (proj_a_i - proj_b_i)^2 ) )
+
+        This weights movement through the spectral subspace by the singular value
+        "mass" of each component. High-variance directions (large σ) contribute
+        more to the distance than low-variance directions.
+
+        Args:
+            emb_a: [N, H] first embedding (e.g., start position)
+            emb_b: [N, H] second embedding (e.g., end position)
+            singular_values: [N, K] singular values for weighting
+            Vt: [N, K, H] right singular vectors defining the subspace
+            dynamic_k: [N] optional per-article component count. If provided,
+                       masks out components beyond K for each article.
+
+        Returns:
+            [N] weighted spectral distance per article
+        """
+        # Handle 1D input (single embedding)
+        if emb_a.dim() == 1:
+            emb_a = emb_a.unsqueeze(0)
+        if emb_b.dim() == 1:
+            emb_b = emb_b.unsqueeze(0)
+
+        N = emb_a.shape[0]
+        K = Vt.shape[1]  # Number of spectral components
+
+        # Project both embeddings onto the spectral basis
+        # proj = Vt @ emb.T → [N, K, H] @ [N, H, 1] → [N, K, 1] → [N, K]
+        proj_a = torch.bmm(Vt, emb_a.unsqueeze(-1)).squeeze(-1)  # [N, K]
+        proj_b = torch.bmm(Vt, emb_b.unsqueeze(-1)).squeeze(-1)  # [N, K]
+
+        # Compute delta in spectral coordinates
+        delta = proj_a - proj_b  # [N, K]
+
+        # Weight by singular values: σ_i × (Δx_i)^2
+        # Use first K singular values
+        sigma = singular_values[:, :K]  # [N, K]
+        sigma_term = self._sigma_weight_term(sigma, self.config.weighted_sigma_mode)
+        weighted_sq = sigma_term * (delta ** 2)  # [N, K]
+
+        # Apply dynamic K masking if provided
+        if dynamic_k is not None:
+            # Create mask: [N, K] where mask[n, k] = 1 if k < dynamic_k[n]
+            k_range = torch.arange(K, device=singular_values.device).unsqueeze(0)  # [1, K]
+            mask = k_range < dynamic_k.unsqueeze(1)  # [N, K]
+            weighted_sq = weighted_sq * mask.float()
+
+        # Sum and sqrt
+        d_spectral = torch.sqrt(
+            weighted_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
+        )  # [N]
+
+        return d_spectral
+
+    def compute_whitened_spectral_distance(
+        self,
+        emb_a: torch.Tensor,  # [N, H] or [H]
+        emb_b: torch.Tensor,  # [N, H] or [H]
+        singular_values: torch.Tensor,  # [N, 8] or [N, K]
+        Vt: torch.Tensor,  # [N, 8, H] or [N, K, H] — right singular vectors
+        dynamic_k: Optional[torch.Tensor] = None,  # [N] — if None, use all components
+        epsilon: Optional[float] = None,  # Optional override floor for singular values
+    ) -> torch.Tensor:
+        """
+        Compute whitened (inverse-weighted) spectral distance between two embeddings.
+
+        d_whitened = sqrt( sum_i( (proj_a_i - proj_b_i)^2 / σ_i^2 ) )
+
+        This AMPLIFIES movement in low-variance directions (small σ). Minor axes
+        become hypersensitive — "lies in the details" are detected because small
+        perturbations in low-variance directions produce large whitened distances.
+
+        Use Case: Lie Detection
+        - Weighted distance: measures "how far did you move in important directions?"
+        - Whitened distance: measures "did you move suspiciously in unimportant directions?"
+
+        A PHANTOM article will have small weighted distance (didn't move much in
+        major axes) but large whitened distance (moved suspiciously in minor axes).
+
+        Args:
+            emb_a: [N, H] first embedding (e.g., start position)
+            emb_b: [N, H] second embedding (e.g., end position)
+            singular_values: [N, K] singular values for inverse weighting
+            Vt: [N, K, H] right singular vectors defining the subspace
+            dynamic_k: [N] optional per-article component count. If provided,
+                       masks out components beyond K for each article.
+            epsilon: floor for singular values to prevent division by zero
+
+        Returns:
+            [N] whitened spectral distance per article
+        """
+        # Handle 1D input (single embedding)
+        if emb_a.dim() == 1:
+            emb_a = emb_a.unsqueeze(0)
+        if emb_b.dim() == 1:
+            emb_b = emb_b.unsqueeze(0)
+
+        N = emb_a.shape[0]
+        K = Vt.shape[1]  # Number of spectral components
+
+        # Project both embeddings onto the spectral basis
+        proj_a = torch.bmm(Vt, emb_a.unsqueeze(-1)).squeeze(-1)  # [N, K]
+        proj_b = torch.bmm(Vt, emb_b.unsqueeze(-1)).squeeze(-1)  # [N, K]
+
+        # Compute delta in spectral coordinates
+        delta = proj_a - proj_b  # [N, K]
+
+        # Inverse weight by singular values: (Δx_i / σ_i)^2
+        # Floor σ to prevent explosion on near-zero components
+        sigma = singular_values[:, :K]  # [N, K]
+        sigma_term = self._sigma_weight_term(sigma, self.config.whitened_sigma_mode)
+        epsilon_floor = (
+            self.config.whitened_sigma_epsilon if epsilon is None else float(epsilon)
+        )
+        sigma_term = sigma_term.clamp(min=epsilon_floor)
+        whitened_sq = (delta / sigma_term) ** 2  # [N, K]
+
+        # Apply dynamic K masking if provided
+        if dynamic_k is not None:
+            k_range = torch.arange(K, device=singular_values.device).unsqueeze(0)
+            mask = k_range < dynamic_k.unsqueeze(1)  # [N, K]
+            whitened_sq = whitened_sq * mask.float()
+
+        # Sum and sqrt
+        d_whitened = torch.sqrt(
+            whitened_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
+        )  # [N]
+
+        return d_whitened
+
+    def compute_phantom_ratio(
+        self,
+        emb_a: torch.Tensor,  # [N, H]
+        emb_b: torch.Tensor,  # [N, H]
+        singular_values: torch.Tensor,  # [N, K]
+        Vt: torch.Tensor,  # [N, K, H]
+        dynamic_k: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute phantom detection ratio: whitened / weighted distance.
+
+        ratio = d_whitened / d_weighted
+
+        Interpretation:
+        - ratio ≈ 1: Movement is proportional across all axes (HONEST)
+        - ratio >> 1: Movement concentrated in minor axes (PHANTOM - suspicious)
+        - ratio << 1: Movement concentrated in major axes (TAUTOLOGY - obvious)
+
+        This is the inverse of the Panic Function's divergence ratio.
+        The Panic Function uses: Δ = W_actual / d_spectral (Walker / Spectral)
+        This uses: d_whitened / d_weighted (minor-axis / major-axis sensitivity)
+
+        Args:
+            emb_a, emb_b: embeddings to compare
+            singular_values, Vt: spectral decomposition
+            dynamic_k: optional dynamic component count
+
+        Returns:
+            [N] phantom ratio per article (>1 indicates phantom behavior)
+        """
+        d_weighted = self.compute_weighted_spectral_distance(
+            emb_a, emb_b, singular_values, Vt, dynamic_k
+        )
+        d_whitened = self.compute_whitened_spectral_distance(
+            emb_a, emb_b, singular_values, Vt, dynamic_k
+        )
+
+        # Avoid division by zero
+        ratio = d_whitened / d_weighted.clamp(min=self.config.normalization_epsilon)
+
+        return ratio
+
+    def compute_expected_spectral_distance(
+        self,
+        singular_values: torch.Tensor,  # [N, 8]
+        dynamic_k: Optional[torch.Tensor] = None,  # [N]
+    ) -> torch.Tensor:
+        """
+        Compute expected spectral distance for random unit displacement.
+
+        E[d] = sqrt( sum_i(σ_i) / K ) — the "null model" distance
+
+        This represents the expected distance if we moved uniformly in all
+        spectral directions. Used as denominator in the Panic Function.
+
+        Args:
+            singular_values: [N, 8] singular value spectrum
+            dynamic_k: [N] optional dynamic component count
+
+        Returns:
+            [N] expected spectral distance per article
+        """
+        N = singular_values.shape[0]
+        K = singular_values.shape[1]
+
+        if dynamic_k is None:
+            # Use all components
+            sigma_sum = singular_values.sum(dim=1)  # [N]
+            k_effective = torch.full((N,), K, device=singular_values.device, dtype=torch.float32)
+        else:
+            # Mask to dynamic K
+            k_range = torch.arange(K, device=singular_values.device).unsqueeze(0)  # [1, K]
+            mask = k_range < dynamic_k.unsqueeze(1)  # [N, K]
+            sigma_sum = (singular_values * mask.float()).sum(dim=1)  # [N]
+            k_effective = dynamic_k.float().clamp(min=1)
+
+        # E[d] = sqrt(sum(σ) / K)
+        expected = torch.sqrt(sigma_sum / k_effective)
+
+        return expected
+
+    def _compute_single_scale_legacy(
+        self,
+        G: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> SpectralPolarityResult:
+        """
+        Legacy single-scale computation (no multi-scale sweep).
+        Kept for backward compatibility and ablation studies.
+        """
+        N, n_probes, H = G.shape
+
+        # SVD at scale=1.0
+        U, S, Vt = torch.linalg.svd(G, full_matrices=False)
+        u_axis = Vt[:, 0, :]
+
+        S_sq = S ** 2
+        total_var = S_sq.sum(dim=1).clamp(min=self.config.normalization_epsilon)
+        evr = S_sq[:, 0] / total_var
+
+        dipole_valid = evr >= self.config.evr_threshold
+
+        # Gauge fixing
+        u_axis = self._gauge_fix(u_axis, G, self.config.reference_probe_idx)
+
+        # Probe magnitudes
+        probe_magnitudes = torch.bmm(G, u_axis.unsqueeze(2)).squeeze(2)
+
+        # Antagonism
+        antagonism = u_axis * S[:, 0:1]
+
+        # Dynamic K
+        dynamic_k = self.determine_dynamic_k(
+            S,
+            threshold_ratio=self.config.dynamic_k_threshold_ratio,
+        )
+
+        # Fake multi-scale outputs for compatibility
+        n_persistent = dipole_valid.long()
+        evr_per_scale = evr.unsqueeze(1)
+
+        n_valid = dipole_valid.sum().item()
+        dipole_state = "DIPOLE_STATE" if n_valid > N / 2 else "BLINKER_STATE"
+
+        return SpectralPolarityResult(
+            u_axis=u_axis.to(dtype=dtype),
+            evr=evr.to(dtype=dtype),
+            dipole_valid=dipole_valid,
+            probe_magnitudes=probe_magnitudes.to(dtype=dtype),
+            singular_values=S.to(dtype=dtype),
+            antagonism=antagonism.to(dtype=dtype),
+            n_persistent_scales=n_persistent,
+            evr_per_scale=evr_per_scale.to(dtype=dtype),
+            dipole_state=dipole_state,
+            dynamic_k=dynamic_k,
+            u_basis=Vt.to(dtype=dtype),
+        )
