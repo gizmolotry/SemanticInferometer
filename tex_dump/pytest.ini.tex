@@ -1,0 +1,25 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{pytest.ini}
+\textbf{Source Path}: \texttt{pytest.ini}\par
+\bigskip
+\begin{CodeBlock}
+[pytest]
+addopts = -q -s --basetemp=.pytest_local_tmp/tmp
+cache_dir = .pytest_local_tmp/.pytest_cache
+python_files = test_*.py
+markers =
+    integration: integration-level tests
+    slow: long-running tests
+
+\end{CodeBlock}
+\end{document}

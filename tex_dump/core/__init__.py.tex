@@ -1,0 +1,23 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{core/\\_\\_init\\_\\_.py}
+\textbf{Source Path}: \texttt{core/\\_\\_init\\_\\_.py}\par
+\bigskip
+\begin{CodeBlock}
+# Make core a package and re-export the tracker.
+
+from .provenance_tracker import ProvenanceTracker, ProvenanceEntry
+
+__all__ = ["ProvenanceTracker", "ProvenanceEntry"]
+
+\end{CodeBlock}
+\end{document}

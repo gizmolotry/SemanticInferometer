@@ -1,0 +1,184 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{scripts/build\\_results\\_registry.py}
+\textbf{Source Path}: \texttt{scripts/build\\_results\\_registry.py}\par
+\bigskip
+\begin{CodeBlock}
+#!/usr/bin/env python3
+"""Build canonical run registry in RESULTS.md from experiment manifests."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class Row:
+    run_id: str
+    date: str
+    purpose: str
+    command_class: str
+    status: str
+    canonical: str
+    notes: str
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def iso_date(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    try:
+        return dt.datetime.fromisoformat(value).date().isoformat()
+    except Exception:
+        return value[:10]
+
+
+def classify_manifest(run_id: str, data: dict[str, Any]) -> Row:
+    date = iso_date(data.get("timestamp"))
+    purpose = "Synthetic" if data.get("experiment_type") == "synthetic" else "Corpus matrix"
+    command_class = "Synthetic" if purpose == "Synthetic" else "Suite"
+
+    if purpose == "Synthetic":
+        sres = data.get("synthetic_result") or {}
+        summary = sres.get("summary") or {}
+        successful_runs = int(summary.get("successful_runs", 0))
+        total_runs = int(summary.get("n_runs", 0))
+        mean_nmi = summary.get("mean_nmi")
+        mean_ari = summary.get("mean_ari")
+
+        if successful_runs > 0:
+            status = "Success"
+            canonical = "Yes"
+            notes = f"successful_runs={successful_runs}/{max(total_runs,1)}"
+            if mean_nmi is not None and mean_ari is not None:
+                notes += f"; mean_nmi={mean_nmi:.4f}; mean_ari={mean_ari:.4f}"
+        else:
+            status = "Failed/Partial"
+            canonical = "No"
+            first_err = ""
+            for item in sres.get("results", []):
+                if item.get("status") != "success":
+                    first_err = item.get("error", "")
+                    break
+            notes = f"successful_runs={successful_runs}/{max(total_runs,1)}"
+            if first_err:
+                notes += f"; error={first_err[:80]}"
+        return Row(run_id, date, purpose, command_class, status, canonical, notes)
+
+    # Suite/corpus format
+    exps = data.get("experiments")
+    if isinstance(exps, list) and len(exps) > 0:
+        failures = [e for e in exps if e.get("status") in {"failed", "partial"}]
+        if failures:
+            status = "Failed/Partial"
+            canonical = "No"
+            notes = f"experiments={len(exps)}; failures={len(failures)}"
+        else:
+            status = "Success"
+            canonical = "Yes"
+            notes = f"experiments={len(exps)}"
+        cfg = data.get("config") or {}
+        kernels = cfg.get("kernels")
+        channels = cfg.get("channels")
+        corpora = cfg.get("corpora")
+        if kernels:
+            notes += f"; kernels={','.join(map(str, kernels))}"
+        if channels:
+            notes += f"; channels={','.join(map(str, channels))}"
+        if corpora:
+            notes += f"; corpora={','.join(map(str, corpora))}"
+        return Row(run_id, date, purpose, command_class, status, canonical, notes)
+
+    # No experiment entries; still may include config
+    status = "Unknown/Empty"
+    canonical = "No"
+    cfg = data.get("config") or {}
+    keys = [k for k in ("kernels", "channels", "corpora", "seeds") if k in cfg]
+    notes = "no experiments[] entries"
+    if keys:
+        notes += "; config_keys=" + ",".join(keys)
+    return Row(run_id, date, purpose, command_class, status, canonical, notes)
+
+
+def build_table(rows: list[Row], generated_at: str) -> str:
+    lines = [
+        f"_Auto-generated from manifests on {generated_at}._",
+        "",
+        "| Run ID | Date | Purpose | Command Class | Status | Canonical | Notes |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r.run_id} | {r.date} | {r.purpose} | {r.command_class} | {r.status} | {r.canonical} | {r.notes} |"
+        )
+    return "\n".join(lines)
+
+
+def update_results_md(results_md: Path, section_title: str, table_md: str) -> None:
+    text = results_md.read_text(encoding="utf-8")
+    marker = f"## {section_title}"
+    start = text.find(marker)
+    if start == -1:
+        raise RuntimeError(f"Section '{section_title}' not found in {results_md}")
+    next_h2 = text.find("\n## ", start + len(marker))
+    if next_h2 == -1:
+        next_h2 = len(text)
+
+    new_section = f"{marker}\n\n{table_md}\n"
+    updated = text[:start] + new_section + text[next_h2:]
+    results_md.write_text(updated, encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build run registry in RESULTS.md")
+    parser.add_argument("--runs-dir", default="outputs/experiments/runs")
+    parser.add_argument("--results-md", default="RESULTS.md")
+    parser.add_argument("--section", default="Canonical Run Registry")
+    args = parser.parse_args()
+
+    runs_dir = Path(args.runs_dir)
+    results_md = Path(args.results_md)
+    manifests = sorted(runs_dir.rglob("experiment_manifest.json"))
+    if not manifests:
+        raise SystemExit(f"No manifests found in {runs_dir}")
+
+    rows: list[Row] = []
+    for mf in manifests:
+        run_id = mf.parent.name
+        data = load_json(mf)
+        rows.append(classify_manifest(run_id, data))
+
+    rows.sort(key=lambda r: r.run_id)
+    generated_at = dt.datetime.now().isoformat(timespec="seconds")
+    table_md = build_table(rows, generated_at)
+    update_results_md(results_md, args.section, table_md)
+
+    total = len(rows)
+    canonical = sum(1 for r in rows if r.canonical == "Yes")
+    print(f"Updated {results_md} with {total} runs ({canonical} canonical).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+\end{CodeBlock}
+\end{document}

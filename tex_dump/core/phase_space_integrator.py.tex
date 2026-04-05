@@ -1,0 +1,1043 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{core/phase\\_space\\_integrator.py}
+\textbf{Source Path}: \texttt{core/phase\\_space\\_integrator.py}\par
+\bigskip
+\begin{CodeBlock}
+"""
+phase_space_integrator.py — The Final Exit Gate (Post-Track Assembly)
+
+EXECUTIVE MANDATE: THE PHASE-SPACE INTEGRATOR (V1.2)
+
+This module performs final assembly of all tracks into a single IntegratedParticle
+that lives on a Unit Hypersphere. Distance on this sphere is the Absolute Metric
+of Framing Difference.
+
+THE SEVEN FINGERS (ASTER v3.2):
+===============================
+Track 1 (Logits):       The "Surface Claim" — explicit NLI verdict
+Track 1.5 (Spectral):   The "Internal Stress" — spectral polarity gradient (∇Φ)
+Track 2 (Hologram):     The "Base Terrain" — RKS-projected embeddings (δ_μν)
+Track 3 (Blinker):      The "Conformal Factor" — Dirichlet variance (1/ρ)
+Track 4 (Walker):       The "Kinetic Probe" — MCMC path conductivity
+Track 5 (Hadamard):     The "Metric Assembly" — K_final = K_T2 ∘ K_T1.5 / sqrt(ρ⊗ρ)
+Track 6 (HoTT):         The "Formal Proofs" — type-theoretic verdicts (✓/✗/?)
+
+EXIT GATE (THIS MODULE): Final normalization to unit hypersphere after Track 5
+
+THE PHYSICS:
+============
+- High Blinker + Low Walker Resistance = NOISE (poorly written, incoherent)
+- High Blinker + High Walker Resistance = STRUCTURAL SINGULARITY (model fighting
+  to maintain specific framing despite ambiguity — the "Hidden Crack")
+- Low Blinker + High Walker Resistance = IDEOLOGICAL BARRIER (clear but hard to cross)
+- Low Blinker + Low Walker Resistance = CONSENSUS (clear and uncontested)
+
+THE METRIC TENSOR (ASTER v3.2):
+===============================
+When use_hadamard_fusion=True, Track 5 (hadamard_fusion.py) assembles:
+    g_μν = (1/ρ)·δ_μν + ∇_μΦ·∇_νΦ
+
+This Exit Gate (Track 6) then:
+1. Receives fused hologram from Track 5 (Hadamard kernel → spectral embedding)
+2. Concatenates with Track 1 (Logits) and Track 4 (Walker)
+3. Applies unit-sphere projection for absolute distance metric
+
+Author: Belief Transformer Project
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+
+from .pca_removal import fit_whitening_matrix, apply_whitening_fixed
+from .thermo_config import ThermodynamicConfig
+
+
+# =============================================================================
+# INTEGRATED PARTICLE: The Final Output
+# =============================================================================
+
+@dataclass
+class IntegratedParticle:
+    """
+    The unified representation of an article in Phase Space.
+
+    Every article becomes a point on the Unit Hypersphere where distance
+    is the Absolute Metric of Framing Difference.
+    """
+    # Core vector (L2-normalized, lives on unit hypersphere)
+    vector: torch.Tensor  # [D_total] where D_total = sum of all track dims
+
+    # Per-track contributions (before concatenation, after scaling)
+    track_contributions: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+    # Liar Score: disagreement between Surface (T1) and Stress (T1.5)
+    # High liar score = article's explicit claim contradicts its internal tension
+    liar_score: float = 0.0
+
+    # Physics interpretation
+    blinker_variance: float = 0.0   # Track 3: static crack magnitude
+    walker_resistance: float = 0.0  # Track 4: kinetic crack magnitude
+
+    # Derived classification
+    singularity_type: str = "unknown"  # noise | structural | barrier | consensus
+
+    # Terrain State (ASTER v3.2 Metric Geometry)
+    # Based on g_μν = δ_μν + ∇Φ ⊗ ∇Φ where:
+    #   - Density (δ): Article coverage / local neighborhood
+    #   - Stress (∇Φ): Observer gradient / conflict magnitude
+    # BRIDGE: High density + Low stress → smooth conductive path
+    # SWAMP: High density + High stress → viscous turbulent region
+    # TIGHTROPE: Low density + Low stress → narrow consensus corridor
+    # VOID: Low density + High stress → metric singularity (rupture zone)
+    terrain_state: str = "unknown"  # BRIDGE | SWAMP | TIGHTROPE | VOID
+
+    # Phantom Path Differential (ASTER v3.2)
+    # Verdicts: TAUTOLOGY | HONEST | PHANTOM | RUPTURE
+    phantom_verdict: str = "unknown"
+    phantom_delta: float = 0.0        # Divergence ratio δ = W/d
+    d_spectral: float = 0.0           # Weighted spectral distance (expected cost)
+    w_actual: float = 0.0             # Actual manifold work (Walker integral)
+    phantom_confidence: float = 0.0   # Confidence in the verdict [0, 1]
+    walker_state: str = "unknown"     # Walker terminal state
+
+    # Provenance
+    article_id: Optional[str] = None
+
+    # Hadamard Fusion diagnostics (ASTER v3.2)
+    hadamard_diagnostics: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for JSON/storage."""
+        return {
+            'vector': self.vector.cpu().numpy().tolist(),
+            'track_contributions': {
+                k: v.cpu().numpy().tolist()
+                for k, v in self.track_contributions.items()
+            },
+            'liar_score': self.liar_score,
+            'blinker_variance': self.blinker_variance,
+            'walker_resistance': self.walker_resistance,
+            'singularity_type': self.singularity_type,
+            'terrain_state': self.terrain_state,
+            'article_id': self.article_id,
+            # Phantom Path Differential (ASTER v3.2)
+            'phantom_verdict': self.phantom_verdict,
+            'phantom_delta': self.phantom_delta,
+            'd_spectral': self.d_spectral,
+            'w_actual': self.w_actual,
+            'phantom_confidence': self.phantom_confidence,
+            'walker_state': self.walker_state,
+            'hadamard_diagnostics': self.hadamard_diagnostics,
+            'u_axis': self.track_contributions.get('antagonism', torch.zeros(1)).cpu().numpy().tolist(),
+        }
+
+
+@dataclass
+class IntegratorConfig:
+    """Configuration for PhaseSpaceIntegrator."""
+
+    # Robust scaling sample size
+    scaling_sample_size: int = 5000
+
+    # ZCA regularization
+    zca_regularization: float = 1e-5
+
+    # Track dimension expectations (for validation)
+    expected_dims: Dict[str, int] = field(default_factory=lambda: {
+        'logits': 24,           # [8 bots × 3 classes]
+        'antagonism': 768,      # Gradient dimension (model hidden size)
+        'hologram': 2048,       # RKS dim (configurable)
+        'blinker': 2048,        # Dirichlet fused_std dim
+        'walker': 2048,         # MCMC projected dim
+    })
+
+    # Physics thresholds for singularity classification
+    blinker_high_threshold: float = 0.7   # High variance = blurry
+    walker_high_threshold: float = 0.7    # High resistance = hard to traverse
+    liar_threshold: float = 0.5           # Surface vs stress disagreement
+
+    # Whether to apply ZCA to concatenated stack (ablation only — disabled by default)
+    apply_global_zca: bool = False
+
+    # Whether to project to unit sphere
+    project_to_sphere: bool = True
+
+
+# =============================================================================
+# PHASE SPACE INTEGRATOR: The Fusion Engine
+# =============================================================================
+
+class PhaseSpaceIntegrator:
+    """
+    The Final Exit Gate: Fuses all six tracks into a single unit-sphere particle.
+
+    Architecture:
+    1. Receive all track tensors
+    2. Apply robust scaling (fit on 5k sample, apply to all)
+    3. Concatenate into mega-vector
+    4. Apply global ZCA whitening (decorrelate tracks)
+    5. L2 normalize to unit hypersphere
+    6. Compute physics diagnostics (liar score, singularity type)
+    """
+
+    def __init__(self, config: Optional[IntegratorConfig] = None):
+        self.config = config or IntegratorConfig()
+
+        # Scaling parameters (fit once, apply to all)
+        self.scaling_params: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.is_fit = False
+
+        # Global ZCA parameters
+        self.global_zca_mu: Optional[torch.Tensor] = None
+        self.global_zca_W: Optional[torch.Tensor] = None
+
+    def fit(
+        self,
+        track_samples: Dict[str, torch.Tensor],
+    ) -> None:
+        """
+        Fit the integrator on a sample corpus (typically 5000 articles).
+
+        This computes:
+        1. Per-track robust scaling parameters (median, IQR)
+        2. Global ZCA whitening matrix on concatenated tracks
+
+        Args:
+            track_samples: Dict mapping track names to [N, D] tensors
+                Expected keys: 'logits', 'antagonism', 'hologram', 'blinker', 'walker'
+        """
+        device = next(iter(track_samples.values())).device
+
+        # 1. Fit robust scaling for each track (with dimension validation)
+        print("[PhaseSpaceIntegrator] Fitting robust scaling...")
+        N_fit = None  # Will be set from first valid 2D tensor
+        for track_name, samples in track_samples.items():
+            if samples is None or samples.numel() == 0:
+                continue
+
+            # Ensure tensor is 2D [N, D]
+            if samples.dim() == 1:
+                # 1D tensor - skip for fitting (need batch dim)
+                print(f"  Track '{track_name}': skipping 1D tensor {samples.shape} for fitting")
+                continue
+            elif samples.dim() == 3:
+                # 3D tensor [N, B, D] - flatten to [N, B*D]
+                samples = samples.reshape(samples.shape[0], -1)
+                track_samples[track_name] = samples
+                print(f"  Track '{track_name}': flattened 3D to {samples.shape}")
+            elif samples.dim() != 2:
+                print(f"  Track '{track_name}': skipping unexpected dim {samples.dim()}")
+                continue
+
+            if N_fit is None:
+                N_fit = samples.shape[0]
+
+            self.scaling_params[track_name] = self._fit_robust_scaler(samples)
+            print(f"  Track '{track_name}': shape {samples.shape}, "
+                  f"median_norm={self.scaling_params[track_name]['median_norm']:.4f}")
+
+        # 2. Scale all tracks and concatenate (only 2D tensors with scaling params)
+        scaled_tracks = []
+        for track_name in ['logits', 'antagonism', 'hologram', 'blinker', 'walker']:
+            if track_name in track_samples and track_samples[track_name] is not None:
+                samples = track_samples[track_name]
+                # Only include tracks that have scaling params (i.e., were valid 2D during step 1)
+                if track_name not in self.scaling_params:
+                    continue
+                # Verify still 2D
+                if samples.dim() != 2:
+                    print(f"  [WARN] Track '{track_name}' not 2D after preprocessing, skipping")
+                    continue
+                scaled = self._apply_robust_scaling(samples, self.scaling_params[track_name])
+                scaled_tracks.append(scaled)
+
+        if not scaled_tracks:
+            raise ValueError("No valid track samples provided for fitting")
+
+        concatenated = torch.cat(scaled_tracks, dim=-1)  # [N, D_total]
+        print(f"[PhaseSpaceIntegrator] Concatenated shape: {concatenated.shape}")
+
+        # 3. Fit global ZCA on concatenated stack
+        if self.config.apply_global_zca:
+            print("[PhaseSpaceIntegrator] Fitting global ZCA whitening...")
+            # Subsample if too large
+            if concatenated.shape[0] > self.config.scaling_sample_size:
+                idx = torch.randperm(concatenated.shape[0])[:self.config.scaling_sample_size]
+                zca_sample = concatenated[idx]
+            else:
+                zca_sample = concatenated
+
+            zca_fit = fit_whitening_matrix(zca_sample, self.config.zca_regularization)
+            self.global_zca_mu = zca_fit['mu'].to(device)
+            self.global_zca_W = zca_fit['whitening_matrix'].to(device)
+            print(f"  ZCA fitted on {zca_sample.shape[0]} samples, "
+                  f"condition={zca_fit['singular_values'][0] / zca_fit['singular_values'][-1]:.2f}")
+
+        self.is_fit = True
+        print("[PhaseSpaceIntegrator] Fitting complete.")
+
+    def _fit_robust_scaler(self, samples: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute robust scaling parameters (median and IQR-based scale).
+
+        More robust to outliers than mean/std normalization.
+        """
+        # Compute per-sample L2 norms
+        norms = samples.norm(dim=-1)  # [N]
+
+        # Robust statistics
+        median_norm = norms.median()
+        q75 = torch.quantile(norms, 0.75)
+        q25 = torch.quantile(norms, 0.25)
+        iqr = q75 - q25
+
+        # Scale factor: normalize so median norm becomes 1.0
+        # Use IQR to handle spread
+        scale = 1.0 / (median_norm + 1e-9)
+
+        return {
+            'median_norm': median_norm,
+            'iqr': iqr,
+            'scale': scale,
+            'q25': q25,
+            'q75': q75,
+        }
+
+    def _apply_robust_scaling(
+        self,
+        features: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply pre-computed robust scaling."""
+        return features * params['scale'].to(features.device)
+
+    def _apply_force_gain(
+        self,
+        position_tracks: Dict[str, torch.Tensor],
+        force_tracks: Dict[str, torch.Tensor],
+        min_energy_fraction: float = 0.2
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Ensure force tracks (antagonism, walker) have minimum energy representation.
+
+        Without this, the high-dimensional hologram/blinker tracks dominate,
+        making the physics signals invisible.
+        """
+        # Compute position track energy
+        E_pos = sum(
+            t.pow(2).sum() for t in position_tracks.values()
+            if t is not None and t.numel() > 0
+        )
+
+        # Compute force track energy
+        E_force = sum(
+            t.pow(2).sum() for t in force_tracks.values()
+            if t is not None and t.numel() > 0
+        )
+
+        if E_force < 1e-9 or E_pos < 1e-9:
+            return force_tracks
+
+        # Target: force should be at least min_energy_fraction of total
+        # E_force / (E_pos + E_force) >= min_energy_fraction
+        # E_force >= min_energy_fraction * E_pos / (1 - min_energy_fraction)
+        target_E_force = min_energy_fraction * E_pos / (1 - min_energy_fraction)
+
+        if E_force < target_E_force:
+            gain = torch.sqrt(target_E_force / E_force)
+            print(f"[PhaseSpace] Applying gain {gain:.2f} to force tracks (energy: {E_force:.4f} -> {target_E_force:.4f})")
+            return {
+                name: (t * gain if t is not None else None)
+                for name, t in force_tracks.items()
+            }
+
+        return force_tracks
+
+    def integrate(
+        self,
+        logits: Optional[torch.Tensor] = None,          # [N, 24] or [N, 8, 3]
+        antagonism: Optional[torch.Tensor] = None,      # [N, 768]
+        hologram: Optional[torch.Tensor] = None,        # [N, D_rks]
+        blinker: Optional[torch.Tensor] = None,         # [N, D_rks] (fused_std)
+        walker: Optional[torch.Tensor] = None,          # [N, D_rks] (MCMC projected)
+        article_ids: Optional[List[str]] = None,
+        use_hadamard_fusion: bool = False,              # ASTER v3.2: Hadamard kernel product
+    ) -> List[IntegratedParticle]:
+        """
+        Integrate all tracks into IntegratedParticles.
+
+        Args:
+            logits: Track 1 - NLI verdict logits
+            antagonism: Track 1.5 - Structural antagonism gradients
+            hologram: Track 2 - ZCA-whitened Matern-projected embeddings
+            blinker: Track 3 - Dirichlet variance (fused_std)
+            walker: Track 4 - MCMC path conductivity projection
+            article_ids: Optional article identifiers
+
+        Returns:
+            List of IntegratedParticle objects, one per article
+        """
+        if not self.is_fit:
+            raise RuntimeError("PhaseSpaceIntegrator must be fit() before integrate()")
+
+        # Determine batch size from first non-None tensor
+        N = None
+        for t in [logits, antagonism, hologram, blinker, walker]:
+            if t is not None:
+                N = t.shape[0]
+                device = t.device
+                break
+
+        if N is None:
+            return []
+
+        # Flatten logits if needed [N, 8, 3] → [N, 24]
+        if logits is not None and logits.dim() == 3:
+            logits = logits.reshape(N, -1)
+
+        # Collect and scale tracks
+        tracks = {
+            'logits': logits,
+            'antagonism': antagonism,
+            'hologram': hologram,
+            'blinker': blinker,
+            'walker': walker,
+        }
+
+        scaled_tracks = {}
+        for name, tensor in tracks.items():
+            if tensor is not None and name in self.scaling_params:
+                scaled_tracks[name] = self._apply_robust_scaling(
+                    tensor, self.scaling_params[name]
+                )
+            elif tensor is not None:
+                # No scaling params — use as-is with warning
+                print(f"[WARN] Track '{name}' has no scaling params, using raw values")
+                scaled_tracks[name] = tensor
+
+        # Apply gain to ensure force tracks are visible
+        position_tracks = {k: scaled_tracks.get(k) for k in ['logits', 'hologram', 'blinker']}
+        force_tracks = {k: scaled_tracks.get(k) for k in ['antagonism', 'walker']}
+        boosted_force = self._apply_force_gain(position_tracks, force_tracks)
+        scaled_tracks.update(boosted_force)
+
+        # ASTER v3.2: Hadamard Kernel Product Fusion
+        # Instead of concatenating Track 2 + Track 1.5 + Track 3, we:
+        #   1. Hadamard product: K_final = K_rks * K_spectral (T2 * T1.5)
+        #   2. Conformal scaling: distances scaled by Track 3 variance
+        #   3. Spectral embedding: recover vector space for Walker
+        hadamard_diagnostics = None
+        if use_hadamard_fusion:
+            thermo_config = ThermodynamicConfig()
+            t2 = scaled_tracks.get('hologram')
+            t15 = scaled_tracks.get('antagonism')
+            t3 = scaled_tracks.get('blinker')
+
+            if t2 is not None and t15 is not None:
+                from .hadamard_fusion import compute_kernel_with_conformal, compute_hadamard_fusion_simple, HadamardFusionConfig
+
+                print("[PhaseSpaceIntegrator] Applying Hadamard fusion (T2 * T1.5)...")
+
+                hf_config = HadamardFusionConfig(
+                    output_dim=t2.shape[-1],  # Match hologram dimension
+                    dark_manifold_rescue=False,
+                    hadamard_softening=0.0,
+                    kernel_floor=thermo_config.hadamard_floor,
+                )
+
+                if t3 is not None:
+                    # Full pipeline with conformal scaling from Track 3
+                    hf_result = compute_kernel_with_conformal(t2, t15, t3, config=hf_config)
+                    fused_hologram = hf_result.embeddings
+                    hadamard_diagnostics = hf_result.to_dict()
+                    print(f"  Hadamard fusion complete: {hf_result.n_isolated_rescued} nodes rescued, "
+                          f"sparsity={hadamard_diagnostics['K_hadamard_sparsity']:.3f}")
+                else:
+                    # Simple Hadamard without conformal (no Track 3)
+                    fused_hologram, hadamard_diagnostics = compute_hadamard_fusion_simple(t2, t15, config=hf_config)
+                    print(f"  Hadamard fusion (no conformal): {hadamard_diagnostics['n_isolated_rescued']} nodes rescued")
+
+                # Replace hologram with fused representation
+                scaled_tracks['hologram'] = fused_hologram
+                # Mark antagonism and blinker as consumed (not to be concatenated)
+                scaled_tracks['antagonism'] = None
+                scaled_tracks['blinker'] = None
+            else:
+                print("[WARN] Hadamard fusion requested but Track 2 or Track 1.5 missing, falling back to concatenation")
+
+        # Concatenate in canonical order with dimension validation
+        # Note: When use_hadamard_fusion=True, antagonism and blinker are None (already fused into hologram)
+        concat_list = []
+        track_slices = {}  # Track where each track lives in the concatenated vector
+        offset = 0
+        for name in ['logits', 'antagonism', 'hologram', 'blinker', 'walker']:
+            if name in scaled_tracks and scaled_tracks[name] is not None:
+                t = scaled_tracks[name]
+
+                # Ensure tensor is 2D [N, D]
+                if t.dim() == 1:
+                    # 1D tensor [D] - expand to [N, D] by repeating
+                    t = t.unsqueeze(0).expand(N, -1)
+                    print(f"[WARN] Track '{name}' was 1D, expanded to {t.shape}")
+                elif t.dim() == 3:
+                    # 3D tensor [N, B, D] - flatten to [N, B*D]
+                    t = t.reshape(t.shape[0], -1)
+                    print(f"[WARN] Track '{name}' was 3D, flattened to {t.shape}")
+                elif t.dim() != 2:
+                    print(f"[WARN] Track '{name}' has unexpected dim {t.dim()}, skipping")
+                    continue
+
+                # Validate batch dimension matches
+                if t.shape[0] != N:
+                    print(f"[WARN] Track '{name}' batch size {t.shape[0]} != expected {N}, skipping")
+                    continue
+
+                concat_list.append(t)
+                track_slices[name] = (offset, offset + t.shape[-1])
+                offset += t.shape[-1]
+
+        if not concat_list:
+            return []
+
+        concatenated = torch.cat(concat_list, dim=-1)  # [N, D_total]
+
+        # Apply global ZCA whitening (with dimension check)
+        if self.config.apply_global_zca and self.global_zca_W is not None:
+            zca_dim = self.global_zca_W.shape[0]
+            concat_dim = concatenated.shape[-1]
+            if concat_dim != zca_dim:
+                print(f"[WARN] ZCA dimension mismatch: concat {concat_dim} vs ZCA {zca_dim}, skipping ZCA")
+            else:
+                concatenated = apply_whitening_fixed(
+                    concatenated,
+                    self.global_zca_mu,
+                    self.global_zca_W,
+                )
+
+        # Project to unit hypersphere
+        if self.config.project_to_sphere:
+            concatenated = F.normalize(concatenated, p=2, dim=-1)
+
+        # Compute physics diagnostics and build particles
+        # First pass: compute raw blinker/walker values for normalization
+        raw_blinker = []
+        raw_walker = []
+        for i in range(N):
+            if blinker is not None:
+                raw_blinker.append(float(blinker[i].norm().item()))
+            else:
+                raw_blinker.append(0.0)
+
+            if walker is not None:
+                raw_walker.append(float(walker[i].norm().item()))
+            else:
+                raw_walker.append(0.0)
+
+        # Normalize to [0, 1] using percentile scaling (robust to outliers)
+        def percentile_normalize(values):
+            """Normalize values to [0, 1] using min-max with percentile clipping."""
+            arr = np.array(values)
+            if arr.max() == arr.min():
+                return np.zeros_like(arr)  # All same value
+            # Use 5th-95th percentile to be robust to outliers
+            p5, p95 = np.percentile(arr, [5, 95])
+            if p95 == p5:
+                p5, p95 = arr.min(), arr.max()
+            clipped = np.clip(arr, p5, p95)
+            normalized = (clipped - p5) / (p95 - p5 + 1e-10)
+            return normalized
+
+        norm_blinker = percentile_normalize(raw_blinker)
+        norm_walker = percentile_normalize(raw_walker)
+
+        # Second pass: build particles with normalized values
+        particles = []
+        for i in range(N):
+            # Extract per-track contributions from the integrated vector
+            track_contribs = {}
+            for name, (start, end) in track_slices.items():
+                track_contribs[name] = concatenated[i, start:end]
+
+            # Compute Liar Score: disagreement between T1 (logits) and T1.5 (antagonism)
+            liar_score = self._compute_liar_score(
+                logits[i] if logits is not None else None,
+                antagonism[i] if antagonism is not None else None,
+            )
+
+            # Use normalized blinker/walker for classification
+            blinker_var = float(norm_blinker[i])
+            walker_res = float(norm_walker[i])
+
+            # Classify singularity type based on physics
+            singularity = self._classify_singularity(
+                blinker_var, walker_res, liar_score
+            )
+
+            # Classify terrain state (ASTER v3.2 metric geometry)
+            terrain = self._classify_terrain(blinker_var, walker_res)
+
+            particle = IntegratedParticle(
+                vector=concatenated[i],
+                track_contributions=track_contribs,
+                liar_score=liar_score,
+                blinker_variance=blinker_var,
+                walker_resistance=walker_res,
+                singularity_type=singularity,
+                terrain_state=terrain,
+                article_id=article_ids[i] if article_ids else None,
+                hadamard_diagnostics=hadamard_diagnostics,  # ASTER v3.2
+            )
+            particles.append(particle)
+
+        return particles
+
+    def compute_phantom_differential(
+        self,
+        d_spectral: torch.Tensor,  # [N] — weighted spectral distance (expected cost)
+        w_actual: List[float],     # [N] — actual manifold work (Walker integral)
+        walker_states: List[str],  # [N] — Walker terminal states
+        blinker_variance: Optional[List[float]] = None,  # [N] — Track 3 variance (for terrain)
+    ) -> List[dict]:
+        """
+        Compute the Panic Function (Divergence Ratio) for Lie Detection.
+
+        Delta = W_actual / d_spectral = (Manifold Work) / (Spectral Projection)
+
+        Now also computes terrain_state (BRIDGE/SWAMP/TIGHTROPE/VOID) per article
+        based on the density × stress manifold from Track 2.
+
+        VERDICT TAXONOMY:
+        =================
+        TAUTOLOGY (δ < 0.8):
+            Article claims controversy but embedding distance is tiny.
+            "Much ado about nothing" — semantic noise, not real disagreement.
+
+        HONEST (0.8 ≤ δ < 1.5):
+            Manifold work matches spectral projection. The article's framing
+            corresponds to genuine semantic distance. No hidden agenda.
+
+        PHANTOM (1.5 ≤ δ < 10.0):
+            Manifold work exceeds spectral expectation. The Walker had to do
+            extra work navigating around semantic obstacles not visible in
+            the flat projection. Hidden structure detected.
+
+        RUPTURE (δ ≥ 10.0 or Walker broken/fog):
+            Extreme divergence. The manifold path is completely disconnected
+            from the spectral projection. Indicates severe framing distortion
+            or fundamental semantic discontinuity.
+
+        Args:
+            d_spectral: [N] weighted spectral distance from SpectralPolarity
+            w_actual: [N] actual work integrals from Walker (Track 4)
+            walker_states: [N] terminal states from Walker ("elastic", "trapped", "broken", "fog")
+            blinker_variance: [N] Track 3 variance values (optional, for terrain classification)
+
+        Returns:
+            List of verdict dicts with keys: verdict, delta, d_spectral, w_actual, confidence,
+            walker_state, terrain_state, blinker_variance, walker_resistance
+        """
+        # Threshold constants (ASTER v3.2 calibration)
+        TAUTOLOGY_THRESHOLD = 0.8   # δ < 0.8 → TAUTOLOGY
+        HONEST_THRESHOLD = 1.5      # 0.8 ≤ δ < 1.5 → HONEST
+        PHANTOM_THRESHOLD = 10.0    # 1.5 ≤ δ < 10.0 → PHANTOM, else RUPTURE
+
+        # Minimum spectral distance to avoid division instability
+        MIN_D_SPECTRAL = 0.01
+
+        verdicts = []
+        for i in range(len(w_actual)):
+            d = float(d_spectral[i]) if d_spectral is not None else MIN_D_SPECTRAL
+            w = w_actual[i]
+            state = walker_states[i] if i < len(walker_states) else "elastic"
+
+            # Get blinker variance for terrain classification
+            blinker_var = blinker_variance[i] if blinker_variance and i < len(blinker_variance) else 0.5
+
+            # Normalize walker resistance for terrain (high work = high resistance = low density)
+            # Clamp to prevent infinity issues
+            w_clamped = min(float(w) if w == w and w != float('inf') else 10.0, 100.0)
+            walker_res = w_clamped / 10.0  # Normalize to ~[0, 10]
+
+            # Classify terrain state (BRIDGE/SWAMP/TIGHTROPE/VOID)
+            terrain = self._classify_terrain(blinker_var, walker_res)
+
+            # Handle catastrophic Walker states first
+            if state in ("fog", "broken") or w == float('inf') or w != w:  # w != w catches NaN
+                verdicts.append({
+                    "verdict": "RUPTURE",
+                    "delta": float('inf'),
+                    "d_spectral": d,
+                    "w_actual": w if w == w else float('inf'),  # Replace NaN with inf
+                    "confidence": 1.0,
+                    "walker_state": state,
+                    "terrain_state": terrain,
+                    "blinker_variance": blinker_var,
+                    "walker_resistance": walker_res,
+                })
+                continue
+
+            # Handle zero/tiny spectral distance (no polarization detected)
+            if d < MIN_D_SPECTRAL:
+                # If Walker also did minimal work → HONEST (trivial case)
+                # If Walker did significant work but no spectral distance → PHANTOM
+                if w < MIN_D_SPECTRAL:
+                    verdict = "HONEST"
+                    delta = 1.0
+                    confidence = 0.5  # Low confidence due to trivial case
+                else:
+                    # Spectral says "no difference" but Walker disagrees
+                    verdict = "PHANTOM"
+                    delta = w / MIN_D_SPECTRAL  # Approximate
+                    confidence = 0.7
+                verdicts.append({
+                    "verdict": verdict,
+                    "delta": delta,
+                    "d_spectral": d,
+                    "w_actual": w,
+                    "confidence": confidence,
+                    "walker_state": state,
+                    "terrain_state": terrain,
+                    "blinker_variance": blinker_var,
+                    "walker_resistance": walker_res,
+                })
+                continue
+
+            # Standard case: compute divergence ratio
+            delta = w / d
+
+            # Classify based on thresholds
+            if delta < TAUTOLOGY_THRESHOLD:
+                verdict = "TAUTOLOGY"
+                # Confidence increases as delta approaches 0 (more clearly tautological)
+                confidence = 1.0 - (delta / TAUTOLOGY_THRESHOLD)
+            elif delta < HONEST_THRESHOLD:
+                verdict = "HONEST"
+                # Confidence peaks at delta=1.0 (perfect match)
+                confidence = 1.0 - abs(delta - 1.0) / 0.5
+            elif delta < PHANTOM_THRESHOLD:
+                verdict = "PHANTOM"
+                # Confidence increases with delta (more clearly phantom)
+                confidence = min(1.0, (delta - HONEST_THRESHOLD) / (PHANTOM_THRESHOLD - HONEST_THRESHOLD))
+            else:
+                verdict = "RUPTURE"
+                confidence = min(1.0, delta / PHANTOM_THRESHOLD - 1.0)
+
+            verdicts.append({
+                "verdict": verdict,
+                "delta": delta,
+                "d_spectral": d,
+                "w_actual": w,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "walker_state": state,
+                "terrain_state": terrain,
+                "blinker_variance": blinker_var,
+                "walker_resistance": walker_res,
+            })
+
+        return verdicts
+
+    def compute_divergence_ratio(
+        self,
+        spectral_result: Any,  # SpectralPolarityResult
+        walker_work_integrals: torch.Tensor,  # [N]
+        walker_states: List[str],
+        emb_start: torch.Tensor,  # [N, H] — article embeddings at "start" pole
+        emb_end: torch.Tensor,    # [N, H] — article embeddings at "end" pole
+    ) -> List[dict]:
+        """
+        Full Panic Function computation using weighted spectral distance.
+
+        This is the preferred entry point that uses the new signal-weighted
+        spectral distance rather than the legacy unweighted version.
+
+        Args:
+            spectral_result: SpectralPolarityResult from SpectralPolarity.compute_batch()
+            walker_work_integrals: [N] tensor of manifold work values from Walker
+            walker_states: [N] list of Walker terminal states
+            emb_start: [N, H] embeddings at one semantic pole
+            emb_end: [N, H] embeddings at the other semantic pole
+
+        Returns:
+            List of verdict dicts (same format as compute_phantom_differential)
+        """
+        from .spectral_polarity import SpectralPolarity
+
+        # Create SpectralPolarity instance for weighted distance computation
+        sp = SpectralPolarity()
+
+        # Compute weighted spectral distance using the spectral basis
+        d_spectral = sp.compute_weighted_spectral_distance(
+            emb_a=emb_start,
+            emb_b=emb_end,
+            singular_values=spectral_result.singular_values,
+            Vt=spectral_result.u_basis,
+            dynamic_k=spectral_result.dynamic_k,
+        )
+
+        # Convert walker work to list
+        w_actual = walker_work_integrals.tolist() if isinstance(walker_work_integrals, torch.Tensor) else list(walker_work_integrals)
+
+        # Use the main verdict computation
+        return self.compute_phantom_differential(d_spectral, w_actual, walker_states)
+
+    def _compute_liar_score(
+        self,
+        logits: Optional[torch.Tensor],
+        antagonism: Optional[torch.Tensor],
+    ) -> float:
+        """
+        Compute disagreement between Surface Claim (T1) and Internal Stress (T1.5).
+
+        Liar Score = 1 - cos(direction_from_logits, direction_from_antagonism)
+
+        High score = article's explicit verdict contradicts its internal tension.
+        """
+        if logits is None or antagonism is None:
+            return 0.0
+
+        # Convert logits to direction vector (which class is favored)
+        if logits.dim() == 1 and logits.shape[0] == 24:
+            # [24] → [8, 3] → mean over bots → [3]
+            logits_3d = logits.reshape(8, 3).mean(dim=0)
+        elif logits.dim() == 1 and logits.shape[0] == 3:
+            logits_3d = logits
+        else:
+            logits_3d = logits.reshape(-1, 3).mean(dim=0) if logits.numel() >= 3 else logits
+
+        # Softmax to get direction
+        logits_dir = F.softmax(logits_3d, dim=-1)
+
+        # For antagonism, we interpret the gradient direction
+        # Normalize to unit vector
+        antag_dir = F.normalize(antagonism.unsqueeze(0), p=2, dim=-1).squeeze(0)
+
+        # Since they're different spaces, we use magnitude-based disagreement
+        # High antagonism magnitude + confident logits but different "feel" = liar
+        logits_confidence = float((logits_dir.max() - logits_dir.min()).item())
+        antag_magnitude = float(antagonism.norm().item())
+
+        # Liar score: high confidence + high stress = potential liar
+        # Normalized to [0, 1]
+        raw_score = logits_confidence * antag_magnitude
+        liar_score = float(torch.sigmoid(torch.tensor(raw_score - 0.5)).item())
+
+        return liar_score
+
+    def _classify_singularity(
+        self,
+        blinker_var: float,
+        walker_res: float,
+        liar_score: float,
+    ) -> str:
+        """
+        Classify the article's singularity type based on physics.
+
+        The 2×2 matrix of Blinker × Walker:
+        - High Blinker + Low Walker = NOISE (blurry and easy to traverse)
+        - High Blinker + High Walker = STRUCTURAL (fighting to maintain frame)
+        - Low Blinker + High Walker = BARRIER (clear but ideologically isolated)
+        - Low Blinker + Low Walker = CONSENSUS (clear and mainstream)
+        """
+        b_high = blinker_var > self.config.blinker_high_threshold
+        w_high = walker_res > self.config.walker_high_threshold
+
+        if b_high and w_high:
+            return "structural_singularity"
+        elif b_high and not w_high:
+            return "noise"
+        elif not b_high and w_high:
+            return "ideological_barrier"
+        else:
+            return "consensus"
+
+    def _classify_terrain(
+        self,
+        blinker_var: float,
+        walker_res: float,
+        local_density: Optional[float] = None,
+    ) -> str:
+        """
+        Classify the article's terrain state based on metric geometry.
+
+        The 2×2 matrix of Density (δ) × Stress (∇Φ):
+
+        Metric tensor: g_μν = δ_μν + ∇Φ ⊗ ∇Φ
+
+        Variable A (δ): Article Density (The Floor)
+            - High density = low walker resistance (easy manifold traversal)
+            - Low density = high walker resistance (sparse/isolated)
+
+        Variable B (∇Φ): Observer Gradient / Stress (The Stress Field)
+            - High stress = high blinker variance (observer disagreement)
+            - Low stress = low blinker variance (observer consensus)
+
+        TERRAIN STATES:
+        ===============
+        BRIDGE: High Density + Low Stress
+            → Smooth, stable, paved connection. Logic flows easily.
+
+        SWAMP: High Density + High Stress
+            → Ground exists but is muddy/turbulent. High viscosity.
+            → Bots screaming at each other over a pile of data.
+
+        TIGHTROPE: Low Density + Low Stress
+            → Agreed upon but narrow. One step off and you fall.
+            → Sparse but coherent corridor.
+
+        VOID: Low Density + High Stress
+            → Total collapse. The Metric Singularity.
+            → Acts as an insulator, not empty space.
+        """
+        # Density: inverse of walker resistance (high resistance = low density)
+        # Use threshold at 0.5 (normalized values)
+        density_high = walker_res < self.config.walker_high_threshold
+
+        # Stress: direct from blinker variance
+        stress_high = blinker_var > self.config.blinker_high_threshold
+
+        if density_high and not stress_high:
+            return "BRIDGE"      # Solid + Consensus = Smooth path
+        elif density_high and stress_high:
+            return "SWAMP"       # Solid + Conflict = Viscous turbulence
+        elif not density_high and not stress_high:
+            return "TIGHTROPE"   # Sparse + Consensus = Narrow corridor
+        else:
+            return "VOID"        # Sparse + Conflict = Metric singularity
+
+    def compute_riemannian_metric(
+        self,
+        features: torch.Tensor,
+        blinker_variance: torch.Tensor,
+        n_neighbors: int = 10,
+    ) -> torch.Tensor:
+        """
+        Compute the Riemannian metric tensor contribution for each article.
+
+        g_μν = δ_μν + ∇Φ ⊗ ∇Φ
+
+        The stress term ∇Φ ⊗ ∇Φ acts as a viscosity field that
+        increases geodesic cost in high-conflict regions.
+
+        Args:
+            features: [N, D] article embeddings
+            blinker_variance: [N] normalized variance (stress proxy)
+            n_neighbors: k for local density estimation
+
+        Returns:
+            [N] local metric coefficient (1 + stress²)
+        """
+        # Stress contribution: ||∇Φ||² ~ blinker_variance²
+        stress_sq = blinker_variance ** 2
+
+        # Metric coefficient: 1 + stress² (identity + stress tensor)
+        metric_coeff = 1.0 + stress_sq
+
+        return metric_coeff
+
+    def save(self, path: Path) -> None:
+        """Save integrator state for reproducibility."""
+        state = {
+            'config': self.config.__dict__,
+            'scaling_params': {
+                k: {kk: vv.cpu() for kk, vv in v.items()}
+                for k, v in self.scaling_params.items()
+            },
+            'global_zca_mu': self.global_zca_mu.cpu() if self.global_zca_mu is not None else None,
+            'global_zca_W': self.global_zca_W.cpu() if self.global_zca_W is not None else None,
+            'is_fit': self.is_fit,
+        }
+        torch.save(state, path)
+        print(f"[PhaseSpaceIntegrator] Saved to {path}")
+
+    @classmethod
+    def load(cls, path: Path) -> 'PhaseSpaceIntegrator':
+        """Load integrator state."""
+        state = torch.load(path, weights_only=False)
+        config = IntegratorConfig(**state['config'])
+        integrator = cls(config)
+        integrator.scaling_params = {
+            k: {kk: vv for kk, vv in v.items()}
+            for k, v in state['scaling_params'].items()
+        }
+        integrator.global_zca_mu = state['global_zca_mu']
+        integrator.global_zca_W = state['global_zca_W']
+        integrator.is_fit = state['is_fit']
+        print(f"[PhaseSpaceIntegrator] Loaded from {path}")
+        return integrator
+
+
+# =============================================================================
+# CONVENIENCE FUNCTIONS
+# =============================================================================
+
+def create_integrator_from_pipeline_output(
+    pipeline_outputs: List[Dict[str, Any]],
+    config: Optional[IntegratorConfig] = None,
+) -> PhaseSpaceIntegrator:
+    """
+    Create and fit a PhaseSpaceIntegrator from pipeline outputs.
+
+    Args:
+        pipeline_outputs: List of dicts from complete_pipeline.py runs
+        config: Optional configuration
+
+    Returns:
+        Fitted PhaseSpaceIntegrator ready for integration
+    """
+    integrator = PhaseSpaceIntegrator(config)
+
+    # Collect samples from all outputs
+    track_samples = {
+        'logits': [],
+        'antagonism': [],
+        'hologram': [],
+        'blinker': [],
+        'walker': [],
+    }
+
+    for output in pipeline_outputs:
+        # Track 1: Logits
+        if 'logits_raw' in output:
+            track_samples['logits'].append(torch.tensor(output['logits_raw']))
+
+        # Track 2: Hologram (fused embeddings)
+        if 'dirichlet_fused' in output:
+            track_samples['hologram'].append(torch.tensor(output['dirichlet_fused']))
+
+        # Track 3: Blinker (variance)
+        if 'dirichlet_fused_std' in output:
+            track_samples['blinker'].append(torch.tensor(output['dirichlet_fused_std']))
+
+    # Stack samples
+    for name in track_samples:
+        if track_samples[name]:
+            track_samples[name] = torch.cat(track_samples[name], dim=0)
+        else:
+            track_samples[name] = None
+
+    # Filter out None values
+    track_samples = {k: v for k, v in track_samples.items() if v is not None}
+
+    if track_samples:
+        integrator.fit(track_samples)
+
+    return integrator
+
+\end{CodeBlock}
+\end{document}

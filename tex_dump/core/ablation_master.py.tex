@@ -1,0 +1,296 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{core/ablation\\_master.py}
+\textbf{Source Path}: \texttt{core/ablation\\_master.py}\par
+\bigskip
+\begin{CodeBlock}
+"""
+ablation_master.py — Legacy Code Archive for Ablation Studies
+
+This module contains the OLD implementations that have been superseded by
+proper ASTER v3.2 components. Preserved here for ablation comparisons.
+
+OLD APPROACH (Before ASTER v3.2):
+- Track 1.5 Antagonism: Simple bot-variance (directionless)
+- Track 4 Walker: No u_axis awareness, just MCMC exploration
+
+NEW APPROACH (ASTER v3.2):
+- Track 1.5 Antagonism: SpectralPolarity (PCA via SVD, gauge-fixed u_axis)
+- Track 4 Walker: u_axis-aware energy, work integral W, state classification
+
+Usage:
+    from core.ablation_master import compute_legacy_antagonism
+    legacy_antag = compute_legacy_antagonism(cls_per_bot_list, rks_basis)
+"""
+
+import torch
+import numpy as np
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+
+
+@dataclass
+class LegacyAntagonismResult:
+    """Result from legacy bot-variance antagonism computation."""
+    # [N, D] — antagonism vectors (directionless, based on variance)
+    antagonism: torch.Tensor
+    # [N, H] — raw bot variance in embedding space
+    bot_variance: torch.Tensor
+    # Method name for logging
+    method: str = "legacy_bot_variance"
+
+
+def compute_legacy_antagonism(
+    cls_per_bot_list: List[torch.Tensor],
+    rks_basis,
+    device: str = "cuda",
+) -> LegacyAntagonismResult:
+    """
+    LEGACY: Compute antagonism using simple bot-variance.
+
+    This was the original Track 1.5 implementation before spectral polarity.
+    It computes variance across the 8 bots per article, which captures
+    "disagreement" but loses all directional information.
+
+    Args:
+        cls_per_bot_list: List of [8, H] tensors (per-bot embeddings)
+        rks_basis: SharedRKSBasis for projection to Track 5 space
+        device: Compute device
+
+    Returns:
+        LegacyAntagonismResult with bot_variance and projected antagonism
+    """
+    if not cls_per_bot_list:
+        return None
+
+    # Stack: [N, 8, H]
+    cls_stacked = torch.stack(cls_per_bot_list, dim=0).to(device)
+
+    # LEGACY: Simple variance across bots (dimension 1)
+    # This gives [N, H] but is DIRECTIONLESS - just magnitude of disagreement
+    bot_variance = cls_stacked.var(dim=1)  # [N, H]
+
+    # Project through RKS basis
+    antagonism = rks_basis(bot_variance)  # [N, D]
+
+    return LegacyAntagonismResult(
+        antagonism=antagonism,
+        bot_variance=bot_variance,
+        method="legacy_bot_variance",
+    )
+
+
+def compute_legacy_walker(
+    cls_per_bot: torch.Tensor,
+    rks_basis,
+    temperature: float = 0.5,
+    n_walkers: int = 20,
+    n_steps: int = 10,
+) -> Dict[str, Any]:
+    """
+    LEGACY: Run MCMC walker without u_axis awareness.
+
+    This was the original Track 4 implementation. The walker explores
+    the bot-weight simplex using gradient-based energy (norm of fused gradient),
+    but without any compass direction for orientation.
+
+    Args:
+        cls_per_bot: [8, H] per-bot embeddings
+        rks_basis: SharedRKSBasis for projection
+        temperature: Walker plasticity
+        n_walkers: Number of MCMC walkers
+        n_steps: Steps per walker
+
+    Returns:
+        Dict with walker_output (no work_integral or state classification)
+    """
+    from .physarum_walk import SemanticWalker
+
+    n_bots = cls_per_bot.shape[0]
+    bot_grads = cls_per_bot - cls_per_bot.mean(dim=0, keepdim=True)
+
+    # Create explorer WITHOUT u_axis (legacy mode)
+    explorer = SemanticWalker(
+        embeddings=cls_per_bot,
+        gradients=bot_grads,
+        rks_basis=rks_basis,
+        temperature=temperature,
+        u_axis=None,  # KEY: No compass direction
+    )
+
+    # Run exploration
+    trajectory = explorer.run_swarm(
+        n_walkers=n_walkers,
+        n_steps=n_steps,
+        start_from_poles=False,  # Can't start from poles without u_axis
+    )
+
+    # Project final position
+    projected = explorer.project_trajectory(trajectory)
+    endpoint = projected[-1].mean(dim=0)  # [D]
+
+    return {
+        "walker_output": endpoint,
+        "method": "legacy_no_u_axis",
+        # No work_integral or state - those require u_axis
+    }
+
+
+def run_ablation_comparison(
+    cls_per_bot_list: List[torch.Tensor],
+    rks_basis,
+    device: str = "cuda",
+) -> Dict[str, Any]:
+    """
+    Run both legacy and new methods for direct comparison.
+
+    Returns dict with:
+        - legacy_antagonism: [N, D] from bot-variance
+        - legacy_walker_outputs: List of [D] from non-u_axis walker
+        - spectral_antagonism: [N, D] from SpectralPolarity
+        - spectral_evr: [N] explained variance ratios
+        - spectral_dipole_valid: [N] validity flags
+        - walker_work_integrals: [N] work integral values
+        - walker_states: List of state strings
+    """
+    from .spectral_polarity import SpectralPolarity, SpectralPolarityConfig
+    from .physarum_walk import compute_walker_resistance
+
+    results = {}
+
+    # 1. Legacy antagonism
+    legacy_antag = compute_legacy_antagonism(cls_per_bot_list, rks_basis, device)
+    if legacy_antag:
+        results["legacy_antagonism"] = legacy_antag.antagonism.detach().cpu().numpy()
+        results["legacy_bot_variance"] = legacy_antag.bot_variance.detach().cpu().numpy()
+
+    # 2. New spectral polarity
+    sp = SpectralPolarity(SpectralPolarityConfig(multi_scale_enabled=True))
+    spectral_results = sp.compute_batch(cls_per_bot_list)
+    spectral_antagonism = rks_basis(spectral_results.antagonism)
+    results["spectral_antagonism"] = spectral_antagonism.detach().cpu().numpy()
+    results["spectral_evr"] = spectral_results.evr.detach().cpu().numpy()
+    results["spectral_dipole_valid"] = spectral_results.dipole_valid.detach().cpu().numpy()
+    results["spectral_u_axis"] = spectral_results.u_axis.detach().cpu().numpy()
+
+    # 3. Legacy walker (no u_axis)
+    legacy_walker_outputs = []
+    for i, bot_embs in enumerate(cls_per_bot_list[:50]):  # Cap for efficiency
+        legacy_result = compute_legacy_walker(bot_embs, rks_basis)
+        legacy_walker_outputs.append(legacy_result["walker_output"].detach().cpu().numpy())
+    if legacy_walker_outputs:
+        results["legacy_walker_outputs"] = np.stack(legacy_walker_outputs)
+
+    # 4. New walker (with u_axis)
+    walker_work_integrals = []
+    walker_states = []
+    walker_outputs = []
+    cls_stacked = torch.stack(cls_per_bot_list, dim=0)
+    for i in range(min(len(cls_per_bot_list), 50)):
+        bot_embs = cls_stacked[i]
+        u_axis_i = spectral_results.u_axis[i]
+        result = compute_walker_resistance(
+            cls_per_bot=bot_embs,
+            rks_basis=rks_basis,
+            u_axis=u_axis_i,
+            n_walkers=20,
+            n_steps=10,
+        )
+        walker_outputs.append(result["walker_output"].detach().cpu().numpy())
+        walker_work_integrals.append(result["work_integral"])
+        walker_states.append(result["state"])
+
+    if walker_outputs:
+        results["new_walker_outputs"] = np.stack(walker_outputs)
+        results["walker_work_integrals"] = np.array(walker_work_integrals)
+        results["walker_states"] = walker_states
+
+    return results
+
+
+def compute_ablation_metrics(comparison: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Compute comparison metrics between legacy and new approaches.
+
+    Returns metrics like:
+        - antagonism_cosine_sim: Mean cosine similarity between legacy and new
+        - antagonism_l2_diff: Mean L2 distance
+        - walker_cosine_sim: Mean cosine similarity of walker outputs
+        - evr_mean: Mean explained variance ratio (new only)
+        - dipole_valid_frac: Fraction of valid dipoles (new only)
+    """
+    metrics = {}
+
+    # Antagonism comparison
+    if "legacy_antagonism" in comparison and "spectral_antagonism" in comparison:
+        leg = comparison["legacy_antagonism"]
+        spec = comparison["spectral_antagonism"]
+
+        # Normalize for cosine sim
+        leg_norm = leg / (np.linalg.norm(leg, axis=1, keepdims=True) + 1e-9)
+        spec_norm = spec / (np.linalg.norm(spec, axis=1, keepdims=True) + 1e-9)
+
+        cosine_sims = (leg_norm * spec_norm).sum(axis=1)
+        metrics["antagonism_cosine_sim_mean"] = float(cosine_sims.mean())
+        metrics["antagonism_cosine_sim_std"] = float(cosine_sims.std())
+
+        l2_diffs = np.linalg.norm(leg - spec, axis=1)
+        metrics["antagonism_l2_diff_mean"] = float(l2_diffs.mean())
+        metrics["antagonism_l2_diff_std"] = float(l2_diffs.std())
+
+    # Walker comparison
+    if "legacy_walker_outputs" in comparison and "new_walker_outputs" in comparison:
+        leg_w = comparison["legacy_walker_outputs"]
+        new_w = comparison["new_walker_outputs"]
+
+        n = min(len(leg_w), len(new_w))
+        leg_w, new_w = leg_w[:n], new_w[:n]
+
+        leg_norm = leg_w / (np.linalg.norm(leg_w, axis=1, keepdims=True) + 1e-9)
+        new_norm = new_w / (np.linalg.norm(new_w, axis=1, keepdims=True) + 1e-9)
+
+        cosine_sims = (leg_norm * new_norm).sum(axis=1)
+        metrics["walker_cosine_sim_mean"] = float(cosine_sims.mean())
+        metrics["walker_cosine_sim_std"] = float(cosine_sims.std())
+
+    # New-only metrics
+    if "spectral_evr" in comparison:
+        metrics["evr_mean"] = float(comparison["spectral_evr"].mean())
+        metrics["evr_std"] = float(comparison["spectral_evr"].std())
+    if "spectral_dipole_valid" in comparison:
+        metrics["dipole_valid_frac"] = float(comparison["spectral_dipole_valid"].mean())
+    if "walker_work_integrals" in comparison:
+        w = comparison["walker_work_integrals"]
+        metrics["work_integral_mean"] = float(w.mean())
+        metrics["work_integral_std"] = float(w.std())
+    if "walker_states" in comparison:
+        states = comparison["walker_states"]
+        from collections import Counter
+        counts = Counter(states)
+        total = len(states)
+        metrics["elastic_frac"] = counts.get("elastic", 0) / total
+        metrics["trapped_frac"] = counts.get("trapped", 0) / total
+        metrics["broken_frac"] = counts.get("broken", 0) / total
+
+    return metrics
+
+
+__all__ = [
+    'LegacyAntagonismResult',
+    'compute_legacy_antagonism',
+    'compute_legacy_walker',
+    'run_ablation_comparison',
+    'compute_ablation_metrics',
+]
+
+\end{CodeBlock}
+\end{document}

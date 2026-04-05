@@ -1,0 +1,789 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{core/physarum\\_walk.py}
+\textbf{Source Path}: \texttt{core/physarum\\_walk.py}\par
+\bigskip
+\begin{CodeBlock}
+"""
+core/physarum_walk.py
+
+Track 4: corpus-level thermodynamic walkers over article neighborhoods.
+
+Primary path:
+- Walkers move between article nodes in Track 2 space.
+- Transition probability follows exp(-DeltaZ / tau).
+- Walkers accumulate fatigue until they hit a cognitive horizon.
+- Retreat adds a homing penalty back to the anchor article.
+
+Legacy path:
+- The older per-article bot-simplex walker is kept as a compatibility
+  helper for focused replay and existing tests.
+"""
+
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+from .hadamard_fusion import ConformalMetric
+from .thermo_config import ThermodynamicConfig
+
+def _to_float_tensor(value: Optional[torch.Tensor], reference: torch.Tensor) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.detach().to(device=reference.device, dtype=torch.float32)
+    return torch.as_tensor(value, device=reference.device, dtype=torch.float32)
+
+
+def _reduce_density(track3_density: Optional[torch.Tensor], embeddings: torch.Tensor) -> torch.Tensor:
+    if track3_density is None:
+        return torch.ones(embeddings.shape[0], device=embeddings.device, dtype=torch.float32)
+    density = _to_float_tensor(track3_density, embeddings)
+    if density is None:
+        return torch.ones(embeddings.shape[0], device=embeddings.device, dtype=torch.float32)
+    if density.ndim > 1:
+        density = ConformalMetric().compute_density(density)
+    density = torch.nan_to_num(density, nan=0.0, posinf=0.0, neginf=0.0)
+    if density.shape[0] != embeddings.shape[0]:
+        density = torch.ones(embeddings.shape[0], device=embeddings.device, dtype=torch.float32)
+    return density.clamp(min=1e-6, max=1.0)
+
+
+def _build_knn_graph(embeddings: torch.Tensor, k_neighbors: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    n_articles = int(embeddings.shape[0])
+    if n_articles <= 1:
+        empty = torch.empty((n_articles, 0), dtype=torch.long, device=embeddings.device)
+        dmat = torch.zeros((n_articles, n_articles), dtype=torch.float32, device=embeddings.device)
+        return empty, dmat
+    k = min(max(int(k_neighbors), 1), n_articles - 1)
+    distance_matrix = torch.cdist(embeddings, embeddings, p=2)
+    neighbors = torch.topk(distance_matrix, k=k + 1, largest=False).indices[:, 1:]
+    return neighbors, distance_matrix
+
+
+def _estimate_shear_field(
+    embeddings: torch.Tensor,
+    scalar_stress: torch.Tensor,
+    distance_matrix: torch.Tensor,
+    k_neighbors: int,
+) -> torch.Tensor:
+    n_articles = int(embeddings.shape[0])
+    if n_articles <= 1:
+        return torch.zeros_like(embeddings)
+
+    k = min(max(int(k_neighbors), 1), n_articles - 1)
+    neighbor_idx = torch.topk(distance_matrix, k=k + 1, largest=False).indices[:, 1:]
+    shear = torch.zeros_like(embeddings)
+
+    for idx in range(n_articles):
+        nbrs = neighbor_idx[idx]
+        if nbrs.numel() == 0:
+            continue
+        dx = embeddings[nbrs] - embeddings[idx]
+        ds = scalar_stress[nbrs] - scalar_stress[idx]
+        dist_sq = (dx * dx).sum(dim=1).clamp(min=1e-6)
+        weights = 1.0 / torch.sqrt(dist_sq)
+        local_grad = (dx * (ds / dist_sq).unsqueeze(1)) * weights.unsqueeze(1)
+        shear[idx] = local_grad.sum(dim=0) / weights.sum().clamp(min=1e-6)
+
+    return torch.nan_to_num(shear, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _build_metric_distance_matrix(
+    embeddings: torch.Tensor,
+    rho: torch.Tensor,
+    shear_vectors: torch.Tensor,
+    euclidean_distance_matrix: torch.Tensor,
+) -> torch.Tensor:
+    euclidean_sq = euclidean_distance_matrix.pow(2)
+    ux = shear_vectors @ embeddings.T
+    ux_diag = torch.diagonal(ux)
+    shear_projection = 0.5 * (ux - ux_diag.unsqueeze(1) + ux_diag.unsqueeze(0) - ux.T)
+    rho_mid = 0.5 * (rho.unsqueeze(1) + rho.unsqueeze(0))
+    metric_sq = euclidean_sq / rho_mid.clamp(min=1e-6) + shear_projection.pow(2)
+    metric_dist = torch.sqrt(metric_sq.clamp(min=0.0))
+    metric_dist.fill_diagonal_(0.0)
+    return torch.nan_to_num(metric_dist, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _build_metric_graph(
+    embeddings: torch.Tensor,
+    rho: torch.Tensor,
+    scalar_stress: torch.Tensor,
+    k_neighbors: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, euclidean_distance_matrix = _build_knn_graph(embeddings, k_neighbors=k_neighbors)
+    shear_vectors = _estimate_shear_field(
+        embeddings=embeddings,
+        scalar_stress=scalar_stress,
+        distance_matrix=euclidean_distance_matrix,
+        k_neighbors=k_neighbors,
+    )
+    metric_distance_matrix = _build_metric_distance_matrix(
+        embeddings=embeddings,
+        rho=rho,
+        shear_vectors=shear_vectors,
+        euclidean_distance_matrix=euclidean_distance_matrix,
+    )
+    n_articles = int(embeddings.shape[0])
+    if n_articles <= 1:
+        empty = torch.empty((n_articles, 0), dtype=torch.long, device=embeddings.device)
+        return empty, metric_distance_matrix, euclidean_distance_matrix, shear_vectors
+    k = min(max(int(k_neighbors), 1), n_articles - 1)
+    neighbors = torch.topk(metric_distance_matrix, k=k + 1, largest=False).indices[:, 1:]
+    return neighbors, metric_distance_matrix, euclidean_distance_matrix, shear_vectors
+
+
+def _metric_horizon(metric_distance_matrix: torch.Tensor, neighbors: torch.Tensor, default: float = 1.0) -> float:
+    if neighbors.numel() == 0:
+        return float(default)
+    edge_costs = metric_distance_matrix.gather(1, neighbors)
+    finite = edge_costs[torch.isfinite(edge_costs) & (edge_costs > 0)]
+    if finite.numel() <= 0:
+        return float(default)
+    return float(torch.quantile(finite, 0.70).item())
+
+
+def _safe_quantile(values: List[float], q: float, default: float) -> float:
+    finite = np.asarray([float(v) for v in values if np.isfinite(v)], dtype=np.float64)
+    if finite.size == 0:
+        return float(default)
+    return float(np.quantile(finite, q))
+
+
+def _legacy_observer_penalty(
+    weights: torch.Tensor,
+    embeddings: torch.Tensor,
+    observer_axis: Optional[torch.Tensor],
+    observer_cost_strength: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    n = weights.shape[0]
+    if observer_axis is None or observer_cost_strength <= 0.0:
+        ones = torch.ones(n, device=weights.device, dtype=torch.float32)
+        zeros = torch.zeros(n, device=weights.device, dtype=torch.float32)
+        return ones, zeros
+    axis = observer_axis.to(device=weights.device, dtype=torch.float32)
+    fused = torch.matmul(weights, embeddings)
+    similarity = torch.nn.functional.cosine_similarity(fused, axis.unsqueeze(0), dim=-1).clamp(-1.0, 1.0)
+    penalty = 1.0 + float(observer_cost_strength) * torch.clamp(1.0 - similarity, min=0.0)
+    return penalty, similarity
+
+
+def _legacy_compute_energy(
+    weights: torch.Tensor,
+    embeddings: torch.Tensor,
+    gradients: torch.Tensor,
+    u_axis: Optional[torch.Tensor],
+    observer_axis: Optional[torch.Tensor],
+    observer_cost_strength: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fused_grad = torch.matmul(weights, gradients)
+    if u_axis is not None:
+        axis = u_axis.to(device=weights.device, dtype=torch.float32)
+        energy = torch.abs((fused_grad * axis.unsqueeze(0)).sum(dim=-1))
+    else:
+        energy = torch.norm(fused_grad, p=2, dim=-1)
+    penalty, similarity = _legacy_observer_penalty(weights, embeddings, observer_axis, observer_cost_strength)
+    if observer_axis is not None and observer_cost_strength > 0.0:
+        energy = energy + torch.clamp(penalty - 1.0, min=0.0)
+    return energy, penalty, similarity
+
+
+def compute_walker_resistance(
+    cls_per_bot: torch.Tensor,
+    rks_basis,
+    u_axis: Optional[torch.Tensor] = None,
+    observer_axis: Optional[torch.Tensor] = None,
+    observer_cost_strength: float = 0.0,
+    temperature: float = 0.5,
+    n_walkers: int = 20,
+    n_steps: int = 10,
+    thermo_config: Optional[ThermodynamicConfig] = None,
+    start_seed: Optional[int] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Legacy per-article simplex walker kept for focused replay compatibility.
+    """
+    embeddings = cls_per_bot.detach().to(dtype=torch.float32)
+    gradients = embeddings - embeddings.mean(dim=0, keepdim=True)
+    thermo = thermo_config or ThermodynamicConfig()
+    if start_seed is not None:
+        torch.manual_seed(int(start_seed))
+
+    n_bots = int(embeddings.shape[0])
+    weights = torch.ones((int(n_walkers), n_bots), device=embeddings.device, dtype=torch.float32) / max(n_bots, 1)
+    trajectory = [weights.clone()]
+    step_work_rows: List[torch.Tensor] = []
+    step_diagnostics: List[Dict[str, Any]] = []
+    cumulative_work = torch.zeros(int(n_walkers), device=embeddings.device, dtype=torch.float32)
+
+    for _step in range(int(max(n_steps, 1))):
+        noise = torch.randn_like(weights) * float(thermo.noise_sigma)
+        proposal = torch.abs(weights + noise)
+        proposal = proposal / proposal.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+        current_energy, current_penalty, current_similarity = _legacy_compute_energy(
+            weights,
+            embeddings,
+            gradients,
+            u_axis,
+            observer_axis,
+            observer_cost_strength,
+        )
+        proposal_energy, proposal_penalty, proposal_similarity = _legacy_compute_energy(
+            proposal,
+            embeddings,
+            gradients,
+            u_axis,
+            observer_axis,
+            observer_cost_strength,
+        )
+        accept_prob = torch.exp(-(proposal_energy - current_energy) / max(float(temperature), 1e-6))
+        accept = torch.rand(int(n_walkers), device=embeddings.device) < accept_prob
+        weights = torch.where(accept.unsqueeze(-1), proposal, weights)
+
+        prev_pos = torch.matmul(trajectory[-1], embeddings)
+        next_pos = torch.matmul(weights, embeddings)
+        mid = (trajectory[-1] + weights) / 2.0
+        fused_mid_grad = torch.matmul(mid, gradients)
+        density = 1.0 / (1.0 + torch.norm(fused_mid_grad, p=2, dim=-1).clamp(max=1000.0))
+        mean_penalty, mean_similarity = _legacy_observer_penalty(mid, embeddings, observer_axis, observer_cost_strength)
+        local_friction = (float(thermo.friction_coefficient) / density.clamp(min=float(thermo.density_clamp_min))) * mean_penalty
+        dist = torch.norm(next_pos - prev_pos, p=2, dim=-1)
+        step_work = local_friction * dist
+        cumulative_work = cumulative_work + step_work
+
+        trajectory.append(weights.clone())
+        step_work_rows.append(step_work)
+        step_diagnostics.append(
+            {
+                "local_friction": float(local_friction.mean().item()),
+                "step_work": float(step_work.mean().item()),
+                "cumulative_work": float(cumulative_work.mean().item()),
+                "observer_penalty": float(mean_penalty.mean().item()),
+                "observer_similarity": float(mean_similarity.mean().item()),
+            }
+        )
+
+    traj = torch.stack(trajectory, dim=0)
+    path_positions = torch.matmul(traj, embeddings)
+    path_xyz = rks_basis(path_positions.reshape(-1, path_positions.shape[-1])).view(path_positions.shape[0], path_positions.shape[1], -1)
+    work = torch.stack(step_work_rows, dim=0).sum(dim=0) if step_work_rows else torch.zeros(int(n_walkers), device=embeddings.device)
+    spectral_distance = torch.norm(path_positions[-1] - path_positions[0], p=2, dim=-1)
+    divergence_ratio = work / spectral_distance.clamp(min=1e-6)
+
+    return {
+        "status": "LEGACY_PATH",
+        "work_integral": float(work.mean().item()) if work.numel() else 0.0,
+        "divergence_ratio": float(divergence_ratio.mean().item()) if divergence_ratio.numel() else 0.0,
+        "spectral_distance": float(spectral_distance.mean().item()) if spectral_distance.numel() else 0.0,
+        "closed_loop": False,
+        "walker_output": path_xyz[-1].mean(dim=0),
+        "path_xyz": path_xyz.mean(dim=1),
+        "final_position": path_positions[-1].mean(dim=0),
+        "observer_cost_strength": float(observer_cost_strength),
+        "step_diagnostics": step_diagnostics,
+    }
+
+
+class SemanticWalker:
+    """
+    Manuscript-aligned Track 4 walker over the article manifold.
+    """
+
+    def __init__(
+        self,
+        embeddings: torch.Tensor,
+        rks_basis,
+        temperature: float = 0.5,
+        track3_density: Optional[torch.Tensor] = None,
+        z_coordinates: Optional[torch.Tensor] = None,
+        metric_stress: Optional[torch.Tensor] = None,
+        article_coords_2d: Optional[torch.Tensor] = None,
+        thermo_config: Optional[ThermodynamicConfig] = None,
+    ):
+        self.embeddings = embeddings.detach().to(dtype=torch.float32)
+        self.kernel = rks_basis
+        self.temperature = float(temperature)
+        self.thermo_config = thermo_config or ThermodynamicConfig()
+        self.track3_density = _reduce_density(track3_density, self.embeddings)
+        self.z_coordinates = _to_float_tensor(z_coordinates, self.embeddings)
+        self.metric_stress = _to_float_tensor(metric_stress, self.embeddings)
+        if self.metric_stress is None:
+            if self.z_coordinates is not None:
+                self.metric_stress = self.z_coordinates.abs().clone()
+            else:
+                self.metric_stress = torch.zeros(self.embeddings.shape[0], device=self.embeddings.device, dtype=torch.float32)
+        elif self.metric_stress.ndim > 1:
+            self.metric_stress = self.metric_stress.norm(dim=-1)
+        if self.z_coordinates is None:
+            self.z_coordinates = self.metric_stress.clone()
+        elif self.z_coordinates.ndim > 1:
+            self.z_coordinates = self.z_coordinates.norm(dim=-1)
+        self.article_coords_2d = _to_float_tensor(article_coords_2d, self.embeddings)
+
+    def select_catalysts(self) -> List[int]:
+        n_articles = int(self.embeddings.shape[0])
+        if n_articles <= 0:
+            return []
+        if n_articles <= 3:
+            return list(range(n_articles))
+        if self.article_coords_2d is None:
+            return [0, n_articles // 2, n_articles - 1]
+
+        influence = torch.abs(self.metric_stress) * self.track3_density
+        working = influence.clone()
+        max_xy = self.article_coords_2d.max(dim=0).values
+        min_xy = self.article_coords_2d.min(dim=0).values
+        exclusion_radius = float(torch.norm(max_xy - min_xy).item()) * 0.25
+        if exclusion_radius <= 0.0:
+            exclusion_radius = 1.0
+
+        catalysts: List[int] = []
+        for _ in range(min(3, n_articles)):
+            idx = int(torch.argmax(working).item())
+            catalysts.append(idx)
+            anchor_xy = self.article_coords_2d[idx]
+            dists = torch.norm(self.article_coords_2d - anchor_xy, p=2, dim=1)
+            working[dists < exclusion_radius] = 0.0
+        return catalysts
+
+    def _simulate_anchor(
+        self,
+        anchor_idx: int,
+        neighbors: torch.Tensor,
+        metric_distance_matrix: torch.Tensor,
+        euclidean_distance_matrix: torch.Tensor,
+        shear_vectors: torch.Tensor,
+        n_walkers: int,
+        max_steps: int,
+        gamma: float,
+        hot_temperature_multiplier: float,
+        rng: np.random.Generator,
+        s_max: float,
+    ) -> Dict[str, Any]:
+        walker_runs: List[Dict[str, Any]] = []
+
+        for walker_idx in range(max(int(n_walkers), 1)):
+            is_hot = walker_idx < 2
+            current_idx = int(anchor_idx)
+            current_temp = self.temperature * (float(hot_temperature_multiplier) if is_hot else 1.0)
+            current_temp = max(current_temp, 1e-6)
+            path = [current_idx]
+            cumulative_work = 0.0
+            max_anchor_distance = 0.0
+            in_retreat = False
+            step_diagnostics: List[Dict[str, Any]] = []
+
+            for _step in range(max(int(max_steps), 1)):
+                candidate_tensor = neighbors[current_idx]
+                if candidate_tensor.numel() == 0:
+                    break
+
+                candidate_indices = candidate_tensor.detach().cpu().numpy()
+                step_delta = metric_distance_matrix[current_idx, candidate_tensor].detach().cpu().numpy()
+                logits = np.exp(-np.clip(step_delta / current_temp, 0.0, 50.0))
+                anchor_dist = metric_distance_matrix[anchor_idx, candidate_tensor].detach().cpu().numpy()
+                if in_retreat:
+                    logits *= np.exp(-np.clip(float(gamma) * anchor_dist, 0.0, 50.0))
+                prob_sum = float(logits.sum())
+                if not np.isfinite(prob_sum) or prob_sum <= 0.0:
+                    break
+
+                probs = logits / prob_sum
+                next_idx = int(rng.choice(candidate_indices, p=probs))
+                step_work = float(metric_distance_matrix[current_idx, next_idx].item())
+                cumulative_work += step_work
+                max_anchor_distance = max(max_anchor_distance, float(metric_distance_matrix[anchor_idx, next_idx].item()))
+
+                step_vector = (self.embeddings[next_idx] - self.embeddings[current_idx]).detach().cpu().numpy().astype(np.float32)
+                rho_mid = 0.5 * float(self.track3_density[current_idx].item() + self.track3_density[next_idx].item())
+                shear_mid = 0.5 * (shear_vectors[current_idx] + shear_vectors[next_idx])
+                shear_projection = float(torch.dot(shear_mid, self.embeddings[next_idx] - self.embeddings[current_idx]).item())
+                step_diagnostics.append(
+                    {
+                        "step_axis_idx": int(next_idx),
+                        "step_axis_vector": step_vector,
+                        "local_friction": float(step_work),
+                        "step_work": float(step_work),
+                        "cumulative_work": float(cumulative_work),
+                        "debt_axis": float(metric_distance_matrix[anchor_idx, next_idx].item()),
+                        "metric_distance": float(step_work),
+                        "euclidean_distance": float(euclidean_distance_matrix[current_idx, next_idx].item()),
+                        "density_midpoint": float(rho_mid),
+                        "shear_projection": float(shear_projection),
+                        "memory_integral": 0.0,
+                        "event_active": bool(in_retreat),
+                        "event_severity": float(step_work / max(s_max, 1e-6)),
+                    }
+                )
+
+                current_idx = next_idx
+                path.append(current_idx)
+
+                if (not in_retreat) and cumulative_work >= s_max:
+                    in_retreat = True
+
+                if in_retreat and current_idx == anchor_idx and len(path) > 1:
+                    break
+
+            closed_loop = bool(in_retreat and current_idx == anchor_idx and len(path) > 1)
+            walker_runs.append(
+                {
+                    "is_hot": bool(is_hot),
+                    "closed_loop": closed_loop,
+                    "path_indices": path,
+                    "work_integral": float(cumulative_work),
+                    "spectral_distance": float(max_anchor_distance),
+                    "divergence_ratio": float(cumulative_work / max(max_anchor_distance, 1e-6)),
+                    "step_diagnostics": step_diagnostics,
+                }
+            )
+
+        successful = [run for run in walker_runs if run["closed_loop"]]
+        cold_successful = [run for run in successful if not run["is_hot"]]
+        if cold_successful:
+            selected = min(cold_successful, key=lambda run: run["work_integral"])
+        elif successful:
+            selected = min(successful, key=lambda run: run["work_integral"])
+        else:
+            selected = max(
+                walker_runs,
+                key=lambda run: (run["spectral_distance"], run["work_integral"], len(run["path_indices"])),
+            )
+
+        path_tensor = self.embeddings[selected["path_indices"]]
+        centroid = path_tensor.mean(dim=0) if path_tensor.numel() > 0 else self.embeddings[anchor_idx]
+        return {
+            "anchor_idx": int(anchor_idx),
+            "work_integral": float(selected["work_integral"]),
+            "spectral_distance": float(selected["spectral_distance"]),
+            "divergence_ratio": float(selected["divergence_ratio"]),
+            "path_indices": list(selected["path_indices"]),
+            "path_xyz": path_tensor.detach().cpu().numpy().astype(np.float32),
+            "walker_output": centroid.detach().clone(),
+            "final_position": self.embeddings[selected["path_indices"][-1]].detach().clone(),
+            "step_diagnostics": selected["step_diagnostics"],
+            "closed_loop": bool(selected["closed_loop"]),
+            "all_runs": walker_runs,
+        }
+
+    def _export_cyclic_paths(
+        self,
+        swarm_records: List[Dict[str, Any]],
+        path_anchor_idx: List[int],
+        path_is_hot: List[bool],
+        output_dir: Optional[str],
+    ) -> None:
+        if not output_dir or not swarm_records:
+            return
+
+        path_xyz = [np.asarray(record["path_xyz"], dtype=np.float32) for record in swarm_records]
+        path_indices = [np.asarray(record.get("path_indices", []), dtype=np.int32) for record in swarm_records]
+        work_integral = np.asarray([float(record["work_integral"]) for record in swarm_records], dtype=np.float32)
+        closed_loop = np.asarray([bool(record["closed_loop"]) for record in swarm_records], dtype=np.bool_)
+        path_anchor_idx_arr = np.asarray([int(idx) for idx in path_anchor_idx], dtype=np.int32)
+        path_is_hot_arr = np.asarray([bool(flag) for flag in path_is_hot], dtype=np.bool_)
+
+        anchor_index_to_runs: Dict[int, List[Dict[str, Any]]] = {}
+        for record, anchor_idx, is_hot in zip(swarm_records, path_anchor_idx, path_is_hot):
+            mechanical_record = dict(record)
+            mechanical_record["is_hot_walker"] = bool(is_hot)
+            anchor_index_to_runs.setdefault(int(anchor_idx), []).append(mechanical_record)
+
+        anchor_indices = np.asarray(sorted(anchor_index_to_runs.keys()), dtype=np.int32)
+        anchor_summaries: List[str] = []
+        for anchor_idx in anchor_indices.tolist():
+            anchor_runs = anchor_index_to_runs.get(anchor_idx, [])
+            hot_runs = [run for run in anchor_runs if bool(run["is_hot_walker"])]
+            cold_runs = [run for run in anchor_runs if not bool(run["is_hot_walker"])]
+            hot_survived = sum(1 for run in hot_runs if bool(run["closed_loop"]))
+            cold_survived = sum(1 for run in cold_runs if bool(run["closed_loop"]))
+            anchor_summaries.append(
+                f"{hot_survived}/{max(len(hot_runs), 1)} Hot Walkers Tunneled | "
+                f"{cold_survived}/{max(len(cold_runs), 1)} Cold Walkers Closed Loop"
+            )
+
+        np.savez_compressed(
+            os.path.join(output_dir, "cyclic_paths.npz"),
+            path_xyz=np.array(path_xyz, dtype=object),
+            path_indices=np.array(path_indices, dtype=object),
+            work_integral=work_integral,
+            closed_loop=closed_loop,
+            path_anchor_idx=path_anchor_idx_arr,
+            path_is_hot=path_is_hot_arr,
+            anchor_indices=anchor_indices,
+            anchor_summary=np.array(anchor_summaries, dtype=object),
+        )
+
+    def run_stress_triggered_cyclic_walk(
+        self,
+        article_ids: Optional[List[str]] = None,
+        max_steps: int = 150,
+        gamma: float = 5.0,
+        k_neighbors: int = 10,
+        start_seed: Optional[int] = None,
+        output_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        n_articles = int(self.embeddings.shape[0])
+        if n_articles == 0:
+            return {
+                "catalyst_indices": [],
+                "swarm_records": [],
+                "swarm_anchor_idx": [],
+                "swarm_is_hot": [],
+                "anchor_summaries": [],
+            }
+
+        rng = np.random.default_rng(int(start_seed) if start_seed is not None else 0)
+        neighbors, metric_distance_matrix, euclidean_distance_matrix, shear_vectors = _build_metric_graph(
+            embeddings=self.embeddings,
+            rho=self.track3_density,
+            scalar_stress=self.metric_stress,
+            k_neighbors=k_neighbors,
+        )
+        s_max = _metric_horizon(metric_distance_matrix, neighbors, default=1.0)
+        if s_max <= 0.0:
+            s_max = 1.0
+
+        catalyst_indices = self.select_catalysts()[:3]
+        swarm_records: List[Dict[str, Any]] = []
+        swarm_anchor_idx: List[int] = []
+        swarm_is_hot: List[bool] = []
+        anchor_summaries: List[str] = []
+
+        for anchor_idx in catalyst_indices:
+            anchor_runs = self._simulate_anchor(
+                anchor_idx=int(anchor_idx),
+                neighbors=neighbors,
+                metric_distance_matrix=metric_distance_matrix,
+                euclidean_distance_matrix=euclidean_distance_matrix,
+                shear_vectors=shear_vectors,
+                n_walkers=5,
+                max_steps=max_steps,
+                gamma=gamma,
+                hot_temperature_multiplier=5.0,
+                rng=rng,
+                s_max=s_max,
+            )["all_runs"]
+
+            hot_survived = 0
+            cold_survived = 0
+            for run in anchor_runs:
+                swarm_records.append(
+                    {
+                        "path_xyz": self.embeddings[run["path_indices"]].detach().cpu().numpy().astype(np.float32),
+                        "path_indices": np.asarray(run["path_indices"], dtype=np.int32),
+                        "work_integral": float(run["work_integral"]),
+                        "closed_loop": bool(run["closed_loop"]),
+                    }
+                )
+                swarm_anchor_idx.append(int(anchor_idx))
+                swarm_is_hot.append(bool(run["is_hot"]))
+                if bool(run["is_hot"]) and bool(run["closed_loop"]):
+                    hot_survived += 1
+                if (not bool(run["is_hot"])) and bool(run["closed_loop"]):
+                    cold_survived += 1
+
+            anchor_summaries.append(
+                f"{hot_survived}/2 Hot Walkers Tunneled | {cold_survived}/3 Cold Walkers Closed Loop"
+            )
+
+        self._export_cyclic_paths(swarm_records, swarm_anchor_idx, swarm_is_hot, output_dir)
+        return {
+            "catalyst_indices": catalyst_indices,
+            "swarm_records": swarm_records,
+            "swarm_anchor_idx": swarm_anchor_idx,
+            "swarm_is_hot": swarm_is_hot,
+            "anchor_summaries": anchor_summaries,
+            "cognitive_horizon": float(s_max),
+        }
+
+    def compute_corpus_walk(
+        self,
+        article_ids: Optional[List[str]] = None,
+        n_walkers: int = 10,
+        max_steps: int = 150,
+        gamma: float = 5.0,
+        k_neighbors: int = 10,
+        hot_temperature_multiplier: float = 5.0,
+        start_seed: Optional[int] = None,
+        output_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        n_articles = int(self.embeddings.shape[0])
+        if n_articles == 0:
+            empty = torch.empty((0, 0), dtype=torch.float32)
+            return {
+                "walker_output": empty,
+                "work_integrals": [],
+                "states": [],
+                "state_records": [],
+                "path_records": [],
+                "step_diagnostics": [],
+            }
+
+        rng = np.random.default_rng(int(start_seed) if start_seed is not None else 0)
+        neighbors, metric_distance_matrix, euclidean_distance_matrix, shear_vectors = _build_metric_graph(
+            embeddings=self.embeddings,
+            rho=self.track3_density,
+            scalar_stress=self.metric_stress,
+            k_neighbors=k_neighbors,
+        )
+        s_max = _metric_horizon(metric_distance_matrix, neighbors, default=1.0)
+        if s_max <= 0.0:
+            s_max = 1.0
+
+        records = [
+            self._simulate_anchor(
+                anchor_idx=article_idx,
+                neighbors=neighbors,
+                metric_distance_matrix=metric_distance_matrix,
+                euclidean_distance_matrix=euclidean_distance_matrix,
+                shear_vectors=shear_vectors,
+                n_walkers=n_walkers,
+                max_steps=max_steps,
+                gamma=gamma,
+                hot_temperature_multiplier=hot_temperature_multiplier,
+                rng=rng,
+                s_max=s_max,
+            )
+            for article_idx in range(n_articles)
+        ]
+
+        walker_output = torch.stack(
+            [record["walker_output"].to(device=self.embeddings.device, dtype=torch.float32) for record in records],
+            dim=0,
+        )
+        work_integrals = [float(record["work_integral"]) for record in records]
+        closed_loop_flags = [bool(record["closed_loop"]) for record in records]
+        states = ["closed_loop" if flag else "open_loop" for flag in closed_loop_flags]
+        state_records = []
+        path_records = []
+        step_diagnostics = []
+
+        for article_idx, record in enumerate(records):
+            state_records.append(
+                {
+                    "label": "closed_loop" if bool(record["closed_loop"]) else "open_loop",
+                    "raw_state": "closed_loop" if bool(record["closed_loop"]) else "open_loop",
+                    "closed_loop": bool(record["closed_loop"]),
+                    "work_integral": float(record["work_integral"]),
+                    "steps": int(max_steps),
+                }
+            )
+            path_records.append(
+                {
+                    "article_idx": int(article_idx),
+                    "bt_uid": article_ids[article_idx] if article_ids and article_idx < len(article_ids) else f"article_{article_idx}",
+                    "path_xyz": record["path_xyz"],
+                    "work_integral": float(record["work_integral"]),
+                    "closed_loop": bool(record["closed_loop"]),
+                    "step_diagnostics": record["step_diagnostics"],
+                }
+            )
+            step_diagnostics.append(
+                {
+                    "article_idx": int(article_idx),
+                    "bt_uid": article_ids[article_idx] if article_ids and article_idx < len(article_ids) else f"article_{article_idx}",
+                    "steps": record["step_diagnostics"],
+                }
+            )
+
+        anchor_swarm = self.run_stress_triggered_cyclic_walk(
+            article_ids=article_ids,
+            max_steps=max_steps,
+            gamma=gamma,
+            k_neighbors=k_neighbors,
+            start_seed=start_seed,
+            output_dir=output_dir,
+        )
+        return {
+            "walker_output": walker_output,
+            "work_integrals": work_integrals,
+            "states": states,
+            "state_records": state_records,
+            "path_records": path_records,
+            "step_diagnostics": step_diagnostics,
+            "catalyst_indices": anchor_swarm.get("catalyst_indices", []),
+            "anchor_summaries": anchor_swarm.get("anchor_summaries", []),
+            "cognitive_horizon": float(s_max),
+        }
+
+
+def compute_corpus_walker_resistance(
+    embeddings: torch.Tensor,
+    rks_basis,
+    track3_density: Optional[torch.Tensor] = None,
+    z_coordinates: Optional[torch.Tensor] = None,
+    metric_stress: Optional[torch.Tensor] = None,
+    article_coords_2d: Optional[torch.Tensor] = None,
+    article_ids: Optional[List[str]] = None,
+    temperature: float = 0.5,
+    n_walkers: int = 10,
+    max_steps: int = 150,
+    gamma: float = 5.0,
+    k_neighbors: int = 10,
+    hot_temperature_multiplier: float = 5.0,
+    thermo_config: Optional[ThermodynamicConfig] = None,
+    start_seed: Optional[int] = None,
+    output_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    walker = SemanticWalker(
+        embeddings=embeddings,
+        rks_basis=rks_basis,
+        temperature=temperature,
+        track3_density=track3_density,
+        z_coordinates=z_coordinates,
+        metric_stress=metric_stress,
+        article_coords_2d=article_coords_2d,
+        thermo_config=thermo_config,
+    )
+    return walker.compute_corpus_walk(
+        article_ids=article_ids,
+        n_walkers=n_walkers,
+        max_steps=max_steps,
+        gamma=gamma,
+        k_neighbors=k_neighbors,
+        hot_temperature_multiplier=hot_temperature_multiplier,
+        start_seed=start_seed,
+        output_dir=output_dir,
+    )
+
+
+def run_cyclic_physarum_ablation(
+    embeddings: torch.Tensor,
+    rks_basis,
+    track3_density: Optional[torch.Tensor],
+    z_coordinates: Optional[torch.Tensor],
+    metric_stress: Optional[torch.Tensor],
+    article_coords_2d: Optional[torch.Tensor],
+    output_dir: str,
+    n_walkers: int = 10,
+    max_steps: int = 1000,
+) -> None:
+    compute_corpus_walker_resistance(
+        embeddings=embeddings,
+        rks_basis=rks_basis,
+        track3_density=track3_density,
+        z_coordinates=z_coordinates,
+        metric_stress=metric_stress,
+        article_coords_2d=article_coords_2d,
+        n_walkers=n_walkers,
+        max_steps=max_steps,
+        output_dir=output_dir,
+    )
+
+\end{CodeBlock}
+\end{document}

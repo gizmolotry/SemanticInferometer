@@ -1,0 +1,1215 @@
+\\documentclass[11pt]{article}
+\\usepackage[T1]{fontenc}
+\\usepackage[utf8]{inputenc}
+\\usepackage{geometry}
+\\usepackage{xcolor}
+\\usepackage{fvextra}
+\\usepackage{hyperref}
+\\geometry{margin=1in}
+\\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{breaklines,breakanywhere,fontsize=\\small}
+
+\begin{document}
+\section*{core/master\\_ablation.py}
+\textbf{Source Path}: \texttt{core/master\\_ablation.py}\par
+\bigskip
+\begin{CodeBlock}
+"""
+core/master_ablation.py
+
+CONSOLIDATED ABLATION FRAMEWORK
+================================
+The "Laboratory" controller for rigorous, reproducible ablation testing.
+
+This module does NOT contain model logic. It imports from complete_pipeline.py
+and core modules, but explicitly controls every critical hyperparameter via
+the AblationConfig dataclass and AblationRunner class.
+
+RELATIONSHIP TO complete_pipeline.py:
+- complete_pipeline.py = "Production" script (default behaviors, general use)
+- master_ablation.py   = "Laboratory" script (explicit control, audit trail)
+They share core/ modules but have different default behaviors.
+
+ABLATION MATRIX:
+| Branch     | Variable         | Null State          | Mature State                  |
+|------------|------------------|---------------------|-------------------------------|
+| Geometry   | Kernel Type      | rbf (Gaussian)      | imq / matern (Student-t)      |
+| Filter     | Backdrop         | None (Raw)          | external_wiki (Signal Iso.)   |
+| Topology   | Aggregation      | linear_avg (Mean)   | superposition (Multimodal)    |
+| Force      | Gradient Scope   | flat_text (Trunc.)  | paragraph_weighted (Struct.)  |
+| Pooling    | Token Pooling    | cls (Legacy)        | mean_pool (Standard)          |
+
+SCIENTIFIC CONSTRAINTS (Hard Invariants):
+- Internal PCA is NEVER allowed (only external backdrop tare)
+- Paragraph awareness is ALWAYS on
+- Logits channel (Track 1) is NEVER kernelized
+- CRN (Common Random Numbers) for reproducible observer composition
+
+USAGE:
+  # Single run with explicit config
+  python -m core.master_ablation --exp-dir experiments_... --kernel imq
+
+  # Full ablation sweep
+  python -m core.master_ablation --exp-dir experiments_... --sweep geometry
+
+  # Matrix sweep (all combinations)
+  python -m core.master_ablation --exp-dir experiments_... --sweep full
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+import datetime
+import hashlib
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import numpy as np
+
+
+# =============================================================================
+# ABLATION CONFIGURATION
+# =============================================================================
+
+@dataclass
+class AblationConfig:
+    """
+    Explicit, auditable configuration for a single ablation run.
+
+    Every parameter that affects the scientific output MUST be declared here.
+    No implicit defaults from other modules are trusted.
+    """
+
+    # --- Identity ---
+    run_name: str = ""
+    run_description: str = ""
+
+    # --- Seeds (Reproducibility) ---
+    observer_seeds: List[int] = field(default_factory=lambda: [42, 420, 4200])
+    basis_seed: int = 42
+    crn_seed: int = 12345
+
+    # --- Data ---
+    corpus_path: str = "data/scraped_articles.jsonl"
+    control_paths: Dict[str, str] = field(default_factory=lambda: {
+        'control_constant': 'data/control_constant.jsonl',
+        'control_shuffled': 'data/control_shuffled.jsonl',
+        'control_random': 'data/control_random.jsonl',
+    })
+    max_articles: int = 500
+    corpora: List[str] = field(default_factory=lambda: [
+        'real', 'control_constant', 'control_shuffled', 'control_random',
+    ])
+
+    # --- Branch 1: GEOMETRY (Kernel Type) ---
+    kernel_type: str = 'imq'         # 'rbf' (null/legacy) | 'imq' | 'matern' | 'laplacian'
+    kernel_nu: float = 1.5           # Matern smoothness (only for matern)
+    kernel_roughness: int = 3        # IMQ Student-t df (only for imq)
+    rks_dim: int = 2048              # RKS output dimension
+    sigma: Optional[float] = None    # Bandwidth (None = auto-estimate)
+    sigma_policy: str = 'median'     # Bandwidth estimation policy
+
+    # --- Branch 2: FILTER (Backdrop / Tare) ---
+    backdrop_mode: str = 'none'      # 'none' (null) | 'external_wiki' (mature)
+    backdrop_path: Optional[str] = None  # Path to global_backdrop_pc1.pt
+    # HARD CONSTRAINT: Internal PCA is NEVER allowed
+    apply_internal_pca: bool = False  # Locked to False. Do not override.
+
+    # --- Branch 3: TOPOLOGY (Aggregation) ---
+    aggregation: str = 'superposition'  # 'linear_avg' (null) | 'superposition' (mature)
+    # linear_avg: φ(Σ w_i · v_i) - legacy muddy mean
+    # superposition: Σ w_i · φ(v_i) - project-first, sum-later
+
+    # --- Branch 4: FORCE (Gradient Scope) ---
+    gradient_scope: str = 'paragraph_weighted'  # 'flat_text' (null) | 'paragraph_weighted' (mature)
+    paragraph_weights: List[float] = field(default_factory=lambda: [0.5, 0.3, 0.2])
+
+    # --- Branch 5: POOLING ---
+    pooling: str = 'mean'            # 'cls' (legacy/null) | 'mean' (mature/standard)
+
+    # --- Dirichlet Fusion ---
+    dirichlet_alpha: float = 1.0
+    n_observers: int = 50
+
+    # --- Channels ---
+    channels: List[str] = field(default_factory=lambda: ['cls', 'logits', 'gradient'])
+
+    # --- Output ---
+    output_dir: str = ''
+    device: str = 'cuda'
+
+    def __post_init__(self):
+        """Enforce hard constraints."""
+        # HARD INVARIANT: No internal PCA ever
+        if self.apply_internal_pca:
+            print("[ABLATION] WARNING: apply_internal_pca forced to False (hard invariant)")
+            self.apply_internal_pca = False
+
+        # Validate kernel
+        valid_kernels = ('rbf', 'imq', 'matern', 'laplacian', 'rq')
+        if self.kernel_type not in valid_kernels:
+            raise ValueError(f"kernel_type must be one of {valid_kernels}, got '{self.kernel_type}'")
+
+        # Validate aggregation
+        if self.aggregation not in ('linear_avg', 'superposition'):
+            raise ValueError(f"aggregation must be 'linear_avg' or 'superposition'")
+
+        # Validate backdrop
+        if self.backdrop_mode == 'external_wiki' and not self.backdrop_path:
+            print("[ABLATION] WARNING: backdrop_mode='external_wiki' but no backdrop_path set")
+
+    @property
+    def config_hash(self) -> str:
+        """Deterministic hash of all scientific parameters."""
+        d = asdict(self)
+        # Remove non-scientific fields
+        for k in ['run_name', 'run_description', 'output_dir', 'device']:
+            d.pop(k, None)
+        raw = json.dumps(d, sort_keys=True, default=str)
+        return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+    def to_manifest(self) -> Dict[str, Any]:
+        """Generate audit manifest for this configuration."""
+        return {
+            'protocol_version': '1.2',
+            'framework': 'master_ablation',
+            'timestamp': datetime.datetime.now().isoformat(),
+            'config_hash': self.config_hash,
+            'scientific_parameters': {
+                'geometry': {
+                    'kernel_type': self.kernel_type,
+                    'kernel_nu': self.kernel_nu,
+                    'kernel_roughness': self.kernel_roughness,
+                    'rks_dim': self.rks_dim,
+                    'sigma': self.sigma,
+                    'sigma_policy': self.sigma_policy,
+                },
+                'filter': {
+                    'backdrop_mode': self.backdrop_mode,
+                    'backdrop_path': self.backdrop_path,
+                    'internal_pca': self.apply_internal_pca,
+                },
+                'topology': {
+                    'aggregation': self.aggregation,
+                    'paragraph_weights': self.paragraph_weights,
+                },
+                'force': {
+                    'gradient_scope': self.gradient_scope,
+                    'paragraph_weights': self.paragraph_weights,
+                },
+                'pooling': {
+                    'method': self.pooling,
+                },
+            },
+            'reproducibility': {
+                'observer_seeds': self.observer_seeds,
+                'basis_seed': self.basis_seed,
+                'crn_seed': self.crn_seed,
+            },
+            'data': {
+                'corpus_path': self.corpus_path,
+                'max_articles': self.max_articles,
+                'corpora': self.corpora,
+            },
+            'evaluation_contract': {
+                'primary_metrics': [
+                    'pairwise_procrustes_residual',
+                    'consensus_fraction',
+                    'residual_fraction',
+                    'structural_invariant_survival_rate',
+                ],
+                'forbidden_judges': [
+                    'analysis/ablation.py',
+                    'tribe_label_nmi',
+                    'red_blue_gray_static_labels',
+                ],
+                'notes': 'Heavy-tailed geometry sweeps are judged downstream by observer alignment and invariant survival, not exogenous label clustering.',
+            },
+        }
+
+
+# =============================================================================
+# ABLATION PRESETS
+# =============================================================================
+
+ABLATION_PRESETS = {
+    # Null states (legacy baselines)
+    'null_geometry': {'kernel_type': 'rbf'},
+    'null_filter': {'backdrop_mode': 'none', 'backdrop_path': None},
+    'null_topology': {'aggregation': 'linear_avg'},
+    'null_force': {'gradient_scope': 'flat_text'},
+    'null_pooling': {'pooling': 'cls'},
+
+    # Mature states (current standard)
+    'mature_geometry_imq': {'kernel_type': 'imq', 'kernel_roughness': 3},
+    'mature_geometry_matern': {'kernel_type': 'matern', 'kernel_nu': 1.5},
+    'mature_filter': {'backdrop_mode': 'external_wiki'},
+    'mature_topology': {'aggregation': 'superposition'},
+    'mature_force': {'gradient_scope': 'paragraph_weighted'},
+    'mature_pooling': {'pooling': 'mean'},
+
+    # Combined presets
+    'full_null': {
+        'kernel_type': 'rbf',
+        'backdrop_mode': 'none',
+        'aggregation': 'linear_avg',
+        'gradient_scope': 'flat_text',
+        'pooling': 'cls',
+    },
+    'full_mature': {
+        'kernel_type': 'imq',
+        'backdrop_mode': 'external_wiki',
+        'aggregation': 'superposition',
+        'gradient_scope': 'paragraph_weighted',
+        'pooling': 'mean',
+    },
+}
+
+
+# =============================================================================
+# SWEEP GENERATORS
+# =============================================================================
+
+def generate_geometry_sweep() -> List[Dict[str, Any]]:
+    """Sweep across kernel types (null vs mature geometry)."""
+    return [
+        {'kernel_type': 'rbf', 'run_name': 'geom_rbf'},
+        {'kernel_type': 'imq', 'kernel_roughness': 3, 'run_name': 'geom_imq_r3'},
+        {'kernel_type': 'imq', 'kernel_roughness': 1, 'run_name': 'geom_imq_r1_cauchy'},
+        {'kernel_type': 'matern', 'kernel_nu': 0.5, 'run_name': 'geom_matern_05'},
+        {'kernel_type': 'matern', 'kernel_nu': 1.5, 'run_name': 'geom_matern_15'},
+        {'kernel_type': 'matern', 'kernel_nu': 2.5, 'run_name': 'geom_matern_25'},
+        {'kernel_type': 'laplacian', 'run_name': 'geom_laplacian'},
+    ]
+
+
+def generate_filter_sweep() -> List[Dict[str, Any]]:
+    """Sweep across backdrop modes (null vs external tare)."""
+    return [
+        {'backdrop_mode': 'none', 'backdrop_path': None, 'run_name': 'filter_none'},
+        {'backdrop_mode': 'external_wiki', 'run_name': 'filter_wiki'},
+    ]
+
+
+def generate_topology_sweep() -> List[Dict[str, Any]]:
+    """Sweep across aggregation methods (null vs superposition)."""
+    return [
+        {'aggregation': 'linear_avg', 'run_name': 'topo_linear_avg'},
+        {'aggregation': 'superposition', 'run_name': 'topo_superposition'},
+    ]
+
+
+def generate_force_sweep() -> List[Dict[str, Any]]:
+    """Sweep across gradient scope (null vs paragraph-weighted)."""
+    return [
+        {'gradient_scope': 'flat_text', 'run_name': 'force_flat'},
+        {'gradient_scope': 'paragraph_weighted', 'run_name': 'force_para'},
+    ]
+
+
+def generate_pooling_sweep() -> List[Dict[str, Any]]:
+    """Sweep across pooling methods."""
+    return [
+        {'pooling': 'cls', 'run_name': 'pool_cls'},
+        {'pooling': 'mean', 'run_name': 'pool_mean'},
+    ]
+
+
+def generate_full_sweep() -> List[Dict[str, Any]]:
+    """
+    Generate the full ablation matrix.
+
+    Crosses: geometry × filter × topology × force
+    (Pooling is fixed to 'mean' in the mature state; 'cls' only as explicit null.)
+    """
+    from itertools import product
+
+    kernels = [
+        {'kernel_type': 'rbf'},
+        {'kernel_type': 'imq', 'kernel_roughness': 3},
+        {'kernel_type': 'matern', 'kernel_nu': 1.5},
+    ]
+    backdrops = [
+        {'backdrop_mode': 'none'},
+        {'backdrop_mode': 'external_wiki'},
+    ]
+    topologies = [
+        {'aggregation': 'linear_avg'},
+        {'aggregation': 'superposition'},
+    ]
+    forces = [
+        {'gradient_scope': 'flat_text'},
+        {'gradient_scope': 'paragraph_weighted'},
+    ]
+
+    configs = []
+    for k, b, t, f in product(kernels, backdrops, topologies, forces):
+        merged = {}
+        merged.update(k)
+        merged.update(b)
+        merged.update(t)
+        merged.update(f)
+        name_parts = [
+            merged['kernel_type'],
+            merged['backdrop_mode'],
+            merged['aggregation'],
+            merged['gradient_scope'],
+        ]
+        merged['run_name'] = '_'.join(name_parts)
+        configs.append(merged)
+
+    return configs
+
+
+SWEEP_GENERATORS = {
+    'geometry': generate_geometry_sweep,
+    'filter': generate_filter_sweep,
+    'topology': generate_topology_sweep,
+    'force': generate_force_sweep,
+    'pooling': generate_pooling_sweep,
+    'full': generate_full_sweep,
+}
+
+
+# =============================================================================
+# ABLATION RUNNER
+# =============================================================================
+
+class AblationRunner:
+    """
+    Executes ablation runs with full audit trail.
+
+    Each run:
+    1. Validates configuration against hard constraints
+    2. Initializes pipeline with explicit overrides
+    3. Runs extraction + projection for each corpus
+    4. Saves results + manifest.json
+    """
+
+    def __init__(self, base_config: AblationConfig):
+        self.base_config = base_config
+
+    def run_single(self, config: AblationConfig) -> Dict[str, Any]:
+        """
+        Execute a single ablation run.
+
+        Returns dict with run metadata and paths to outputs.
+        """
+        from .complete_pipeline import run_multi_observer_experiment_simple
+        from run_full_experiment_suite import (
+            _emit_ablation_results_json,
+            _translate_lab_diagnostics_to_ablation_summary,
+            _normalize_run_provenance,
+            emit_consumer_contract_bundle,
+        )
+
+        run_dir = Path(config.output_dir) / (config.run_name or config.config_hash)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save manifest FIRST (audit trail)
+        manifest = config.to_manifest()
+        manifest_path = run_dir / 'manifest.json'
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2, default=str)
+        print(f"[ABLATION] Manifest saved: {manifest_path}")
+
+        results = {}
+        t_start = time.time()
+
+        for corpus_name in config.corpora:
+            corpus_path = self._resolve_corpus_path(corpus_name, config)
+            if corpus_path is None:
+                print(f"[ABLATION] Skipping {corpus_name}: path not found")
+                continue
+
+            articles = self._load_articles(corpus_path, max_articles=config.max_articles)
+            corpus_dir = run_dir / corpus_name
+            corpus_dir.mkdir(parents=True, exist_ok=True)
+
+            print(
+                f"\n[ABLATION] Corpus={corpus_name} | kernel={config.kernel_type} "
+                f"| observers={len(config.observer_seeds)} | articles={len(articles)}"
+            )
+
+            run_multi_observer_experiment_simple(
+                articles=articles,
+                seeds=config.observer_seeds,
+                use_contrastive=True,
+                use_pca_removal=False,
+                use_cls_tokens=True,
+                shared_pca=False,
+                kernel_type=config.kernel_type,
+                kernel_params=self._kernel_params_for_run(config),
+                use_gru=False,
+                use_multi_framing_rks=True,
+                use_attention=False,
+                use_dirichlet_fusion=True,
+                normalize_features=True,
+                device=config.device,
+                track_variance=True,
+                output_dir=corpus_dir,
+                rks_sigma=config.sigma,
+                corpus_name=corpus_name,
+                emit_label_validation=False,
+                enable_checkpoints=True,
+                dirichlet_alpha=config.dirichlet_alpha,
+                dirichlet_n_observers=config.n_observers,
+                dirichlet_rks_dim=config.rks_dim,
+                dirichlet_basis_seed=config.basis_seed,
+                dirichlet_crn_seed=config.crn_seed,
+                kernel_nu=config.kernel_nu,
+                kernel_roughness=config.kernel_roughness,
+            )
+
+            relativity_result = self._materialize_relativity_payloads(
+                corpus_dir=corpus_dir,
+                articles=articles,
+                config=config,
+                corpus_name=corpus_name,
+                normalize_run_provenance=_normalize_run_provenance,
+            )
+
+            observer_payloads = self._load_observer_payloads(corpus_dir, config.observer_seeds)
+            diagnostics = self._compute_lab_diagnostics(observer_payloads)
+            diagnostics_path = corpus_dir / "lab_diagnostics.json"
+            with open(diagnostics_path, "w", encoding="utf-8") as f:
+                json.dump(diagnostics, f, indent=2, default=str)
+            ablation_payload = _translate_lab_diagnostics_to_ablation_summary(diagnostics, diagnostics_path)
+            ablation_summary_path = corpus_dir / "ablation_summary.json"
+            ablation_summary_path.write_text(json.dumps(ablation_payload, indent=2), encoding="utf-8")
+            _emit_ablation_results_json(corpus_dir, ablation_payload)
+
+            results[corpus_name] = {
+                'output_dir': str(corpus_dir),
+                'corpus_path': corpus_path,
+                'n_articles': len(articles),
+                'observer_files': [str(corpus_dir / f"observer_{seed}.pt") for seed in config.observer_seeds],
+                'relativity_materialization': relativity_result,
+                'diagnostics_path': str(diagnostics_path),
+                'ablation_summary_path': str(ablation_summary_path),
+            }
+
+        for corpus_name, corpus_result in results.items():
+            corpus_dir = Path(corpus_result["output_dir"])
+            try:
+                bundle_result = emit_consumer_contract_bundle(corpus_dir)
+            except Exception as exc:
+                bundle_result = {
+                    "status": "failed",
+                    "error": f"consumer bundle emission failed: {exc}",
+                }
+            corpus_result["consumer_bundle"] = bundle_result
+
+        elapsed = time.time() - t_start
+        manifest['elapsed_seconds'] = elapsed
+        manifest['results'] = results
+
+        # Update manifest with timing
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2, default=str)
+
+        print(f"\n[ABLATION] Run complete: {config.run_name or config.config_hash} ({elapsed:.1f}s)")
+        return manifest
+
+    def run_sweep(self, sweep_name: str) -> List[Dict[str, Any]]:
+        """
+        Execute a named sweep (geometry, filter, topology, force, full).
+        """
+        if sweep_name not in SWEEP_GENERATORS:
+            raise ValueError(f"Unknown sweep: {sweep_name}. Choose from {list(SWEEP_GENERATORS.keys())}")
+
+        overrides_list = SWEEP_GENERATORS[sweep_name]()
+        print(f"[ABLATION] Running sweep '{sweep_name}' with {len(overrides_list)} configurations")
+
+        all_results = []
+        for i, overrides in enumerate(overrides_list):
+            print(f"\n{'='*60}")
+            print(f"[ABLATION] Sweep {i+1}/{len(overrides_list)}: {overrides.get('run_name', '?')}")
+            print(f"{'='*60}")
+
+            config = self._apply_overrides(overrides)
+            result = self.run_single(config)
+            all_results.append(result)
+
+        # Save sweep summary
+        sweep_dir = Path(self.base_config.output_dir)
+        summary_path = sweep_dir / f'sweep_{sweep_name}_summary.json'
+        with open(summary_path, 'w') as f:
+            json.dump({
+                'sweep_name': sweep_name,
+                'n_configs': len(all_results),
+                'timestamp': datetime.datetime.now().isoformat(),
+                'runs': all_results,
+            }, f, indent=2, default=str)
+
+        print(f"\n[ABLATION] Sweep summary: {summary_path}")
+        return all_results
+
+    def _apply_overrides(self, overrides: Dict[str, Any]) -> AblationConfig:
+        """Create a new config from base with overrides applied."""
+        base_dict = asdict(self.base_config)
+        base_dict.update(overrides)
+        return AblationConfig(**base_dict)
+
+    def _config_to_pipeline_kwargs(self, config: AblationConfig) -> Dict[str, Any]:
+        """Map AblationConfig to initialize_full_pipeline kwargs."""
+        return {
+            'device': config.device,
+            'use_cls_tokens': True,  # Always extract embeddings
+            'use_rks': True,
+            'use_gru': False,  # Hard-disabled (known dimension mismatch)
+            'use_attention': False,
+            'pca_remove': False,  # HARD INVARIANT: no internal PCA
+            'kernel_type': config.kernel_type,
+            'kernel_bandwidth': config.sigma,
+            'rks_output_dim': config.rks_dim,
+            'use_dirichlet_fusion': True,
+            'dirichlet_alpha': config.dirichlet_alpha,
+            'dirichlet_n_observers': config.n_observers,
+            'dirichlet_rks_dim': config.rks_dim,
+            'dirichlet_basis_seed': config.basis_seed,
+            'dirichlet_crn_seed': config.crn_seed,
+            'kernel_nu': config.kernel_nu,
+            'kernel_roughness': config.kernel_roughness,
+            'normalize_features': True,
+        }
+
+    def _kernel_params_for_run(self, config: AblationConfig) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if config.kernel_type == 'matern':
+            params['nu'] = float(config.kernel_nu)
+        if config.kernel_type == 'imq':
+            params['roughness'] = int(config.kernel_roughness)
+        return params
+
+    def _load_articles(self, corpus_path: str, max_articles: int) -> List[Dict[str, Any]]:
+        from .canonical_ids import assign_canonical_uids
+
+        articles: List[Dict[str, Any]] = []
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                articles.append(json.loads(line))
+                if max_articles and len(articles) >= max_articles:
+                    break
+
+        articles, _ = assign_canonical_uids(articles)
+        return articles
+
+    def _load_observer_payloads(self, corpus_dir: Path, seeds: List[int]) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for seed in seeds:
+            observer_path = corpus_dir / f"observer_{seed}.pt"
+            if observer_path.exists():
+                payloads.append(torch.load(observer_path, map_location='cpu', weights_only=False))
+        return payloads
+
+    def _materialize_relativity_payloads(
+        self,
+        corpus_dir: Path,
+        articles: List[Dict[str, Any]],
+        config: AblationConfig,
+        corpus_name: str,
+        normalize_run_provenance,
+    ) -> Dict[str, Any]:
+        from .complete_pipeline import BeliefTransformerPipeline, get_git_hash, initialize_full_pipeline
+
+        corpus_dir = Path(corpus_dir)
+        rel_dir = corpus_dir / "relativity_cache"
+        rel_dir.mkdir(parents=True, exist_ok=True)
+
+        if not articles:
+            return {"status": "skipped", "reason": "no articles loaded"}
+
+        existing_local = list(rel_dir.glob("observer_*.pt"))
+        if existing_local and (corpus_dir / "observer_global.pt").exists():
+            return {
+                "status": "already_exists",
+                "observer_payloads": len(existing_local),
+                "seed": int(config.observer_seeds[0]) if config.observer_seeds else int(config.basis_seed),
+            }
+
+        canonical_seed = int(config.observer_seeds[0]) if config.observer_seeds else int(config.basis_seed)
+        pipeline_kwargs = self._config_to_pipeline_kwargs(config)
+        pipeline_kwargs.update(
+            {
+                "output_dim": int(config.rks_dim),
+                "embedding_dim": 8192,
+            }
+        )
+        components = initialize_full_pipeline(
+            random_seed=canonical_seed,
+            **pipeline_kwargs,
+        )
+        pipeline = BeliefTransformerPipeline(
+            components=components,
+            random_seed=canonical_seed,
+            enable_provenance=True,
+            provenance_dir=str(corpus_dir),
+        )
+
+        run_meta = {
+            "kernel": config.kernel_type,
+            "seed": canonical_seed,
+            "channel": "cls",
+            "corpus": corpus_name,
+            "n_articles": len(articles),
+            "git_hash": get_git_hash(),
+        }
+
+        pipeline_config = {
+            "enable_checkpoints": True,
+            "checkpoint_dir": str(corpus_dir),
+            "output_dir": str(corpus_dir),
+        }
+
+        global_result = pipeline.process_month(
+            articles=articles,
+            month_name=f"{corpus_name}_ablation_global",
+            config=pipeline_config,
+        )
+        normalized_global_provenance = normalize_run_provenance(global_result, run_meta)
+        global_result["provenance"] = normalized_global_provenance
+        global_result.setdefault("meta", {})["provenance"] = normalized_global_provenance
+        torch.save(global_result, corpus_dir / "observer_global.pt")
+
+        written = 0
+        for obs_i in range(len(articles)):
+            obs_sub_dir = rel_dir / f"obs_{obs_i}"
+            obs_sub_dir.mkdir(parents=True, exist_ok=True)
+            obs_config = dict(pipeline_config)
+            obs_config["output_dir"] = str(obs_sub_dir)
+            obs_config["checkpoint_dir"] = str(obs_sub_dir)
+            obs_result = pipeline.process_month(
+                articles=articles,
+                month_name=f"{corpus_name}_ablation_obs{obs_i}",
+                config=obs_config,
+                observer_idx=obs_i,
+            )
+            normalized_obs_provenance = normalize_run_provenance(obs_result, run_meta)
+            obs_result["provenance"] = normalized_obs_provenance
+            obs_result.setdefault("meta", {})["provenance"] = normalized_obs_provenance
+            torch.save(obs_result, rel_dir / f"observer_{obs_i}.pt")
+            written += 1
+            del obs_result
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return {
+            "status": "success",
+            "seed": canonical_seed,
+            "observer_payloads": written,
+            "global_payload": str(corpus_dir / "observer_global.pt"),
+        }
+
+    def _compute_lab_diagnostics(self, observer_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        from .procrustes import compute_consensus_and_residuals, procrustes_align
+
+        diagnostics: Dict[str, Any] = {
+            'evaluation_policy': {
+                'label_nmi_used': False,
+                'analysis_ablation_used': False,
+                'primary_metrics': [
+                    'pairwise_procrustes_residual',
+                    'consensus_fraction',
+                    'residual_fraction',
+                    'structural_invariant_survival_rate',
+                ],
+            },
+            'n_observers_loaded': len(observer_payloads),
+        }
+
+        feature_mats: List[torch.Tensor] = []
+        for payload in observer_payloads:
+            features = payload.get('features')
+            if features is None:
+                features = payload.get('embeddings')
+            if features is None:
+                continue
+            feature_mats.append(torch.as_tensor(features, dtype=torch.float32))
+
+        if len(feature_mats) >= 2:
+            align = procrustes_align(feature_mats, reference_idx=0)
+            _consensus, _residuals, variance = compute_consensus_and_residuals(align['aligned'])
+            diagnostics['procrustes'] = {
+                'reference_idx': 0,
+                'mean_distance_before': float(np.mean(align['distances_before'])),
+                'mean_distance_after': float(np.mean(align['distances_after'])),
+                'consensus_fraction': float(variance['consensus_fraction']),
+                'residual_fraction': float(variance['residual_fraction']),
+                'mean_per_observer_residual_energy': float(np.mean(variance['per_observer_residual_energy'])),
+            }
+
+        invariant_fields = [
+            'T1_embeddings',
+            'T1.5_spectral',
+            'T2_kernels',
+            'T3_topology',
+            'walker_states',
+            'walker_work_integrals',
+            'phantom_verdicts',
+        ]
+        per_field = {}
+        for field_name in invariant_fields:
+            alive = 0
+            for payload in observer_payloads:
+                value = payload.get(field_name)
+                if value is None:
+                    continue
+                if hasattr(value, '__len__') and not isinstance(value, (str, bytes)) and len(value) == 0:
+                    continue
+                alive += 1
+            per_field[field_name] = {
+                'alive_observers': int(alive),
+                'survival_rate': float(alive / len(observer_payloads)) if observer_payloads else 0.0,
+            }
+
+        diagnostics['structural_invariants'] = {
+            'per_field': per_field,
+            'mean_survival_rate': float(np.mean([v['survival_rate'] for v in per_field.values()])) if per_field else 0.0,
+        }
+        return diagnostics
+
+    def _resolve_corpus_path(self, corpus_name: str, config: AblationConfig) -> Optional[str]:
+        """Resolve corpus name to file path."""
+        if corpus_name == 'real':
+            p = Path(config.corpus_path)
+            return str(p) if p.exists() else None
+        elif corpus_name in config.control_paths:
+            p = Path(config.control_paths[corpus_name])
+            return str(p) if p.exists() else None
+        return None
+
+
+# =============================================================================
+# LEGACY WIRING REGISTRY
+# =============================================================================
+# Track components that have been superseded by the Jagged Truth Protocol.
+# This registry documents what changed, when, and what the null/mature states are.
+# Use this when wiring up backward-ablation comparisons.
+
+LEGACY_REGISTRY = {
+    'cls_per_bot': {
+        'status': 'superseded',
+        'superseded_by': 'cls_paragraphs + superposition aggregation',
+        'null_behavior': 'Weighted mean of paragraph embeddings in 768d (linear_avg)',
+        'mature_behavior': 'Per-paragraph vectors projected independently then summed in RKS space',
+        'files_affected': ['core/nli_extraction.py'],
+        'protocol': 'Jagged Truth v1.2, Mandate 2',
+    },
+    'cls_token_pooling': {
+        'status': 'superseded',
+        'superseded_by': 'mean_pool (attention-weighted average)',
+        'null_behavior': 'CLS token [0] from last hidden state',
+        'mature_behavior': 'Attention-masked mean of all token hidden states',
+        'files_affected': ['core/nli_extraction.py', 'core/metric_gradients.py'],
+        'protocol': 'Mean Pooling Upgrade',
+    },
+    'internal_pca': {
+        'status': 'disabled',
+        'superseded_by': 'External backdrop tare (global_backdrop_pc1.pt)',
+        'null_behavior': 'No PCA removal (raw signal)',
+        'mature_behavior': 'External Wiki PC1 subtraction at 1.25 Gate',
+        'files_affected': ['core/nli_extraction.py', 'core/complete_pipeline.py'],
+        'protocol': 'Jagged Truth v1.2, Mandate 3',
+    },
+    'rbf_kernel_default': {
+        'status': 'demoted',
+        'superseded_by': 'IMQ / Matern kernels with Student-t sampling',
+        'null_behavior': 'RBF (Gaussian sampling, smooth manifold)',
+        'mature_behavior': 'IMQ (Student-t df=3) or Matern (Student-t df=2nu)',
+        'files_affected': ['core/kernel_library.py', 'core/dirichlet_fusion.py'],
+        'protocol': 'Jagged Truth v1.2, Mandate 1',
+    },
+    'gaussian_rks_sampling': {
+        'status': 'superseded',
+        'superseded_by': 'Kernel-specific spectral measures',
+        'null_behavior': 'torch.randn for all kernel types',
+        'mature_behavior': 'Student-t (IMQ/Matern), Laplace (Laplacian), Gaussian (RBF only)',
+        'files_affected': ['core/dirichlet_fusion.py SharedRKSBasis._sample_basis()'],
+        'protocol': 'Jagged Truth v1.2, Mandate 1',
+    },
+}
+
+
+# =============================================================================
+# MANIFOLD RESOLUTION METRICS (Phase-Space Diagnostics)
+# =============================================================================
+
+def compute_manifold_resolution(
+    vectors_v12: np.ndarray,
+    vectors_v11: Optional[np.ndarray] = None,
+    labels: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """
+    Measure manifold resolution: Does V1.2 (Matern/ZCA/Antagonism) produce
+    tighter, more distinct clusters than V1.1 (RBF/PCA/Magnitude)?
+
+    Metrics:
+    1. Silhouette Score: Cluster separation quality (-1 to 1, higher=better)
+    2. Davies-Bouldin Index: Cluster similarity (lower=better)
+    3. Intra-cluster variance: Compactness of clusters
+    4. Inter-cluster distance: Separation between clusters
+
+    Args:
+        vectors_v12: [N, D] V1.2 integrated vectors
+        vectors_v11: Optional [N, D'] V1.1 baseline vectors for comparison
+        labels: Optional [N] cluster labels (if known)
+
+    Returns:
+        Dict with resolution metrics and comparison
+    """
+    from sklearn.metrics import silhouette_score, davies_bouldin_score
+    from sklearn.cluster import KMeans
+
+    results = {}
+
+    # If no labels, discover clusters via K-means
+    n_clusters = 5  # Reasonable default for framing detection
+    if labels is None:
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels_v12 = kmeans.fit_predict(vectors_v12)
+    else:
+        labels_v12 = labels
+        n_clusters = len(np.unique(labels))
+
+    # V1.2 metrics
+    results['v12'] = {
+        'silhouette': float(silhouette_score(vectors_v12, labels_v12)),
+        'davies_bouldin': float(davies_bouldin_score(vectors_v12, labels_v12)),
+        'n_clusters': n_clusters,
+    }
+
+    # Compute per-cluster stats
+    cluster_variances = []
+    cluster_centers = []
+    for c in range(n_clusters):
+        mask = labels_v12 == c
+        if mask.sum() > 0:
+            cluster_vecs = vectors_v12[mask]
+            cluster_centers.append(cluster_vecs.mean(axis=0))
+            cluster_variances.append(float(cluster_vecs.var()))
+
+    results['v12']['mean_intra_variance'] = float(np.mean(cluster_variances))
+
+    # Inter-cluster distances
+    if len(cluster_centers) > 1:
+        centers = np.stack(cluster_centers)
+        dists = []
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                dists.append(float(np.linalg.norm(centers[i] - centers[j])))
+        results['v12']['mean_inter_distance'] = float(np.mean(dists))
+    else:
+        results['v12']['mean_inter_distance'] = 0.0
+
+    # Compare with V1.1 if provided
+    if vectors_v11 is not None:
+        # Use same cluster labels for fair comparison
+        results['v11'] = {
+            'silhouette': float(silhouette_score(vectors_v11, labels_v12)),
+            'davies_bouldin': float(davies_bouldin_score(vectors_v11, labels_v12)),
+        }
+
+        # Compute improvement ratios
+        results['improvement'] = {
+            'silhouette_gain': results['v12']['silhouette'] - results['v11']['silhouette'],
+            'davies_bouldin_reduction': results['v11']['davies_bouldin'] - results['v12']['davies_bouldin'],
+        }
+
+    return results
+
+
+def compute_track_contributions(
+    particles: List[Any],  # List[IntegratedParticle]
+) -> Dict[str, Any]:
+    """
+    Analyze which track dominates the integrated representation.
+
+    Returns per-track contribution statistics.
+    """
+    if not particles:
+        return {}
+
+    # Extract track contributions
+    track_norms = {
+        'logits': [],
+        'antagonism': [],
+        'hologram': [],
+        'blinker': [],
+        'walker': [],
+    }
+
+    for p in particles:
+        for track_name, track_vec in p.track_contributions.items():
+            if track_vec is not None:
+                norm = float(track_vec.norm().item()) if hasattr(track_vec, 'norm') else float(np.linalg.norm(track_vec))
+                track_norms[track_name].append(norm)
+
+    # Compute statistics
+    results = {}
+    total_contribution = 0.0
+    for track_name, norms in track_norms.items():
+        if norms:
+            mean_norm = float(np.mean(norms))
+            results[track_name] = {
+                'mean_norm': mean_norm,
+                'std_norm': float(np.std(norms)),
+                'min_norm': float(np.min(norms)),
+                'max_norm': float(np.max(norms)),
+            }
+            total_contribution += mean_norm
+
+    # Compute relative contributions
+    if total_contribution > 0:
+        for track_name in results:
+            results[track_name]['relative_contribution'] = results[track_name]['mean_norm'] / total_contribution
+
+    # Find dominant track
+    if results:
+        dominant = max(results.keys(), key=lambda k: results[k].get('mean_norm', 0))
+        results['dominant_track'] = dominant
+
+    return results
+
+
+def compute_singularity_audit(
+    particles: List[Any],  # List[IntegratedParticle]
+) -> Dict[str, Any]:
+    """
+    Audit the Blinker (Track 3) and Walker (Track 4) diagnostics.
+
+    Verifies:
+    - Geometric Mold (T3): Flagging "Blurred" articles
+    - Kinetic Mold (T4): Finding "Highways" between clusters
+
+    Returns detailed singularity breakdown and physics validation.
+    """
+    if not particles:
+        return {}
+
+    # Count singularity types
+    type_counts = {
+        'structural_singularity': 0,
+        'noise': 0,
+        'ideological_barrier': 0,
+        'consensus': 0,
+        'unknown': 0,
+    }
+
+    blinker_values = []
+    walker_values = []
+    liar_scores = []
+
+    for p in particles:
+        type_counts[p.singularity_type] = type_counts.get(p.singularity_type, 0) + 1
+        blinker_values.append(p.blinker_variance)
+        walker_values.append(p.walker_resistance)
+        liar_scores.append(p.liar_score)
+
+    N = len(particles)
+
+    results = {
+        'counts': type_counts,
+        'percentages': {k: v / N * 100 for k, v in type_counts.items()},
+        'blinker': {
+            'mean': float(np.mean(blinker_values)),
+            'std': float(np.std(blinker_values)),
+            'high_variance_pct': sum(1 for v in blinker_values if v > 0.7) / N * 100,
+        },
+        'walker': {
+            'mean': float(np.mean(walker_values)),
+            'std': float(np.std(walker_values)),
+            'high_resistance_pct': sum(1 for v in walker_values if v > 0.7) / N * 100,
+        },
+        'liar': {
+            'mean': float(np.mean(liar_scores)),
+            'std': float(np.std(liar_scores)),
+            'n_liars': sum(1 for s in liar_scores if s > 0.5),
+            'liar_pct': sum(1 for s in liar_scores if s > 0.5) / N * 100,
+        },
+    }
+
+    # Physics validation
+    # High Blinker + High Walker = Structural Singularity (the interesting ones)
+    results['physics_validation'] = {
+        'structural_detected': type_counts['structural_singularity'] > 0,
+        'barriers_detected': type_counts['ideological_barrier'] > 0,
+        'blinker_active': results['blinker']['high_variance_pct'] > 5.0,
+        'walker_active': results['walker']['high_resistance_pct'] > 5.0,
+    }
+
+    return results
+
+
+def run_manifold_diagnostics(
+    pipeline_output: Dict[str, Any],
+    baseline_output: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Run full manifold diagnostics on pipeline output.
+
+    This is the main entry point for ablation-level analysis.
+
+    Args:
+        pipeline_output: Output from complete_pipeline.py with Track 5 results
+        baseline_output: Optional V1.1 baseline output for comparison
+
+    Returns:
+        Comprehensive diagnostic report
+    """
+    results = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'has_phase_space': 'integrated_vectors' in pipeline_output,
+    }
+
+    # Manifold resolution
+    if 'integrated_vectors' in pipeline_output:
+        v12 = pipeline_output['integrated_vectors']
+        v11 = baseline_output.get('features') if baseline_output else None
+
+        results['manifold_resolution'] = compute_manifold_resolution(
+            vectors_v12=v12,
+            vectors_v11=v11,
+        )
+
+    # Track contributions
+    if 'particles' in pipeline_output:
+        # Reconstruct particles from serialized form if needed
+        particles = pipeline_output['particles']
+        if particles and isinstance(particles[0], dict):
+            # Serialized — skip detailed analysis (would need reconstruction)
+            results['track_contributions'] = {'note': 'particles serialized, skipping detailed analysis'}
+        else:
+            results['track_contributions'] = compute_track_contributions(particles)
+            results['singularity_audit'] = compute_singularity_audit(particles)
+
+    # Singularity counts (always available if Track 5 ran)
+    if 'singularity_counts' in pipeline_output:
+        results['singularity_summary'] = pipeline_output['singularity_counts']
+
+    # Liar detection
+    if 'n_liars' in pipeline_output:
+        results['liar_detection'] = {
+            'n_liars': pipeline_output['n_liars'],
+            'mean_liar_score': pipeline_output.get('mean_liar_score', 0.0),
+        }
+
+    return results
+
+
+# =============================================================================
+# CLI INTERFACE
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Belief Transformer - Consolidated Ablation Framework",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Sweeps:
+  geometry   - Kernel types (rbf, imq, matern, laplacian)
+  filter     - Backdrop modes (none, external_wiki)
+  topology   - Aggregation (linear_avg, superposition)
+  force      - Gradient scope (flat_text, paragraph_weighted)
+  pooling    - Token pooling (cls, mean)
+  full       - Cross-product of geometry × filter × topology × force
+
+Presets:
+  full_null    - All null states (legacy baseline)
+  full_mature  - All mature states (current standard)
+        """
+    )
+
+    parser.add_argument('--exp-dir', required=True, help='Output directory for ablation results')
+    parser.add_argument('--sweep', choices=list(SWEEP_GENERATORS.keys()),
+                        help='Run a named sweep')
+    parser.add_argument('--preset', choices=list(ABLATION_PRESETS.keys()),
+                        help='Use a named preset')
+
+    # Individual overrides
+    parser.add_argument('--kernel', choices=['rbf', 'imq', 'matern', 'laplacian'],
+                        help='Kernel type')
+    parser.add_argument('--nu', type=float, help='Matern smoothness parameter')
+    parser.add_argument('--roughness', type=int, help='IMQ roughness (Student-t df)')
+    parser.add_argument('--backdrop', choices=['none', 'external_wiki'],
+                        help='Backdrop mode')
+    parser.add_argument('--backdrop-path', type=str, help='Path to backdrop PC1 file')
+    parser.add_argument('--aggregation', choices=['linear_avg', 'superposition'],
+                        help='Aggregation method')
+    parser.add_argument('--gradient-scope', choices=['flat_text', 'paragraph_weighted'],
+                        help='Gradient scope')
+    parser.add_argument('--pooling', choices=['cls', 'mean'], help='Pooling method')
+    parser.add_argument('--seeds', nargs='+', type=int, default=[42, 420, 4200])
+    parser.add_argument('--max-articles', type=int, default=500)
+    parser.add_argument('--device', default='cuda')
+
+    # Registry inspection
+    parser.add_argument('--show-legacy', action='store_true',
+                        help='Print the legacy wiring registry and exit')
+
+    args = parser.parse_args()
+
+    if args.show_legacy:
+        print("\n" + "="*70)
+        print("LEGACY WIRING REGISTRY")
+        print("="*70)
+        for name, entry in LEGACY_REGISTRY.items():
+            print(f"\n[{entry['status'].upper()}] {name}")
+            print(f"  Superseded by: {entry['superseded_by']}")
+            print(f"  Null:   {entry['null_behavior']}")
+            print(f"  Mature: {entry['mature_behavior']}")
+            print(f"  Files:  {', '.join(entry['files_affected'])}")
+            print(f"  Protocol: {entry['protocol']}")
+        return
+
+    # Build config
+    config = AblationConfig(
+        output_dir=args.exp_dir,
+        observer_seeds=args.seeds,
+        max_articles=args.max_articles,
+        device=args.device,
+    )
+
+    # Apply preset if specified
+    if args.preset:
+        preset = ABLATION_PRESETS[args.preset]
+        for k, v in preset.items():
+            setattr(config, k, v)
+
+    # Apply individual overrides
+    if args.kernel:
+        config.kernel_type = args.kernel
+    if args.nu is not None:
+        config.kernel_nu = args.nu
+    if args.roughness is not None:
+        config.kernel_roughness = args.roughness
+    if args.backdrop:
+        config.backdrop_mode = args.backdrop
+    if args.backdrop_path:
+        config.backdrop_path = args.backdrop_path
+    if args.aggregation:
+        config.aggregation = args.aggregation
+    if args.gradient_scope:
+        config.gradient_scope = args.gradient_scope
+    if args.pooling:
+        config.pooling = args.pooling
+
+    runner = AblationRunner(config)
+
+    if args.sweep:
+        runner.run_sweep(args.sweep)
+    else:
+        runner.run_single(config)
+
+
+if __name__ == '__main__':
+    main()
+
+\end{CodeBlock}
+\end{document}
