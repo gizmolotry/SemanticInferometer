@@ -1,3 +1,6 @@
+SOURCE PATH: analysis/isolated_dash_prototype.py
+================================================================================
+
 #!/usr/bin/env python3
 """
 MONOLITH Artifact Command Center

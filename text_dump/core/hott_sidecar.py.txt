@@ -1,3 +1,6 @@
+SOURCE PATH: core/hott_sidecar.py
+================================================================================
+
 """
 Track 6: HoTT Sidecar — The Proof Engine
 

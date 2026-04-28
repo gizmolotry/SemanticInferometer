@@ -1,0 +1,11 @@
+SOURCE PATH: requirements.txt
+================================================================================
+
+numpy
+scipy
+pandas
+scikit-learn
+pyyaml
+torch
+transformers
+plotly

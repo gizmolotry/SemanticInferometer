@@ -1,3 +1,6 @@
+SOURCE PATH: core/complete_pipeline.py
+================================================================================
+
 """
 complete_pipeline.py  end-to-end orchestration for the Belief Transformer / bias-geometry experiments.
 

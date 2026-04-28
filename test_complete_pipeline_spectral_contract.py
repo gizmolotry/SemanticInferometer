@@ -14,7 +14,7 @@ from core.complete_pipeline import (
 )
 from core.dirichlet_fusion import SharedRKSBasis
 from core.metric_fusion import calculate_unified_metric
-from core.physarum_walk import compute_walker_resistance
+from core.physarum_walk import compute_corpus_walker_resistance, compute_walker_resistance
 
 
 def test_canonical_cls_per_bot_contract_is_magnitude_preserving():
@@ -84,6 +84,7 @@ def test_metric_fusion_prefers_track5_verdict_ledger():
     np.save(run_dir / "features.npy", np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32))
     np.save(run_dir / "spectral_u_axis.npy", np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))
     np.save(run_dir / "walker_work_integrals.npy", np.array([5.0, 50.0], dtype=np.float32))
+    np.save(run_dir / "d_spectral.npy", np.array([1.0, 2.0], dtype=np.float32))
     np.save(run_dir / "spectral_probe_magnitudes.npy", np.array([[1.0, -1.0], [1.0, -1.0]], dtype=np.float32))
     (run_dir / "article_metadata.csv").write_text(
         "index,bt_uid,title\n0,u0,A0\n1,u1,A1\n",
@@ -220,3 +221,55 @@ def test_compute_walker_resistance_observer_cost_changes_path_metrics():
     assert not np.allclose(base_path, conditioned_path, atol=1e-5)
     assert "observer_penalty" in conditioned["step_diagnostics"][0]
     assert "observer_similarity" in conditioned["step_diagnostics"][0]
+
+
+def test_compute_corpus_walker_resistance_returns_article_neighbor_contract():
+    embeddings = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.1, 0.0, 0.0],
+            [1.1, 1.0, 0.0, 0.0],
+            [0.1, 1.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    density = torch.full((4, 4), 0.5, dtype=torch.float32)
+    stress = torch.tensor([0.0, 0.4, 0.9, 0.2], dtype=torch.float32)
+    basis = SharedRKSBasis(input_dim=4, output_dim=4, seed=13, kernel_type="rbf")
+    basis.set_sigma(1.0)
+
+    result = compute_corpus_walker_resistance(
+        embeddings=embeddings,
+        rks_basis=basis,
+        track3_density=density,
+        z_coordinates=stress,
+        metric_stress=stress,
+        article_coords_2d=embeddings[:, :2],
+        article_ids=["a0", "a1", "a2", "a3"],
+        n_walkers=4,
+        max_steps=12,
+        k_neighbors=2,
+        start_seed=7,
+    )
+
+    assert result["walker_output"].shape == embeddings.shape
+    assert len(result["work_integrals"]) == 4
+    assert len(result["states"]) == 4
+    assert len(result["state_records"]) == 4
+    assert len(result["path_records"]) == 4
+    assert len(result["step_diagnostics"]) == 4
+    assert len(result["catalyst_indices"]) <= 3
+    assert len(result["anchor_summaries"]) == len(result["catalyst_indices"])
+    assert all(record["bt_uid"].startswith("a") for record in result["path_records"])
+    assert all(np.asarray(record["path_xyz"], dtype=np.float32).ndim == 2 for record in result["path_records"])
+    assert set(result["states"]).issubset({"closed_loop", "open_loop"})
+    assert all("closed_loop" in record for record in result["state_records"])
+    assert all("work_integral" in record for record in result["state_records"])
+    assert all("closed_loop" in record for record in result["path_records"])
+    assert all("work_integral" in record for record in result["path_records"])
+    non_empty_steps = [record["steps"] for record in result["step_diagnostics"] if record.get("steps")]
+    assert non_empty_steps
+    first_step = non_empty_steps[0][0]
+    assert "metric_distance" in first_step
+    assert "density_midpoint" in first_step
+    assert "shear_projection" in first_step

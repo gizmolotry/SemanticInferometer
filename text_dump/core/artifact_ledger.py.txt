@@ -1,3 +1,6 @@
+SOURCE PATH: core/artifact_ledger.py
+================================================================================
+
 import sys
 from pathlib import Path
 

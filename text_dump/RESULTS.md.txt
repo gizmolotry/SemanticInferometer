@@ -1,3 +1,6 @@
+SOURCE PATH: RESULTS.md
+================================================================================
+
 # Results (Canonical Evidence Ledger)
 
 This file is the single source of truth for thesis-facing results.

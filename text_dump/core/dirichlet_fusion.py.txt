@@ -1,3 +1,6 @@
+SOURCE PATH: core/dirichlet_fusion.py
+================================================================================
+
 """
 dirichlet_fusion.py - Dirichlet Observer Fusion for CLS Embeddings
 

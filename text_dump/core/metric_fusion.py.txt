@@ -1,3 +1,6 @@
+SOURCE PATH: core/metric_fusion.py
+================================================================================
+
 """
 metric_fusion.py - Implements the Track 3 Unified Metric Tensor logic.
 

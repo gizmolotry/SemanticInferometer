@@ -1,0 +1,9 @@
+SOURCE PATH: requirements-dev.txt
+================================================================================
+
+-r requirements.txt
+pytest
+ruff
+black
+mypy
+pre-commit
