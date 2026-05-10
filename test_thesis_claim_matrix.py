@@ -56,6 +56,7 @@ def test_write_thesis_evidence_writes_expected_summary_files(tmp_path: Path):
         "track4_traversal_summary",
         "metric_signal_cartography",
         "variance_separation_summary",
+        "kernel_signal_summary",
         "unsafe_claim_strategy",
     }
     assert all(path.exists() for path in written.values())

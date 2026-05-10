@@ -24,6 +24,7 @@ SUMMARY_FILES = (
     "track4_traversal_summary.json",
     "metric_signal_cartography.json",
     "variance_separation_summary.json",
+    "kernel_signal_summary.json",
     "unsafe_claim_strategy.json",
 )
 DEFAULT_CANONICAL_KERNELS = ["rbf", "laplacian", "rq", "imq"]
@@ -767,6 +768,109 @@ def _summarize_variance_separation(rows: Sequence[Dict[str, Any]]) -> Dict[str, 
             "Variance separation is evaluated as absolute log displacement. Direct observer payload "
             "failure is sensitivity evidence, not a failure of the integrated comprehensive-basis claim."
         ),
+    }
+
+
+def _summarize_kernel_signal(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    kernel_rows = [
+        row for row in rows
+        if row.get("basis") == "comprehensive_results"
+        and row.get("control_family") == "stochastic_controls"
+        and row.get("abs_log_ratio") is not None
+    ]
+    by_metric: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for row in kernel_rows:
+        metric = str(row.get("metric") or "unknown")
+        kernel = str(row.get("kernel") or "unknown")
+        by_metric.setdefault(metric, {}).setdefault(kernel, []).append(row)
+
+    metrics: Dict[str, Any] = {}
+    for metric, kernel_map in sorted(by_metric.items()):
+        per_kernel: Dict[str, Any] = {}
+        for kernel, kernel_specific_rows in sorted(kernel_map.items()):
+            values = [row.get("abs_log_ratio") for row in kernel_specific_rows]
+            directions: Dict[str, int] = {}
+            for row in kernel_specific_rows:
+                direction = str(row.get("direction") or "undefined")
+                directions[direction] = directions.get(direction, 0) + 1
+            per_kernel[kernel] = {
+                "n_rows": len(kernel_specific_rows),
+                "mean_abs_log_ratio": _mean(values),
+                "pass_rate": (
+                    sum(1 for row in kernel_specific_rows if row.get("passes_separation_threshold"))
+                    / float(len(kernel_specific_rows))
+                    if kernel_specific_rows else 0.0
+                ),
+                "direction_counts": directions,
+            }
+        ranked = sorted(
+            [
+                (kernel, stats)
+                for kernel, stats in per_kernel.items()
+                if stats.get("mean_abs_log_ratio") is not None
+            ],
+            key=lambda item: float(item[1].get("mean_abs_log_ratio") or 0.0),
+            reverse=True,
+        )
+        metrics[metric] = {
+            "per_kernel": per_kernel,
+            "ranking": [
+                {
+                    "rank": idx + 1,
+                    "kernel": kernel,
+                    "mean_abs_log_ratio": stats.get("mean_abs_log_ratio"),
+                    "pass_rate": stats.get("pass_rate"),
+                    "direction_counts": stats.get("direction_counts"),
+                }
+                for idx, (kernel, stats) in enumerate(ranked)
+            ],
+            "best_kernel": ranked[0][0] if ranked else None,
+        }
+
+    simple = metrics.get("simple_variance") or {}
+    simple_ranking = simple.get("ranking") or []
+    matern_rank = next(
+        (row for row in simple_ranking if row.get("kernel") == "matern"),
+        None,
+    )
+    best_simple = simple_ranking[0] if simple_ranking else None
+    next_best = simple_ranking[1] if len(simple_ranking) > 1 else None
+    margin_over_next = None
+    if best_simple and next_best:
+        margin_over_next = (
+            float(best_simple.get("mean_abs_log_ratio") or 0.0)
+            - float(next_best.get("mean_abs_log_ratio") or 0.0)
+        )
+    matern_supported = bool(
+        matern_rank
+        and best_simple
+        and best_simple.get("kernel") == "matern"
+        and (matern_rank.get("mean_abs_log_ratio") or 0.0) >= CONTROL_VARIANCE_SEPARATION_ABS_LOG_MIN
+        and (matern_rank.get("pass_rate") or 0.0) >= 1.0
+    )
+
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "primary_basis": "comprehensive_results",
+        "primary_control_family": "stochastic_controls",
+        "metrics": metrics,
+        "student_t_matern_superiority": {
+            "supported": matern_supported,
+            "best_kernel": best_simple.get("kernel") if best_simple else None,
+            "matern_rank": matern_rank.get("rank") if matern_rank else None,
+            "matern_mean_abs_log_ratio": (
+                matern_rank.get("mean_abs_log_ratio") if matern_rank else None
+            ),
+            "best_mean_abs_log_ratio": (
+                best_simple.get("mean_abs_log_ratio") if best_simple else None
+            ),
+            "margin_over_next_kernel": margin_over_next,
+            "interpretation": (
+                "Matérn/Student-t superiority is supported only when Matérn is the top "
+                "comprehensive-basis stochastic-control separator on the primary metric. "
+                "Otherwise treat Matérn as a robustness condition rather than the proven source of signal."
+            ),
+        },
     }
 
 
@@ -2073,6 +2177,9 @@ def build_thesis_evidence(
     variance_separation_summary = _summarize_variance_separation(
         metric_signal_cartography_records
     )
+    kernel_signal_summary = _summarize_kernel_signal(
+        metric_signal_cartography_records
+    )
     seed_dispersion = _mean([row.get("real_procrustes_std") or 0.0 for row in control_safe])
     kernel_pass_map: Dict[str, int] = {}
     kernel_total_map: Dict[str, int] = {}
@@ -2676,6 +2783,13 @@ def build_thesis_evidence(
             "threshold_real_over_stochastic_variance_ratio_max": CONTROL_STOCHASTIC_VARIANCE_RATIO_MAX,
         },
         "stochastic_control_variance_separation": variance_separation_summary,
+        "kernel_signal_summary": {
+            "student_t_matern_superiority": kernel_signal_summary.get(
+                "student_t_matern_superiority"
+            ),
+            "primary_basis": kernel_signal_summary.get("primary_basis"),
+            "primary_control_family": kernel_signal_summary.get("primary_control_family"),
+        },
         "synthetic_recoverability": synthetic_summary,
         "seed_robustness": {
             "mean_real_procrustes_std": seed_dispersion,
@@ -2756,6 +2870,7 @@ def build_thesis_evidence(
         "track4_traversal_summary": track4_traversal_summary,
         "metric_signal_cartography": metric_signal_cartography,
         "variance_separation_summary": variance_separation_summary,
+        "kernel_signal_summary": kernel_signal_summary,
         "unsafe_claim_strategy": unsafe_claim_strategy,
     }
 

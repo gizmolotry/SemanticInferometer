@@ -266,6 +266,35 @@ def test_variance_separation_summary_reports_required_kernels_and_controls(tmp_p
     assert {"Constant", "Shuffled", "Random", "stochastic_controls"}.issubset(control_families)
 
 
+def test_kernel_signal_summary_marks_matern_superiority_as_unsupported_when_rbf_wins(tmp_path: Path):
+    fixture = build_canonical_fixture(tmp_path, kernels=["rbf", "matern", "imq"], channels=["cls"])
+    desired_real = {"rbf": 1.50, "matern": 1.15, "imq": 1.35}
+    for kernel, real_value in desired_real.items():
+        for metrics_path in fixture["runs_dir"].glob(
+            f"experiments_*/{kernel}/cls/real/control_metrics.comprehensive_results.json"
+        ):
+            write_control_metrics(
+                metrics_path,
+                simple_variance_real=real_value,
+                simple_variance_shuffled=1.0,
+                simple_variance_random=1.0,
+                metric_basis="comprehensive_results",
+            )
+
+    payloads = build_thesis_evidence(
+        runs_dir=fixture["runs_dir"],
+        methods_path=fixture["methods"],
+        results_path=fixture["results"],
+    )
+
+    superiority = payloads["kernel_signal_summary"]["student_t_matern_superiority"]
+    assert superiority["supported"] is False
+    assert superiority["best_kernel"] == "rbf"
+    assert superiority["matern_rank"] > 1
+    ranking = payloads["kernel_signal_summary"]["metrics"]["simple_variance"]["ranking"]
+    assert [row["kernel"] for row in ranking] == ["rbf", "imq", "matern"]
+
+
 def test_control_metric_provenance_surfaces_direct_vs_comprehensive_disagreement(tmp_path: Path):
     fixture = build_canonical_fixture(tmp_path)
     real_metrics = (
