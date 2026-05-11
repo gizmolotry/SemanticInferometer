@@ -57,9 +57,51 @@ def test_write_thesis_evidence_writes_expected_summary_files(tmp_path: Path):
         "metric_signal_cartography",
         "variance_separation_summary",
         "kernel_signal_summary",
+        "paper_claim_profile",
         "unsafe_claim_strategy",
+        "paper_claim_profile_csv",
+        "paper_metric_signal_cartography_csv",
+        "paper_basis_comparison_csv",
     }
     assert all(path.exists() for path in written.values())
+    assert written["paper_claim_profile_csv"].read_text(encoding="utf-8").startswith("claim_id,")
+    assert "comprehensive_results" in written["paper_basis_comparison_csv"].read_text(encoding="utf-8")
+
+
+def test_paper_claim_profile_only_promotes_supported_core_claims(tmp_path: Path):
+    fixture = build_canonical_fixture(tmp_path)
+    from thesis_test_support import write_relativity_deltas
+
+    broken_relativity = (
+        fixture["runs_dir"]
+        / "experiments_20260504_010101"
+        / "rbf"
+        / "cls"
+        / "real"
+        / "relativity_deltas.json"
+    )
+    write_relativity_deltas(
+        broken_relativity,
+        mean_coord_delta=0.0,
+        max_coord_delta=0.0,
+        rotation_deg=0.0,
+        path_flip_count=0,
+    )
+
+    payloads = build_thesis_evidence(
+        runs_dir=fixture["runs_dir"],
+        methods_path=fixture["methods"],
+        results_path=fixture["results"],
+    )
+
+    profile = payloads["paper_claim_profile"]
+    assert profile["publication_ready"] is False
+    core_claim_ids = {row["claim_id"] for row in profile["core_claims"]}
+    blocked_claim_ids = {row["claim_id"] for row in profile["blocked_core_claims"]}
+    assert "observer_relativity" not in core_claim_ids
+    assert "observer_relativity" in blocked_claim_ids
+    assert "track4_traversal_validity" not in core_claim_ids
+    assert "stochastic_control_variance_compression" not in core_claim_ids
 
 
 def test_thesis_evidence_can_focus_on_explicit_run_allowlist(tmp_path: Path):

@@ -86,6 +86,11 @@ def main() -> int:
         action="store_true",
         help="Print the scientific_validation_summary payload after writing files.",
     )
+    parser.add_argument(
+        "--publication-profile",
+        action="store_true",
+        help="Require the narrow paper_claim_profile core claims to be publication-ready.",
+    )
     args = parser.parse_args()
 
     suite_manifest_paths = [Path(item) for item in (args.suite_manifest or [])]
@@ -127,6 +132,25 @@ def main() -> int:
     if not focused_ok:
         print(f"[THESIS_EVIDENCE][FAIL] {focused_reason}", file=sys.stderr)
         return 1
+    if args.publication_profile:
+        profile = payloads.get("paper_claim_profile") or {}
+        ready = bool(profile.get("publication_ready", False))
+        core_claims = [
+            row.get("claim_id")
+            for row in profile.get("core_claims", [])
+            if isinstance(row, dict)
+        ]
+        blocked = [
+            row.get("claim_id")
+            for row in profile.get("blocked_core_claims", [])
+            if isinstance(row, dict)
+        ]
+        print(f"Publication profile ready: {ready}")
+        print(f"- core claims: {', '.join(map(str, core_claims))}")
+        if blocked:
+            print(f"- blocked core claims: {', '.join(map(str, blocked))}")
+        if not ready:
+            return 1
     return 0
 
 

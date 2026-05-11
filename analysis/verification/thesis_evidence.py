@@ -25,6 +25,7 @@ SUMMARY_FILES = (
     "metric_signal_cartography.json",
     "variance_separation_summary.json",
     "kernel_signal_summary.json",
+    "paper_claim_profile.json",
     "unsafe_claim_strategy.json",
 )
 DEFAULT_CANONICAL_KERNELS = ["rbf", "laplacian", "rq", "imq"]
@@ -71,6 +72,20 @@ PROCRUSTES_PROVENANCE_REQUIRED_CHECKS = ("crn_locked", "seed_stability")
 PROCRUSTES_PROVENANCE_IGNORED_FAILURES = ("control_ordering",)
 PROCRUSTES_PROVENANCE_OPTIONAL_CHECKS = ("alpha_sweep_sanity",)
 XY_COLLAPSE_EPS = 1e-6
+PAPER_CORE_CLAIM_IDS = (
+    "procrustes_control_separation",
+    "stochastic_control_variance_separation",
+    "observer_relativity",
+    "track5_ablation_coverage",
+    "verification_provenance",
+)
+PAPER_EXPLORATORY_CLAIM_IDS = (
+    "synthetic_recoverability",
+    "track4_traversal_validity",
+    "track4_work_barrier_signal",
+    "control_destruction",
+    "canonical_freeze",
+)
 
 
 @dataclass(frozen=True)
@@ -870,6 +885,172 @@ def _summarize_kernel_signal(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 "comprehensive-basis stochastic-control separator on the primary metric. "
                 "Otherwise treat Matérn as a robustness condition rather than the proven source of signal."
             ),
+        },
+    }
+
+
+def _claim_profile_status(claim: Dict[str, Any]) -> str:
+    claim_id = str(claim.get("claim_id") or "")
+    if claim_id in PAPER_CORE_CLAIM_IDS:
+        return "core_supported" if bool(claim.get("thesis_safe")) else "core_blocked"
+    if str(claim.get("status") or "") == "retired_directional_hypothesis":
+        return "retired"
+    if claim_id in PAPER_EXPLORATORY_CLAIM_IDS:
+        return "exploratory_or_unsupported"
+    return "excluded_from_publication_profile"
+
+
+def _direction_count_string(rows: Sequence[Dict[str, Any]]) -> str:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        direction = str(row.get("direction") or "undefined")
+        counts[direction] = counts.get(direction, 0) + 1
+    return ";".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
+
+def _cartography_table_rows(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    metric_filter: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        metric = str(row.get("metric") or "unknown")
+        if metric_filter and metric not in metric_filter:
+            continue
+        abs_log = row.get("abs_log_ratio")
+        if abs_log is None:
+            continue
+        key = (
+            str(row.get("basis") or "unknown"),
+            metric,
+            str(row.get("kernel") or "unknown"),
+            str(row.get("control_family") or "unknown"),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    table: List[Dict[str, Any]] = []
+    for (basis, metric, kernel, control_family), group_rows in sorted(grouped.items()):
+        ratios = [row.get("ratio_real_over_control") for row in group_rows]
+        abs_logs = [row.get("abs_log_ratio") for row in group_rows]
+        table.append({
+            "basis": basis,
+            "metric": metric,
+            "kernel": kernel,
+            "control_family": control_family,
+            "n_rows": len(group_rows),
+            "mean_ratio_real_over_control": _mean(ratios),
+            "mean_abs_log_ratio": _mean(abs_logs),
+            "pass_rate": (
+                sum(1 for row in group_rows if row.get("passes_separation_threshold"))
+                / float(len(group_rows))
+                if group_rows else 0.0
+            ),
+            "direction_counts": _direction_count_string(group_rows),
+        })
+    return table
+
+
+def _build_paper_claim_profile(
+    *,
+    claim_matrix_claims: Sequence[Dict[str, Any]],
+    metric_signal_cartography_records: Sequence[Dict[str, Any]],
+    variance_separation_summary: Dict[str, Any],
+    kernel_signal_summary: Dict[str, Any],
+    observer_relativity_summary: Dict[str, Any],
+    ablation_matrix: Dict[str, Any],
+) -> Dict[str, Any]:
+    claims_by_id = {str(claim.get("claim_id")): dict(claim) for claim in claim_matrix_claims}
+    core_claims: List[Dict[str, Any]] = []
+    blocked_core_claims: List[Dict[str, Any]] = []
+    claim_rows: List[Dict[str, Any]] = []
+
+    for claim in claim_matrix_claims:
+        claim_id = str(claim.get("claim_id") or "")
+        status = _claim_profile_status(claim)
+        row = {
+            "claim_id": claim_id,
+            "paper_status": status,
+            "thesis_safe": bool(claim.get("thesis_safe")),
+            "point_estimate": claim.get("point_estimate"),
+            "effect_direction": claim.get("effect_direction"),
+            "artifact_family": claim.get("artifact_family"),
+            "missing_evidence_count": len(claim.get("missing_evidence") or []),
+        }
+        claim_rows.append(row)
+        if claim_id in PAPER_CORE_CLAIM_IDS:
+            if bool(claim.get("thesis_safe")):
+                core_claims.append(row)
+            else:
+                blocked_core_claims.append(row)
+
+    missing_core_claim_ids = [
+        claim_id for claim_id in PAPER_CORE_CLAIM_IDS
+        if claim_id not in claims_by_id
+    ]
+    for claim_id in missing_core_claim_ids:
+        blocked_core_claims.append({
+            "claim_id": claim_id,
+            "paper_status": "core_missing",
+            "thesis_safe": False,
+            "point_estimate": None,
+            "effect_direction": None,
+            "artifact_family": None,
+            "missing_evidence_count": 1,
+        })
+
+    metric_table = _cartography_table_rows(
+        metric_signal_cartography_records,
+        metric_filter=set(CONTROL_SIGNAL_CARTOGRAPHY_METRICS),
+    )
+    basis_table = [
+        row for row in metric_table
+        if row["metric"] == "simple_variance"
+        and row["control_family"] == "stochastic_controls"
+        and row["basis"] in CONTROL_SIGNAL_CARTOGRAPHY_BASES
+    ]
+
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "profile_name": "publication_core",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "core_claim_ids_requested": list(PAPER_CORE_CLAIM_IDS),
+        "core_claims": core_claims,
+        "blocked_core_claims": blocked_core_claims,
+        "publication_ready": not blocked_core_claims and len(core_claims) == len(PAPER_CORE_CLAIM_IDS),
+        "interpretation": (
+            "This profile is intentionally narrower than the full thesis matrix. It includes only "
+            "claims that should carry the first publishable methods paper; Track 4 terrain traversal, "
+            "broad all-metric control destruction, and retired directional variance compression remain outside "
+            "the core profile unless their own gates pass in later evidence bundles."
+        ),
+        "headline_findings": {
+            "variance_separation_primary_basis": variance_separation_summary.get("primary_basis"),
+            "variance_separation_mean_abs_log": variance_separation_summary.get("mean_primary_abs_log_ratio"),
+            "direct_payload_sensitivity_mean_abs_log": variance_separation_summary.get("mean_direct_abs_log_ratio"),
+            "observer_relativity_mean_coord_delta": (
+                observer_relativity_summary.get("aggregate") or {}
+            ).get("mean_coord_delta"),
+            "observer_relativity_max_rotation_deg": (
+                observer_relativity_summary.get("aggregate") or {}
+            ).get("max_rotation_deg"),
+            "track5_required_modes_present": ablation_matrix.get("required_modes_present"),
+            "matern_student_t_superiority_supported": (
+                kernel_signal_summary.get("student_t_matern_superiority") or {}
+            ).get("supported"),
+            "best_simple_variance_kernel": (
+                kernel_signal_summary.get("student_t_matern_superiority") or {}
+            ).get("best_kernel"),
+        },
+        "tables": {
+            "claim_profile": claim_rows,
+            "metric_signal_cartography": metric_table,
+            "basis_comparison": basis_table,
+        },
+        "table_files": {
+            "claim_profile": "paper_claim_profile.csv",
+            "metric_signal_cartography": "paper_metric_signal_cartography.csv",
+            "basis_comparison": "paper_basis_comparison.csv",
         },
     }
 
@@ -2855,6 +3036,14 @@ def build_thesis_evidence(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "claims": claim_matrix_claims,
     }
+    paper_claim_profile = _build_paper_claim_profile(
+        claim_matrix_claims=claim_matrix_claims,
+        metric_signal_cartography_records=metric_signal_cartography_records,
+        variance_separation_summary=variance_separation_summary,
+        kernel_signal_summary=kernel_signal_summary,
+        observer_relativity_summary=observer_relativity_summary,
+        ablation_matrix=ablation_matrix,
+    )
     unsafe_claim_strategy = _build_claim_strategy(
         claims_by_id=claims_by_id,
         scientific_validation_summary=scientific_validation_summary,
@@ -2871,6 +3060,7 @@ def build_thesis_evidence(
         "metric_signal_cartography": metric_signal_cartography,
         "variance_separation_summary": variance_separation_summary,
         "kernel_signal_summary": kernel_signal_summary,
+        "paper_claim_profile": paper_claim_profile,
         "unsafe_claim_strategy": unsafe_claim_strategy,
     }
 
@@ -2901,4 +3091,34 @@ def write_thesis_evidence(
         path = out_dir / f"{name}.json"
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         written[name] = path
+    profile = payloads.get("paper_claim_profile") or {}
+    table_files = profile.get("table_files") if isinstance(profile, dict) else {}
+    tables = profile.get("tables") if isinstance(profile, dict) else {}
+    if isinstance(table_files, dict) and isinstance(tables, dict):
+        for table_name, filename in table_files.items():
+            rows = tables.get(table_name) or []
+            if not isinstance(rows, list):
+                continue
+            csv_path = out_dir / str(filename)
+            _write_table_csv(csv_path, rows)
+            written[f"paper_{table_name}_csv"] = csv_path
     return written
+
+
+def _write_table_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    fieldnames: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(str(key))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        if not fieldnames:
+            handle.write("")
+            return
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
