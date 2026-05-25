@@ -3,6 +3,7 @@ import zipfile
 from pathlib import Path
 
 from scripts.build_track4_diagnostic_packet import build_packet, packet_file_count, write_packet_zip
+from scripts.verify_track4_diagnostic_packet import verify_packet as verify_track4_packet
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -81,13 +82,28 @@ def test_build_track4_diagnostic_packet_stays_under_ten_files(tmp_path: Path):
     assert (packet_dir / "evidence" / "track4_terrain_semantics_diagnostics_summary.json").exists()
     assert (packet_dir / "evidence" / "soft_terrain_work_coupling.json").exists()
     assert not (packet_dir / "evidence" / "terrain_contrast_matrix.csv").exists()
+    assert "artifact_manifest.json" in manifest["packet_files"]
+    assert "README.md" in manifest["packet_files"]
+    packet_fingerprints = {
+        row["name"]: row
+        for row in manifest["packet_file_fingerprints"]
+    }
+    assert "artifact_manifest.json" not in packet_fingerprints
+    assert "README.md" in packet_fingerprints
+    copied_soft = [
+        row
+        for row in manifest["copied_artifacts"]
+        if row["packet_relpath"] == "evidence/soft_terrain_work_coupling.json"
+    ][0]
+    assert copied_soft["bytes"] > 0
+    assert len(copied_soft["sha256"]) == 64
     readme = (packet_dir / "README.md").read_text(encoding="utf-8")
     assert "Terrain specificity supported: `true`" in readme
     assert "Pooled soft terrain specificity supported: `false`" in readme
     assert "Matched soft terrain specificity supported: `true`" in readme
     assert "Matched supporting cells: `7` / `9`" in readme
     assert "not a broad semantic-terrain ontology" in readme
-    assert "Bridge_vs_Swamp" in readme
+    assert "Top contrast" not in readme
 
 
 def test_write_track4_diagnostic_packet_zip_preserves_layout(tmp_path: Path):
@@ -106,3 +122,95 @@ def test_write_track4_diagnostic_packet_zip_preserves_layout(tmp_path: Path):
             "artifact_manifest.json",
             "evidence/x.json",
         ]
+
+
+def test_verify_track4_diagnostic_packet_passes_on_generated_packet(tmp_path: Path):
+    source = tmp_path / "diagnostics"
+    source.mkdir()
+    note = tmp_path / "TRACK4_SOFT_TERRAIN_DIAGNOSTIC_20260525.md"
+    note.write_text("# Track 4 note\n", encoding="utf-8")
+    _write_diagnostic_source(source)
+
+    packet_dir = tmp_path / "packet"
+    build_packet(diagnostic_dir=source, out_dir=packet_dir, note_path=note, max_files=10)
+
+    payload = verify_track4_packet(packet_dir)
+
+    assert payload["pass"] is True
+    assert payload["failure_reasons"] == []
+    assert payload["actual_packet_file_count"] == 10
+    assert payload["max_files"] == 10
+    assert payload["verified_file_count"] == 9
+    assert payload["verified_copied_file_count"] == 8
+    assert payload["manifest_fingerprint"]["name"] == "artifact_manifest.json"
+
+
+def test_verify_track4_diagnostic_packet_detects_missing_copied_file(tmp_path: Path):
+    source = tmp_path / "diagnostics"
+    source.mkdir()
+    note = tmp_path / "TRACK4_SOFT_TERRAIN_DIAGNOSTIC_20260525.md"
+    note.write_text("# Track 4 note\n", encoding="utf-8")
+    _write_diagnostic_source(source)
+    packet_dir = tmp_path / "packet"
+    build_packet(diagnostic_dir=source, out_dir=packet_dir, note_path=note, max_files=10)
+    (packet_dir / "evidence" / "soft_terrain_work_coupling.json").unlink()
+
+    payload = verify_track4_packet(packet_dir)
+
+    assert payload["pass"] is False
+    assert "missing_file:evidence/soft_terrain_work_coupling.json" in payload["failure_reasons"]
+    assert "copied_file_missing:evidence/soft_terrain_work_coupling.json" in payload["failure_reasons"]
+    assert "listed_file_missing:evidence/soft_terrain_work_coupling.json" in payload["failure_reasons"]
+
+
+def test_verify_track4_diagnostic_packet_detects_tampered_copied_file(tmp_path: Path):
+    source = tmp_path / "diagnostics"
+    source.mkdir()
+    note = tmp_path / "TRACK4_SOFT_TERRAIN_DIAGNOSTIC_20260525.md"
+    note.write_text("# Track 4 note\n", encoding="utf-8")
+    _write_diagnostic_source(source)
+    packet_dir = tmp_path / "packet"
+    build_packet(diagnostic_dir=source, out_dir=packet_dir, note_path=note, max_files=10)
+    target = packet_dir / "evidence" / "soft_terrain_work_coupling.json"
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload["tampered"] = True
+    target.write_text(json.dumps(payload), encoding="utf-8")
+
+    verification = verify_track4_packet(packet_dir)
+
+    assert verification["pass"] is False
+    assert "fingerprint_mismatch:evidence/soft_terrain_work_coupling.json" in verification["failure_reasons"]
+    assert "copied_file_tampered:evidence/soft_terrain_work_coupling.json" in verification["failure_reasons"]
+
+
+def test_verify_track4_diagnostic_packet_detects_tampered_readme(tmp_path: Path):
+    source = tmp_path / "diagnostics"
+    source.mkdir()
+    note = tmp_path / "TRACK4_SOFT_TERRAIN_DIAGNOSTIC_20260525.md"
+    note.write_text("# Track 4 note\n", encoding="utf-8")
+    _write_diagnostic_source(source)
+    packet_dir = tmp_path / "packet"
+    build_packet(diagnostic_dir=source, out_dir=packet_dir, note_path=note, max_files=10)
+    (packet_dir / "README.md").write_text("tampered", encoding="utf-8")
+
+    verification = verify_track4_packet(packet_dir)
+
+    assert verification["pass"] is False
+    assert "fingerprint_mismatch:README.md" in verification["failure_reasons"]
+
+
+def test_verify_track4_diagnostic_packet_detects_cap_drift(tmp_path: Path):
+    source = tmp_path / "diagnostics"
+    source.mkdir()
+    note = tmp_path / "TRACK4_SOFT_TERRAIN_DIAGNOSTIC_20260525.md"
+    note.write_text("# Track 4 note\n", encoding="utf-8")
+    _write_diagnostic_source(source)
+    packet_dir = tmp_path / "packet"
+    build_packet(diagnostic_dir=source, out_dir=packet_dir, note_path=note, max_files=10)
+    (packet_dir / "extra.txt").write_text("extra", encoding="utf-8")
+
+    payload = verify_track4_packet(packet_dir)
+
+    assert payload["pass"] is False
+    assert "packet_file_count_exceeds_max" in payload["failure_reasons"]
+    assert "unlisted_packet_file:extra.txt" in payload["failure_reasons"]

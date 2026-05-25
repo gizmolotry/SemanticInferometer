@@ -8,6 +8,7 @@ heavy per-run artifacts such as ``cyclic_paths.npz`` and observer tensors.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import zipfile
@@ -55,16 +56,65 @@ def _fmt(value: Any, digits: int = 3) -> str:
     return str(value)
 
 
-def _copy_if_exists(source: Path, target: Path) -> Dict[str, str]:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_if_exists(source: Path, target: Path, packet_dir: Path) -> Dict[str, Any]:
     if not source.exists():
-        return {"name": source.name, "status": "missing", "source": str(source), "packet_path": ""}
+        return {
+            "name": source.name,
+            "status": "missing",
+            "source": str(source),
+            "packet_path": "",
+            "packet_relpath": "",
+            "bytes": None,
+            "sha256": "",
+        }
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
-    return {"name": source.name, "status": "copied", "source": str(source), "packet_path": str(target)}
+    return {
+        "name": source.name,
+        "status": "copied",
+        "source": str(source),
+        "packet_path": str(target),
+        "packet_relpath": str(target.relative_to(packet_dir)).replace("\\", "/"),
+        "bytes": target.stat().st_size,
+        "sha256": _sha256(target),
+    }
 
 
 def packet_file_count(packet_dir: Path) -> int:
     return sum(1 for path in Path(packet_dir).rglob("*") if path.is_file())
+
+
+def packet_file_relpaths(packet_dir: Path) -> List[str]:
+    packet_dir = Path(packet_dir)
+    return sorted(
+        str(path.relative_to(packet_dir)).replace("\\", "/")
+        for path in packet_dir.rglob("*")
+        if path.is_file()
+    )
+
+
+def packet_file_fingerprints(packet_dir: Path) -> List[Dict[str, Any]]:
+    packet_dir = Path(packet_dir)
+    fingerprints: List[Dict[str, Any]] = []
+    for path in sorted(packet_dir.rglob("*")):
+        if not path.is_file() or path.name == "artifact_manifest.json":
+            continue
+        fingerprints.append(
+            {
+                "name": str(path.relative_to(packet_dir)).replace("\\", "/"),
+                "bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+    return fingerprints
 
 
 def build_packet(
@@ -79,10 +129,12 @@ def build_packet(
     note_path = Path(note_path).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    copied: List[Dict[str, str]] = []
+    copied: List[Dict[str, Any]] = []
     for file_name in PACKET_FILES:
-        copied.append(_copy_if_exists(diagnostic_dir / file_name, out_dir / "evidence" / file_name))
-    copied.append(_copy_if_exists(note_path, out_dir / note_path.name))
+        copied.append(
+            _copy_if_exists(diagnostic_dir / file_name, out_dir / "evidence" / file_name, out_dir)
+        )
+    copied.append(_copy_if_exists(note_path, out_dir / note_path.name, out_dir))
 
     summary = _load_json(diagnostic_dir / "track4_terrain_semantics_diagnostics_summary.json")
     construct = _load_json(diagnostic_dir / "terrain_construct_validity.json")
@@ -93,7 +145,6 @@ def build_packet(
     soft = _load_json(diagnostic_dir / "soft_terrain_work_coupling.json")
     targeted = _load_json(diagnostic_dir / "targeted_event_pair_results.json")
     claim_boundary = summary.get("claim_boundary", {}) if isinstance(summary, dict) else {}
-    top_contrast = (contrast.get("ranked_contrasts") or [{}])[0] if isinstance(contrast, dict) else {}
     matched = soft.get("matched_cell_specificity", {}) if isinstance(soft.get("matched_cell_specificity"), dict) else {}
 
     readme = f"""# Track 4 Terrain Semantics Diagnostic Packet
@@ -135,15 +186,14 @@ not claim-ready.
 - Matched soft terrain pass rate: `{_fmt(matched.get("matched_cell_pass_rate"))}`
 - Matched supporting cells: `{_fmt(matched.get("supporting_cell_count"), 0)}` / `{_fmt(matched.get("usable_matched_cell_count"), 0)}`
 - Median matched excess correlation: `{_fmt(matched.get("median_excess_corr_real_minus_control"))}`
-- Top contrast: `{top_contrast.get("contrast", "n/a")}` with mean work gap `{_fmt(top_contrast.get("mean_work_gap_abs"))}`
 - Walker score range: `{_fmt(walker.get("score_range"))}`
 - Work/path-edge correlation: `{_fmt((work.get("confound_correlations") or {}).get("work_vs_path_edge_count"))}`
 - Targeted event-pair result: `{targeted.get("status", "n/a")}`
 
 ## Files
 
-The `evidence/` folder contains JSON/CSV summaries. The Markdown note contains
-the human-readable interpretation and recommended next experiment.
+The `evidence/` folder contains compact JSON summaries. The Markdown note
+contains the human-readable interpretation and recommended next experiment.
 """
     (out_dir / "README.md").write_text(readme, encoding="utf-8")
 
@@ -158,9 +208,13 @@ the human-readable interpretation and recommended next experiment.
         "copied_artifacts": copied,
         "claim_boundary": claim_boundary,
         "file_count": packet_file_count(out_dir),
+        "packet_files": [],
+        "packet_file_fingerprints": [],
     }
     (out_dir / "artifact_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     manifest["file_count"] = packet_file_count(out_dir)
+    manifest["packet_files"] = packet_file_relpaths(out_dir)
+    manifest["packet_file_fingerprints"] = packet_file_fingerprints(out_dir)
     (out_dir / "artifact_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if manifest["file_count"] > int(max_files):
         raise RuntimeError(f"Track 4 diagnostic packet has {manifest['file_count']} files; max_files={max_files}")
