@@ -167,6 +167,7 @@ def test_build_focused_paper_packet_caps_output_at_ten_files(tmp_path: Path):
     assert terrain["claim_boundary"]["pooled_soft_terrain_specificity_supported"] is False
     assert terrain["soft_terrain"]["supporting_cell_count"] == 7
     assert terrain["soft_terrain"]["usable_matched_cell_count"] == 9
+    assert "does not promote hard terrain ontology" in terrain["interpretation"]
 
 
 def test_build_focused_paper_packet_rejects_overlarge_packets(tmp_path: Path):

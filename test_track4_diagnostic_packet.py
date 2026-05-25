@@ -86,6 +86,7 @@ def test_build_track4_diagnostic_packet_stays_under_ten_files(tmp_path: Path):
     assert "Pooled soft terrain specificity supported: `false`" in readme
     assert "Matched soft terrain specificity supported: `true`" in readme
     assert "Matched supporting cells: `7` / `9`" in readme
+    assert "not a broad semantic-terrain ontology" in readme
     assert "Bridge_vs_Swamp" in readme
 
 
