@@ -9,10 +9,10 @@ import numpy as np
 
 
 LOCAL_RECOMPUTE_MODE = "local_track_recompute"
-LOCAL_RECOMPUTE_DEFAULT_VARIANT = "focus_weighted_rks"
+LOCAL_RECOMPUTE_DEFAULT_VARIANT = "uniform_weighted_rks"
 LOCAL_RECOMPUTE_VARIANTS = (
     LOCAL_RECOMPUTE_DEFAULT_VARIANT,
-    "uniform_weighted_rks",
+    "focus_weighted_rks",
     "local_tangent_pca",
     "cls_mean_pca",
 )
@@ -188,7 +188,7 @@ def _track2_features_for_variant(
     focus_idx: int,
     variant: str,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    if variant in {LOCAL_RECOMPUTE_DEFAULT_VARIANT, "uniform_weighted_rks"}:
+    if variant in {"focus_weighted_rks", "uniform_weighted_rks"}:
         features, diag = _project_track2(local_tangent, payload)
         diag = dict(diag)
         diag["variant_projection_policy"] = "rks_project_local_tangent"

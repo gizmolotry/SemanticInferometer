@@ -393,6 +393,62 @@ def _test_metric_mean(results: Sequence[Mapping[str, Any]], test_name: str, metr
     return _mean(values)
 
 
+def _anchor_failure_diagnostics(results: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Summarize which recenter anchors fail strict validation most often."""
+
+    by_anchor: Dict[str, Dict[str, Any]] = {}
+    for result in results:
+        for observer in result.get("observers", []) or []:
+            if not isinstance(observer, Mapping):
+                continue
+            anchor_label = str(observer.get("anchor_label") or observer.get("anchor_idx") or "unknown")
+            anchor = by_anchor.setdefault(
+                anchor_label,
+                {
+                    "anchor_label": anchor_label,
+                    "observer_count": 0,
+                    "pass_count": 0,
+                    "failed_test_counts": Counter(),
+                    "primary_gains": [],
+                    "kernels": set(),
+                    "seeds": set(),
+                },
+            )
+            anchor["observer_count"] += 1
+            anchor["kernels"].add(str(result.get("kernel") or "unknown"))
+            anchor["seeds"].add(str(result.get("seed") or "unknown"))
+            gain = _primary_gain(observer)
+            if gain is not None:
+                anchor["primary_gains"].append(gain)
+            tests = ((observer.get("label_geometry_tests") or {}).get("tests") or {})
+            failed_any = False
+            for test_name, test_payload in tests.items():
+                if isinstance(test_payload, Mapping) and not bool(test_payload.get("pass")):
+                    anchor["failed_test_counts"][str(test_name)] += 1
+                    failed_any = True
+            if not failed_any and tests:
+                anchor["pass_count"] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for anchor in by_anchor.values():
+        observer_count = int(anchor["observer_count"])
+        pass_count = int(anchor["pass_count"])
+        failed = dict(sorted(anchor["failed_test_counts"].items()))
+        rows.append(
+            {
+                "anchor_label": anchor["anchor_label"],
+                "observer_count": observer_count,
+                "pass_count": pass_count,
+                "pass_rate": float(pass_count / observer_count) if observer_count else None,
+                "mean_primary_label_gain": _mean(anchor["primary_gains"]),
+                "failed_test_counts": failed,
+                "kernels": sorted(anchor["kernels"]),
+                "seeds": sorted(anchor["seeds"]),
+            }
+        )
+    return sorted(rows, key=lambda row: (float(row["pass_rate"] or 0.0), row["anchor_label"]))
+
+
 def aggregate_results(cell_results: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     by_baseline: Dict[str, List[Mapping[str, Any]]] = {}
     for cell in cell_results:
@@ -421,6 +477,7 @@ def aggregate_results(cell_results: Sequence[Mapping[str, Any]]) -> Dict[str, An
             "mean_silhouette_gain": _test_metric_mean(rows, "silhouette", "silhouette_gain_over_translation"),
             "mean_nmi_gain": _test_metric_mean(rows, "ari_nmi", "nmi_gain_over_translation"),
             "suite_status_counts": dict(sorted(suite_pass_counts.items())),
+            "anchor_diagnostics": _anchor_failure_diagnostics(rows),
         }
     return aggregates
 
