@@ -1,1 +1,0 @@
-{"schema_version": "1", "cache_version": "1", "dataset_hash": "abc12345", "code_hash_or_commit": "deadbeef", "weights_hash": "feedf00d", "kernel_params": {"kernel": "rbf"}, "rks_dim": 2048, "crn_seed": 12345, "alpha": 1.0, "timestamp_utc": "2026-02-26T00:00:00Z", "verification_status": "VERIFIED"}
