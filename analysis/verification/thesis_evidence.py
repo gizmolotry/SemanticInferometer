@@ -12,8 +12,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from analysis.verification.scientific_summaries import (
     summarize_observer_relativity,
+    summarize_terrain_incremental_signal,
     summarize_track4_traversal,
 )
+from scripts.summarize_track4_action_graph_runs import evaluate_observer_state_claim
 
 EVIDENCE_SCHEMA_VERSION = "1.0"
 SUMMARY_FILES = (
@@ -22,6 +24,8 @@ SUMMARY_FILES = (
     "ablation_matrix.json",
     "observer_relativity_summary.json",
     "track4_traversal_summary.json",
+    "terrain_incremental_signal_summary.json",
+    "track4_observer_state_action_summary.json",
     "metric_signal_cartography.json",
     "variance_separation_summary.json",
     "kernel_signal_summary.json",
@@ -83,6 +87,9 @@ PAPER_EXPLORATORY_CLAIM_IDS = (
     "synthetic_recoverability",
     "track4_traversal_validity",
     "track4_work_barrier_signal",
+    "track4_observer_state_action_only_separation",
+    "track4_observer_state_action_separation",
+    "terrain_incremental_signal",
     "control_destruction",
     "canonical_freeze",
 )
@@ -130,6 +137,230 @@ def _load_json(path: Path) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {path}")
     return payload
+
+
+def _track4_observer_state_no_data() -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "summary_type": "track4_observer_state_ablation",
+        "status": "NO_DATA",
+        "claim_scope": "exploratory_track4",
+        "safe_for_thesis_claim": False,
+        "pass": False,
+        "thesis_safe": False,
+        "row_count": 0,
+        "rows": [],
+        "required_kernels_present": False,
+        "observer_simplex_contract_supported": False,
+        "comparisons": {"real_vs_control": {}},
+        "baseline_comparisons": {},
+    }
+    summary["claim_evaluation"] = evaluate_observer_state_claim(summary)
+    return summary
+
+
+def _track4_observer_state_scoped_finding(path: Path, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    claim = payload.get("claim_evaluation")
+    if not isinstance(claim, dict):
+        claim = evaluate_observer_state_claim(payload)
+    if not bool(claim.get("safe_for_thesis_claim")):
+        return None
+    required_bases = payload.get("required_bases") or claim.get("required_bases") or []
+    if not isinstance(required_bases, list):
+        required_bases = [required_bases]
+    scope = [str(value) for value in required_bases if str(value)]
+    if not scope:
+        parent = path.parent.name.lower()
+        if "track2" in parent:
+            scope = ["track2"]
+        elif "integrated" in parent:
+            scope = ["integrated"]
+        elif "logits" in parent:
+            scope = ["logits_flat"]
+    if not scope:
+        return None
+    return {
+        "scope_type": "track4_basis",
+        "scope_values": scope,
+        "source_path": str(path),
+        "point_estimate": claim.get("point_estimate"),
+        "effect_direction": claim.get("effect_direction"),
+        "required_kernels": payload.get("required_kernels", claim.get("required_kernels")),
+        "required_seeds": payload.get("required_seeds", claim.get("required_seeds")),
+        "required_bases": required_bases,
+        "action_ratio_by_kernel": claim.get("action_ratio_by_kernel", payload.get("action_ratio_by_kernel")),
+        "action_ratio_by_seed": claim.get("action_ratio_by_seed", payload.get("action_ratio_by_seed")),
+        "action_ratio_by_basis": claim.get("action_ratio_by_basis", payload.get("action_ratio_by_basis")),
+        "dispersion_across_kernels": claim.get(
+            "dispersion_across_kernels",
+            payload.get("dispersion_across_kernels"),
+        ),
+        "dispersion_across_seeds": claim.get(
+            "dispersion_across_seeds",
+            payload.get("dispersion_across_seeds"),
+        ),
+        "dispersion_across_bases": claim.get(
+            "dispersion_across_bases",
+            payload.get("dispersion_across_bases"),
+        ),
+        "claim_scope": claim.get("claim_scope"),
+    }
+
+
+def _track4_summary_family_key(path: Path, graph_root: Path) -> str:
+    summary_root = path.parent.parent if path.parent.name.lower().startswith("summary") else path.parent
+    try:
+        summary_root.relative_to(graph_root)
+    except ValueError:
+        return str(summary_root.resolve())
+    if summary_root == graph_root:
+        return str(graph_root.resolve())
+    root_name = summary_root.name
+    if "_parallel_" in root_name:
+        return root_name.split("_parallel_", 1)[0]
+    return root_name
+
+
+def _load_track4_observer_state_action_summary(
+    *,
+    runs_dir: Path,
+    repo_root: Path,
+    preferred_summary_path: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], Optional[Path]]:
+    outputs_root = runs_dir.parents[1] if len(runs_dir.parents) > 1 else repo_root / "outputs"
+    candidates = [
+        runs_dir / "track4_observer_state_action_summary.json",
+        outputs_root / "track4_action_graph" / "track4_observer_state_ablation_summary.json",
+        outputs_root / "track4_action_graph" / "observer_state_ablation_summary.json",
+    ]
+    if preferred_summary_path is not None:
+        candidates.insert(0, preferred_summary_path)
+    graph_root = outputs_root / "track4_action_graph"
+    if graph_root.exists():
+        candidates.extend(sorted(graph_root.glob("**/track4_observer_state_ablation_summary.json")))
+    existing = []
+    seen_paths: Set[Path] = set()
+    for path in candidates:
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        existing.append(path)
+    if not existing:
+        return _track4_observer_state_no_data(), None
+    loaded_candidates: List[Dict[str, Any]] = []
+    unreadable_candidates: List[Dict[str, Any]] = []
+    preferred_resolved = preferred_summary_path.resolve() if preferred_summary_path is not None else None
+    for path in existing:
+        try:
+            candidate_payload = _load_json(path)
+        except Exception as exc:
+            unreadable_candidates.append(
+                {
+                    "path": str(path),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
+        claim = candidate_payload.get("claim_evaluation")
+        if not isinstance(claim, dict):
+            claim = evaluate_observer_state_claim(candidate_payload)
+            candidate_payload["claim_evaluation"] = claim
+        else:
+            evaluated_claim = evaluate_observer_state_claim(candidate_payload)
+            for key, value in evaluated_claim.items():
+                claim.setdefault(key, value)
+            candidate_payload["claim_evaluation"] = claim
+        candidate_payload.setdefault("safe_for_thesis_claim", bool(claim.get("safe_for_thesis_claim")))
+        candidate_payload.setdefault("pass", bool(claim.get("pass")))
+        candidate_payload.setdefault("thesis_safe", bool(claim.get("thesis_safe")))
+        path_parts = {part.lower() for part in path.parts}
+        try:
+            relative_depth = len(path.relative_to(graph_root).parts)
+        except ValueError:
+            relative_depth = len(path.parts)
+        loaded_candidates.append(
+            {
+                "path": path,
+                "payload": candidate_payload,
+                "claim": claim,
+                "safe": bool(claim.get("safe_for_thesis_claim")),
+                "summary_all": "summary_all" in path_parts,
+                "relative_depth": relative_depth,
+                "mtime": path.stat().st_mtime,
+                "explicit": preferred_resolved is not None and path.resolve() == preferred_resolved,
+            }
+        )
+    if not loaded_candidates:
+        return _track4_observer_state_no_data(), None
+
+    latest_record = max(
+        loaded_candidates,
+        key=lambda item: (
+            1 if bool(item["summary_all"]) else 0,
+            float(item["mtime"]),
+        ),
+    )
+    selected_record = max(
+        loaded_candidates,
+        key=lambda item: (
+            1 if bool(item["explicit"]) else 0,
+            1 if bool(item["safe"]) else 0,
+            1 if bool(item["summary_all"]) else 0,
+            -int(item["relative_depth"]),
+            float(item["mtime"]),
+        ),
+    )
+    latest = Path(selected_record["path"])
+    payload = dict(selected_record["payload"])
+    selected_family_key = _track4_summary_family_key(latest, graph_root)
+    scoped_by_scope: Dict[str, Tuple[Tuple[int, int, int, float], Dict[str, Any]]] = {}
+    for item in loaded_candidates:
+        path = Path(item["path"])
+        if _track4_summary_family_key(path, graph_root) != selected_family_key:
+            continue
+        finding = _track4_observer_state_scoped_finding(path, item["payload"])
+        if finding is not None:
+            scope_key = ",".join(finding.get("scope_values") or [])
+            rank = (
+                1 if path == latest else 0,
+                1 if bool(item["summary_all"]) else 0,
+                -int(item["relative_depth"]),
+                float(item["mtime"]),
+            )
+            previous = scoped_by_scope.get(scope_key)
+            if previous is None or rank > previous[0]:
+                scoped_by_scope[scope_key] = (rank, finding)
+    scoped_findings = [payload for _, payload in scoped_by_scope.values()]
+    scoped_findings.sort(
+        key=lambda finding: (
+            ",".join(finding.get("scope_values") or []),
+            str(finding.get("source_path") or ""),
+        )
+    )
+    payload["scoped_supported_findings"] = scoped_findings
+    payload["selection_policy"] = (
+        "explicit_summary_path_then_thesis_safe_then_summary_all_then_mtime"
+        if preferred_summary_path is not None
+        else "thesis_safe_then_summary_all_then_mtime"
+    )
+    payload["candidate_inventory"] = {
+        "candidate_count": len(loaded_candidates),
+        "unreadable_candidate_count": len(unreadable_candidates),
+        "unreadable_candidates": unreadable_candidates[:25],
+        "safe_candidate_count": sum(1 for item in loaded_candidates if bool(item["safe"])),
+        "unsafe_candidate_count": sum(1 for item in loaded_candidates if not bool(item["safe"])),
+        "summary_all_candidate_count": sum(1 for item in loaded_candidates if bool(item["summary_all"])),
+        "selected_source_path": str(latest),
+        "selected_family_key": selected_family_key,
+        "latest_summary_all_preferred_by_old_policy": str(latest_record["path"]),
+        "latest_summary_all_safe_for_thesis": bool(latest_record["safe"]),
+    }
+    payload["source_path"] = str(latest)
+    return payload, latest
 
 
 def _load_csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -896,7 +1127,7 @@ def _claim_profile_status(claim: Dict[str, Any]) -> str:
     if str(claim.get("status") or "") == "retired_directional_hypothesis":
         return "retired"
     if claim_id in PAPER_EXPLORATORY_CLAIM_IDS:
-        return "exploratory_or_unsupported"
+        return "secondary_supported" if bool(claim.get("thesis_safe")) else "exploratory_or_unsupported"
     return "excluded_from_publication_profile"
 
 
@@ -957,6 +1188,7 @@ def _build_paper_claim_profile(
     metric_signal_cartography_records: Sequence[Dict[str, Any]],
     variance_separation_summary: Dict[str, Any],
     kernel_signal_summary: Dict[str, Any],
+    synthetic_summary: Dict[str, Any],
     observer_relativity_summary: Dict[str, Any],
     ablation_matrix: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -1028,6 +1260,10 @@ def _build_paper_claim_profile(
             "variance_separation_primary_basis": variance_separation_summary.get("primary_basis"),
             "variance_separation_mean_abs_log": variance_separation_summary.get("mean_primary_abs_log_ratio"),
             "direct_payload_sensitivity_mean_abs_log": variance_separation_summary.get("mean_direct_abs_log_ratio"),
+            "synthetic_recoverability_mean_nmi": synthetic_summary.get("mean_nmi"),
+            "synthetic_recoverability_std_nmi": synthetic_summary.get("std_nmi"),
+            "synthetic_recoverability_mean_ari": synthetic_summary.get("mean_ari"),
+            "synthetic_recoverability_thesis_safe": synthetic_summary.get("thesis_safe"),
             "observer_relativity_mean_coord_delta": (
                 observer_relativity_summary.get("aggregate") or {}
             ).get("mean_coord_delta"),
@@ -1460,6 +1696,17 @@ def _build_claim_strategy(
             action = "retire"
             reason = "The real/stochastic variance ratio trends the wrong way in the focused bundle."
             next_step = "Remove this as a positive thesis claim unless future reruns reverse the effect direction."
+        elif claim_id == "terrain_incremental_signal" and not thesis_safe:
+            action = "hold_out"
+            reason = (
+                "Terrain labels do not yet show a robust incremental semantic effect beyond the current "
+                "synthetic/control structure."
+            )
+            next_step = (
+                "Keep terrain semantics as diagnostic or exploratory until cross-zone work gaps beat "
+                "same-zone baselines under the focused evidence gate."
+            )
+            kernel_note = "Do not use this claim to support the core paper profile in the current bundle."
         elif claim_id == "track4_traversal_validity" and not thesis_safe:
             action = "fix"
             reason = (
@@ -1716,6 +1963,111 @@ def _aggregate_synthetic(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "pass": thesis_safe,
         "thesis_safe": thesis_safe,
         "effect_direction": "recovers_planted_structure" if thesis_safe else "weak_or_failed_recovery",
+    }
+
+
+def _terrain_incremental_signal_records(
+    synthetic_records: Sequence[Dict[str, Any]],
+    *,
+    repo_root: Path,
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for synthetic_record in synthetic_records:
+        manifest_path = Path(str(synthetic_record.get("manifest_path") or ""))
+        base_dir = manifest_path.parent if manifest_path.name else repo_root
+        for item in synthetic_record.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            run_dir = _resolve_path(
+                item.get("run_dir"),
+                repo_root=repo_root,
+                base_dir=base_dir,
+            )
+            if run_dir is None:
+                continue
+            summary = summarize_terrain_incremental_signal(run_dir)
+            compact_summary = {
+                key: value
+                for key, value in summary.items()
+                if key != "pair_rows"
+            }
+            records.append(
+                {
+                    "run_id": str(synthetic_record.get("run_id") or _manifest_run_id(manifest_path)),
+                    "run_key": str(item.get("run_key") or run_dir.name),
+                    "kernel": str(item.get("kernel") or "unknown"),
+                    "seed": str(item.get("seed") or "unknown"),
+                    "nmi": _safe_float(item.get("nmi")),
+                    "ari": _safe_float(item.get("ari")),
+                    "run_dir": str(run_dir),
+                    **compact_summary,
+                }
+            )
+    return records
+
+
+def _aggregate_terrain_incremental_signal(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    safe_records = [row for row in records if bool(row.get("safe_for_thesis_claim"))]
+    by_kernel: Dict[str, List[Dict[str, Any]]] = {}
+    by_seed: Dict[str, List[Dict[str, Any]]] = {}
+    for row in records:
+        by_kernel.setdefault(str(row.get("kernel") or "unknown"), []).append(row)
+        by_seed.setdefault(str(row.get("seed") or "unknown"), []).append(row)
+
+    def _group_stats(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "n_runs": len(rows),
+            "pass_rate": (
+                sum(1 for row in rows if bool(row.get("safe_for_thesis_claim"))) / float(len(rows))
+                if rows else 0.0
+            ),
+            "mean_cross_minus_same_work_gap": _mean([
+                row.get("cross_minus_same_work_gap") for row in rows
+            ]),
+            "mean_cliffs_delta_cross_gt_same": _mean([
+                row.get("cliffs_delta_cross_gt_same") for row in rows
+            ]),
+        }
+
+    pass_rate = (len(safe_records) / float(len(records))) if records else 0.0
+    thesis_safe = bool(records) and pass_rate >= 1.0
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "records": list(records),
+        "aggregate": {
+            "n_runs": len(records),
+            "safe_run_count": len(safe_records),
+            "pass_rate": pass_rate,
+            "mean_cross_minus_same_work_gap": _mean([
+                row.get("cross_minus_same_work_gap") for row in records
+            ]),
+            "mean_cross_over_same_work_gap_ratio": _mean([
+                row.get("cross_over_same_work_gap_ratio") for row in records
+            ]),
+            "mean_cliffs_delta_cross_gt_same": _mean([
+                row.get("cliffs_delta_cross_gt_same") for row in records
+            ]),
+            "per_kernel": {
+                kernel: _group_stats(rows)
+                for kernel, rows in sorted(by_kernel.items())
+            },
+            "per_seed": {
+                seed: _group_stats(rows)
+                for seed, rows in sorted(by_seed.items())
+            },
+        },
+        "pass": thesis_safe,
+        "thesis_safe": thesis_safe,
+        "effect_direction": (
+            "terrain_adds_within_label_traversal_signal"
+            if thesis_safe
+            else "terrain_incremental_signal_unproven"
+        ),
+        "interpretation": (
+            "This is an anti-circularity check for synthetic NMI: within the same planted "
+            "label, cross-terrain article pairs should differ more in traversal work than "
+            "same-terrain pairs. It does not validate real-world semantics by itself."
+        ),
     }
 
 
@@ -2000,6 +2352,7 @@ def build_thesis_evidence(
     suite_manifest_paths: Optional[Sequence[Path]] = None,
     synthetic_manifest_paths: Optional[Sequence[Path]] = None,
     control_metric_basis: str = "auto",
+    track4_observer_state_summary_path: Optional[Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
     runs_dir = runs_dir.resolve()
     repo_root = _resolve_repo_root(runs_dir)
@@ -2014,6 +2367,21 @@ def build_thesis_evidence(
         synthetic_manifest_paths=synthetic_manifest_paths,
     )
     manifest_ids = [_manifest_run_id(path) for path in manifests]
+    track4_observer_state_action_summary, track4_observer_state_action_path = (
+        _load_track4_observer_state_action_summary(
+            runs_dir=runs_dir,
+            repo_root=repo_root,
+            preferred_summary_path=(
+                track4_observer_state_summary_path.resolve()
+                if track4_observer_state_summary_path is not None
+                else None
+            ),
+        )
+    )
+    track4_observer_state_claim = track4_observer_state_action_summary.get("claim_evaluation")
+    if not isinstance(track4_observer_state_claim, dict):
+        track4_observer_state_claim = evaluate_observer_state_claim(track4_observer_state_action_summary)
+        track4_observer_state_action_summary["claim_evaluation"] = track4_observer_state_claim
     suite_manifests: List[Tuple[Path, Dict[str, Any]]] = []
     synthetic_manifests: List[Tuple[Path, Dict[str, Any]]] = []
     failure_modes: List[Dict[str, Any]] = []
@@ -2269,6 +2637,9 @@ def build_thesis_evidence(
                 failure_modes.append({**leaf_common, "failure_type": "placeholder_ablation", "detail": abl_eval.get("reason")})
 
     synthetic_summary = _aggregate_synthetic(synthetic_records)
+    terrain_incremental_signal_summary = _aggregate_terrain_incremental_signal(
+        _terrain_incremental_signal_records(synthetic_records, repo_root=repo_root)
+    )
     canonical_freeze = _evaluate_canonical_freeze(protocol, suite_manifests, synthetic_records)
     if selection_summary["focused_filter_active"]:
         narrative_audit = _focused_narrative_audit(results_path, manifest_ids)
@@ -2540,6 +2911,7 @@ def build_thesis_evidence(
             "observer_relativity",
             "track4_traversal_validity",
             "track4_work_barrier_signal",
+            "track4_observer_state_action_separation",
             "track5_ablation_coverage",
             "verification_provenance",
             "procrustes_verification_provenance",
@@ -2675,6 +3047,38 @@ def build_thesis_evidence(
             "supporting_runs": [record["run_id"] for record in synthetic_records],
         },
         {
+            "claim_id": "terrain_incremental_signal",
+            "description": (
+                "Within planted synthetic labels, cross-terrain article pairs show larger "
+                "Track 4 work gaps than same-terrain pairs."
+            ),
+            "artifact_family": "terrain_incremental_signal_summary.json",
+            "point_estimate": (
+                terrain_incremental_signal_summary.get("aggregate", {})
+                .get("mean_cross_minus_same_work_gap")
+            ),
+            "dispersion_across_seeds": _std([
+                row.get("cross_minus_same_work_gap")
+                for row in terrain_incremental_signal_summary.get("records", [])
+            ]),
+            "dispersion_across_kernels": _std([
+                stats.get("mean_cross_minus_same_work_gap")
+                for stats in (
+                    terrain_incremental_signal_summary.get("aggregate", {})
+                    .get("per_kernel", {})
+                    .values()
+                )
+            ]),
+            "effect_direction": terrain_incremental_signal_summary.get("effect_direction"),
+            "pass": terrain_incremental_signal_summary["pass"],
+            "thesis_safe": terrain_incremental_signal_summary["thesis_safe"],
+            "supporting_runs": [
+                row["run_dir"]
+                for row in terrain_incremental_signal_summary.get("records", [])
+                if row.get("safe_for_thesis_claim")
+            ],
+        },
+        {
             "claim_id": "observer_relativity",
             "description": "Observer-conditioned manifolds induce non-placeholder displacement, rotation, and path flips.",
             "artifact_family": "relativity_deltas.json",
@@ -2762,6 +3166,125 @@ def build_thesis_evidence(
             ),
             "supporting_runs": [row["run_dir"] for row in track4_real_work_safe],
             "missing_evidence": missing_evidence_by_claim["track4_work_barrier_signal"],
+        },
+        {
+            "claim_id": "track4_observer_state_action_only_separation",
+            "description": (
+                "Exploratory Track 4 least-action replay shows real discourse requires "
+                "more observer-state action/work than stochastic controls across the "
+                "tested kernels, seeds, and bases. This claim does not require the "
+                "hysteresis-mechanism baseline to pass."
+            ),
+            "artifact_family": "track4_observer_state_ablation_summary.json",
+            "point_estimate": track4_observer_state_claim.get("point_estimate"),
+            "dispersion_across_seeds": track4_observer_state_claim.get(
+                "dispersion_across_seeds",
+                track4_observer_state_action_summary.get("dispersion_across_seeds"),
+            ),
+            "dispersion_across_kernels": track4_observer_state_claim.get(
+                "dispersion_across_kernels",
+                track4_observer_state_action_summary.get("dispersion_across_kernels"),
+            ),
+            "dispersion_across_bases": track4_observer_state_claim.get(
+                "dispersion_across_bases",
+                track4_observer_state_action_summary.get("dispersion_across_bases"),
+            ),
+            "effect_direction": "real_observer_state_action_gt_controls",
+            "pass": (
+                bool(track4_observer_state_claim.get("action_only_robustness_pass"))
+                and track4_observer_state_action_path is not None
+            ),
+            "thesis_safe": (
+                bool(track4_observer_state_claim.get("action_only_robustness_pass"))
+                and track4_observer_state_action_path is not None
+            ),
+            "supporting_runs": [
+                row.get("summary_path")
+                for row in track4_observer_state_action_summary.get("rows", [])
+                if isinstance(row, dict) and row.get("corpus") == "real" and row.get("ablation") == "full"
+            ],
+            "missing_evidence": (
+                []
+                if track4_observer_state_action_path is not None
+                else [
+                    {
+                        "claim_id": "track4_observer_state_action_only_separation",
+                        "artifact_family": "track4_observer_state_ablation_summary.json",
+                        "artifact_path": None,
+                        "present": False,
+                        "detail": "missing",
+                    }
+                ]
+            ),
+            "claim_scope": track4_observer_state_claim.get("claim_scope"),
+            "failure_reasons": (
+                []
+                if bool(track4_observer_state_claim.get("action_only_robustness_pass"))
+                else ["action_only_robustness_failed"]
+            ),
+            "action_robustness": {
+                "kernel": track4_observer_state_claim.get("action_kernel_robustness_pass"),
+                "seed": track4_observer_state_claim.get("action_seed_robustness_pass"),
+                "basis": track4_observer_state_claim.get("action_basis_robustness_pass"),
+                "basis_seed": track4_observer_state_claim.get("action_basis_seed_robustness_pass"),
+                "kernel_basis": track4_observer_state_claim.get("action_kernel_basis_robustness_pass"),
+                "kernel_seed_basis": track4_observer_state_claim.get("action_kernel_seed_basis_robustness_pass"),
+            },
+        },
+        {
+            "claim_id": "track4_observer_state_action_separation",
+            "description": (
+                "Exploratory Track 4 least-action replay shows real discourse requires more "
+                "V-observer simplex transport and directed hysteresis than controls or destroyed "
+                "observer-state baselines."
+            ),
+            "artifact_family": "track4_observer_state_ablation_summary.json",
+            "point_estimate": track4_observer_state_claim.get("point_estimate"),
+            "dispersion_across_seeds": track4_observer_state_claim.get(
+                "dispersion_across_seeds",
+                track4_observer_state_action_summary.get("dispersion_across_seeds"),
+            ),
+            "dispersion_across_kernels": track4_observer_state_claim.get(
+                "dispersion_across_kernels",
+                track4_observer_state_action_summary.get("dispersion_across_kernels"),
+            ),
+            "dispersion_across_bases": track4_observer_state_claim.get(
+                "dispersion_across_bases",
+                track4_observer_state_action_summary.get("dispersion_across_bases"),
+            ),
+            "effect_direction": track4_observer_state_claim.get("effect_direction"),
+            "pass": (
+                bool(track4_observer_state_claim.get("pass"))
+                and track4_observer_state_action_path is not None
+            ),
+            "thesis_safe": (
+                bool(track4_observer_state_claim.get("thesis_safe"))
+                and track4_observer_state_action_path is not None
+            ),
+            "supporting_runs": [
+                row.get("summary_path")
+                for row in track4_observer_state_action_summary.get("rows", [])
+                if isinstance(row, dict) and row.get("corpus") == "real" and row.get("ablation") == "full"
+            ],
+            "missing_evidence": (
+                []
+                if track4_observer_state_action_path is not None
+                else [
+                    {
+                        "claim_id": "track4_observer_state_action_separation",
+                        "artifact_family": "track4_observer_state_ablation_summary.json",
+                        "artifact_path": None,
+                        "present": False,
+                        "detail": "missing",
+                    }
+                ]
+            ),
+            "claim_scope": track4_observer_state_claim.get("claim_scope"),
+            "failure_reasons": track4_observer_state_claim.get("failure_reasons", []),
+            "scoped_supported_findings": track4_observer_state_action_summary.get(
+                "scoped_supported_findings",
+                [],
+            ),
         },
         {
             "claim_id": "track5_ablation_coverage",
@@ -2858,8 +3381,10 @@ def build_thesis_evidence(
             "stochastic_control_variance_separation",
             "procrustes_verification_provenance",
             "synthetic_recoverability",
+            "terrain_incremental_signal",
             "observer_relativity",
             "track4_work_barrier_signal",
+            "track4_observer_state_action_separation",
             "track5_ablation_coverage",
         )
         if bool((claims_by_id.get(claim_id) or {}).get("thesis_safe"))
@@ -2972,6 +3497,7 @@ def build_thesis_evidence(
             "primary_control_family": kernel_signal_summary.get("primary_control_family"),
         },
         "synthetic_recoverability": synthetic_summary,
+        "terrain_incremental_signal": terrain_incremental_signal_summary.get("aggregate", {}),
         "seed_robustness": {
             "mean_real_procrustes_std": seed_dispersion,
             "pass": seed_dispersion is not None and seed_dispersion <= 0.35,
@@ -2981,6 +3507,7 @@ def build_thesis_evidence(
         "semantic_signal_interpretation": semantic_signal_interpretation,
         "observer_relativity": observer_relativity_summary["aggregate"],
         "track4_traversal": track4_traversal_summary["aggregate"],
+        "track4_observer_state_action": track4_observer_state_action_summary,
         "track4_work_barrier_signal": {
             "records": traversal_work_pair_safe,
             "pass_rate": (
@@ -3041,8 +3568,33 @@ def build_thesis_evidence(
         metric_signal_cartography_records=metric_signal_cartography_records,
         variance_separation_summary=variance_separation_summary,
         kernel_signal_summary=kernel_signal_summary,
+        synthetic_summary=synthetic_summary,
         observer_relativity_summary=observer_relativity_summary,
         ablation_matrix=ablation_matrix,
+    )
+    scientific_validation_summary["semantic_signal_interpretation"].update(
+        {
+            "paper_profile_ready": bool(paper_claim_profile.get("publication_ready", False)),
+            "paper_profile_status": (
+                "focused_core_profile_supported"
+                if bool(paper_claim_profile.get("publication_ready", False))
+                else "focused_core_profile_blocked"
+            ),
+            "paper_core_claim_ids": [
+                row.get("claim_id")
+                for row in paper_claim_profile.get("core_claims", []) or []
+                if isinstance(row, dict)
+            ],
+            "paper_blocked_core_claim_ids": [
+                row.get("claim_id")
+                for row in paper_claim_profile.get("blocked_core_claims", []) or []
+                if isinstance(row, dict)
+            ],
+            "paper_profile_scope_warning": (
+                "Paper-profile readiness applies only to the focused core claim set; "
+                "full thesis/canonical claims may still be unsafe."
+            ),
+        }
     )
     unsafe_claim_strategy = _build_claim_strategy(
         claims_by_id=claims_by_id,
@@ -3057,6 +3609,8 @@ def build_thesis_evidence(
         "ablation_matrix": ablation_matrix,
         "observer_relativity_summary": observer_relativity_summary,
         "track4_traversal_summary": track4_traversal_summary,
+        "terrain_incremental_signal_summary": terrain_incremental_signal_summary,
+        "track4_observer_state_action_summary": track4_observer_state_action_summary,
         "metric_signal_cartography": metric_signal_cartography,
         "variance_separation_summary": variance_separation_summary,
         "kernel_signal_summary": kernel_signal_summary,
@@ -3075,6 +3629,7 @@ def write_thesis_evidence(
     suite_manifest_paths: Optional[Sequence[Path]] = None,
     synthetic_manifest_paths: Optional[Sequence[Path]] = None,
     control_metric_basis: str = "auto",
+    track4_observer_state_summary_path: Optional[Path] = None,
 ) -> Dict[str, Path]:
     payloads = build_thesis_evidence(
         runs_dir=runs_dir,
@@ -3084,7 +3639,12 @@ def write_thesis_evidence(
         suite_manifest_paths=suite_manifest_paths,
         synthetic_manifest_paths=synthetic_manifest_paths,
         control_metric_basis=control_metric_basis,
+        track4_observer_state_summary_path=track4_observer_state_summary_path,
     )
+    return write_thesis_evidence_payloads(payloads=payloads, out_dir=out_dir)
+
+
+def write_thesis_evidence_payloads(*, payloads: Dict[str, Dict[str, Any]], out_dir: Path) -> Dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written: Dict[str, Path] = {}
     for name, payload in payloads.items():

@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import numpy as np
 
+from .ablation_dag import AblationDag, NodeSpec, build_cache_key, fingerprint_path
 
 # =============================================================================
 # ABLATION CONFIGURATION
@@ -115,6 +116,9 @@ class AblationConfig:
     # --- Branch 5: POOLING ---
     pooling: str = 'mean'            # 'cls' (legacy/null) | 'mean' (mature/standard)
 
+    # --- Branch 6: TRACK 5 ASSEMBLY ---
+    track5_mode: str = 'hadamard_strict'  # 'hadamard_strict' | 'riemannian_strict'
+
     # --- Dirichlet Fusion ---
     dirichlet_alpha: float = 1.0
     n_observers: int = 50
@@ -141,6 +145,9 @@ class AblationConfig:
         # Validate aggregation
         if self.aggregation not in ('linear_avg', 'superposition'):
             raise ValueError(f"aggregation must be 'linear_avg' or 'superposition'")
+
+        if self.track5_mode not in ('hadamard_strict', 'riemannian_strict'):
+            raise ValueError("track5_mode must be 'hadamard_strict' or 'riemannian_strict'")
 
         # Validate backdrop
         if self.backdrop_mode == 'external_wiki' and not self.backdrop_path:
@@ -187,6 +194,9 @@ class AblationConfig:
                 },
                 'pooling': {
                     'method': self.pooling,
+                },
+                'track5': {
+                    'assembly_mode': self.track5_mode,
                 },
             },
             'reproducibility': {
@@ -243,6 +253,7 @@ ABLATION_PRESETS = {
         'aggregation': 'linear_avg',
         'gradient_scope': 'flat_text',
         'pooling': 'cls',
+        'track5_mode': 'hadamard_strict',
     },
     'full_mature': {
         'kernel_type': 'imq',
@@ -250,6 +261,7 @@ ABLATION_PRESETS = {
         'aggregation': 'superposition',
         'gradient_scope': 'paragraph_weighted',
         'pooling': 'mean',
+        'track5_mode': 'hadamard_strict',
     },
 }
 
@@ -393,108 +405,324 @@ class AblationRunner:
 
         run_dir = Path(config.output_dir) / (config.run_name or config.config_hash)
         run_dir.mkdir(parents=True, exist_ok=True)
+        dag = AblationDag(
+            run_dir=run_dir,
+            run_id=config.run_name or config.config_hash,
+            config_hash=config.config_hash,
+        )
 
         # Save manifest FIRST (audit trail)
         manifest = config.to_manifest()
+        manifest['run_status'] = 'running'
+        manifest['dag'] = dag.snapshot()
         manifest_path = run_dir / 'manifest.json'
-        with open(manifest_path, 'w') as f:
-            json.dump(manifest, f, indent=2, default=str)
+        self._write_json(manifest_path, manifest)
         print(f"[ABLATION] Manifest saved: {manifest_path}")
 
         results = {}
         t_start = time.time()
+        try:
+            for corpus_name in config.corpora:
+                corpus_path = self._resolve_corpus_path(corpus_name, config)
+                if corpus_path is None:
+                    print(f"[ABLATION] Skipping {corpus_name}: path not found")
+                    continue
 
-        for corpus_name in config.corpora:
-            corpus_path = self._resolve_corpus_path(corpus_name, config)
-            if corpus_path is None:
-                print(f"[ABLATION] Skipping {corpus_name}: path not found")
-                continue
+                articles = self._load_articles(corpus_path, max_articles=config.max_articles)
+                corpus_dir = run_dir / corpus_name
+                corpus_dir.mkdir(parents=True, exist_ok=True)
+                corpus_fingerprint = fingerprint_path(Path(corpus_path))
 
-            articles = self._load_articles(corpus_path, max_articles=config.max_articles)
-            corpus_dir = run_dir / corpus_name
-            corpus_dir.mkdir(parents=True, exist_ok=True)
+                print(
+                    f"\n[ABLATION] Corpus={corpus_name} | kernel={config.kernel_type} "
+                    f"| track5={config.track5_mode} | observers={len(config.observer_seeds)} "
+                    f"| articles={len(articles)}"
+                )
 
-            print(
-                f"\n[ABLATION] Corpus={corpus_name} | kernel={config.kernel_type} "
-                f"| observers={len(config.observer_seeds)} | articles={len(articles)}"
-            )
+                input_manifest_path = corpus_dir / "corpus_input_manifest.json"
+                input_node = dag.execute(
+                    NodeSpec(
+                        node_id=f"{corpus_name}.input_resolution",
+                        cache_key=self._node_cache_key(
+                            config=config,
+                            corpus_name=corpus_name,
+                            corpus_fingerprint=corpus_fingerprint,
+                            node_name='input_resolution',
+                            extra={'max_articles': config.max_articles},
+                        ),
+                        outputs=[input_manifest_path],
+                        metadata={
+                            'corpus_name': corpus_name,
+                            'corpus_path': corpus_path,
+                            'n_articles': len(articles),
+                        },
+                    ),
+                    lambda input_manifest_path=input_manifest_path, corpus_name=corpus_name, corpus_path=corpus_path, articles=articles: self._execute_input_resolution_node(
+                        input_manifest_path=input_manifest_path,
+                        corpus_name=corpus_name,
+                        corpus_path=corpus_path,
+                        articles=articles,
+                    ),
+                )
 
-            run_multi_observer_experiment_simple(
-                articles=articles,
-                seeds=config.observer_seeds,
-                use_contrastive=True,
-                use_pca_removal=False,
-                use_cls_tokens=True,
-                shared_pca=False,
-                kernel_type=config.kernel_type,
-                kernel_params=self._kernel_params_for_run(config),
-                use_gru=False,
-                use_multi_framing_rks=True,
-                use_attention=False,
-                use_dirichlet_fusion=True,
-                normalize_features=True,
-                device=config.device,
-                track_variance=True,
-                output_dir=corpus_dir,
-                rks_sigma=config.sigma,
-                corpus_name=corpus_name,
-                emit_label_validation=False,
-                enable_checkpoints=True,
-                dirichlet_alpha=config.dirichlet_alpha,
-                dirichlet_n_observers=config.n_observers,
-                dirichlet_rks_dim=config.rks_dim,
-                dirichlet_basis_seed=config.basis_seed,
-                dirichlet_crn_seed=config.crn_seed,
-                kernel_nu=config.kernel_nu,
-                kernel_roughness=config.kernel_roughness,
-            )
+                experiment_node = dag.execute(
+                    NodeSpec(
+                        node_id=f"{corpus_name}.experiment",
+                        cache_key=self._node_cache_key(
+                            config=config,
+                            corpus_name=corpus_name,
+                            corpus_fingerprint=corpus_fingerprint,
+                            node_name='experiment',
+                            dependency_keys=[input_node['cache_key']],
+                            extra={
+                                'observer_seeds': config.observer_seeds,
+                                'kernel_params': self._kernel_params_for_run(config),
+                            },
+                        ),
+                        outputs=[corpus_dir / f"observer_{seed}.pt" for seed in config.observer_seeds],
+                        dependencies=[f"{corpus_name}.input_resolution"],
+                        metadata={
+                            'corpus_name': corpus_name,
+                            'corpus_path': corpus_path,
+                            'n_articles': len(articles),
+                        },
+                    ),
+                    lambda corpus_dir=corpus_dir, corpus_name=corpus_name, articles=articles: self._execute_experiment_node(
+                        run_multi_observer_experiment_simple=run_multi_observer_experiment_simple,
+                        config=config,
+                        corpus_dir=corpus_dir,
+                        corpus_name=corpus_name,
+                        articles=articles,
+                    ),
+                )
 
-            relativity_result = self._materialize_relativity_payloads(
-                corpus_dir=corpus_dir,
-                articles=articles,
-                config=config,
-                corpus_name=corpus_name,
-                normalize_run_provenance=_normalize_run_provenance,
-            )
+                relativity_node = dag.execute(
+                    NodeSpec(
+                        node_id=f"{corpus_name}.relativity",
+                        cache_key=self._node_cache_key(
+                            config=config,
+                            corpus_name=corpus_name,
+                            corpus_fingerprint=corpus_fingerprint,
+                            node_name='relativity',
+                            dependency_keys=[experiment_node['cache_key']],
+                            extra={'basis_seed': config.basis_seed},
+                        ),
+                        outputs=(
+                            [corpus_dir / "observer_global.pt"]
+                            + [corpus_dir / "relativity_cache" / f"observer_{idx}.pt" for idx in range(len(articles))]
+                            if articles
+                            else [corpus_dir / "observer_global.pt"]
+                        ),
+                        dependencies=[f"{corpus_name}.experiment"],
+                        metadata={'corpus_name': corpus_name, 'n_articles': len(articles)},
+                    ),
+                    lambda corpus_dir=corpus_dir, corpus_name=corpus_name, articles=articles: self._materialize_relativity_payloads(
+                        corpus_dir=corpus_dir,
+                        articles=articles,
+                        config=config,
+                        corpus_name=corpus_name,
+                        normalize_run_provenance=_normalize_run_provenance,
+                    ),
+                )
 
-            observer_payloads = self._load_observer_payloads(corpus_dir, config.observer_seeds)
-            diagnostics = self._compute_lab_diagnostics(observer_payloads)
-            diagnostics_path = corpus_dir / "lab_diagnostics.json"
-            with open(diagnostics_path, "w", encoding="utf-8") as f:
-                json.dump(diagnostics, f, indent=2, default=str)
-            ablation_payload = _translate_lab_diagnostics_to_ablation_summary(diagnostics, diagnostics_path)
-            ablation_summary_path = corpus_dir / "ablation_summary.json"
-            ablation_summary_path.write_text(json.dumps(ablation_payload, indent=2), encoding="utf-8")
-            _emit_ablation_results_json(corpus_dir, ablation_payload)
+                checkpoint_dir = self._latest_checkpoint_dir(corpus_dir)
+                track_stage_nodes: Dict[str, Dict[str, Any]] = {}
+                for stage_name in ("track15_extract", "track2_projection", "track3_density", "track5_assembly"):
+                    artifacts = self._track_stage_artifacts(checkpoint_dir, stage_name)
+                    if stage_name == "track5_assembly":
+                        artifacts = [
+                            corpus_dir / "features.npy",
+                            corpus_dir / "MONOLITH_DATA.csv",
+                            corpus_dir / "phantom_verdicts.json",
+                            corpus_dir / "walker_work_integrals.npy",
+                        ]
+                    track_stage_nodes[stage_name] = dag.execute(
+                        NodeSpec(
+                            node_id=f"{corpus_name}.{stage_name}",
+                            cache_key=self._node_cache_key(
+                                config=config,
+                                corpus_name=corpus_name,
+                                corpus_fingerprint=corpus_fingerprint,
+                                node_name=stage_name,
+                                dependency_keys=[experiment_node['cache_key']],
+                                extra={'checkpoint_dir': str(checkpoint_dir) if checkpoint_dir else None},
+                            ),
+                            outputs=artifacts,
+                            dependencies=[f"{corpus_name}.experiment"],
+                            metadata={
+                                'corpus_name': corpus_name,
+                                'stage_name': stage_name,
+                                'track5_mode': config.track5_mode,
+                            },
+                        ),
+                        lambda corpus_dir=corpus_dir, stage_name=stage_name, checkpoint_dir=checkpoint_dir: self._execute_track_stage_node(
+                            corpus_dir=corpus_dir,
+                            stage_name=stage_name,
+                            checkpoint_dir=checkpoint_dir,
+                            config=config,
+                        ),
+                    )
 
-            results[corpus_name] = {
-                'output_dir': str(corpus_dir),
-                'corpus_path': corpus_path,
-                'n_articles': len(articles),
-                'observer_files': [str(corpus_dir / f"observer_{seed}.pt") for seed in config.observer_seeds],
-                'relativity_materialization': relativity_result,
-                'diagnostics_path': str(diagnostics_path),
-                'ablation_summary_path': str(ablation_summary_path),
-            }
+                diagnostics_path = corpus_dir / "lab_diagnostics.json"
+                ablation_summary_path = corpus_dir / "ablation_summary.json"
+                diagnostics_node = dag.execute(
+                    NodeSpec(
+                        node_id=f"{corpus_name}.diagnostics",
+                        cache_key=self._node_cache_key(
+                            config=config,
+                            corpus_name=corpus_name,
+                            corpus_fingerprint=corpus_fingerprint,
+                            node_name='diagnostics',
+                            dependency_keys=[experiment_node['cache_key']],
+                            extra={
+                                'observer_seeds': config.observer_seeds,
+                                'track_stage_cache_keys': {
+                                    name: node['cache_key'] for name, node in track_stage_nodes.items()
+                                },
+                            },
+                        ),
+                        outputs=[
+                            diagnostics_path,
+                            ablation_summary_path,
+                            corpus_dir / "ablation_results.json",
+                        ],
+                        dependencies=[
+                            f"{corpus_name}.experiment",
+                            *[f"{corpus_name}.{stage_name}" for stage_name in track_stage_nodes],
+                        ],
+                        metadata={'corpus_name': corpus_name},
+                    ),
+                    lambda corpus_dir=corpus_dir, diagnostics_path=diagnostics_path: self._execute_diagnostics_node(
+                        corpus_dir=corpus_dir,
+                        diagnostics_path=diagnostics_path,
+                        observer_seeds=config.observer_seeds,
+                        translate_lab_diagnostics_to_ablation_summary=_translate_lab_diagnostics_to_ablation_summary,
+                        emit_ablation_results_json=_emit_ablation_results_json,
+                    ),
+                )
 
-        for corpus_name, corpus_result in results.items():
-            corpus_dir = Path(corpus_result["output_dir"])
-            try:
-                bundle_result = emit_consumer_contract_bundle(corpus_dir)
-            except Exception as exc:
-                bundle_result = {
-                    "status": "failed",
-                    "error": f"consumer bundle emission failed: {exc}",
+                bundle_node = dag.execute(
+                    NodeSpec(
+                        node_id=f"{corpus_name}.consumer_bundle",
+                        cache_key=self._node_cache_key(
+                            config=config,
+                            corpus_name=corpus_name,
+                            corpus_fingerprint=corpus_fingerprint,
+                            node_name='consumer_bundle',
+                            dependency_keys=[
+                                experiment_node['cache_key'],
+                                relativity_node['cache_key'],
+                                diagnostics_node['cache_key'],
+                                *[node['cache_key'] for node in track_stage_nodes.values()],
+                            ],
+                        ),
+                        outputs=[
+                            corpus_dir / "baseline_meta.json",
+                            corpus_dir / "validation.json",
+                        ],
+                        dependencies=[
+                            f"{corpus_name}.experiment",
+                            f"{corpus_name}.relativity",
+                            f"{corpus_name}.diagnostics",
+                            *[f"{corpus_name}.{stage_name}" for stage_name in track_stage_nodes],
+                        ],
+                        metadata={'corpus_name': corpus_name},
+                    ),
+                    lambda corpus_dir=corpus_dir: self._execute_consumer_bundle_node(
+                        corpus_dir=corpus_dir,
+                        emit_consumer_contract_bundle=emit_consumer_contract_bundle,
+                    ),
+                )
+
+                airflow_ablation_dir = corpus_dir / "airflow_ablation"
+                airflow_base_csv = corpus_dir / "MONOLITH_DATA.csv"
+                airflow_ablation_node = dag.execute(
+                    NodeSpec(
+                        node_id=f"{corpus_name}.airflow_csv_ablation",
+                        cache_key=self._node_cache_key(
+                            config=config,
+                            corpus_name=corpus_name,
+                            corpus_fingerprint=corpus_fingerprint,
+                            node_name='airflow_csv_ablation',
+                            dependency_keys=[
+                                track_stage_nodes['track5_assembly']['cache_key'],
+                                bundle_node['cache_key'],
+                            ],
+                            extra={
+                                'scalar_bins': 8,
+                                'base_csv_fingerprint': (
+                                    fingerprint_path(airflow_base_csv)
+                                    if airflow_base_csv.exists()
+                                    else None
+                                ),
+                            },
+                        ),
+                        outputs=[
+                            airflow_ablation_dir / "manifold_ablation_summary.json",
+                            airflow_ablation_dir / "manifold_ablation_summary.csv",
+                            airflow_ablation_dir / "airflow_ablation_manifest.json",
+                        ],
+                        dependencies=[
+                            f"{corpus_name}.track5_assembly",
+                            f"{corpus_name}.consumer_bundle",
+                        ],
+                        metadata={
+                            'corpus_name': corpus_name,
+                            'base_csv': str(corpus_dir / "MONOLITH_DATA.csv"),
+                            'sidecar': 'analysis.airflow_ablation_orchestrator.run_ablation_matrix',
+                        },
+                    ),
+                    lambda corpus_dir=corpus_dir, airflow_ablation_dir=airflow_ablation_dir: self._execute_airflow_csv_ablation_node(
+                        corpus_dir=corpus_dir,
+                        output_dir=airflow_ablation_dir,
+                    ),
+                )
+
+                results[corpus_name] = {
+                    'output_dir': str(corpus_dir),
+                    'corpus_path': corpus_path,
+                    'n_articles': len(articles),
+                    'observer_files': [str(corpus_dir / f"observer_{seed}.pt") for seed in config.observer_seeds],
+                    'relativity_materialization': relativity_node.get('result'),
+                    'diagnostics_path': str(diagnostics_path),
+                    'ablation_summary_path': str(ablation_summary_path),
+                    'consumer_bundle': bundle_node.get('result'),
+                    'airflow_csv_ablation': airflow_ablation_node.get('result'),
+                    'dag': {
+                        'input_resolution': self._node_result_summary(input_node),
+                        'experiment': self._node_result_summary(experiment_node),
+                        'relativity': self._node_result_summary(relativity_node),
+                        **{
+                            stage_name: self._node_result_summary(node)
+                            for stage_name, node in track_stage_nodes.items()
+                        },
+                        'diagnostics': self._node_result_summary(diagnostics_node),
+                        'consumer_bundle': self._node_result_summary(bundle_node),
+                        'airflow_csv_ablation': self._node_result_summary(airflow_ablation_node),
+                    },
                 }
-            corpus_result["consumer_bundle"] = bundle_result
+
+                manifest['results'] = results
+                manifest['dag'] = dag.snapshot()
+                self._write_json(manifest_path, manifest)
+        except Exception as exc:
+            dag.mark_failed(f"{type(exc).__name__}: {exc}")
+            manifest['run_status'] = 'failed'
+            manifest['results'] = results
+            manifest['dag'] = dag.snapshot()
+            manifest['elapsed_seconds'] = time.time() - t_start
+            self._write_json(manifest_path, manifest)
+            raise
 
         elapsed = time.time() - t_start
         manifest['elapsed_seconds'] = elapsed
         manifest['results'] = results
+        dag.mark_completed()
+        manifest['run_status'] = 'completed'
+        manifest['dag'] = dag.snapshot()
 
         # Update manifest with timing
-        with open(manifest_path, 'w') as f:
-            json.dump(manifest, f, indent=2, default=str)
+        self._write_json(manifest_path, manifest)
 
         print(f"\n[ABLATION] Run complete: {config.run_name or config.config_hash} ({elapsed:.1f}s)")
         return manifest
@@ -560,7 +788,187 @@ class AblationRunner:
             'kernel_nu': config.kernel_nu,
             'kernel_roughness': config.kernel_roughness,
             'normalize_features': True,
+            'track5_assembly_mode': config.track5_mode,
         }
+
+    @staticmethod
+    def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding='utf-8')
+
+    @staticmethod
+    def _node_result_summary(node_result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'status': node_result.get('status'),
+            'cache_key': node_result.get('cache_key'),
+            'manifest_path': node_result.get('manifest_path'),
+        }
+
+    def _node_cache_key(
+        self,
+        config: AblationConfig,
+        corpus_name: str,
+        corpus_fingerprint: Dict[str, Any],
+        node_name: str,
+        dependency_keys: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        return build_cache_key(
+            {
+                'dag_version': 'ablation_dag_v2',
+                'config_hash': config.config_hash,
+                'corpus_name': corpus_name,
+                'corpus_fingerprint': corpus_fingerprint,
+                'node_name': node_name,
+                'dependency_keys': dependency_keys or [],
+                'extra': extra or {},
+            }
+        )
+
+    def _execute_experiment_node(
+        self,
+        run_multi_observer_experiment_simple,
+        config: AblationConfig,
+        corpus_dir: Path,
+        corpus_name: str,
+        articles: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        run_multi_observer_experiment_simple(
+            articles=articles,
+            seeds=config.observer_seeds,
+            use_contrastive=True,
+            use_pca_removal=False,
+            use_cls_tokens=True,
+            shared_pca=False,
+            kernel_type=config.kernel_type,
+            kernel_params=self._kernel_params_for_run(config),
+            use_gru=False,
+            use_multi_framing_rks=True,
+            use_attention=False,
+            use_dirichlet_fusion=True,
+            normalize_features=True,
+            device=config.device,
+            track_variance=True,
+            output_dir=corpus_dir,
+            rks_sigma=config.sigma,
+            corpus_name=corpus_name,
+            emit_label_validation=False,
+            enable_checkpoints=True,
+            dirichlet_alpha=config.dirichlet_alpha,
+            dirichlet_n_observers=config.n_observers,
+            dirichlet_rks_dim=config.rks_dim,
+            dirichlet_basis_seed=config.basis_seed,
+            dirichlet_crn_seed=config.crn_seed,
+            kernel_nu=config.kernel_nu,
+            kernel_roughness=config.kernel_roughness,
+            track5_assembly_mode=config.track5_mode,
+        )
+        return {
+            'observer_files': [str(Path(corpus_dir) / f"observer_{seed}.pt") for seed in config.observer_seeds],
+            'n_articles': len(articles),
+            'n_observers': len(config.observer_seeds),
+        }
+
+    @staticmethod
+    def _execute_input_resolution_node(
+        *,
+        input_manifest_path: Path,
+        corpus_name: str,
+        corpus_path: str,
+        articles: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        payload = {
+            "corpus_name": corpus_name,
+            "corpus_path": corpus_path,
+            "n_articles": len(articles),
+            "bt_uids": [article.get("bt_uid") for article in articles],
+        }
+        Path(input_manifest_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    def _execute_track_stage_node(
+        self,
+        *,
+        corpus_dir: Path,
+        stage_name: str,
+        checkpoint_dir: Optional[Path],
+        config: AblationConfig,
+    ) -> Dict[str, Any]:
+        contract_path = self._write_stage_contract(
+            corpus_dir=corpus_dir,
+            stage_name=stage_name,
+            checkpoint_dir=checkpoint_dir,
+            config=config,
+        )
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        if payload.get("status") != "ready":
+            raise FileNotFoundError(f"{stage_name} artifacts missing for {corpus_dir}")
+        return {
+            "stage_name": stage_name,
+            "contract_path": str(contract_path),
+            "artifacts": payload.get("artifacts", []),
+            "track5_mode": config.track5_mode,
+        }
+
+    def _execute_diagnostics_node(
+        self,
+        corpus_dir: Path,
+        diagnostics_path: Path,
+        observer_seeds: List[int],
+        translate_lab_diagnostics_to_ablation_summary,
+        emit_ablation_results_json,
+    ) -> Dict[str, Any]:
+        observer_payloads = self._load_observer_payloads(corpus_dir, observer_seeds)
+        diagnostics = self._compute_lab_diagnostics(observer_payloads)
+        self._write_json(diagnostics_path, diagnostics)
+        ablation_payload = translate_lab_diagnostics_to_ablation_summary(diagnostics, diagnostics_path)
+        ablation_summary_path = Path(corpus_dir) / "ablation_summary.json"
+        self._write_json(ablation_summary_path, ablation_payload)
+        results_path = emit_ablation_results_json(corpus_dir, ablation_payload)
+        return {
+            'n_observers_loaded': len(observer_payloads),
+            'diagnostics_path': str(diagnostics_path),
+            'ablation_summary_path': str(ablation_summary_path),
+            'ablation_results_path': str(results_path),
+        }
+
+    @staticmethod
+    def _execute_consumer_bundle_node(corpus_dir: Path, emit_consumer_contract_bundle) -> Dict[str, Any]:
+        try:
+            return emit_consumer_contract_bundle(corpus_dir)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "error": f"consumer bundle emission failed: {exc}",
+            }
+
+    @staticmethod
+    def _execute_airflow_csv_ablation_node(corpus_dir: Path, output_dir: Path) -> Dict[str, Any]:
+        base_csv = Path(corpus_dir) / "MONOLITH_DATA.csv"
+        if not base_csv.exists():
+            raise FileNotFoundError(f"Airflow CSV ablation requires MONOLITH_DATA.csv: {base_csv}")
+        from analysis.airflow_ablation_orchestrator import run_ablation_matrix
+
+        output_dir = Path(output_dir)
+        summary_path = run_ablation_matrix(
+            base_csv=base_csv,
+            output_dir=output_dir,
+            scalar_bins=8,
+        )
+        payload = {
+            'status': 'success',
+            'summary_json': str(summary_path),
+            'summary_csv': str(output_dir / "manifold_ablation_summary.csv"),
+            'base_csv': str(base_csv),
+            'base_csv_fingerprint': fingerprint_path(base_csv),
+            'sidecar': 'analysis.airflow_ablation_orchestrator.run_ablation_matrix',
+            'scalar_bins': 8,
+        }
+        manifest_path = output_dir / "airflow_ablation_manifest.json"
+        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        payload['manifest_path'] = str(manifest_path)
+        return payload
 
     def _kernel_params_for_run(self, config: AblationConfig) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
@@ -569,6 +977,70 @@ class AblationRunner:
         if config.kernel_type == 'imq':
             params['roughness'] = int(config.kernel_roughness)
         return params
+
+    def _latest_checkpoint_dir(self, corpus_dir: Path) -> Optional[Path]:
+        checkpoint_manifests = sorted(
+            corpus_dir.glob("checkpoints/*/manifest.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        if not checkpoint_manifests:
+            return None
+        return checkpoint_manifests[0].parent
+
+    def _track_stage_artifacts(self, checkpoint_dir: Optional[Path], stage_name: str) -> List[Path]:
+        if checkpoint_dir is None:
+            return []
+        stage_map = {
+            "track15_extract": [
+                checkpoint_dir / "T1.5_spectral_state.npz",
+                checkpoint_dir / "manifest.json",
+            ],
+            "track2_projection": [
+                checkpoint_dir / "T2_kernel_projections.npz",
+                checkpoint_dir / "T2_kernel_meta.json",
+                checkpoint_dir / "manifest.json",
+            ],
+            "track3_density": [
+                checkpoint_dir / "T3_topology.npz",
+                checkpoint_dir / "T3_topology.json",
+                checkpoint_dir / "manifest.json",
+            ],
+        }
+        return [path for path in stage_map.get(stage_name, []) if path.exists()]
+
+    def _write_stage_contract(
+        self,
+        *,
+        corpus_dir: Path,
+        stage_name: str,
+        checkpoint_dir: Optional[Path],
+        config: AblationConfig,
+    ) -> Path:
+        contract_dir = corpus_dir / "ablation_stage_contracts"
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = self._track_stage_artifacts(checkpoint_dir, stage_name)
+        if stage_name == "track5_assembly":
+            artifacts = [
+                path
+                for path in [
+                    corpus_dir / "features.npy",
+                    corpus_dir / "MONOLITH_DATA.csv",
+                    corpus_dir / "phantom_verdicts.json",
+                    corpus_dir / "walker_work_integrals.npy",
+                ]
+                if path.exists()
+            ]
+        payload = {
+            "stage": stage_name,
+            "status": "ready" if artifacts else "missing",
+            "track5_mode": config.track5_mode,
+            "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
+            "artifacts": [str(path) for path in artifacts],
+        }
+        contract_path = contract_dir / f"{stage_name}.json"
+        contract_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return contract_path
 
     def _load_articles(self, corpus_path: str, max_articles: int) -> List[Dict[str, Any]]:
         from .canonical_ids import assign_canonical_uids
@@ -1130,6 +1602,8 @@ Presets:
     parser.add_argument('--gradient-scope', choices=['flat_text', 'paragraph_weighted'],
                         help='Gradient scope')
     parser.add_argument('--pooling', choices=['cls', 'mean'], help='Pooling method')
+    parser.add_argument('--track5-mode', choices=['hadamard_strict', 'riemannian_strict'],
+                        help='Track 5 assembly mode')
     parser.add_argument('--seeds', nargs='+', type=int, default=[42, 420, 4200])
     parser.add_argument('--max-articles', type=int, default=500)
     parser.add_argument('--device', default='cuda')
@@ -1184,6 +1658,8 @@ Presets:
         config.gradient_scope = args.gradient_scope
     if args.pooling:
         config.pooling = args.pooling
+    if args.track5_mode:
+        config.track5_mode = args.track5_mode
 
     runner = AblationRunner(config)
 

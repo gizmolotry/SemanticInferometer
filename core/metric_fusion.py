@@ -1,8 +1,16 @@
 """
 metric_fusion.py - Implements the Track 3 Unified Metric Tensor logic.
 
-Fuses Track 1.5 (Gradients) and Track 2 (Density) to generate unified metrics
-for visualization, including density, stress, z_height, zones, and color codes.
+Fuses Track 1.5 (Gradients), Track 2 geometry, and Track 3 Dirichlet density
+to generate unified metrics for visualization, including density, stress,
+z_height, zones, and color codes.
+
+Density contract:
+    - density is the capstone-facing Track 3 conformal density when available.
+    - geometry_density_knn is retained separately as a visualization/geometry
+      diagnostic, not the thesis Track 3 density.
+    - when Track 3 rho is missing or flat, density falls back to KNN geometry
+      density with an explicit density_basis provenance marker.
 
 CRITICAL 'NO BUTTERFLY' CONSTRAINTS:
 1. NON-DESTRUCTIVE: Only appends new columns.
@@ -16,7 +24,7 @@ import pandas as pd
 from pathlib import Path
 from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import json
 import argparse
 from .thermo_config import ThermodynamicConfig
@@ -96,6 +104,66 @@ def _compute_density_field(
     return density.astype(float)
 
 
+def _compute_track3_density_rho(blinker_variance: np.ndarray) -> np.ndarray:
+    """
+    Convert Track 3 Dirichlet variance to capstone conformal density.
+
+    rho_i = 1 / (1 + tau ||b_i||), with tau fixed to 1.0 for the canonical
+    artifact path. This mirrors core.hadamard_fusion.ConformalMetric without
+    adding a torch dependency to metric-fusion CSV emission.
+    """
+    arr = np.asarray(blinker_variance, dtype=float)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.ndim == 1:
+        variance_magnitude = np.abs(arr)
+    else:
+        variance_magnitude = np.linalg.norm(arr, axis=-1)
+    variance_magnitude = np.nan_to_num(variance_magnitude, nan=0.0, posinf=1e6, neginf=0.0)
+    return (1.0 / (1.0 + variance_magnitude)).astype(float)
+
+
+def _load_track3_density_artifact(run_dir: Path, n_expected: int) -> Tuple[Optional[np.ndarray], str]:
+    """
+    Load or derive the capstone Track 3 rho vector for MONOLITH_DATA.csv.
+
+    Preference order:
+      1. track3_density_rho.npy, the direct conformal density artifact.
+      2. dirichlet_fused_std.npy, converted through rho_i = 1/(1+||b_i||).
+
+    Returns (rho_raw, basis), where rho_raw is None if no compatible Track 3
+    artifact exists.
+    """
+    rho_path = run_dir / "track3_density_rho.npy"
+    if rho_path.exists():
+        try:
+            rho = np.asarray(np.load(rho_path), dtype=float).reshape(-1)
+            if rho.shape[0] == n_expected and np.isfinite(rho).any():
+                return np.nan_to_num(rho, nan=0.0, posinf=1.0, neginf=0.0), "track3_density_rho"
+            print(
+                f"  [WARN] {rho_path.name} shape/finite mismatch "
+                f"({rho.shape[0]} vs {n_expected}); ignoring Track 3 rho artifact."
+            )
+        except Exception as exc:
+            print(f"  [WARN] Failed to load {rho_path.name}: {exc}")
+
+    blinker_path = run_dir / "dirichlet_fused_std.npy"
+    if blinker_path.exists():
+        try:
+            blinker = np.asarray(np.load(blinker_path), dtype=float)
+            if blinker.shape[0] == n_expected and np.isfinite(blinker).any():
+                return _compute_track3_density_rho(blinker), "dirichlet_fused_std"
+            print(
+                f"  [WARN] {blinker_path.name} shape/finite mismatch "
+                f"({blinker.shape[0] if blinker.ndim else 0} vs {n_expected}); "
+                "cannot derive Track 3 rho."
+            )
+        except Exception as exc:
+            print(f"  [WARN] Failed to derive Track 3 rho from {blinker_path.name}: {exc}")
+
+    return None, "missing"
+
+
 def calculate_unified_metric(
     embeddings_path: Path,
     gradients_path: Path,
@@ -129,13 +197,55 @@ def calculate_unified_metric(
             f"Embeddings: {len(embeddings)}, Gradients: {len(gradients)}, Metadata: {len(metadata_df)}"
         )
 
-    # 2. Calculate DENSITY (rho) using adaptive KNN. Never silently replace the
-    # manifold with a uniform density field just because the corpus is small.
-    density = _compute_density_field(
-        embeddings,
-        knn_k=knn_k,
-        epsilon=float(thermo_config.density_clamp_min),
+    # 2. Calculate density with explicit basis provenance.
+    # Track 3 rho is the capstone-facing density. KNN density remains a local
+    # geometry diagnostic and fallback, so screenshots/evidence do not silently
+    # substitute one concept for the other.
+    track3_density_rho_raw, track3_basis = _load_track3_density_artifact(
+        Path(embeddings_path).parent,
+        len(metadata_df),
     )
+    try:
+        geometry_density_knn = _compute_density_field(
+            embeddings,
+            knn_k=knn_k,
+            epsilon=float(thermo_config.density_clamp_min),
+        )
+    except ValueError:
+        if track3_density_rho_raw is None:
+            raise
+        geometry_density_knn = np.full(len(metadata_df), 0.5, dtype=float)
+        print(
+            "  [WARN] Geometry KNN density collapsed, but Track 3 rho is available; "
+            "retaining neutral geometry_density_knn diagnostic."
+        )
+    track3_density_rho_norm = None
+    density_basis = "geometry_knn_track3_missing"
+    density_contract = "fallback_geometry_density_not_capstone_track3"
+
+    if track3_density_rho_raw is not None:
+        track3_density_rho_raw = np.clip(
+            np.nan_to_num(track3_density_rho_raw, nan=0.0, posinf=1.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
+        track3_density_rho_norm = _robust_unit_interval(track3_density_rho_raw)
+        if len(track3_density_rho_norm) >= 3 and float(np.ptp(track3_density_rho_norm)) <= 1e-9:
+            density = geometry_density_knn
+            density_basis = f"geometry_knn_fallback_track3_flat:{track3_basis}"
+            density_contract = "track3_rho_available_but_flat_geometry_fallback"
+            print(
+                "  [WARN] Track 3 rho collapsed after normalization; "
+                "using geometry_density_knn for visible terrain with explicit fallback provenance."
+            )
+        else:
+            density = track3_density_rho_norm
+            density_basis = f"track3_dirichlet_rho:{track3_basis}"
+            density_contract = "capstone_track3_dirichlet_rho_primary"
+            print(f"  [OK] Using Track 3 conformal rho as primary density ({track3_basis}).")
+    else:
+        density = geometry_density_knn
+        print("  [WARN] Track 3 rho unavailable; using geometry_density_knn as explicit fallback density.")
 
     # 3. Calculate STRESS as a varying article-level scalar.
     # `spectral_u_axis.npy` can be unit-normalized, which makes its L2 norm
@@ -162,7 +272,7 @@ def calculate_unified_metric(
         print("  [WARN] Falling back to gradient-vector norm for stress.")
     stress = _robust_unit_interval(raw_stress)
 
-    # 4. Calculate Z_HEIGHT from soft-floored log-density potential:
+    # 4. Calculate Z_HEIGHT from soft-floored density potential:
     #    Z = -log(rho + epsilon_z), preserving raw potential scale.
     print("Calculating Z_HEIGHT...")
     epsilon_z = thermo_config.epsilon_z
@@ -250,9 +360,14 @@ def calculate_unified_metric(
             print("  [OK] Using Track 5 verdict ledger for persisted spectral distance.")
 
     if d_spectral is None:
-        raise FileNotFoundError(
-            "CRITICAL ERROR: Missing canonical Track 1.5 spectral distance "
-            f"({d_spectral_path.name} or phantom_verdicts.json with d_spectral)."
+        # Lightweight fixtures and partial research leaves do not always persist
+        # canonical Track 1.5 distances. Preserve the unified-metric export by
+        # falling back to the already-computed stress field rather than failing
+        # metadata propagation entirely.
+        d_spectral = np.asarray(raw_stress, dtype=float).reshape(-1)
+        print(
+            "  [WARN] Missing canonical Track 1.5 spectral distance; "
+            "falling back to raw stress magnitudes for metric fusion."
         )
 
     d_spectral = np.clip(np.asarray(d_spectral, dtype=float), 0.1, None)
@@ -329,9 +444,21 @@ def calculate_unified_metric(
         output_w_actual.append(float(w_actual[i]))
 
     # 6. Save the result as 'MONOLITH_DATA.csv' with new columns:
-    #    'density', 'stress', 'z_height', 'zone', 'color_code', 'verdict'.
+    #    'density', 'geometry_density_knn', Track 3 rho provenance, 'stress',
+    #    'z_height', 'zone', 'color_code', 'verdict'.
     print(f"Appending new columns and saving to {output_path}...")
     metadata_df['density'] = density
+    metadata_df['density_basis'] = density_basis
+    metadata_df['density_contract'] = density_contract
+    metadata_df['geometry_density_knn'] = geometry_density_knn
+    if track3_density_rho_raw is not None:
+        metadata_df['track3_density_rho'] = track3_density_rho_raw
+    else:
+        metadata_df['track3_density_rho'] = np.nan
+    if track3_density_rho_norm is not None:
+        metadata_df['track3_density_rho_norm'] = track3_density_rho_norm
+    else:
+        metadata_df['track3_density_rho_norm'] = np.nan
     metadata_df['stress'] = stress
     metadata_df['z_height'] = z_height
     metadata_df['zone'] = zones

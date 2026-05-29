@@ -27,10 +27,22 @@ Usage:
 # WINDOWS UNICODE FIX - Must be before all other imports
 # ============================================================================
 import sys
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+
+def _ensure_utf8_console_streams() -> None:
+    if sys.platform != "win32":
+        return
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_console_streams()
 # ============================================================================
 
 import torch
@@ -159,10 +171,13 @@ def load_observer_files(file_list: List[Path], filter_seeds: Optional[List[int]]
             
             # Load data
             data = torch_load_trusted(fpath, map_location='cpu')
-            
+
             # Extract features
             if isinstance(data, dict):
-                features = data.get('features', data.get('embeddings', data.get('article_tokens')))
+                features = data.get(
+                    'integrated_vectors',
+                    data.get('features', data.get('embeddings', data.get('article_tokens')))
+                )
             else:
                 features = data
             
@@ -315,7 +330,14 @@ def metric_intrinsic_dimension(obs: np.ndarray, n_components: int = 50, threshol
     Estimate intrinsic dimensionality via PCA.
     Returns: Number of components needed to explain threshold variance.
     """
-    pca = PCA(n_components=min(n_components, obs.shape[1]))
+    obs = np.asarray(obs)
+    if obs.ndim != 2 or min(obs.shape) <= 0:
+        return 0.0
+    # PCA cannot request more components than either samples or features.
+    # Focused proof bundles often use N=30, so the previous 50-component
+    # default crashed exactly when reviewer-facing control comparisons ran.
+    effective_components = max(1, min(int(n_components), int(obs.shape[0]), int(obs.shape[1])))
+    pca = PCA(n_components=effective_components)
     pca.fit(obs)
     
     cumsum = np.cumsum(pca.explained_variance_ratio_)

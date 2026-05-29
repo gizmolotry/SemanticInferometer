@@ -24,7 +24,6 @@ Author: Belief Transformer Project (ASTER v3.2)
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import numpy as np
 import sys
@@ -33,12 +32,20 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Union
 from datetime import datetime
 
-if sys.platform == "win32":
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    except AttributeError:
-        pass
+def _ensure_utf8_console_streams() -> None:
+    if sys.platform != "win32":
+        return
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_console_streams()
 
 # =============================================================================
 # OPTIONAL IMPORTS

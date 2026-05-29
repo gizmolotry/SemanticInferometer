@@ -13,7 +13,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from analysis.verification.thesis_evidence import build_thesis_evidence, write_thesis_evidence
+from analysis.verification.thesis_evidence import (
+    build_thesis_evidence,
+    write_thesis_evidence_payloads,
+)
 
 
 def _load_path_list(path: Path) -> list[Path]:
@@ -82,6 +85,14 @@ def main() -> int:
         help="Read control_metrics basis snapshots when available.",
     )
     parser.add_argument(
+        "--track4-observer-state-summary",
+        default=None,
+        help=(
+            "Optional explicit track4_observer_state_ablation_summary.json path "
+            "to pin the Track 4 observer-state action evidence."
+        ),
+    )
+    parser.add_argument(
         "--print-bundle",
         action="store_true",
         help="Print the scientific_validation_summary payload after writing files.",
@@ -102,17 +113,12 @@ def main() -> int:
         synthetic_manifest_paths.extend(_load_path_list(Path(args.synthetic_manifest_list)))
 
     run_id_allowlist_path = Path(args.run_id_allowlist) if args.run_id_allowlist else None
-
-    written = write_thesis_evidence(
-        runs_dir=Path(args.runs_dir),
-        methods_path=Path(args.methods_path),
-        results_path=Path(args.results_path),
-        out_dir=Path(args.output_dir),
-        run_id_allowlist_path=run_id_allowlist_path,
-        suite_manifest_paths=suite_manifest_paths or None,
-        synthetic_manifest_paths=synthetic_manifest_paths or None,
-        control_metric_basis=args.control_metric_basis,
+    track4_observer_state_summary_path = (
+        Path(args.track4_observer_state_summary)
+        if args.track4_observer_state_summary
+        else None
     )
+
     payloads = build_thesis_evidence(
         runs_dir=Path(args.runs_dir),
         methods_path=Path(args.methods_path),
@@ -121,17 +127,39 @@ def main() -> int:
         suite_manifest_paths=suite_manifest_paths or None,
         synthetic_manifest_paths=synthetic_manifest_paths or None,
         control_metric_basis=args.control_metric_basis,
+        track4_observer_state_summary_path=track4_observer_state_summary_path,
     )
     focused_ok, focused_reason = _focused_selection_is_valid(payloads.get("scientific_validation_summary") or {})
+    if not focused_ok:
+        print(f"[THESIS_EVIDENCE][FAIL] {focused_reason}", file=sys.stderr)
+        return 1
+    if args.publication_profile:
+        profile = payloads.get("paper_claim_profile") or {}
+        ready = bool(profile.get("publication_ready", False))
+        core_claims = [
+            row.get("claim_id")
+            for row in profile.get("core_claims", [])
+            if isinstance(row, dict)
+        ]
+        blocked = [
+            row.get("claim_id")
+            for row in profile.get("blocked_core_claims", [])
+            if isinstance(row, dict)
+        ]
+        if not ready:
+            print(f"Publication profile ready: {ready}")
+            print(f"- core claims: {', '.join(map(str, core_claims))}")
+            if blocked:
+                print(f"- blocked core claims: {', '.join(map(str, blocked))}")
+            return 1
+
+    written = write_thesis_evidence_payloads(payloads=payloads, out_dir=Path(args.output_dir))
 
     print("Built thesis evidence bundle:")
     for key, target in written.items():
         print(f"- {key}: {target}")
     if args.print_bundle:
         print(json.dumps(payloads["scientific_validation_summary"], indent=2))
-    if not focused_ok:
-        print(f"[THESIS_EVIDENCE][FAIL] {focused_reason}", file=sys.stderr)
-        return 1
     if args.publication_profile:
         profile = payloads.get("paper_claim_profile") or {}
         ready = bool(profile.get("publication_ready", False))

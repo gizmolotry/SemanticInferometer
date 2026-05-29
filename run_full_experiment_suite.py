@@ -30,6 +30,7 @@ Output structure:
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
 import math
@@ -37,18 +38,32 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Sequence
 import subprocess
 import sys
 
-# Fix Windows console encoding for Unicode characters (do once at module load)
-if sys.platform == 'win32':
-    import io
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-    except AttributeError:
-        pass  # Already wrapped
+
+def _ensure_utf8_console_streams() -> None:
+    """Avoid destructive stdout/stderr re-wrapping at import time.
+
+    Replacing ``sys.stdout`` / ``sys.stderr`` with a new ``TextIOWrapper`` can cause
+    pytest (and other harnesses) to keep a reference to a stream object that later
+    gets finalized/closed. Reconfigure in place when supported and otherwise leave
+    the active streams alone.
+    """
+    if sys.platform != "win32":
+        return
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_console_streams()
 
 # For alpha sweep (optional - graceful fallback if not available)
 try:
@@ -58,12 +73,32 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+
+def _release_transient_memory() -> None:
+    """Keep long suite orchestration from retaining bulky transient allocations."""
+    gc.collect()
+    if TORCH_AVAILABLE:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 # For gradient channel (Track 3)
 try:
     from core.metric_gradients import MetricGradientExtractor, MetricGradientAnalyzer, MetricGradientConfig
     GRADIENT_AVAILABLE = True
 except ImportError:
     GRADIENT_AVAILABLE = False
+
+try:
+    from analysis.verification.scientific_summaries import (
+        write_observer_relativity_summary,
+        write_track4_traversal_summary,
+    )
+    SCIENTIFIC_SUMMARIES_AVAILABLE = True
+except ImportError:
+    SCIENTIFIC_SUMMARIES_AVAILABLE = False
 
 
 # -----------------------------
@@ -176,6 +211,16 @@ def validate_against_ground_truth(
         "label_set": label_set,
         "feature_source": feature_source,
     }
+
+
+def _preferred_artifact_features(result: Dict[str, Any]) -> Any:
+    """Prefer Track 5 integrated vectors for artifact-facing geometry when available."""
+    if not isinstance(result, dict):
+        return None
+    integrated = result.get("integrated_vectors")
+    if integrated is not None:
+        return integrated
+    return result.get("features")
 
 
 # -----------------------------
@@ -567,7 +612,141 @@ def run_single_corpus(
     }
 
 
-def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str, Any]:
+def _write_observer_manifest_stub(target_dir: Path, *, reason: str, scope: str = "stub") -> Path:
+    target_dir = Path(target_dir)
+    manifest_path = target_dir / "observer_manifest.json"
+    payload = {
+        "schema_version": "1.0",
+        "variant": "MONOLITH.html",
+        "mode": "focused",
+        "status": "SKIPPED",
+        "scope": str(scope or "stub"),
+        "reason": str(reason or "observer artifact generation skipped"),
+        "coverage": {"found": 0, "total": 0},
+        "observers": [],
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return manifest_path
+
+
+def _normalize_observer_indices(observer_indices: Optional[Sequence[int]], n_articles: int) -> List[int]:
+    if n_articles <= 0:
+        return []
+    if observer_indices is None:
+        return list(range(n_articles))
+    selected: List[int] = []
+    seen = set()
+    for raw in observer_indices:
+        try:
+            idx = int(raw)
+        except Exception:
+            continue
+        if idx < 0 or idx >= n_articles or idx in seen:
+            continue
+        selected.append(idx)
+        seen.add(idx)
+    return selected
+
+
+def _parse_observer_indices_arg(raw: Optional[Sequence[str]]) -> Optional[List[int]]:
+    if not raw:
+        return None
+    values: List[int] = []
+    for chunk in raw:
+        for token in str(chunk).replace(",", " ").split():
+            if token.strip():
+                values.append(int(token))
+    return values
+
+
+def _select_anchor_observer_indices(run_dir: Path, rows: List[Dict[str, Any]], *, count: int = 3) -> List[int]:
+    run_dir = Path(run_dir)
+    n_articles = len(rows)
+    limit = max(1, int(count or 3))
+    selected: List[int] = []
+
+    def _add(raw: Any) -> None:
+        if len(selected) >= limit:
+            return
+        try:
+            idx = int(raw)
+        except Exception:
+            return
+        if 0 <= idx < n_articles and idx not in selected:
+            selected.append(idx)
+
+    cyclic_path = run_dir / "cyclic_paths.npz"
+    if cyclic_path.exists():
+        try:
+            import numpy as np_local
+
+            with np_local.load(cyclic_path, allow_pickle=True) as cyclic:
+                for raw in cyclic.get("anchor_indices", []):
+                    _add(raw)
+        except Exception:
+            pass
+    if len(selected) >= limit:
+        return selected
+
+    walker_path = run_dir / "walker_states.json"
+    if walker_path.exists():
+        try:
+            states = json.loads(walker_path.read_text(encoding="utf-8"))
+            if isinstance(states, list):
+                ranked = sorted(
+                    enumerate(states),
+                    key=lambda item: float((item[1] or {}).get("work_integral") or 0.0)
+                    if isinstance(item[1], dict)
+                    else 0.0,
+                    reverse=True,
+                )
+                for idx, _ in ranked:
+                    _add(idx)
+        except Exception:
+            pass
+    if len(selected) >= limit:
+        return selected
+
+    ranked_rows = sorted(
+        enumerate(rows),
+        key=lambda item: (
+            _safe_float((item[1] or {}).get("stress"), 0.0)
+            + _safe_float((item[1] or {}).get("w_actual"), 0.0)
+        ),
+        reverse=True,
+    )
+    for fallback_pos, row in ranked_rows:
+        _add((row or {}).get("index", fallback_pos))
+    return selected
+
+
+def _resolve_observer_indices_for_leaf(
+    run_dir: Path,
+    rows: List[Dict[str, Any]],
+    *,
+    observer_indices: Optional[Sequence[int]] = None,
+    observer_index_policy: str = "all",
+    observer_index_count: int = 3,
+) -> Optional[List[int]]:
+    if observer_indices is not None:
+        return _normalize_observer_indices(observer_indices, len(rows))
+    policy = str(observer_index_policy or "all").strip().lower()
+    if policy in {"anchor", "anchors", "auto", "auto_anchors"}:
+        return _select_anchor_observer_indices(run_dir, rows, count=observer_index_count)
+    return None
+
+
+def materialize_baseline_bundle(
+    run_dir: Path,
+    strict: bool = True,
+    *,
+    allow_observer_backfill: bool = True,
+    generate_observer_manifest: bool = True,
+    observer_indices: Optional[Sequence[int]] = None,
+    observer_index_policy: str = "all",
+    observer_index_count: int = 3,
+    isolate_contract_bundle: bool = False,
+) -> Dict[str, Any]:
     """
     Emit thesis-facing baseline artifacts for Dash browsing:
       - MONOLITH.html
@@ -649,6 +828,15 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
     if strict:
         viz_cmd.append("--strict")
 
+    selection_rows = _load_monolith_rows(monolith_csv)
+    resolved_observer_indices = _resolve_observer_indices_for_leaf(
+        target_dir,
+        selection_rows,
+        observer_indices=observer_indices,
+        observer_index_policy=observer_index_policy,
+        observer_index_count=observer_index_count,
+    )
+
     precompute_cmd = [
         sys.executable,
         "-m",
@@ -660,6 +848,25 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
         "focused",
         "--overwrite",
     ]
+    if resolved_observer_indices is not None:
+        precompute_cmd.extend(["--observer-indices", *[str(idx) for idx in resolved_observer_indices]])
+
+    contract_result_path = target_dir / "contract_bundle_result.json"
+    contract_cmd = [
+        sys.executable,
+        "scripts/backfill_observer_contract.py",
+        str(target_dir),
+        "--output-json",
+        str(contract_result_path),
+        "--observer-index-policy",
+        str(observer_index_policy),
+        "--observer-index-count",
+        str(observer_index_count),
+    ]
+    if not allow_observer_backfill:
+        contract_cmd.append("--no-observer-backfill")
+    if resolved_observer_indices is not None:
+        contract_cmd.extend(["--observer-indices", *[str(idx) for idx in resolved_observer_indices]])
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -667,7 +874,23 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
 
     try:
         print(f"[BUNDLE] Emitting consumer contract bundle for {target_dir}...")
-        contract_res = emit_consumer_contract_bundle(target_dir)
+        if isolate_contract_bundle:
+            contract_proc = subprocess.run(contract_cmd, env=env)
+            if contract_proc.returncode != 0:
+                return {
+                    "status": "failed",
+                    "stage": "contract_bundle",
+                    "returncode": contract_proc.returncode,
+                    "run_dir": str(run_dir),
+                    "target_dir": str(target_dir),
+                }
+            contract_res = _load_json_if_exists(contract_result_path) or {"status": "success"}
+        else:
+            contract_res = emit_consumer_contract_bundle(
+                target_dir,
+                allow_observer_backfill=allow_observer_backfill,
+                observer_indices=resolved_observer_indices,
+            )
         if contract_res.get("status") != "success":
             return {
                 "status": "failed",
@@ -689,16 +912,23 @@ def materialize_baseline_bundle(run_dir: Path, strict: bool = True) -> Dict[str,
                 "contract_bundle": contract_res,
             }
 
-        print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
-        pre_res = subprocess.run(precompute_cmd, env=env)
-        if pre_res.returncode != 0:
-            return {
-                "status": "failed",
-                "stage": "observer_manifest",
-                "returncode": pre_res.returncode,
-                "run_dir": str(run_dir),
-                "target_dir": str(target_dir),
-            }
+        if generate_observer_manifest:
+            print(f"[BUNDLE] Materializing observer manifest for {target_dir}...")
+            pre_res = subprocess.run(precompute_cmd, env=env)
+            if pre_res.returncode != 0:
+                return {
+                    "status": "failed",
+                    "stage": "observer_manifest",
+                    "returncode": pre_res.returncode,
+                    "run_dir": str(run_dir),
+                    "target_dir": str(target_dir),
+                }
+        else:
+            _write_observer_manifest_stub(
+                target_dir,
+                reason="observer manifest generation disabled for this leaf",
+                scope="disabled",
+            )
         missing = _validate_required_bundle_outputs(target_dir)
         if missing:
             return {
@@ -924,6 +1154,7 @@ def _infer_runtime_config_from_payload(payload: Dict[str, Any]) -> "PipelineRunt
     from core.pipeline_config import PipelineRuntimeConfig, DEFAULT_PIPELINE_RUNTIME_CONFIG
 
     meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+    provenance = payload.get("provenance", {}) if isinstance(payload.get("provenance"), dict) else {}
     basis_state = payload.get("rks_basis_state", {}) if isinstance(payload.get("rks_basis_state"), dict) else {}
     cls_per_bot = payload.get("cls_per_bot")
     features = payload.get("features")
@@ -946,6 +1177,12 @@ def _infer_runtime_config_from_payload(payload: Dict[str, Any]) -> "PipelineRunt
 
     return PipelineRuntimeConfig(
         use_contrastive=bool(meta.get("use_contrastive", True)),
+        track5_assembly_mode=str(
+            meta.get(
+                "track5_assembly_mode",
+                provenance.get("track5_assembly_mode", payload.get("track5_assembly_mode", DEFAULT_PIPELINE_RUNTIME_CONFIG.track5_assembly_mode)),
+            )
+        ),
         use_pca_removal=bool(meta.get("use_pca_removal", False)),
         use_cls_tokens=bool(cls_per_bot is not None or str(meta.get("channel", "")).lower() == "cls"),
         use_gru=bool(meta.get("use_gru", True)),
@@ -984,10 +1221,11 @@ def _save_observer_run_leaf(obs_sub_dir: Path, obs_result: Dict[str, Any]) -> No
         except Exception:
             pass
 
-    _save_npy("features.npy", obs_result.get("features"))
+    _save_npy("features.npy", _preferred_artifact_features(obs_result))
     _save_npy("integrated_vectors.npy", obs_result.get("integrated_vectors"))
     _save_npy("dirichlet_fused.npy", obs_result.get("dirichlet_fused"))
     _save_npy("dirichlet_fused_std.npy", obs_result.get("dirichlet_fused_std"))
+    _save_npy("track3_density_rho.npy", obs_result.get("track3_density_rho"))
     _save_npy("walker_work_integrals.npy", obs_result.get("walker_work_integrals"))
 
     t15 = obs_result.get("T1.5_spectral", {}) if isinstance(obs_result.get("T1.5_spectral"), dict) else {}
@@ -1023,15 +1261,38 @@ def _save_observer_run_leaf(obs_sub_dir: Path, obs_result: Dict[str, Any]) -> No
     walker_paths = obs_result.get("walker_paths")
     if isinstance(walker_paths, list) and walker_paths:
         try:
-            article_idx = np.arange(len(walker_paths), dtype=np.int64)
-            path_xyz = np.array([np.asarray(path, dtype=float) for path in walker_paths], dtype=object)
-            path_space = np.array(["embedding"], dtype=object)
-            np.savez(obs_sub_dir / "walker_paths.npz", article_idx=article_idx, path_xyz=path_xyz, path_space=path_space)
+            article_idx = []
+            path_xyz_entries = []
+            for i, path in enumerate(walker_paths):
+                if isinstance(path, dict):
+                    coords = path.get("path_xyz")
+                    if coords is None:
+                        coords = path.get("coords")
+                    if coords is None:
+                        coords = path.get("trajectory")
+                    if coords is None:
+                        continue
+                    article_idx.append(int(path.get("article_idx", i)))
+                    path_xyz_entries.append(np.asarray(coords, dtype=float))
+                else:
+                    article_idx.append(i)
+                    path_xyz_entries.append(np.asarray(path, dtype=float))
+            if path_xyz_entries:
+                path_space = np.array(["embedding"], dtype=object)
+                np.savez(
+                    obs_sub_dir / "walker_paths.npz",
+                    article_idx=np.asarray(article_idx, dtype=np.int64),
+                    path_xyz=np.array(path_xyz_entries, dtype=object),
+                    path_space=path_space,
+                )
         except Exception:
             pass
 
 
-def _ensure_observer_universes_materialized(run_dir: Path) -> Dict[str, Any]:
+def _ensure_observer_universes_materialized(
+    run_dir: Path,
+    observer_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
     run_dir = Path(run_dir)
     rel_dir = run_dir / "relativity_cache"
     rel_dir.mkdir(parents=True, exist_ok=True)
@@ -1043,10 +1304,17 @@ def _ensure_observer_universes_materialized(run_dir: Path) -> Dict[str, Any]:
     n_articles = int(primary_payload.get("n_articles") or len(primary_payload.get("article_metadata", [])) or 0)
     if n_articles <= 0:
         return {"status": "failed", "reason": "observer payload missing article count"}
+    target_indices = _normalize_observer_indices(observer_indices, n_articles)
+    if not target_indices:
+        return {"status": "skipped", "reason": "no observer indices selected", "selected_observer_indices": []}
 
-    existing_payloads = len(list(rel_dir.glob("observer_*.pt")))
-    existing_obs_dirs = len([p for p in rel_dir.glob("obs_*") if p.is_dir()])
-    if existing_payloads >= n_articles and existing_obs_dirs >= n_articles:
+    existing_payloads = sum(1 for idx in target_indices if (rel_dir / f"observer_{idx}.pt").exists())
+    existing_obs_dirs = sum(
+        1
+        for idx in target_indices
+        if (rel_dir / f"obs_{idx}").is_dir() and (rel_dir / f"obs_{idx}" / "features.npy").exists()
+    )
+    if existing_payloads >= len(target_indices) and existing_obs_dirs >= len(target_indices):
         if not (run_dir / "observer_global.pt").exists() and TORCH_AVAILABLE:
             try:
                 torch.save(primary_payload, run_dir / "observer_global.pt")
@@ -1056,6 +1324,7 @@ def _ensure_observer_universes_materialized(run_dir: Path) -> Dict[str, Any]:
             "status": "already_exists",
             "observer_payloads": existing_payloads,
             "observer_dirs": existing_obs_dirs,
+            "selected_observer_indices": target_indices,
         }
 
     articles, article_source = _recover_articles_for_observer_backfill(run_dir, primary_payload)
@@ -1104,13 +1373,16 @@ def _ensure_observer_universes_materialized(run_dir: Path) -> Dict[str, Any]:
 
     written_payloads = 0
     written_dirs = 0
-    for obs_i in range(n_articles):
+    for selected_pos, obs_i in enumerate(target_indices, start=1):
         obs_pt_path = rel_dir / f"observer_{obs_i}.pt"
         obs_sub_dir = rel_dir / f"obs_{obs_i}"
         if obs_pt_path.exists() and obs_sub_dir.exists() and (obs_sub_dir / "features.npy").exists():
             continue
 
-        print(f"[RELATIVITY][BACKFILL] Materializing observer universe {obs_i + 1}/{n_articles} for {run_dir.name}...")
+        print(
+            f"[RELATIVITY][BACKFILL] Materializing observer universe {obs_i} "
+            f"({selected_pos}/{len(target_indices)} selected, N={n_articles}) for {run_dir.name}..."
+        )
         obs_config = {
             "enable_checkpoints": True,
             "output_dir": str(obs_sub_dir),
@@ -1141,6 +1413,7 @@ def _ensure_observer_universes_materialized(run_dir: Path) -> Dict[str, Any]:
         "observer_payloads": len(list(rel_dir.glob("observer_*.pt"))),
         "observer_dirs": len([p for p in rel_dir.glob("obs_*") if p.is_dir()]),
         "article_source": article_source,
+        "selected_observer_indices": target_indices,
         "written_payloads": written_payloads,
         "written_dirs": written_dirs,
     }
@@ -1266,7 +1539,7 @@ def _load_control_observers(corpus_dir: Path) -> Dict[int, Dict[str, Any]]:
             payload = torch.load(fpath, map_location="cpu", weights_only=False)
         except Exception:
             continue
-        matrix = payload.get("features") if isinstance(payload, dict) else payload
+        matrix = _preferred_artifact_features(payload) if isinstance(payload, dict) else payload
         if matrix is None and isinstance(payload, dict):
             matrix = payload.get("embeddings")
         if matrix is None:
@@ -1307,12 +1580,14 @@ def _compute_direct_control_metrics(observers: Dict[int, Dict[str, Any]]) -> Opt
     procrustes_vals: List[float] = []
     distance_vals: List[float] = []
     feature_mats: List[np.ndarray] = [np.asarray(observers[s]["features"], dtype=np.float64) for s in seeds]
+    simple_variance_vals: List[float] = []
     for i, seed_a in enumerate(seeds):
         for seed_b in seeds[i + 1:]:
             obs_a = np.asarray(observers[seed_a]["features"], dtype=np.float64)
             obs_b = np.asarray(observers[seed_b]["features"], dtype=np.float64)
             procrustes_vals.append(_procrustes_residual(obs_a, obs_b))
             distance_vals.append(_distance_correlation_residual(obs_a, obs_b))
+            simple_variance_vals.append(float(np.mean(np.abs(obs_a - obs_b))))
     if not procrustes_vals or not distance_vals:
         return None
     return {
@@ -1325,6 +1600,11 @@ def _compute_direct_control_metrics(observers: Dict[int, Dict[str, Any]]) -> Opt
             "mean": float(np.mean(distance_vals)),
             "std": float(np.std(distance_vals)),
             "values": [float(v) for v in distance_vals],
+        },
+        "simple_variance": {
+            "mean": float(np.mean(simple_variance_vals)),
+            "std": float(np.std(simple_variance_vals)),
+            "values": [float(v) for v in simple_variance_vals],
         },
         "consensus_residual": _consensus_residual_summary(feature_mats),
         "n_observers": len(seeds),
@@ -1393,6 +1673,7 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
         control_names = [name for name in aligned_family.keys() if name != "Real"]
         control_pair_procrustes: List[float] = []
         control_pair_distcorr: List[float] = []
+        control_pair_variance: List[float] = []
         if len(control_names) >= 2:
             for i, name_a in enumerate(control_names):
                 for name_b in control_names[i + 1:]:
@@ -1400,20 +1681,25 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
                     arr_b = aligned_family[name_b]
                     control_pair_procrustes.append(_procrustes_residual(arr_a, arr_b))
                     control_pair_distcorr.append(_distance_correlation_residual(arr_a, arr_b))
+                    control_pair_variance.append(float(np.mean(np.abs(arr_a - arr_b))))
 
         real_vs_control_procrustes: List[float] = []
         real_vs_control_distcorr: List[float] = []
+        real_vs_control_variance: List[float] = []
         fallback_results: Dict[str, Dict[str, Any]] = {}
         for control_name in control_names:
             ctrl_arr = aligned_family[control_name]
             p_val = _procrustes_residual(real_arr, ctrl_arr)
             d_val = _distance_correlation_residual(real_arr, ctrl_arr)
+            v_val = float(np.mean(np.abs(real_arr - ctrl_arr)))
             real_vs_control_procrustes.append(p_val)
             real_vs_control_distcorr.append(d_val)
+            real_vs_control_variance.append(v_val)
             fallback_results[control_name] = {
                 "comparison_to_real": {
                     "procrustes": float(p_val),
                     "distance_corr": float(d_val),
+                    "simple_variance": float(v_val),
                 },
                 "n_observers": 1,
                 "seeds": [int(primary_family[control_name]["seed"])],
@@ -1433,8 +1719,14 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
             if control_pair_distcorr
             else 1.0
         )
+        variance_control_avg = (
+            float(np.mean(control_pair_variance))
+            if control_pair_variance
+            else 1.0
+        )
         procrustes_real_value = float(np.mean(real_vs_control_procrustes))
         distcorr_real_value = float(np.mean(real_vs_control_distcorr))
+        variance_real_value = float(np.mean(real_vs_control_variance))
 
         interpretation = {
             "has_real": True,
@@ -1475,6 +1767,23 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
                         )
                     ),
                 },
+                "simple_variance": {
+                    "real_value": variance_real_value,
+                    "control_avg": variance_control_avg,
+                    "ratio": (
+                        float(variance_real_value / variance_control_avg)
+                        if abs(variance_control_avg) > 1e-12
+                        else None
+                    ),
+                    "separates": bool(
+                        abs(variance_real_value - variance_control_avg) > 1e-9
+                        and (
+                            abs(variance_real_value / variance_control_avg - 1.0) > 0.2
+                            if abs(variance_control_avg) > 1e-12
+                            else True
+                        )
+                    ),
+                },
             },
             "consensus_residual": {
                 "real": {
@@ -1503,7 +1812,7 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
             "real": results_dict["Real"].get("consensus_residual", {}),
         },
     }
-    for metric_name in ("procrustes", "distance_corr"):
+    for metric_name in ("procrustes", "distance_corr", "simple_variance"):
         if metric_name not in results_dict["Real"]:
             continue
         real_val = float(results_dict["Real"][metric_name]["mean"])
@@ -1531,6 +1840,37 @@ def _build_direct_control_results_blob(run_dir: Path) -> Optional[Dict[str, Any]
 
 
 def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], source_path: Optional[Path]) -> Dict[str, Any]:
+    def _metric_ratio(metrics_blob: Dict[str, Any], metric_name: str) -> Optional[float]:
+        metric = metrics_blob.get(metric_name, {}) if isinstance(metrics_blob, dict) else {}
+        return _safe_float((metric or {}).get("ratio"), default=None)
+
+    def _metric_real_value(metrics_blob: Dict[str, Any], metric_name: str) -> Optional[float]:
+        metric = metrics_blob.get(metric_name, {}) if isinstance(metrics_blob, dict) else {}
+        return _safe_float((metric or {}).get("real_value"), default=None)
+
+    def _metric_control_avg(metrics_blob: Dict[str, Any], metric_name: str) -> Optional[float]:
+        metric = metrics_blob.get(metric_name, {}) if isinstance(metrics_blob, dict) else {}
+        return _safe_float((metric or {}).get("control_avg"), default=None)
+
+    def _control_metric_mean(controls_blob: Any, control_name: str, metric_name: str) -> Optional[float]:
+        if not isinstance(controls_blob, dict):
+            return None
+        control = controls_blob.get(control_name) or controls_blob.get(control_name.lower())
+        if not isinstance(control, dict):
+            return None
+        metric = control.get(metric_name)
+        if isinstance(metric, dict):
+            return _safe_float(metric.get("mean"), default=None)
+        return None
+
+    def _stochastic_control_mean(controls_blob: Any, metric_name: str) -> Optional[float]:
+        vals = [
+            _control_metric_mean(controls_blob, "Shuffled", metric_name),
+            _control_metric_mean(controls_blob, "Random", metric_name),
+        ]
+        vals = [float(v) for v in vals if v is not None]
+        return float(np.mean(vals)) if vals else None
+
     def _control_explanation(controls_blob: Any) -> str:
         if not isinstance(controls_blob, dict):
             return (
@@ -1566,6 +1906,33 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
             "to show whether the manifold is carrying structured signal rather than noise."
         )
 
+    def _procrustes_control_rows(interpretation_blob: Any) -> Dict[str, Any]:
+        if not isinstance(interpretation_blob, dict):
+            return {"available": False, "rows": [], "min_ratio_real_over_control": None}
+        block = interpretation_blob.get("procrustes_real_vs_controls")
+        if not isinstance(block, dict):
+            return {"available": False, "rows": [], "min_ratio_real_over_control": None}
+        rows: List[Dict[str, Any]] = []
+        ratios: List[float] = []
+        for raw_row in block.get("rows") or []:
+            if not isinstance(raw_row, dict):
+                continue
+            ratio = _safe_float(raw_row.get("ratio_real_over_control"), default=None)
+            row = {
+                "control": str(raw_row.get("control") or "unknown"),
+                "real_mean": _safe_float(raw_row.get("real_mean"), default=None),
+                "control_mean": _safe_float(raw_row.get("control_mean"), default=None),
+                "ratio_real_over_control": ratio,
+            }
+            if ratio is not None:
+                ratios.append(float(ratio))
+            rows.append(row)
+        return {
+            "available": bool(rows),
+            "rows": rows,
+            "min_ratio_real_over_control": min(ratios) if ratios else None,
+        }
+
     controls_blob = results_blob.get("results", {}) if isinstance(results_blob, dict) else {}
     payload: Dict[str, Any] = {
         "status": "NO_DATA",
@@ -1577,6 +1944,11 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
         "metrics": {
             "procrustes_ratio": None,
             "distance_corr_ratio": None,
+            "simple_variance_ratio": None,
+            "simple_variance_stochastic_ratio": None,
+            "simple_variance_real": None,
+            "simple_variance_control_avg": None,
+            "simple_variance_stochastic_control_mean": None,
             "separates_count": 0,
             "consensus_pct": None,
             "residual_pct": None,
@@ -1607,12 +1979,31 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
 
     metrics = interpretation.get("metrics", {})
     metrics = metrics if isinstance(metrics, dict) else {}
-    procrustes_ratio = _safe_float((metrics.get("procrustes", {}) or {}).get("ratio"), default=float("nan"))
-    distance_corr_ratio = _safe_float((metrics.get("distance_corr", {}) or {}).get("ratio"), default=float("nan"))
+    procrustes_per_control = _procrustes_control_rows(interpretation)
+    procrustes_ratio = _metric_ratio(metrics, "procrustes")
+    distance_corr_ratio = _metric_ratio(metrics, "distance_corr")
+    simple_variance_ratio = _metric_ratio(metrics, "simple_variance")
+    simple_variance_real = _metric_real_value(metrics, "simple_variance")
+    simple_variance_control_avg = _metric_control_avg(metrics, "simple_variance")
     separates_count = sum(1 for m in metrics.values() if isinstance(m, dict) and bool(m.get("separates")))
     consensus_residual = ((interpretation.get("consensus_residual", {}) or {}).get("real", {}) or {})
     controls = controls_blob
     controls = controls if isinstance(controls, dict) else {}
+    if simple_variance_real is None:
+        simple_variance_real = _control_metric_mean(controls, "Real", "simple_variance")
+    simple_variance_stochastic_mean = _stochastic_control_mean(controls, "simple_variance")
+    if simple_variance_ratio is None and simple_variance_real is not None and simple_variance_stochastic_mean:
+        simple_variance_ratio = (
+            float(simple_variance_real / simple_variance_stochastic_mean)
+            if abs(simple_variance_stochastic_mean) > 1e-12 else None
+        )
+    simple_variance_stochastic_ratio = (
+        float(simple_variance_real / simple_variance_stochastic_mean)
+        if simple_variance_real is not None
+        and simple_variance_stochastic_mean is not None
+        and abs(simple_variance_stochastic_mean) > 1e-12
+        else None
+    )
 
     payload.update(
         {
@@ -1621,8 +2012,14 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
             "message": "loaded",
             "explanation": _control_explanation(controls),
             "metrics": {
-                "procrustes_ratio": None if str(procrustes_ratio) == "nan" else procrustes_ratio,
-                "distance_corr_ratio": None if str(distance_corr_ratio) == "nan" else distance_corr_ratio,
+                "procrustes_ratio": procrustes_ratio,
+                "procrustes_min_control_ratio": procrustes_per_control["min_ratio_real_over_control"],
+                "distance_corr_ratio": distance_corr_ratio,
+                "simple_variance_ratio": simple_variance_ratio,
+                "simple_variance_stochastic_ratio": simple_variance_stochastic_ratio,
+                "simple_variance_real": simple_variance_real,
+                "simple_variance_control_avg": simple_variance_control_avg,
+                "simple_variance_stochastic_control_mean": simple_variance_stochastic_mean,
                 "separates_count": int(separates_count),
                 "consensus_pct": _safe_float(consensus_residual.get("consensus_pct"), default=None),
                 "residual_pct": _safe_float(consensus_residual.get("residual_pct"), default=None),
@@ -1635,33 +2032,135 @@ def _build_control_metrics_payload(results_blob: Optional[Dict[str, Any]], sourc
                     "larger separation indicates signal survives against noise baselines."
                 ),
             },
+            "procrustes_real_vs_controls": procrustes_per_control,
         }
     )
     return payload
 
 
-def _emit_control_metrics_json(run_dir: Path) -> Path:
+def _normalize_control_metric_basis(raw: Optional[str]) -> str:
+    value = str(raw or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "direct": "direct_observer_payload",
+        "direct_observer": "direct_observer_payload",
+        "direct_observer_payload": "direct_observer_payload",
+        "comprehensive": "comprehensive_results",
+        "comprehensive_results": "comprehensive_results",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "control metric basis must be one of: auto, direct, comprehensive"
+        )
+    return aliases[value]
+
+
+def _configured_control_metric_basis() -> str:
+    return _normalize_control_metric_basis(os.environ.get("BT_CONTROL_METRIC_BASIS", "auto"))
+
+
+def _write_control_metrics_payload(out: Path, payload: Dict[str, Any]) -> None:
+    out = Path(out)
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    basis = str(payload.get("metric_basis") or "").strip()
+    if basis and basis not in {"none", "unknown"}:
+        snapshot = out.with_name(f"{out.stem}.{basis}{out.suffix}")
+        snapshot.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _emit_control_metrics_json(run_dir: Path, metric_basis: Optional[str] = None) -> Path:
     run_dir = Path(run_dir)
     out = run_dir / "control_metrics.json"
+    requested_basis = _normalize_control_metric_basis(metric_basis) if metric_basis else _configured_control_metric_basis()
+    source_candidates = [
+        run_dir / "comprehensive_results.json",
+        run_dir.parent / "comprehensive_results.json",
+    ]
+    comprehensive_source_path = next(
+        (path for path in source_candidates if path.exists()),
+        run_dir / "comprehensive_results.json",
+    )
     direct_blob = _build_direct_control_results_blob(run_dir)
+    comprehensive_blob: Dict[str, Any] = {}
+    if comprehensive_source_path.exists():
+        try:
+            loaded = json.loads(comprehensive_source_path.read_text(encoding="utf-8"))
+            comprehensive_blob = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            comprehensive_blob = {}
+
+    direct_available = isinstance(direct_blob, dict) and bool(direct_blob)
+    comprehensive_available = bool(comprehensive_blob)
+    use_comprehensive_primary = (
+        requested_basis == "comprehensive_results" and comprehensive_available
+    ) or (
+        requested_basis == "auto"
+        and not direct_available
+        and comprehensive_available
+    )
+
+    if use_comprehensive_primary:
+        payload = _build_control_metrics_payload(
+            comprehensive_blob,
+            comprehensive_source_path,
+        )
+        payload["metric_basis"] = "comprehensive_results"
+        payload["requested_metric_basis"] = requested_basis
+        payload["primary_metric_source"] = "comprehensive_results"
+        if direct_available:
+            direct_source_path = Path(str(direct_blob.get("direct_source", run_dir)))
+            alternate_payload = _build_control_metrics_payload(direct_blob, direct_source_path)
+            payload["alternate_sources"] = {
+                "direct_observer_payload": {
+                    "metric_basis": "direct_observer_payload",
+                    "source": alternate_payload.get("source"),
+                    "status": alternate_payload.get("status"),
+                    "metrics": alternate_payload.get("metrics", {}),
+                    "message": "loaded from direct control observer payloads",
+                }
+            }
+        if requested_basis == "comprehensive_results" and not comprehensive_available:
+            payload["basis_warning"] = "requested comprehensive_results but source was unavailable"
+        _write_control_metrics_payload(out, payload)
+        return out
+
     if isinstance(direct_blob, dict) and direct_blob:
         source_path = Path(str(direct_blob.get("direct_source", run_dir)))
         payload = _build_control_metrics_payload(direct_blob, source_path)
         payload["message"] = "loaded from direct control observer payloads"
         payload["synthetic_placeholder"] = False
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        payload["metric_basis"] = "direct_observer_payload"
+        payload["requested_metric_basis"] = requested_basis
+        payload["primary_metric_source"] = "direct_control_observer_payloads"
+        if comprehensive_available:
+            alternate_payload = _build_control_metrics_payload(
+                comprehensive_blob,
+                comprehensive_source_path,
+            )
+            payload["alternate_sources"] = {
+                "comprehensive_results": {
+                    "metric_basis": "comprehensive_results",
+                    "source": alternate_payload.get("source"),
+                    "status": alternate_payload.get("status"),
+                    "metrics": alternate_payload.get("metrics", {}),
+                    "message": alternate_payload.get("message"),
+                }
+            }
+        if requested_basis == "comprehensive_results" and not comprehensive_available:
+            payload["basis_warning"] = "requested comprehensive_results but fell back to direct_observer_payload"
+        _write_control_metrics_payload(out, payload)
         return out
 
-    source_path = run_dir / "comprehensive_results.json"
-    if source_path.exists():
-        try:
-            results_blob = json.loads(source_path.read_text(encoding="utf-8"))
-        except Exception:
-            results_blob = {}
-    else:
-        results_blob = {}
+    source_path = comprehensive_source_path
+    results_blob = comprehensive_blob if source_path.exists() else {}
     payload = _build_control_metrics_payload(results_blob, source_path if source_path.exists() else None)
-    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    payload["metric_basis"] = "comprehensive_results" if source_path.exists() else "none"
+    payload["requested_metric_basis"] = requested_basis
+    payload["primary_metric_source"] = "comprehensive_results" if source_path.exists() else "missing"
+    if requested_basis == "direct_observer_payload":
+        payload["basis_warning"] = "requested direct_observer_payload but direct observer controls were unavailable"
+    _write_control_metrics_payload(out, payload)
     return out
 
 
@@ -1689,9 +2188,12 @@ def _repair_validation_payload(existing: Dict[str, Any]) -> Optional[Dict[str, A
         return None
     repaired = dict(existing)
     repaired["nmi"] = inferred_nmi
-    if "status" in repaired and str(repaired.get("status", "")).strip().lower() == "failed":
-        repaired["status"] = "success"
-    if str(repaired.get("trust_level", "")).strip().upper() in {"", "UNAVAILABLE", "FAILED"}:
+    status = str(repaired.get("status", "")).strip().lower()
+    trust_level = str(repaired.get("trust_level", "")).strip().upper()
+    if status in {"failed", "failure", "error"} or trust_level in {"UNAVAILABLE", "FAILED"}:
+        repaired["repair_status"] = "inferred_nmi_only_not_claim_valid"
+        return repaired
+    if trust_level == "":
         repaired["trust_level"] = "MEASURED"
     return repaired
 
@@ -1707,10 +2209,12 @@ def _normalize_validation_payload(existing: Dict[str, Any]) -> Optional[Dict[str
         return None
     normalized = dict(existing)
     changed = False
-    if str(normalized.get("status", "")).strip().lower() == "failed":
-        normalized["status"] = "success"
-        changed = True
-    if str(normalized.get("trust_level", "")).strip().upper() in {"", "UNAVAILABLE", "FAILED"}:
+    status = str(normalized.get("status", "")).strip().lower()
+    trust_level = str(normalized.get("trust_level", "")).strip().upper()
+    if status in {"failed", "failure", "error"} or trust_level in {"UNAVAILABLE", "FAILED"}:
+        normalized["repair_status"] = "preserved_failed_validation_state"
+        return normalized if normalized != existing else None
+    if trust_level == "":
         normalized["trust_level"] = "MEASURED"
         changed = True
     return normalized if changed else None
@@ -1972,6 +2476,102 @@ def _translate_lab_diagnostics_to_ablation_summary(lab_blob: Optional[Dict[str, 
     return payload
 
 
+def _build_leaf_proxy_ablation_summary(run_dir: Path, source_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    run_dir = Path(run_dir)
+    validation_blob = _load_json_if_exists(run_dir / "validation.json") or {}
+    control_blob = _load_json_if_exists(run_dir / "control_metrics.json") or {}
+    traversal_blob = _load_json_if_exists(run_dir / "track4_traversal_summary.json") or {}
+    track5_blob = _load_json_if_exists(run_dir / "track5_summary.json") or {}
+
+    stage_1 = _safe_float(
+        validation_blob.get("nmi", validation_blob.get("normalized_mutual_info")),
+        default=None,
+    )
+
+    stage_2_candidates: List[float] = []
+    control_metrics = control_blob.get("metrics", {}) if isinstance(control_blob.get("metrics"), dict) else {}
+    if str(control_blob.get("status", "")).strip().upper() == "OK":
+        for key in ("procrustes_ratio", "distance_corr_ratio"):
+            ratio = _safe_float(control_metrics.get(key), default=None)
+            if ratio is None:
+                continue
+            stage_2_candidates.append(float(ratio / (1.0 + abs(ratio))))
+
+    stage_2 = float(np.mean(stage_2_candidates)) if stage_2_candidates else None
+    if stage_2 is None and bool(track5_blob.get("uses_integrated_geometry")):
+        stage_2 = 1.0
+
+    stage_3 = _safe_float(traversal_blob.get("closed_loop_rate"), default=None)
+    if stage_3 is None:
+        view_state = _load_json_if_exists(run_dir / "MONOLITH.view_state.json") or {}
+        metrics = view_state.get("metrics", {}) if isinstance(view_state.get("metrics"), dict) else {}
+        stage_3 = _safe_float(metrics.get("walker_survival_rate"), default=None)
+
+    if any(value is None for value in (stage_1, stage_2, stage_3)):
+        return None
+
+    delta_alignment = float(stage_2 - stage_1)
+    retained_pct = float(stage_3 * 100.0)
+    mode_name = _normalize_track5_mode_name(track5_blob.get("track5_assembly_mode"))
+    payload = {
+        "status": "OK",
+        "panel_type": "ablation_laboratory",
+        "source": str(source_path or (run_dir / "validation.json")),
+        "synthetic_placeholder": False,
+        "reason": None,
+        "message": "synthesized from focused leaf diagnostics",
+        "explanation": (
+            "Ablation coverage proxy synthesized from leaf-local diagnostics when a full laboratory "
+            "null-vs-mature artifact is unavailable. Stage 1 uses validation agreement, stage 2 uses "
+            "control-separation or integrated-geometry support, and stage 3 uses Track 4 closed-loop survival."
+        ),
+        "stage_1_alignment_score": stage_1,
+        "stage_2_alignment_score": stage_2,
+        "stage_3_survival_rate": stage_3,
+        "delta_alignment_score": delta_alignment,
+        "stage_1_nmi": stage_1,
+        "stage_2_nmi": stage_2,
+        "stage_3_nmi": stage_3,
+        "delta_nmi": delta_alignment,
+        "retained_percentage": retained_pct,
+        "retained_pct": retained_pct,
+        "legacy_mean_variance": None,
+        "mean_variance": None,
+        "metrics": {
+            "stage_1_alignment_score": stage_1,
+            "stage_2_alignment_score": stage_2,
+            "stage_3_survival_rate": stage_3,
+            "delta_alignment_score": delta_alignment,
+            "stage_1_nmi": stage_1,
+            "stage_2_nmi": stage_2,
+            "stage_3_nmi": stage_3,
+            "delta_nmi": delta_alignment,
+            "retained_pct": retained_pct,
+            "legacy_mean_variance": None,
+        },
+        "translation": {
+            "source_type": "focused_leaf_proxy",
+            "track5_mode": mode_name,
+            "validation_nmi": stage_1,
+            "control_metric_scores": stage_2_candidates,
+            "track4_closed_loop_rate": stage_3,
+            "uses_integrated_geometry": bool(track5_blob.get("uses_integrated_geometry")),
+        },
+        "summary": {
+            "stage_map": {
+                "stage_1_alignment_score": "validation agreement proxy",
+                "stage_2_alignment_score": "control-separation / geometry-support proxy",
+                "stage_3_survival_rate": "Track 4 closed-loop survival rate",
+            },
+            "interpretation": (
+                "Higher stage 2 and stage 3 values indicate the cited Track 5 branch preserved more "
+                "reviewer-facing structure and traversability on this leaf."
+            ),
+        },
+    }
+    return payload
+
+
 def _emit_ablation_results_json(run_dir: Path, payload: Dict[str, Any]) -> Path:
     out = Path(run_dir) / "ablation_results.json"
     legacy_blob = dict(payload)
@@ -2029,6 +2629,12 @@ def _emit_ablation_summary_json(run_dir: Path) -> Path:
             out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             _emit_ablation_results_json(run_dir, payload)
             return out
+
+    proxy_payload = _build_leaf_proxy_ablation_summary(run_dir, source_path)
+    if proxy_payload is not None:
+        out.write_text(json.dumps(proxy_payload, indent=2), encoding="utf-8")
+        _emit_ablation_results_json(run_dir, proxy_payload)
+        return out
 
     payload = _build_ablation_summary_payload(existing_blob, out if out.exists() else source_path)
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -2216,7 +2822,12 @@ def _hydrate_run_leaf_from_observer(run_dir: Path) -> Dict[str, Any]:
     def _save_npy(name: str, key: str) -> None:
         if (run_dir / name).exists():
             return
-        value = observer.get(key)
+        if key == "features":
+            value = observer.get("integrated_vectors")
+            if value is None:
+                value = observer.get(key)
+        else:
+            value = observer.get(key)
         if value is None:
             return
         np.save(run_dir / name, np.asarray(value))
@@ -3148,6 +3759,45 @@ def _safe_optional_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_track5_mode_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "hadamard": "hadamard_strict",
+        "hadamard_strict": "hadamard_strict",
+        "strict_hadamard": "hadamard_strict",
+        "riemannian": "riemannian_strict",
+        "strict_riemannian": "riemannian_strict",
+        "riemannian_strict": "riemannian_strict",
+        "concatenate": "concatenate",
+        "concat": "concatenate",
+    }
+    return aliases.get(text, text or "unknown")
+
+
+def _shape_list(value: Any) -> Optional[List[int]]:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value)
+    except Exception:
+        return None
+    try:
+        return [int(dim) for dim in arr.shape]
+    except Exception:
+        return None
+
+
 def _normalize_rows_for_relativity(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for i, row in enumerate(rows):
@@ -3297,7 +3947,11 @@ def _angle_deg(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cos)))
 
 
-def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _emit_relativity_from_payload(
+    run_dir: Path,
+    rows: List[Dict[str, Any]],
+    observer_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
     payload = _load_primary_observer_payload(run_dir)
     if not isinstance(payload, dict):
         return {"status": "fallback", "reason": "observer payload unavailable"}
@@ -3306,6 +3960,9 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
     n_articles = len(normalized_rows)
     if n_articles == 0:
         return {"status": "fallback", "reason": "no MONOLITH rows available"}
+    target_indices = _normalize_observer_indices(observer_indices, n_articles)
+    if not target_indices:
+        return {"status": "fallback", "reason": "no observer indices selected"}
 
     ordered_uids = [str(row.get("bt_uid", "")) for row in normalized_rows]
 
@@ -3442,24 +4099,46 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
 
     rel_dir = run_dir / "relativity_cache"
     rel_dir.mkdir(parents=True, exist_ok=True)
-    observer_payload_paths = sorted(rel_dir.glob("observer_*.pt"))
-    if not observer_payload_paths:
+    missing_payload_indices = [
+        int(idx)
+        for idx in target_indices
+        if not (rel_dir / f"observer_{idx}.pt").exists()
+    ]
+    if missing_payload_indices:
         return {
             "status": "fallback",
             "reason": "observer-conditioned relativity payloads missing",
+            "missing_observer_payloads": missing_payload_indices,
         }
 
     written_state = 0
     written_delta = 0
-    for idx in range(n_articles):
+    for idx in target_indices:
         # NUCLEAR DAG: Load the physically distinct universe for this observer
         obs_pt_path = rel_dir / f"observer_{idx}.pt"
-        current_obs_payload = payload  # Default to global
-        if obs_pt_path.exists() and TORCH_AVAILABLE:
-            try:
-                current_obs_payload = torch.load(obs_pt_path, map_location="cpu", weights_only=False)
-            except Exception:
-                pass
+        if not obs_pt_path.exists():
+            return {
+                "status": "fallback",
+                "reason": "observer-conditioned relativity payload missing during load",
+                "missing_observer_payload": int(idx),
+            }
+        if not TORCH_AVAILABLE:
+            return {"status": "fallback", "reason": "torch unavailable for observer-conditioned relativity payload load"}
+        try:
+            current_obs_payload = torch.load(obs_pt_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            return {
+                "status": "fallback",
+                "reason": "observer-conditioned relativity payload corrupt or unloadable",
+                "observer_idx": int(idx),
+                "error": str(exc),
+            }
+        if not isinstance(current_obs_payload, dict):
+            return {
+                "status": "fallback",
+                "reason": "observer-conditioned relativity payload is not a dict",
+                "observer_idx": int(idx),
+            }
         
         # Build map for CURRENT observer's results
         obs_article_maps = _build_article_maps(current_obs_payload, n_articles)
@@ -3469,7 +4148,11 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
         }
         observer_metric_matrix = _ordered_metric_matrix_from_payload(current_obs_payload)
         if observer_metric_matrix is None:
-            observer_metric_matrix = baseline_metric_matrix
+            return {
+                "status": "fallback",
+                "reason": "observer-conditioned feature matrix unavailable",
+                "observer_idx": int(idx),
+            }
 
         focus_row = normalized_rows[idx]
         
@@ -3657,11 +4340,308 @@ def _emit_relativity_from_payload(run_dir: Path, rows: List[Dict[str, Any]]) -> 
         "state_files": written_state,
         "delta_files": written_delta,
         "mode": "observer_payload_relativity_v1",
+        "selected_observer_indices": target_indices,
     }
 
 
-def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, int]:
-    real = _emit_relativity_from_payload(run_dir, rows)
+def _emit_relativity_from_view_states(
+    run_dir: Path,
+    rows: List[Dict[str, Any]],
+    observer_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    global_view_state_path = run_dir / "MONOLITH.view_state.json"
+    if not global_view_state_path.exists():
+        return {"status": "fallback", "reason": "global MONOLITH.view_state.json missing"}
+
+    try:
+        global_view_state = json.loads(global_view_state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"status": "fallback", "reason": f"global MONOLITH.view_state.json unreadable: {exc}"}
+    if not isinstance(global_view_state, dict):
+        return {"status": "fallback", "reason": "global MONOLITH.view_state.json malformed"}
+
+    normalized_rows = _normalize_rows_for_relativity(rows)
+    n_articles = len(normalized_rows)
+    if n_articles == 0:
+        return {"status": "fallback", "reason": "no MONOLITH rows available"}
+
+    target_indices = _normalize_observer_indices(observer_indices, n_articles)
+    if not target_indices:
+        return {"status": "fallback", "reason": "no observer indices selected"}
+
+    row_by_index = {int(row["index"]): dict(row) for row in normalized_rows}
+    global_articles = global_view_state.get("articles", [])
+    if not isinstance(global_articles, list) or not global_articles:
+        return {"status": "fallback", "reason": "global MONOLITH view_state has no articles"}
+
+    def _article_idx(article: Dict[str, Any]) -> Optional[int]:
+        try:
+            return int(article.get("idx"))
+        except Exception:
+            return None
+
+    def _coords(article: Dict[str, Any]) -> np.ndarray:
+        return np.asarray(
+            [
+                _safe_float(article.get("x"), default=0.0),
+                _safe_float(article.get("y"), default=0.0),
+                _safe_float(article.get("z"), default=0.0),
+            ],
+            dtype=np.float64,
+        )
+
+    def _principal_axis_stats(coords: np.ndarray) -> Tuple[np.ndarray, float]:
+        centered = np.asarray(coords, dtype=np.float64)
+        if centered.ndim != 2 or centered.shape[0] == 0:
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float64), 0.0
+        centered = centered - np.mean(centered, axis=0, keepdims=True)
+        if centered.shape[0] < 2:
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float64), 0.0
+        try:
+            _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
+        except Exception:
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float64), 0.0
+        axis = np.asarray(vt[0], dtype=np.float64) if vt.size else np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        denom = float(np.sum(singular_values ** 2))
+        evr = float((singular_values[0] ** 2) / denom) if singular_values.size and denom > 1e-12 else 0.0
+        return axis, evr
+
+    def _nearest_neighbor_indices(coords: np.ndarray, *, k: int = 5) -> List[Tuple[int, ...]]:
+        coords = np.asarray(coords, dtype=np.float64)
+        if coords.ndim != 2 or coords.shape[0] == 0:
+            return []
+        dist = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=2)
+        np.fill_diagonal(dist, np.inf)
+        neighbor_count = max(1, min(k, max(1, coords.shape[0] - 1)))
+        return [tuple(int(i) for i in np.argsort(dist[row_i])[:neighbor_count]) for row_i in range(coords.shape[0])]
+
+    global_map = {
+        idx: dict(article)
+        for article in global_articles
+        if isinstance(article, dict)
+        for idx in [_article_idx(article)]
+        if idx is not None
+    }
+    ordered_indices = [int(row["index"]) for row in normalized_rows if int(row["index"]) in global_map]
+    if not ordered_indices:
+        return {"status": "fallback", "reason": "global observer frame has no matching article ids"}
+
+    global_coords = np.asarray([_coords(global_map[idx]) for idx in ordered_indices], dtype=np.float64)
+    global_neighbor_sets = _nearest_neighbor_indices(global_coords)
+    global_axis, global_axis1_evr = _principal_axis_stats(global_coords)
+    global_metrics = global_view_state.get("metrics", {}) if isinstance(global_view_state.get("metrics"), dict) else {}
+    global_mean_work = _safe_float(global_metrics.get("walker_mean_action"), default=0.0)
+    global_survival_pct = 100.0 * _safe_float(global_metrics.get("walker_survival_rate"), default=0.0)
+    global_nmi = _safe_float(global_metrics.get("synthesis_nmi"), default=None)
+    global_anomaly_rate = 0.0
+    try:
+        global_anomaly_rate = float(int(global_metrics.get("anomaly_count", 0)) / max(1, len(ordered_indices)))
+    except Exception:
+        global_anomaly_rate = 0.0
+
+    rel_dir = run_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    written_state = 0
+    written_delta = 0
+    missing_view_states = 0
+
+    for idx in target_indices:
+        observer_idx = int(normalized_rows[idx]["index"])
+        observer_view_state_path = run_dir / f"observer_{observer_idx}" / "MONOLITH.view_state.json"
+        if not observer_view_state_path.exists():
+            missing_view_states += 1
+            continue
+        try:
+            observer_view_state = json.loads(observer_view_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            missing_view_states += 1
+            continue
+        if not isinstance(observer_view_state, dict):
+            missing_view_states += 1
+            continue
+
+        observer_articles = observer_view_state.get("articles", [])
+        if not isinstance(observer_articles, list) or not observer_articles:
+            missing_view_states += 1
+            continue
+        observer_map = {
+            article_key: dict(article)
+            for article in observer_articles
+            if isinstance(article, dict)
+            for article_key in [_article_idx(article)]
+            if article_key is not None
+        }
+        common_indices = [article_idx for article_idx in ordered_indices if article_idx in observer_map]
+        if not common_indices:
+            missing_view_states += 1
+            continue
+
+        baseline_coords = np.asarray([_coords(global_map[article_idx]) for article_idx in common_indices], dtype=np.float64)
+        observer_coords = np.asarray([_coords(observer_map[article_idx]) for article_idx in common_indices], dtype=np.float64)
+        centered_observer_coords = observer_coords - np.mean(observer_coords, axis=0, keepdims=True) + np.mean(
+            baseline_coords, axis=0, keepdims=True
+        )
+        delta_vectors = observer_coords - baseline_coords
+        coord_delta = np.linalg.norm(delta_vectors, axis=1)
+        observer_neighbor_sets = _nearest_neighbor_indices(observer_coords)
+        translation_neighbor_sets = _nearest_neighbor_indices(centered_observer_coords)
+        flip_details: Dict[str, float] = {}
+        flip_count = 0
+        translation_flip_count = 0
+        for pos, article_idx in enumerate(common_indices):
+            baseline_neighbors = set(global_neighbor_sets[pos]) if pos < len(global_neighbor_sets) else set()
+            observer_neighbors = set(observer_neighbor_sets[pos]) if pos < len(observer_neighbor_sets) else set()
+            translation_neighbors = set(translation_neighbor_sets[pos]) if pos < len(translation_neighbor_sets) else set()
+            if observer_neighbors != baseline_neighbors:
+                flip_count += 1
+            if translation_neighbors != baseline_neighbors:
+                translation_flip_count += 1
+            diff = len(observer_neighbors.symmetric_difference(baseline_neighbors))
+            if diff > 0:
+                row = row_by_index.get(article_idx, {})
+                key = f"{row.get('bt_uid', '')}|{str(row.get('title', ''))[:48]}"
+                flip_details[key] = float(diff)
+
+        observer_axis, observer_axis1_evr = _principal_axis_stats(observer_coords)
+        axis_rotation_deg = _angle_deg(global_axis, observer_axis)
+        observer_metrics = observer_view_state.get("metrics", {}) if isinstance(observer_view_state.get("metrics"), dict) else {}
+        observer_walker_paths = observer_view_state.get("walker_paths")
+        if not isinstance(observer_walker_paths, list):
+            observer_walker_paths = []
+        observer_mean_work = _safe_float(observer_metrics.get("walker_mean_action"), default=0.0)
+        observer_survival_pct = 100.0 * _safe_float(observer_metrics.get("walker_survival_rate"), default=0.0)
+        observer_nmi = _safe_float(observer_metrics.get("synthesis_nmi"), default=None)
+        observer_anomaly_rate = 0.0
+        try:
+            observer_anomaly_rate = float(int(observer_metrics.get("anomaly_count", 0)) / max(1, len(common_indices)))
+        except Exception:
+            observer_anomaly_rate = 0.0
+
+        focus_row = row_by_index.get(observer_idx, {})
+        focus_observer_article = observer_map.get(observer_idx, {})
+        articles_blob: List[Dict[str, Any]] = []
+        for pos, article_idx in enumerate(common_indices):
+            row = dict(row_by_index.get(article_idx, {}))
+            row.update(
+                {
+                    "index": int(article_idx),
+                    "baseline_x": float(baseline_coords[pos][0]),
+                    "baseline_y": float(baseline_coords[pos][1]),
+                    "baseline_z": float(baseline_coords[pos][2]),
+                    "observer_x": float(observer_coords[pos][0]),
+                    "observer_y": float(observer_coords[pos][1]),
+                    "observer_z": float(observer_coords[pos][2]),
+                    "delta_x": float(delta_vectors[pos][0]),
+                    "delta_y": float(delta_vectors[pos][1]),
+                    "delta_z": float(delta_vectors[pos][2]),
+                    "coord_delta": float(coord_delta[pos]),
+                }
+            )
+            articles_blob.append(row)
+
+        ranked_indices = np.argsort(-coord_delta)
+        path_flip_delta = dict(flip_details)
+        for ranked_pos in ranked_indices:
+            if len(path_flip_delta) >= 8:
+                break
+            article_idx = common_indices[int(ranked_pos)]
+            row = row_by_index.get(article_idx, {})
+            key = f"{row.get('bt_uid', '')}|{str(row.get('title', ''))[:48]}"
+            path_flip_delta.setdefault(key, float(coord_delta[int(ranked_pos)]))
+
+        state_payload = {
+            "observer_id": observer_idx,
+            "articles": articles_blob,
+            "paths": [f"observer_{observer_idx}/MONOLITH.html"],
+            "walker_paths": observer_walker_paths,
+            "axes": {
+                "x": "view_state_axis_1",
+                "y": "view_state_axis_2",
+                "z": "view_state_axis_3",
+            },
+            "metrics": {
+                "observer_bt_uid": str(focus_row.get("bt_uid", "")),
+                "observer_title": str(focus_row.get("title", "")),
+                "observer_zone": str(focus_observer_article.get("zone", focus_row.get("zone", ""))),
+                "observer_verdict": str(focus_observer_article.get("verdict", focus_row.get("verdict", ""))).upper(),
+                "observer_density": _safe_float(focus_observer_article.get("density"), default=_safe_float(focus_row.get("density"), default=0.0)),
+                "observer_stress": _safe_float(focus_observer_article.get("stress"), default=_safe_float(focus_row.get("stress"), default=0.0)),
+                "observer_z_height": _safe_float(focus_observer_article.get("z_height"), default=_safe_float(focus_row.get("z_height"), default=0.0)),
+                "observer_mean_work": observer_mean_work,
+                "global_mean_work": global_mean_work,
+                "global_survival_pct": global_survival_pct,
+                "observer_survival_pct": observer_survival_pct,
+                "global_nmi": global_nmi,
+                "observer_conditioned_nmi": observer_nmi,
+                "observer_track_nmi": {"SYN": observer_nmi} if observer_nmi is not None else {},
+            },
+            "provenance": {
+                "source": "observer_view_state_relativity_v1",
+                "synthetic_placeholder": False,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "observer_bt_uid": str(focus_row.get("bt_uid", "")),
+            },
+        }
+        (rel_dir / f"state_{observer_idx}.json").write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+        written_state += 1
+
+        max_coord_delta = float(np.max(coord_delta)) if coord_delta.size else 0.0
+        delta_payload = {
+            "observer_id": observer_idx,
+            "null_observer_equivalence": {
+                "equivalent": bool(max_coord_delta <= 1e-9 and flip_count == 0 and axis_rotation_deg <= 1e-9),
+                "max_coord_delta": max_coord_delta,
+                "path_flip_count": int(flip_count),
+                "axis_rotation_deg": float(axis_rotation_deg),
+            },
+            "path_flip_delta": path_flip_delta,
+            "metrics_delta": {
+                "d_rupture_rate": float(observer_anomaly_rate - global_anomaly_rate),
+                "d_mean_work": float(observer_mean_work - global_mean_work),
+                "d_survival_pct": float(observer_survival_pct - global_survival_pct),
+                "d_nmi": (float(observer_nmi - global_nmi) if observer_nmi is not None and global_nmi is not None else None),
+                "d_ari": None,
+            },
+            "axis_delta": {
+                "rotation_deg": float(axis_rotation_deg),
+                "d_explained_variance_axis1": float(observer_axis1_evr - global_axis1_evr),
+            },
+            "translation_only_comparison": {
+                "d_path_flip_count": int(flip_count - translation_flip_count),
+                "d_mean_work": float(observer_mean_work - global_mean_work),
+            },
+            "provenance": {
+                "source": "observer_view_state_relativity_v1",
+                "synthetic_placeholder": False,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "observer_bt_uid": str(focus_row.get("bt_uid", "")),
+            },
+        }
+        (rel_dir / f"delta_{observer_idx}.json").write_text(json.dumps(delta_payload, indent=2), encoding="utf-8")
+        written_delta += 1
+
+    if written_state <= 0 or written_delta <= 0:
+        return {
+            "status": "fallback",
+            "reason": "observer view_state relativity unavailable",
+            "missing_view_states": missing_view_states,
+        }
+    return {
+        "status": "success",
+        "state_files": written_state,
+        "delta_files": written_delta,
+        "mode": "observer_view_state_relativity_v1",
+        "selected_observer_indices": target_indices,
+        "missing_view_states": missing_view_states,
+    }
+
+
+def _emit_relativity_defaults(
+    run_dir: Path,
+    rows: List[Dict[str, Any]],
+    observer_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, int]:
+    real = _emit_relativity_from_payload(run_dir, rows, observer_indices=observer_indices)
     if real.get("status") == "success":
         return {
             "state_files": int(real.get("state_files", 0)),
@@ -3669,11 +4649,23 @@ def _emit_relativity_defaults(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict
             "mode": str(real.get("mode", "observer_payload_relativity_v1")),
         }
 
+    view_state = _emit_relativity_from_view_states(run_dir, rows, observer_indices=observer_indices)
+    if view_state.get("status") == "success":
+        return {
+            "state_files": int(view_state.get("state_files", 0)),
+            "delta_files": int(view_state.get("delta_files", 0)),
+            "mode": str(view_state.get("mode", "observer_view_state_relativity_v1")),
+        }
+
     rel_dir = run_dir / "relativity_cache"
     rel_dir.mkdir(parents=True, exist_ok=True)
     written_state = 0
     written_delta = 0
-    indices = [int(r.get("index", i)) for i, r in enumerate(rows)]
+    selected_positions = _normalize_observer_indices(observer_indices, len(rows))
+    indices = [
+        int(rows[pos].get("index", pos))
+        for pos in selected_positions
+    ]
     for idx in indices:
         state_path = rel_dir / f"state_{idx}.json"
         delta_path = rel_dir / f"delta_{idx}.json"
@@ -3841,6 +4833,7 @@ def _emit_label_derivatives(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[s
 
 def _emit_validation_json(run_dir: Path) -> Path:
     validation_path = run_dir / "validation.json"
+    validation_path.parent.mkdir(parents=True, exist_ok=True)
     existing: Dict[str, Any] = {}
     if validation_path.exists():
         try:
@@ -3951,6 +4944,8 @@ def _emit_validation_json(run_dir: Path) -> Path:
             "metric_source": "kmeans_on_final_features",
         }
 
+    preferred_features = _preferred_artifact_features(observer_payload) if isinstance(observer_payload, dict) else None
+
     if isinstance(observer_payload, dict) and callable(_compute_alignment_metrics) and callable(_extract_validation_label_info):
         label_rows = rows or (observer_payload.get("article_metadata") if isinstance(observer_payload.get("article_metadata"), list) else [])
         try:
@@ -3961,7 +4956,7 @@ def _emit_validation_json(run_dir: Path) -> Path:
             )
         except Exception:
             label_info = None
-        features = observer_payload.get("features")
+        features = preferred_features
         if label_info is not None and features is not None:
             try:
                 alignment_metrics = _compute_alignment_metrics(features, label_info)
@@ -3969,7 +4964,7 @@ def _emit_validation_json(run_dir: Path) -> Path:
                 alignment_metrics = None
             try:
                 result_like = {
-                    "features": observer_payload.get("features"),
+                    "features": preferred_features,
                     "spectral_probe_magnitudes": observer_payload.get("spectral_probe_magnitudes"),
                     "dirichlet_fused_std": observer_payload.get("dirichlet_fused_std"),
                     "checkpoints": {
@@ -3988,10 +4983,10 @@ def _emit_validation_json(run_dir: Path) -> Path:
                 track_metrics = {}
 
     if alignment_metrics is None and isinstance(observer_payload, dict):
-        alignment_metrics = _simple_zone_alignment_metrics(observer_payload.get("features"))
+        alignment_metrics = _simple_zone_alignment_metrics(preferred_features)
         if isinstance(alignment_metrics, dict):
             track_inputs = {
-                "SYN": observer_payload.get("features"),
+                "SYN": preferred_features,
                 "T1": observer_payload.get("T1_embeddings"),
                 "T2": observer_payload.get("T2_kernels"),
                 "T1.5": observer_payload.get("spectral_probe_magnitudes"),
@@ -4344,7 +5339,393 @@ def _finalize_synthetic_leaf_artifacts(
     }
 
 
-def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
+def _emit_track5_summary_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "track5_summary.json"
+    payload = _load_primary_observer_payload(run_dir) or {}
+    meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+    provenance = payload.get("provenance", {}) if isinstance(payload.get("provenance"), dict) else {}
+    manifest = _load_json_if_exists(run_dir.parent / "experiment_manifest.json") or {}
+    config = manifest.get("config", {}) if isinstance(manifest.get("config"), dict) else {}
+    suite_config = _load_json_if_exists(run_dir.parent / "suite_config.json") or {}
+
+    mode = (
+        meta.get("track5_assembly_mode")
+        or provenance.get("track5_assembly_mode")
+        or config.get("track5_assembly_mode")
+        or suite_config.get("track5_assembly_mode")
+    )
+    normalized_mode = _normalize_track5_mode_name(mode)
+
+    integrated_vectors = payload.get("integrated_vectors")
+    if integrated_vectors is None and (run_dir / "integrated_vectors.npy").exists():
+        try:
+            integrated_vectors = np.load(run_dir / "integrated_vectors.npy", allow_pickle=True)
+        except Exception:
+            integrated_vectors = None
+    features = payload.get("features")
+    if features is None and (run_dir / "features.npy").exists():
+        try:
+            features = np.load(run_dir / "features.npy", allow_pickle=True)
+        except Exception:
+            features = None
+
+    integrated_shape = _shape_list(integrated_vectors)
+    features_shape = _shape_list(features)
+    summary = {
+        "status": "OK" if normalized_mode != "unknown" or integrated_shape or features_shape else "NO_DATA",
+        "run_dir": str(run_dir),
+        "track5_assembly_mode": normalized_mode,
+        "mode_source": "meta"
+        if meta.get("track5_assembly_mode") is not None
+        else "provenance"
+        if provenance.get("track5_assembly_mode") is not None
+        else "experiment_manifest"
+        if config.get("track5_assembly_mode") is not None
+        else "suite_config"
+        if suite_config.get("track5_assembly_mode") is not None
+        else "unknown",
+        "kernel": meta.get("kernel") or config.get("kernel") or suite_config.get("kernel"),
+        "channel": meta.get("channel") or config.get("channel") or suite_config.get("channel"),
+        "projection_dim": meta.get("projection_dim") or config.get("projection_dim") or suite_config.get("projection_dim"),
+        "integrated_vectors_shape": integrated_shape,
+        "features_shape": features_shape,
+        "preferred_geometry_source": "integrated_vectors"
+        if integrated_shape is not None
+        else "features"
+        if features_shape is not None
+        else "none",
+        "uses_integrated_geometry": bool(integrated_shape is not None),
+        "safe_for_thesis_claim": bool(
+            normalized_mode in {"hadamard_strict", "riemannian_strict", "concatenate"} and integrated_shape is not None
+        ),
+    }
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_leaf_artifact_inventory_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "leaf_artifact_inventory.json"
+    observer_dirs = sorted([p.name for p in run_dir.glob("observer_*") if p.is_dir()])
+    observer_cache = run_dir / "relativity_cache"
+    key_artifacts = {
+        "monolith_html": run_dir / "MONOLITH.html",
+        "monolith_csv": run_dir / "MONOLITH_DATA.csv",
+        "view_state": run_dir / "MONOLITH.view_state.json",
+        "observer_manifest": run_dir / "observer_manifest.json",
+        "relativity_deltas": run_dir / "relativity_deltas.json",
+        "observer_recenter_summary": run_dir / "observer_recenter_summary.json",
+        "observer_relativity_summary": run_dir / "observer_relativity_summary.json",
+        "track4_traversal_summary": run_dir / "track4_traversal_summary.json",
+        "track5_summary": run_dir / "track5_summary.json",
+        "validation_json": run_dir / "validation.json",
+        "verification_report": run_dir / "verification_report.json",
+        "control_metrics": run_dir / "control_metrics.json",
+        "ablation_summary": run_dir / "ablation_summary.json",
+        "walker_states": run_dir / "walker_states.json",
+        "walker_paths": run_dir / "walker_paths.npz",
+        "cyclic_paths": run_dir / "cyclic_paths.npz",
+        "features": run_dir / "features.npy",
+        "integrated_vectors": run_dir / "integrated_vectors.npy",
+    }
+    presence = {name: path.exists() for name, path in key_artifacts.items()}
+    summary = {
+        "status": "OK",
+        "run_dir": str(run_dir),
+        "artifact_count_present": int(sum(1 for present in presence.values() if present)),
+        "artifact_count_total": int(len(presence)),
+        "artifacts": {name: str(path) for name, path in key_artifacts.items()},
+        "presence": presence,
+        "observer_directory_count": len(observer_dirs),
+        "observer_directories": observer_dirs,
+        "relativity_cache_state_files": len(list(observer_cache.glob("state_*.json"))) if observer_cache.exists() else 0,
+        "relativity_cache_delta_files": len(list(observer_cache.glob("delta_*.json"))) if observer_cache.exists() else 0,
+        "relativity_cache_observer_payloads": len(list(observer_cache.glob("observer_*.pt"))) if observer_cache.exists() else 0,
+    }
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_observer_recenter_summary_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "observer_recenter_summary.json"
+    tolerance = 1e-7
+    global_view_state = _load_json_if_exists(run_dir / "MONOLITH.view_state.json") or {}
+    observer_dirs = sorted([p for p in run_dir.glob("observer_*") if p.is_dir()])
+    rel_dir = run_dir / "relativity_cache"
+
+    def _safe_coord(row: Dict[str, Any], key: str) -> Optional[float]:
+        try:
+            value = float(row.get(key))
+        except Exception:
+            return None
+        if not np.isfinite(value):
+            return None
+        return value
+
+    def _article_map(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+        articles = payload.get("articles", []) if isinstance(payload, dict) else []
+        if not isinstance(articles, list):
+            return {}
+        mapped: Dict[int, Dict[str, Any]] = {}
+        for row in articles:
+            if not isinstance(row, dict):
+                continue
+            try:
+                idx = int(row.get("idx", row.get("index")))
+            except Exception:
+                continue
+            mapped[idx] = row
+        return mapped
+
+    global_articles = _article_map(global_view_state)
+    observer_rows: List[Dict[str, Any]] = []
+    for observer_dir in observer_dirs:
+        try:
+            observer_idx = int(str(observer_dir.name).split("_", 1)[1])
+        except Exception:
+            observer_idx = -1
+        view_state_path = observer_dir / "MONOLITH.view_state.json"
+        artifact_path = observer_dir / "MONOLITH.html"
+        view_state = _load_json_if_exists(view_state_path) or {}
+        observer_focus = view_state.get("observer_focus", {}) if isinstance(view_state.get("observer_focus"), dict) else {}
+        focus_idx = observer_idx
+        try:
+            if observer_focus.get("idx") is not None:
+                focus_idx = int(observer_focus.get("idx"))
+        except Exception:
+            focus_idx = observer_idx
+
+        observer_articles = _article_map(view_state)
+        focus_article = observer_articles.get(focus_idx, {})
+        focus_x = _safe_coord(focus_article, "x")
+        focus_y = _safe_coord(focus_article, "y")
+        focus_z = _safe_coord(focus_article, "z")
+        focus_xy_centered = bool(
+            focus_x is not None
+            and focus_y is not None
+            and abs(float(focus_x)) <= tolerance
+            and abs(float(focus_y)) <= tolerance
+        )
+        global_focus = global_articles.get(focus_idx, {})
+        global_focus_x = _safe_coord(global_focus, "x")
+        global_focus_y = _safe_coord(global_focus, "y")
+        global_focus_was_not_origin = bool(
+            global_focus_x is not None
+            and global_focus_y is not None
+            and (abs(float(global_focus_x)) > tolerance or abs(float(global_focus_y)) > tolerance)
+        )
+
+        walker_paths = view_state.get("walker_paths", []) if isinstance(view_state, dict) else []
+        if not isinstance(walker_paths, list):
+            walker_paths = []
+        path_start_count = 0
+        path_start_match_count = 0
+        replay_path_count = 0
+        path_mismatches: List[Dict[str, Any]] = []
+        for path_row in walker_paths:
+            if not isinstance(path_row, dict):
+                continue
+            try:
+                article_idx = int(path_row.get("article_idx"))
+            except Exception:
+                continue
+            owner = observer_articles.get(article_idx)
+            if not isinstance(owner, dict):
+                continue
+            path_start_count += 1
+            start_x = _safe_coord(path_row, "start_x")
+            start_y = _safe_coord(path_row, "start_y")
+            start_z = _safe_coord(path_row, "start_z")
+            owner_x = _safe_coord(owner, "x")
+            owner_y = _safe_coord(owner, "y")
+            owner_z = _safe_coord(owner, "z")
+            matches = bool(
+                start_x is not None
+                and start_y is not None
+                and owner_x is not None
+                and owner_y is not None
+                and abs(start_x - owner_x) <= tolerance
+                and abs(start_y - owner_y) <= tolerance
+                and (
+                    start_z is None
+                    or owner_z is None
+                    or abs(start_z - owner_z) <= tolerance
+                )
+            )
+            if matches:
+                path_start_match_count += 1
+            else:
+                path_mismatches.append({"article_idx": article_idx, "start": [start_x, start_y, start_z], "owner": [owner_x, owner_y, owner_z]})
+            if bool(path_row.get("focused_observer_replay", False)):
+                replay_path_count += 1
+
+        state_path = rel_dir / f"state_{observer_idx}.json"
+        delta_path = rel_dir / f"delta_{observer_idx}.json"
+        state_payload = _load_json_if_exists(state_path) or {}
+        state_walker_paths = state_payload.get("walker_paths", []) if isinstance(state_payload, dict) else []
+        state_has_walker_paths = isinstance(state_walker_paths, list) and len(state_walker_paths) > 0
+        path_starts_match_articles = bool(path_start_count > 0 and path_start_count == path_start_match_count)
+        ok = bool(
+            artifact_path.exists()
+            and view_state_path.exists()
+            and focus_xy_centered
+            and path_starts_match_articles
+            and state_path.exists()
+            and delta_path.exists()
+        )
+        observer_rows.append(
+            {
+                "observer_idx": int(observer_idx),
+                "focus_idx": int(focus_idx),
+                "artifact": str(artifact_path),
+                "view_state": str(view_state_path),
+                "artifact_exists": bool(artifact_path.exists()),
+                "view_state_exists": bool(view_state_path.exists()),
+                "focus_xy_centered": focus_xy_centered,
+                "focus_xyz": [focus_x, focus_y, focus_z],
+                "global_focus_was_not_origin": global_focus_was_not_origin,
+                "path_start_count": int(path_start_count),
+                "path_start_match_count": int(path_start_match_count),
+                "path_starts_match_articles": path_starts_match_articles,
+                "focused_observer_replay_path_count": int(replay_path_count),
+                "path_mismatches": path_mismatches[:8],
+                "relativity_state_exists": bool(state_path.exists()),
+                "relativity_delta_exists": bool(delta_path.exists()),
+                "relativity_state_has_walker_paths": bool(state_has_walker_paths),
+                "ok": ok,
+            }
+        )
+
+    observer_count = len(observer_rows)
+    ok_count = sum(1 for row in observer_rows if row.get("ok"))
+    payload = {
+        "status": "OK" if observer_count > 0 and ok_count == observer_count else ("NO_DATA" if observer_count == 0 else "INVALID"),
+        "run_dir": str(run_dir),
+        "observer_count": int(observer_count),
+        "ok_count": int(ok_count),
+        "focus_xy_centered_count": int(sum(1 for row in observer_rows if row.get("focus_xy_centered"))),
+        "path_start_match_observer_count": int(sum(1 for row in observer_rows if row.get("path_starts_match_articles"))),
+        "replay_path_observer_count": int(sum(1 for row in observer_rows if int(row.get("focused_observer_replay_path_count", 0)) > 0)),
+        "global_view_state_exists": bool((run_dir / "MONOLITH.view_state.json").exists()),
+        "z_origin_policy": "xy_origin_preserve_canonical_z",
+        "observers": observer_rows,
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_track4_animation_manifest_json(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "track4_animation_manifest.json"
+    cyclic_path = run_dir / "cyclic_paths.npz"
+    payload: Dict[str, Any] = {
+        "status": "NO_DATA",
+        "run_dir": str(run_dir),
+        "supports_anchor_swarm_reveal": False,
+        "supports_audit_micro_animation": False,
+        "supports_stepwise_path_animation": False,
+        "segment_coding": ["width", "opacity", "lift"],
+    }
+    if not cyclic_path.exists():
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out
+
+    try:
+        with np.load(cyclic_path, allow_pickle=True) as npz:
+            work = np.asarray(npz["work_integral"], dtype=float).reshape(-1) if "work_integral" in npz.files else np.asarray([])
+            closed_loop = np.asarray(npz["closed_loop"], dtype=bool).reshape(-1) if "closed_loop" in npz.files else np.asarray([])
+            path_anchor_idx = np.asarray(npz["path_anchor_idx"], dtype=int).reshape(-1) if "path_anchor_idx" in npz.files else np.asarray([])
+            anchor_indices = np.asarray(npz["anchor_indices"], dtype=int).reshape(-1) if "anchor_indices" in npz.files else np.asarray([])
+            path_is_hot = (
+                np.asarray(npz["path_is_hot"], dtype=bool).reshape(-1)
+                if "path_is_hot" in npz.files
+                else np.asarray([], dtype=bool)
+            )
+            anchor_summary = npz["anchor_summary"].tolist() if "anchor_summary" in npz.files else None
+            anchor_terrain = npz["anchor_terrain_label"].tolist() if "anchor_terrain_label" in npz.files else None
+            path_indices_present = "path_indices" in npz.files
+            markov_fields = {
+                "committor": "committor_to_void" in npz.files,
+                "mfpt": "mfpt_to_bridge" in npz.files and "mfpt_to_void" in npz.files,
+                "reactive_flux": "reactive_flux_edges" in npz.files and "reactive_flux_values" in npz.files,
+                "dominant_reactive_path": "dominant_reactive_path_indices" in npz.files,
+            }
+            markov_status = None
+            if "track4_markov_status" in npz.files:
+                status_arr = np.asarray(npz["track4_markov_status"], dtype=object).reshape(-1)
+                markov_status = str(status_arr[0]) if status_arr.size else None
+    except Exception as exc:
+        payload["status"] = "INVALID"
+        payload["error"] = str(exc)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out
+
+    markov_summary_path = run_dir / "track4_markov_summary.json"
+    markov_summary = {}
+    if markov_summary_path.exists():
+        try:
+            markov_summary = json.loads(markov_summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            markov_summary = {}
+
+    cold_path_count = int(work.size) - int(path_is_hot.sum()) if path_is_hot.size else int(work.size)
+    payload.update(
+        {
+            "status": "OK",
+            "path_count": int(work.size),
+            "anchor_count": int(anchor_indices.size),
+            "hot_path_count": int(path_is_hot.sum()) if path_is_hot.size else 0,
+            "cold_path_count": max(cold_path_count, 0),
+            "closed_loop_rate": float(closed_loop.mean()) if closed_loop.size else None,
+            "mean_work_integral": float(np.mean(work)) if work.size else None,
+            "anchor_indices": [int(v) for v in anchor_indices.tolist()],
+            "path_anchor_indices": [int(v) for v in path_anchor_idx.tolist()],
+            "anchor_summary": anchor_summary,
+            "anchor_terrain_label": anchor_terrain,
+            "supports_anchor_swarm_reveal": bool(work.size and anchor_indices.size),
+            "supports_audit_micro_animation": bool(work.size and anchor_indices.size),
+            "supports_stepwise_path_animation": bool(path_indices_present),
+            "supports_markov_observables": bool(markov_fields.get("committor") and markov_fields.get("mfpt")),
+            "supports_reactive_flux_overlay": bool(markov_fields.get("reactive_flux")),
+            "markov_observable_fields": markov_fields,
+            "markov_status": markov_status or markov_summary.get("status"),
+            "markov_summary": markov_summary,
+            "path_indices_present": bool(path_indices_present),
+        }
+    )
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def _emit_scientific_leaf_summaries(run_dir: Path) -> Dict[str, Optional[str]]:
+    run_dir = Path(run_dir)
+    outputs: Dict[str, Optional[str]] = {
+        "observer_relativity_summary": None,
+        "track4_traversal_summary": None,
+    }
+    if not SCIENTIFIC_SUMMARIES_AVAILABLE:
+        return outputs
+    try:
+        outputs["observer_relativity_summary"] = str(write_observer_relativity_summary(run_dir))
+    except Exception:
+        outputs["observer_relativity_summary"] = None
+    try:
+        outputs["track4_traversal_summary"] = str(write_track4_traversal_summary(run_dir))
+    except Exception:
+        outputs["track4_traversal_summary"] = None
+    return outputs
+
+
+def emit_consumer_contract_bundle(
+    run_dir: Path,
+    *,
+    allow_observer_backfill: bool = True,
+    observer_indices: Optional[Sequence[int]] = None,
+    observer_index_policy: str = "all",
+    observer_index_count: int = 3,
+) -> Dict[str, Any]:
     run_dir = Path(run_dir)
     monolith_csv = run_dir / "MONOLITH_DATA.csv"
     if not monolith_csv.exists():
@@ -4375,11 +5756,37 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     copied: List[str] = []
 
     rows = _load_monolith_rows(monolith_csv)
+    resolved_observer_indices = _resolve_observer_indices_for_leaf(
+        run_dir,
+        rows,
+        observer_indices=observer_indices,
+        observer_index_policy=observer_index_policy,
+        observer_index_count=observer_index_count,
+    )
     observer_backfill = None
     rel_dir = run_dir / "relativity_cache"
-    has_observer_payloads = rel_dir.exists() and any(rel_dir.glob("observer_*.pt"))
-    if not has_observer_payloads:
-        observer_backfill = _ensure_observer_universes_materialized(run_dir)
+    selected_observer_indices = resolved_observer_indices
+    required_observer_indices = (
+        _normalize_observer_indices(None, len(rows))
+        if selected_observer_indices is None
+        else list(selected_observer_indices)
+    )
+    has_observer_payloads = bool(required_observer_indices) and all(
+        (rel_dir / f"observer_{idx}.pt").exists()
+        for idx in required_observer_indices
+    )
+    if not has_observer_payloads and allow_observer_backfill:
+        observer_backfill = _ensure_observer_universes_materialized(
+            run_dir,
+            observer_indices=selected_observer_indices,
+        )
+    elif not has_observer_payloads:
+        observer_backfill = {
+            "status": "skipped",
+            "reason": "observer backfill disabled for this leaf",
+            "selected_observer_indices": selected_observer_indices,
+            "required_observer_indices": required_observer_indices,
+        }
     verification_res: Dict[str, Any]
     exp_root = _infer_verification_exp_dir(run_dir)
     if exp_root is not None and exp_root.exists():
@@ -4394,10 +5801,15 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
     baseline_meta = _emit_baseline_meta(run_dir)
     baseline_state = _emit_baseline_state(run_dir, rows)
     validation_json = _emit_validation_json(run_dir)
-    rel_stats = _emit_relativity_defaults(run_dir, rows)
+    rel_stats = _emit_relativity_defaults(run_dir, rows, observer_indices=selected_observer_indices)
     control_metrics = _emit_control_metrics_json(run_dir)
-    ablation_summary = _emit_ablation_summary_json(run_dir)
     relativity_deltas = _emit_relativity_deltas_json(run_dir)
+    scientific_summaries = _emit_scientific_leaf_summaries(run_dir)
+    track5_summary = _emit_track5_summary_json(run_dir)
+    animation_manifest = _emit_track4_animation_manifest_json(run_dir)
+    ablation_summary = _emit_ablation_summary_json(run_dir)
+    observer_recenter_summary = _emit_observer_recenter_summary_json(run_dir)
+    artifact_inventory = _emit_leaf_artifact_inventory_json(run_dir)
     label_paths = _emit_label_derivatives(run_dir, rows)
 
     return {
@@ -4412,6 +5824,11 @@ def emit_consumer_contract_bundle(run_dir: Path) -> Dict[str, Any]:
         "verification": verification_res,
         "relativity": rel_stats,
         "relativity_deltas": str(relativity_deltas),
+        "scientific_summaries": scientific_summaries,
+        "track5_summary": str(track5_summary),
+        "track4_animation_manifest": str(animation_manifest),
+        "observer_recenter_summary": str(observer_recenter_summary),
+        "leaf_artifact_inventory": str(artifact_inventory),
         "labels": label_paths,
     }
 
@@ -4583,6 +6000,7 @@ def run_synthetic_experiment_suite(
     n_articles_per_cluster: int = 15,
     n_clusters: int = 4,
     enable_checkpoints: bool = False,
+    track5_assembly_mode: str = "hadamard_strict",
 ) -> Dict:
     """
     Run synthetic controlled experiment with embedded ground truth labels.
@@ -4667,6 +6085,7 @@ def run_synthetic_experiment_suite(
                 actual_hidden_dim = 1536  # DeBERTa-v3-large hidden size
                 runtime_cfg = PipelineRuntimeConfig(
                     kernel_type=kernel,
+                    track5_assembly_mode=track5_assembly_mode,
                     use_cls_tokens=True,
                     use_dirichlet_fusion=True,
                     dirichlet_rks_dim=512,
@@ -4760,7 +6179,9 @@ def run_synthetic_experiment_suite(
                     obs_result.setdefault("meta", {})["provenance"] = normalized_obs_provenance
                     
                     # Redundant save for safety (the pipeline already writes some to obs_sub_dir)
-                    np.save(obs_sub_dir / "features.npy", obs_result['features'])
+                    preferred_obs_features = _preferred_artifact_features(obs_result)
+                    if preferred_obs_features is not None:
+                        np.save(obs_sub_dir / "features.npy", preferred_obs_features)
                     if 'dirichlet_fused' in obs_result:
                          np.save(obs_sub_dir / "gradients.npy", obs_result['dirichlet_fused'])
                     
@@ -4787,7 +6208,9 @@ def run_synthetic_experiment_suite(
                 )
 
                 # Save artifacts
-                np.save(run_dir / "features.npy", result['features'])
+                preferred_run_features = _preferred_artifact_features(result)
+                if preferred_run_features is not None:
+                    np.save(run_dir / "features.npy", preferred_run_features)
                 with open(run_dir / "validation.json", 'w') as f:
                     json.dump(validation, f, indent=2)
 
@@ -4812,6 +6235,8 @@ def run_synthetic_experiment_suite(
                     np.save(run_dir / "logit_confidence.npy", result['logit_confidence'])
                 if 'dirichlet_fused_std' in result:
                     np.save(run_dir / "dirichlet_fused_std.npy", result['dirichlet_fused_std'])
+                if 'track3_density_rho' in result:
+                    np.save(run_dir / "track3_density_rho.npy", result['track3_density_rho'])
 
                 # Track 4/5: Walker and Phantom Path Data
                 if 'walker_work_integrals' in result:
@@ -5290,6 +6715,8 @@ def _restore_args_from_resume(args: argparse.Namespace, exp_dir: Path) -> argpar
     for key in ("limit", "mode"):
         if key in stored and stored[key] is not None:
             setattr(args, key, stored[key])
+    if stored.get("control_metric_basis") is not None:
+        setattr(args, "control_metric_basis", stored["control_metric_basis"])
 
     for key in ("seeds", "kernels", "channels", "corpora"):
         value = stored.get(key)
@@ -5413,26 +6840,150 @@ def run_comparison(exp_dir: Path, seeds: List[int], kernels: List[str] = None, c
                 sys.executable,
                 "compare_controls.py",
                 "--data-dir", str(data_dir),
+                "--output-dir", str(data_dir),
                 "--seeds",
             ] + [str(s) for s in seeds]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
+            tail: List[str] = []
+            if getattr(subprocess.run, "__module__", "subprocess") != "subprocess":
+                process = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+                combined_output = "\n".join(
+                    part for part in [process.stdout or "", process.stderr or ""] if part
+                )
+                output_iter = combined_output.splitlines()
+                returncode = int(process.returncode)
+            else:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+                assert process.stdout is not None
+                output_iter = process.stdout
+                returncode = None
 
-            if result.returncode != 0:
-                print(f"  FAILED: {result.stderr[:500]}")
+            for line in output_iter:
+                clean = line.rstrip()
+                if clean:
+                    tail.append(clean)
+                    if len(tail) > 40:
+                        tail.pop(0)
+                    if any(
+                        kw in clean.lower()
+                        for kw in ["verdict", "real vs", "effect size", "p-value", "loaded", "shape", "separation"]
+                    ):
+                        print(f"  {clean}")
+            if returncode is None:
+                returncode = int(process.wait())
+
+            if returncode != 0:
+                print("  FAILED:")
+                for line in tail[-8:]:
+                    print(f"    {line}")
             else:
                 any_success = True
                 print(f"  Comparison complete for {kernel}/{channel}")
-                if result.stdout.strip():
-                    for line in result.stdout.strip().split(chr(10)):
-                        if any(kw in line.lower() for kw in ["verdict", "real vs", "effect size", "p-value", "loaded", "shape", "separation"]):
-                            print(f"  {line}")
+            _release_transient_memory()
 
     if not any_success:
         print("No comparisons succeeded.")
         return False
 
     return True
+
+
+def _refresh_leaf_contracts_after_comparison(
+    exp_dir: Path,
+    *,
+    kernels: List[str],
+    channels: List[str],
+    corpora: List[str],
+    control_metric_basis: Optional[str] = None,
+    observer_bundle_scope: str = "all",
+    observer_indices: Optional[Sequence[int]] = None,
+    observer_index_policy: str = "all",
+    observer_index_count: int = 3,
+) -> Dict[str, Any]:
+    refreshed_controls: List[str] = []
+    refreshed_bundles: List[str] = []
+    failures: List[Dict[str, str]] = []
+
+    refresh_config = {
+        "kernels": list(kernels or []),
+        "channels": list(channels or []),
+        "corpora": list(corpora or []),
+        "control_metric_basis": _normalize_control_metric_basis(control_metric_basis or _configured_control_metric_basis()),
+    }
+    observer_scope = str(observer_bundle_scope or "all").strip().lower()
+
+    def _allow_observer_backfill_for_leaf(corpus: str) -> bool:
+        corpus_name = str(corpus or "").strip().lower()
+        if observer_scope == "none":
+            return False
+        if corpus_name != "real":
+            return False
+        if observer_scope == "real":
+            return True
+        return True
+
+    for output_dir in _iter_suite_leaf_dirs(exp_dir, refresh_config):
+        try:
+            control_path = _emit_control_metrics_json(
+                output_dir,
+                metric_basis=refresh_config["control_metric_basis"],
+            )
+            refreshed_controls.append(str(control_path))
+            corpus_name = output_dir.name
+            bundle_kwargs = {
+                "allow_observer_backfill": _allow_observer_backfill_for_leaf(corpus_name),
+                "observer_indices": observer_indices,
+                "observer_index_policy": observer_index_policy,
+                "observer_index_count": observer_index_count,
+            }
+            try:
+                bundle_res = emit_consumer_contract_bundle(output_dir, **bundle_kwargs)
+            except TypeError as exc:
+                if "observer_" not in str(exc):
+                    raise
+                bundle_res = emit_consumer_contract_bundle(
+                    output_dir,
+                    allow_observer_backfill=bundle_kwargs["allow_observer_backfill"],
+                )
+            if bundle_res.get("status") == "success":
+                refreshed_bundles.append(str(output_dir))
+            else:
+                failures.append({
+                    "leaf": str(output_dir),
+                    "stage": "contract_bundle",
+                    "error": str(bundle_res.get("error", bundle_res)),
+                })
+        except Exception as exc:
+            failures.append({
+                "leaf": str(output_dir),
+                "stage": "post_comparison_refresh",
+                "error": str(exc),
+            })
+
+    return {
+        "status": "success" if not failures else "partial",
+        "refreshed_control_metrics": refreshed_controls,
+        "refreshed_contract_bundles": refreshed_bundles,
+        "failures": failures,
+    }
 
 
 # -----------------------------
@@ -5496,6 +7047,13 @@ def main():
         default=["logits", "cls"],
         help="Feature channels to extract (default: logits, cls). Options: logits, cls, gradient"
     )
+    parser.add_argument(
+        "--track5-assembly-mode",
+        type=str,
+        default="hadamard_strict",
+        choices=["hadamard", "hadamard_strict", "strict_riemannian", "riemannian", "riemannian_strict", "concatenate", "concat"],
+        help="Track 5 synthesis branch to use for this suite run."
+    )
     
     parser.add_argument(
         "--corpora",
@@ -5549,9 +7107,55 @@ def main():
         help="Run verification harness after experiment suite"
     )
     parser.add_argument(
+        "--verify-ablations",
+        action="store_true",
+        help="When --verify is set, also run expensive verification ablation jobs before verifying layers."
+    )
+    parser.add_argument(
         "--no-post-sync-results",
         action="store_true",
         help="Skip automatic RESULTS.md registry sync after suite completion."
+    )
+    parser.add_argument(
+        "--observer-bundle-scope",
+        choices=["all", "real", "none"],
+        default="all",
+        help="Scope for observer-manifest materialization during bundle emission (default: all).",
+    )
+    parser.add_argument(
+        "--observer-indices",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional observer/article indices to materialize for observer-centered bundles. "
+            "Accepts space- or comma-separated integers; omitted means every article."
+        ),
+    )
+    parser.add_argument(
+        "--observer-index-policy",
+        choices=["all", "anchors"],
+        default="all",
+        help="When --observer-indices is omitted, choose all observers or only Track 4 anchor observers.",
+    )
+    parser.add_argument(
+        "--observer-index-count",
+        type=int,
+        default=3,
+        help="Maximum automatic observers when --observer-index-policy anchors is active.",
+    )
+    parser.add_argument(
+        "--isolate-contract-bundle",
+        action="store_true",
+        help="Emit consumer contract bundles in a child process to release observer-backfill memory after each leaf.",
+    )
+    parser.add_argument(
+        "--control-metric-basis",
+        choices=["auto", "direct", "comprehensive"],
+        default="auto",
+        help=(
+            "Primary basis for control_metrics.json. direct=observer payloads, "
+            "comprehensive=compare_controls.py output, auto=direct-first with alternates."
+        ),
     )
     parser.add_argument(
         "--post-validate-thesis",
@@ -5706,6 +7310,11 @@ def main():
         help="Batch size for probe (default: 16)"
     )
     parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Disable the NLI probe even if probe files are present."
+    )
+    parser.add_argument(
         "--probe-nonfatal",
         action="store_true",
         default=True,  # DEFAULT: Continue even if probe fails
@@ -5719,12 +7328,17 @@ def main():
     )
 
     args = parser.parse_args()
+    try:
+        args.observer_indices = _parse_observer_indices_arg(args.observer_indices)
+    except Exception as exc:
+        parser.error(f"invalid --observer-indices: {exc}")
+    os.environ["BT_CONTROL_METRIC_BASIS"] = _normalize_control_metric_basis(args.control_metric_basis)
 
     # Validate probe files (always try to use probe)
     probe_hyp_path = Path(args.probe_hypotheses)
     probe_script_path = Path(args.probe_script)
     
-    probe_enabled = True
+    probe_enabled = not args.no_probe
     if not probe_hyp_path.exists():
         print(f"  WARNING: Probe hypotheses not found: {probe_hyp_path}")
         print(f"  Probe will be DISABLED")
@@ -5758,6 +7372,7 @@ def main():
     print(f"Corpora: {args.corpora}")
     print(f"Articles per corpus: {args.limit}")
     print(f"Seeds: {args.seeds}")
+    print(f"Track 5 assembly mode: {args.track5_assembly_mode}")
     print(f"Variance tracking: {not args.no_variance_tracking}")
     
     # Calculate total experiments
@@ -5783,6 +7398,11 @@ def main():
         "kernels": args.kernels,
         "channels": args.channels,
         "corpora": args.corpora,
+        "track5_assembly_mode": args.track5_assembly_mode,
+        "control_metric_basis": _normalize_control_metric_basis(args.control_metric_basis),
+        "observer_indices": list(args.observer_indices) if args.observer_indices is not None else None,
+        "observer_index_policy": args.observer_index_policy,
+        "observer_index_count": int(args.observer_index_count),
         "variance_tracking": not args.no_variance_tracking,
         "structure": "kernel/channel/corpus/observer_SEED.pt",
         "probe": {
@@ -5845,6 +7465,7 @@ def main():
             n_articles_per_cluster=getattr(args, 'synthetic_n_articles', 15),
             n_clusters=getattr(args, 'synthetic_clusters', 4),
             enable_checkpoints=enable_checkpoints,
+            track5_assembly_mode=args.track5_assembly_mode,
         )
 
         # Emit thesis-facing baseline artifacts for each synthetic run
@@ -5852,11 +7473,21 @@ def main():
             print(f"\n{'='*80}")
             print("MATERIALIZING SYNTHETIC BASELINE BUNDLES")
             print(f"{'='*80}")
+            synthetic_observer_bundle_enabled = str(getattr(args, "observer_bundle_scope", "all")).lower() == "all"
             for res in synthetic_result.get("results", []):
                 if res.get("status") == "success" and res.get("run_dir"):
                     run_dir = Path(res["run_dir"])
                     print(f"\n  Processing: {res['run_key']}")
-                    bundle_res = materialize_baseline_bundle(run_dir, strict=True)
+                    bundle_res = materialize_baseline_bundle(
+                        run_dir,
+                        strict=True,
+                        allow_observer_backfill=synthetic_observer_bundle_enabled,
+                        generate_observer_manifest=synthetic_observer_bundle_enabled,
+                        observer_indices=getattr(args, "observer_indices", None),
+                        observer_index_policy=getattr(args, "observer_index_policy", "all"),
+                        observer_index_count=getattr(args, "observer_index_count", 3),
+                        isolate_contract_bundle=getattr(args, "isolate_contract_bundle", False),
+                    )
                     res["baseline_bundle"] = bundle_res
                     if bundle_res.get("status") == "success":
                         print(f"    [BUNDLE][OK] {bundle_res.get('observer_manifest')}")
@@ -5942,6 +7573,9 @@ def main():
         print(f"Results saved to: {exp_dir.absolute()}")
         if not args.no_post_sync_results:
             run_post_thesis_sync(run_validation=args.post_validate_thesis)
+        if synthetic_result.get("status") != "success":
+            print(f"[SUITE][FAIL] Synthetic experiment status: {synthetic_result.get('status')}")
+            sys.exit(1)
         return
 
     corpora = args.corpora
@@ -6014,6 +7648,14 @@ def main():
         for seed in seeds:
             if not (combo_dir / f"observer_{seed}.pt").exists():
                 return False
+        return True
+
+    def should_materialize_observer_bundle(corpus: str) -> bool:
+        scope = str(getattr(args, "observer_bundle_scope", "all") or "all").strip().lower()
+        if scope == "none":
+            return False
+        if scope == "real":
+            return str(corpus).strip().lower() == "real"
         return True
 
     # Main experiment loop: OPTIMIZED ORDER for NLI caching
@@ -6112,6 +7754,7 @@ def main():
                     track_variance=not args.no_variance_tracking,
                     kernel_type=kernel,
                     nli_cache_path=str(nli_cache_path) if nli_cache_path else None,
+                    extra_flags=["--track5-assembly-mode", args.track5_assembly_mode],
                 )
                 
                 result["kernel"] = kernel
@@ -6126,7 +7769,17 @@ def main():
                     break
 
                 # Emit baseline + observer manifest artifacts (no online recompute in Dash).
-                bundle_result = materialize_baseline_bundle(output_dir, strict=True)
+                observer_bundle_enabled = should_materialize_observer_bundle(corpus)
+                bundle_result = materialize_baseline_bundle(
+                    output_dir,
+                    strict=True,
+                    allow_observer_backfill=observer_bundle_enabled,
+                    generate_observer_manifest=observer_bundle_enabled,
+                    observer_indices=getattr(args, "observer_indices", None),
+                    observer_index_policy=getattr(args, "observer_index_policy", "all"),
+                    observer_index_count=getattr(args, "observer_index_count", 3),
+                    isolate_contract_bundle=getattr(args, "isolate_contract_bundle", False),
+                )
                 result["baseline_bundle"] = bundle_result
                 if bundle_result.get("status") != "success":
                     print(f"[BUNDLE][WARN] {bundle_result}")
@@ -6233,6 +7886,7 @@ def main():
 
                 results.append(result)
                 save_manifest(exp_dir, results, base_config)
+                _release_transient_memory()
 
                 # Progress update
                 completed_so_far = len([r for r in results if r.get("status") == "success"])
@@ -6242,7 +7896,7 @@ def main():
                 print(f"{'='*80}\n")
                 sys.stdout.flush()
 
-    # Refresh direct control metrics after all sibling corpora exist.
+    # Refresh control metrics after all sibling corpora exist.
     refreshed_control_metrics: List[str] = []
     refreshed_contract_bundles: List[str] = []
     refreshed_control_dirs: set[str] = set()
@@ -6254,12 +7908,23 @@ def main():
             continue
         refreshed_control_dirs.add(key)
         try:
-            refreshed_path = _emit_control_metrics_json(output_dir)
+            refreshed_path = _emit_control_metrics_json(
+                output_dir,
+                metric_basis=args.control_metric_basis,
+            )
             refreshed_control_metrics.append(str(refreshed_path))
         except Exception as refresh_exc:
-            print(f"[CONTROL][WARN] Failed to refresh direct control metrics for {output_dir}: {refresh_exc}")
+            print(f"[CONTROL][WARN] Failed to refresh control metrics for {output_dir}: {refresh_exc}")
         try:
-            bundle_res = emit_consumer_contract_bundle(output_dir)
+            corpus_name = output_dir.name
+            observer_bundle_enabled = should_materialize_observer_bundle(corpus_name)
+            bundle_res = emit_consumer_contract_bundle(
+                output_dir,
+                allow_observer_backfill=observer_bundle_enabled,
+                observer_indices=getattr(args, "observer_indices", None),
+                observer_index_policy=getattr(args, "observer_index_policy", "all"),
+                observer_index_count=getattr(args, "observer_index_count", 3),
+            )
             if bundle_res.get("status") == "success":
                 refreshed_contract_bundles.append(str(output_dir))
             else:
@@ -6851,12 +8516,35 @@ def main():
             import traceback
             traceback.print_exc()
 
+    suite_exit_failures: List[str] = []
+
     # Only run comparison if all experiments succeeded
     all_success = all(r.get("status") == "success" for r in results if r.get("corpus") in corpora)
     if all_success:
-        run_comparison(exp_dir, args.seeds)
+        comparison_ok = run_comparison(exp_dir, args.seeds, args.kernels, args.channels)
+        if comparison_ok:
+            refresh_res = _refresh_leaf_contracts_after_comparison(
+                exp_dir,
+                kernels=args.kernels,
+                channels=args.channels,
+                corpora=args.corpora,
+                control_metric_basis=args.control_metric_basis,
+                observer_bundle_scope=getattr(args, "observer_bundle_scope", "all"),
+                observer_indices=getattr(args, "observer_indices", None),
+                observer_index_policy=getattr(args, "observer_index_policy", "all"),
+                observer_index_count=getattr(args, "observer_index_count", 3),
+            )
+            status = str(refresh_res.get("status", "unknown")).upper()
+            refreshed = len(refresh_res.get("refreshed_control_metrics", []) or [])
+            failures = len(refresh_res.get("failures", []) or [])
+            print(f"[COMPARISON REFRESH] status={status} leaves={refreshed} failures={failures}")
+            if str(refresh_res.get("status", "")).lower() != "success":
+                suite_exit_failures.append(f"post-comparison contract refresh incomplete: {failures} failure(s)")
+        else:
+            suite_exit_failures.append("control comparison failed")
     else:
         print("\n[WARN] Skipping comparison due to earlier failures.")
+        suite_exit_failures.append("one or more suite leaves failed")
 
     
     # =========================================================================
@@ -6882,24 +8570,27 @@ def main():
             rep_channel = [c for c in args.channels if c != 'gradient'][0]
             rep_kernel = args.kernels[0]
             
-            print(f"\n[VERIFY] Running Ablation A1: CRN OFF ({rep_kernel}/{rep_channel})")
-            for corpus in args.corpora:
-                a1_out = exp_dir / "ablation" / "crn_off" / rep_kernel / rep_channel / corpus
-                a1_out.mkdir(parents=True, exist_ok=True)
-                run_single_corpus(corpus, args.seeds, args.limit, a1_out, 
-                                 mode=get_mode_for_channel(rep_channel, args.mode), 
-                                 track_variance=False, kernel_type=rep_kernel,
-                                 extra_flags=["--no-crn"])
-            
-            if getattr(args, 'alpha_sweep', False):
-                print(f"\n[VERIFY] Running Ablation A2: ALPHA COLLAPSE ({rep_kernel}/{rep_channel})")
+            if getattr(args, "verify_ablations", False):
+                print(f"\n[VERIFY] Running Ablation A1: CRN OFF ({rep_kernel}/{rep_channel})")
                 for corpus in args.corpora:
-                    a2_out = exp_dir / "ablation" / "alpha_collapse" / rep_kernel / rep_channel / corpus
-                    a2_out.mkdir(parents=True, exist_ok=True)
-                    run_single_corpus(corpus, args.seeds, args.limit, a2_out, 
-                                     mode=get_mode_for_channel(rep_channel, args.mode), 
+                    a1_out = exp_dir / "ablation" / "crn_off" / rep_kernel / rep_channel / corpus
+                    a1_out.mkdir(parents=True, exist_ok=True)
+                    run_single_corpus(corpus, args.seeds, args.limit, a1_out,
+                                     mode=get_mode_for_channel(rep_channel, args.mode),
                                      track_variance=False, kernel_type=rep_kernel,
-                                     extra_flags=["--alpha-collapse"])
+                                     extra_flags=["--no-crn"])
+
+                if getattr(args, 'alpha_sweep', False):
+                    print(f"\n[VERIFY] Running Ablation A2: ALPHA COLLAPSE ({rep_kernel}/{rep_channel})")
+                    for corpus in args.corpora:
+                        a2_out = exp_dir / "ablation" / "alpha_collapse" / rep_kernel / rep_channel / corpus
+                        a2_out.mkdir(parents=True, exist_ok=True)
+                        run_single_corpus(corpus, args.seeds, args.limit, a2_out,
+                                         mode=get_mode_for_channel(rep_channel, args.mode),
+                                         track_variance=False, kernel_type=rep_kernel,
+                                         extra_flags=["--alpha-collapse"])
+            else:
+                print("[VERIFY] Skipping expensive verification ablation jobs; pass --verify-ablations to enable them.")
 
             # Verify each discovered layer in the current experiment layout.
             all_layers = discover_all_layers(exp_dir)
@@ -6924,6 +8615,7 @@ def main():
             print(f"[VERIFY] Error during verification: {e}")
             import traceback
             traceback.print_exc()
+            suite_exit_failures.append(f"verification harness error: {e}")
 
     if not args.no_post_sync_results:
         run_post_thesis_sync(run_validation=args.post_validate_thesis)
@@ -6932,6 +8624,11 @@ def main():
     print(f"\n{'='*80}")
     print("SUITE COMPLETE")
     print(f"{'='*80}")
+    if suite_exit_failures:
+        print("\n[SUITE][FAIL] Blocking issue(s):")
+        for failure in suite_exit_failures:
+            print(f"  - {failure}")
+        sys.exit(1)
     print("Results summary:")
     for r in results:
         status_emoji = "[OK]" if r.get("status") == "success" else "[FAIL]"

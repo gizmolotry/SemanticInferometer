@@ -1,6 +1,6 @@
 import csv
 import json
-import shutil
+import tempfile
 from pathlib import Path
 
 import run_full_experiment_suite as suite
@@ -69,13 +69,9 @@ def _write_verification_summary(path: Path) -> None:
 
 
 def _workspace_tmp(test_name: str) -> Path:
-    root = Path.cwd() / ".pytest_local_tmp"
+    root = Path.cwd() / ".pytest_local_tmp" / "contract_cases"
     root.mkdir(parents=True, exist_ok=True)
-    case_dir = root / test_name
-    if case_dir.exists():
-        shutil.rmtree(case_dir, ignore_errors=True)
-    case_dir.mkdir(parents=True, exist_ok=True)
-    return case_dir
+    return Path(tempfile.mkdtemp(prefix=f"{test_name}_", dir=root))
 
 
 def test_emit_consumer_contract_bundle_happy_path():

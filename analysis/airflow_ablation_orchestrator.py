@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -133,7 +133,7 @@ def run_ablation_matrix(base_csv: Path, output_dir: Path, scalar_bins: int = 8) 
             )
 
     summary = {
-        "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_csv": str(config.base_csv),
         "cells": rows,
     }

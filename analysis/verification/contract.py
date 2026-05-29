@@ -17,6 +17,13 @@ OPTIONAL_CONSUMER_ARTIFACTS = (
     "ablation_summary.json",
     "control_metrics.json",
     "relativity_deltas.json",
+    "observer_relativity_summary.json",
+    "observer_recenter_summary.json",
+    "observer_atlas_bundle.json",
+    "observer_slice_transport_summary.json",
+    "track4_traversal_summary.json",
+    "track5_summary.json",
+    "leaf_artifact_inventory.json",
     "labels/hidden_groups.csv",
     "labels/derived/group_summaries.json",
     "labels/derived/group_matrix.json",
@@ -113,6 +120,16 @@ def _safe_json_or_empty(path: Path) -> Dict[str, Any]:
     try:
         return _safe_json(path)
     except Exception:
+        return {}
+
+
+def _load_required_json_for_contract(path: Path, artifact_name: str, errors: List[str]) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return _safe_json(path)
+    except Exception as exc:
+        errors.append(f"{artifact_name} parse error: {exc}")
         return {}
 
 
@@ -236,12 +253,17 @@ def validate_validation_json(validation: Dict[str, Any]) -> ValidationResult:
     warnings: List[str] = []
     source = str(validation.get("source", "")).strip().lower()
     provenance_source = str(validation.get("provenance_source", "")).strip().lower()
+    status = str(validation.get("status", "")).strip().lower()
     comparability_status = str(validation.get("comparability_status", "")).strip().upper()
     trust_level = str(validation.get("trust_level", "")).strip().upper()
     if bool(validation.get("synthetic_placeholder", False)) or source in {"suite-default", "suite-default-placeholder"}:
         errors.append("validation contains synthetic placeholder data")
     elif provenance_source in {"suite-default", "suite-default-placeholder"}:
         errors.append("validation provenance_source indicates synthetic placeholder data")
+    if status in {"failed", "failure", "error"}:
+        errors.append(f"validation status is not claim-valid: {status}")
+    if trust_level in {"UNAVAILABLE", "FAILED"}:
+        errors.append(f"validation trust_level is not claim-valid: {trust_level}")
 
     if "nmi" not in validation:
         errors.append("validation missing 'nmi'")
@@ -304,6 +326,13 @@ def _artifact_map(run_dir: Path) -> Dict[str, Optional[Path]]:
         "ablation_summary.json": run_dir / "ablation_summary.json",
         "control_metrics.json": run_dir / "control_metrics.json",
         "relativity_deltas.json": run_dir / "relativity_deltas.json",
+        "observer_relativity_summary.json": run_dir / "observer_relativity_summary.json",
+        "observer_recenter_summary.json": run_dir / "observer_recenter_summary.json",
+        "observer_atlas_bundle.json": run_dir / "observer_atlas_bundle.json",
+        "observer_slice_transport_summary.json": run_dir / "observer_slice_transport_summary.json",
+        "track4_traversal_summary.json": run_dir / "track4_traversal_summary.json",
+        "track5_summary.json": run_dir / "track5_summary.json",
+        "leaf_artifact_inventory.json": run_dir / "leaf_artifact_inventory.json",
         "labels/hidden_groups.csv": run_dir / "labels" / "hidden_groups.csv",
         "labels/derived/group_summaries.json": run_dir / "labels" / "derived" / "group_summaries.json",
         "labels/derived/group_matrix.json": run_dir / "labels" / "derived" / "group_matrix.json",
@@ -321,7 +350,7 @@ def evaluate_consumer_contract(run_dir: Path) -> ConsumerDiagnostics:
     verification_status = LayerStatus.UNVERIFIED.value
     global_pass = False
 
-    report = _safe_json_or_empty(paths["verification_report.json"])
+    report = _load_required_json_for_contract(paths["verification_report.json"], "verification_report.json", schema_errors)
     if report:
         v_report = validate_report(report)
         schema_errors.extend(v_report.errors)
@@ -342,7 +371,7 @@ def evaluate_consumer_contract(run_dir: Path) -> ConsumerDiagnostics:
             else:
                 verification_status = LayerStatus.UNVERIFIED.value
 
-    meta = _safe_json_or_empty(paths["baseline_meta.json"])
+    meta = _load_required_json_for_contract(paths["baseline_meta.json"], "baseline_meta.json", schema_errors)
     if meta:
         vm = validate_baseline_meta(meta)
         schema_errors.extend(vm.errors)
@@ -351,7 +380,7 @@ def evaluate_consumer_contract(run_dir: Path) -> ConsumerDiagnostics:
         if meta_status in {s.value for s in LayerStatus} and verification_status == LayerStatus.UNVERIFIED.value:
             verification_status = meta_status
 
-    state = _safe_json_or_empty(paths["baseline_state.json"])
+    state = _load_required_json_for_contract(paths["baseline_state.json"], "baseline_state.json", schema_errors)
     if state:
         vs = validate_baseline_state(state)
         schema_errors.extend(vs.errors)

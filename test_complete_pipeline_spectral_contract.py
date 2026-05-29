@@ -1,4 +1,5 @@
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,10 @@ from core.complete_pipeline import (
     _classify_track5_semantic_verdicts,
     _construct_spectral_poles,
     _map_track4_state_to_track5_verdict,
+    _normalize_track4_basis_mode,
     _serialize_rks_basis_state,
+    _select_track4_embedding_basis,
+    _track4_pca_coords_2d,
 )
 from core.dirichlet_fusion import SharedRKSBasis
 from core.metric_fusion import calculate_unified_metric
@@ -37,6 +41,88 @@ def test_canonical_cls_per_bot_contract_is_magnitude_preserving():
     assert stacked[0].norm(dim=-1).max().item() > 1.0
     assert torch.equal(as_list[0], stacked[0])
     assert torch.equal(as_list[1], stacked[1])
+
+
+def test_track4_basis_selector_defaults_to_track2_and_records_shape():
+    hologram = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+    selected, info = _select_track4_embedding_basis(
+        "track2",
+        hologram_t2=hologram,
+    )
+
+    assert torch.equal(selected, hologram)
+    assert info["requested_basis"] == "track2"
+    assert info["effective_basis"] == "track2"
+    assert info["basis_warning"] is None
+    assert info["embedding_dim"] == 4
+    assert info["n_articles"] == 5
+
+
+def test_track4_basis_selector_uses_logits_flat_when_available():
+    hologram = torch.zeros((3, 4), dtype=torch.float32)
+    nli_pairs = [
+        {"logits_raw": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        {"logits_raw": torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]])},
+        {"logits_raw": torch.tensor([[13.0, 14.0, 15.0], [16.0, 17.0, 18.0]])},
+    ]
+
+    selected, info = _select_track4_embedding_basis(
+        "logits_flat",
+        hologram_t2=hologram,
+        nli_pairs=nli_pairs,
+    )
+
+    assert selected.shape == (3, 6)
+    assert info["requested_basis"] == "logits_flat"
+    assert info["effective_basis"] == "logits_flat"
+    assert torch.allclose(selected[0], torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+
+
+def test_track4_basis_selector_supports_bot_norms_and_fallback_warning():
+    hologram = torch.ones((2, 3), dtype=torch.float32)
+    cls_per_bot = torch.tensor(
+        [
+            [[3.0, 4.0], [5.0, 12.0]],
+            [[8.0, 15.0], [7.0, 24.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    selected, info = _select_track4_embedding_basis(
+        "bot_norms",
+        hologram_t2=hologram,
+        cls_per_bot_tensor=cls_per_bot,
+    )
+
+    assert selected.shape == (2, 2)
+    assert torch.allclose(selected, torch.tensor([[5.0, 13.0], [17.0, 25.0]]))
+    assert info["effective_basis"] == "bot_norms"
+
+    fallback, fallback_info = _select_track4_embedding_basis(
+        "logits_flat",
+        hologram_t2=hologram,
+        nli_pairs=None,
+    )
+
+    assert torch.equal(fallback, hologram)
+    assert fallback_info["requested_basis"] == "logits_flat"
+    assert fallback_info["effective_basis"] == "track2"
+    assert "fell back" in fallback_info["basis_warning"]
+
+
+def test_track4_basis_aliases_and_scalar_coords_are_stable():
+    assert _normalize_track4_basis_mode("logits") == "logits_flat"
+    assert _normalize_track4_basis_mode("cls-per-bot-flat") == "cls_stacked"
+    assert _normalize_track4_basis_mode("d_spectral") == "spectral_pc1"
+    assert _normalize_track4_basis_mode("nonsense") == "track2"
+
+    scalar_basis = torch.tensor([0.1, 0.2, 0.4], dtype=torch.float32)
+    coords = _track4_pca_coords_2d(scalar_basis)
+
+    assert coords.shape == (3, 2)
+    assert torch.allclose(coords[:, 0], scalar_basis)
+    assert torch.allclose(coords[:, 1], torch.zeros(3))
 
 
 def test_construct_spectral_poles_falls_back_for_missing_positive_bucket():
@@ -79,8 +165,9 @@ def test_track4_panic_bypass_preserves_native_states():
 
 
 def test_metric_fusion_prefers_track5_verdict_ledger():
-    run_dir = Path(".pytest_local_tmp/test_metric_fusion_prefers_track5_verdict_ledger")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    scratch_root = Path(".pytest_local_tmp") / "metric_fusion_cases"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="test_metric_fusion_prefers_track5_verdict_ledger_", dir=scratch_root))
     np.save(run_dir / "features.npy", np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32))
     np.save(run_dir / "spectral_u_axis.npy", np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))
     np.save(run_dir / "walker_work_integrals.npy", np.array([5.0, 50.0], dtype=np.float32))

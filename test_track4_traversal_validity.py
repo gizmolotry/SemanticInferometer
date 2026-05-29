@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import numpy as np
 
@@ -21,27 +22,39 @@ def _write_cyclic_paths(
     path_is_hot: list[bool] | None = None,
     work_integral: list[float] | None = None,
     closed_loop: list[bool] | None = None,
+    terrain_labels: list[str] | None = None,
+    feature_basis: str | None = None,
+    proposal_mode: str | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     path_count = len(path_anchor_idx)
-    np.savez(
-        run_dir / "cyclic_paths.npz",
-        work_integral=np.asarray(
+    payload = {
+        "work_integral": np.asarray(
             work_integral if work_integral is not None else [12.0 + idx for idx in range(path_count)],
             dtype=float,
         ),
-        closed_loop=np.asarray(
+        "closed_loop": np.asarray(
             closed_loop if closed_loop is not None else [idx % 2 == 0 for idx in range(path_count)],
             dtype=bool,
         ),
-        path_anchor_idx=np.asarray(path_anchor_idx, dtype=int),
-        anchor_indices=np.asarray(anchor_indices, dtype=int),
-        path_is_hot=np.asarray(
+        "path_anchor_idx": np.asarray(path_anchor_idx, dtype=int),
+        "anchor_indices": np.asarray(anchor_indices, dtype=int),
+        "path_is_hot": np.asarray(
             path_is_hot if path_is_hot is not None else [idx < 2 for idx in range(path_count)],
             dtype=bool,
         ),
-        path_indices=np.asarray(path_indices, dtype=object),
-    )
+        "path_indices": np.asarray(path_indices, dtype=object),
+    }
+    if feature_basis is not None:
+        payload["path_feature_basis"] = np.asarray([feature_basis] * path_count, dtype=object)
+    if proposal_mode is not None:
+        payload["path_proposal_mode"] = np.asarray([proposal_mode] * path_count, dtype=object)
+    if terrain_labels is not None:
+        payload["anchor_selection_metadata"] = np.asarray(
+            [json.dumps({"terrain_labels": terrain_labels})],
+            dtype=object,
+        )
+    np.savez(run_dir / "cyclic_paths.npz", **payload)
 
 
 def test_track4_traversal_detects_dead_paths_and_collapsed_geometry(tmp_path: Path):
@@ -225,6 +238,29 @@ def test_track4_summary_exposes_touched_zone_diagnostics_separately_from_anchor_
     assert summary["per_anchor"][0]["touched_zones"] == ["Bridge", "Tightrope", "Void"]
 
 
+def test_track4_summary_prefers_exact_anchor_article_ids_over_ordinal_fallback(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    write_monolith_data(run_dir / "MONOLITH_DATA.csv")
+    _write_cyclic_paths(
+        run_dir,
+        anchor_indices=[1, 3],
+        path_anchor_idx=[1, 1, 3, 3, 1, 3],
+        path_indices=[[1, 0, 3], [1, 2, 3], [3, 2, 1], [3, 0, 1], [1, 3], [3, 1]],
+        path_is_hot=[True, True, False, False, True, False],
+        closed_loop=[True, True, False, False, True, False],
+        work_integral=[10.0, 12.0, 42.0, 55.0, 11.0, 48.0],
+    )
+
+    summary = summarize_track4_traversal(run_dir)
+
+    anchors = {row["anchor_article_idx"]: row for row in summary["per_anchor"]}
+    assert set(anchors) == {1, 3}
+    assert anchors[1]["zone"] == "Swamp"
+    assert anchors[3]["zone"] == "Void"
+    assert summary["zone_summary"]["Swamp"]["path_count"] == 3
+    assert summary["zone_summary"]["Void"]["path_count"] == 3
+
+
 def test_track4_summary_promotes_touched_zones_to_primary_when_anchor_coverage_is_sparse(tmp_path: Path):
     run_dir = tmp_path / "run"
     write_monolith_data(run_dir / "MONOLITH_DATA.csv")
@@ -254,6 +290,45 @@ def test_track4_summary_promotes_touched_zones_to_primary_when_anchor_coverage_i
     assert set(summary["primary_zone_summary"].keys()) == {"Bridge", "Tightrope", "Void"}
     assert summary["primary_bridge_vs_void"]["closed_loop_rate_gap"] > 0.05
     assert summary["primary_bridge_vs_void"]["work_integral_gap"] > 0.05
+
+
+def test_track4_summary_rejects_zero_reactive_flux_when_markov_boundaries_exist(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    write_monolith_data(run_dir / "MONOLITH_DATA.csv")
+    _write_cyclic_paths(
+        run_dir,
+        anchor_indices=[0, 3],
+        path_anchor_idx=[0, 0, 3, 3, 0],
+        path_indices=[[0, 2, 3], [0, 1, 3], [3, 2, 0], [3, 0], [0, 3]],
+        path_is_hot=[True, True, False, False, False],
+        closed_loop=[True, True, False, False, True],
+        work_integral=[10.0, 12.0, 45.0, 55.0, 11.0],
+    )
+    with np.load(run_dir / "cyclic_paths.npz", allow_pickle=True) as payload:
+        data = {key: payload[key] for key in payload.files}
+    data["reactive_flux_values"] = np.asarray([], dtype=float)
+    data["reactive_flux_edges"] = np.empty((0, 2), dtype=int)
+    data["track4_markov_status"] = np.asarray(["OK"], dtype=object)
+    np.savez(run_dir / "cyclic_paths.npz", **data)
+    (run_dir / "track4_markov_summary.json").write_text(
+        json.dumps(
+            {
+                "status": "OK",
+                "bridge_count": 1,
+                "void_count": 1,
+                "bridge_to_void_reachable": False,
+                "void_to_bridge_reachable": False,
+                "reactive_flux_total": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_track4_traversal(run_dir)
+
+    assert summary["status"] == "INVALID"
+    assert "track 4 Markov bridge/void reactive flux is zero" in summary["failure_reasons"]
+    assert "track 4 metric graph has no directed Bridge-to-Void route" in summary["failure_reasons"]
 
 
 def test_track4_evaluator_uses_primary_touched_summary_before_anchor_summary():
@@ -295,6 +370,8 @@ def test_track4_summary_rejects_repeated_path_trace_collapse(tmp_path: Path):
 
     assert summary["status"] == "INVALID"
     assert summary["unique_path_shape_count"] == 1
+    assert summary["path_shape_entropy_norm"] == 0.0
+    assert summary["path_edge_entropy_norm"] is not None
     assert "all Track 4 paths collapse to one repeated index trace" in summary["failure_reasons"]
 
 
@@ -332,6 +409,54 @@ def test_track4_summary_rejects_trivial_bridge_void_effect_size(tmp_path: Path):
     assert summary["status"] == "INVALID"
     assert "bridge/void closed-loop gap below minimum semantic effect size" in summary["failure_reasons"]
     assert "bridge/void work-integral gap below minimum semantic effect size" in summary["failure_reasons"]
+
+
+def test_track4_summary_accepts_work_gap_when_all_loops_close(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    write_monolith_data(run_dir / "MONOLITH_DATA.csv")
+    _write_cyclic_paths(
+        run_dir,
+        anchor_indices=[0, 3],
+        path_anchor_idx=[0, 0, 3, 3, 0, 3],
+        path_indices=[[0, 2], [0, 1, 2], [3, 2], [3, 1, 2], [0, 2], [3, 2]],
+        path_is_hot=[True, True, False, False, True, False],
+        closed_loop=[True, True, True, True, True, True],
+        work_integral=[10.0, 12.0, 42.0, 55.0, 11.0, 48.0],
+        feature_basis="logits_flat",
+        proposal_mode="metric_softmax",
+    )
+
+    summary = summarize_track4_traversal(run_dir)
+
+    assert summary["status"] == "OK"
+    assert summary["safe_for_thesis_claim"] is True
+    assert summary["primary_bridge_vs_void"]["closed_loop_rate_gap"] == 0.0
+    assert summary["primary_bridge_vs_void"]["work_integral_gap"] > 0.05
+    assert summary["path_shape_entropy_norm"] > 0.0
+    assert summary["mean_path_edge_count"] > 0.0
+    assert summary["feature_basis_counts"] == {"logits_flat": 6}
+    assert summary["proposal_mode_counts"] == {"metric_softmax": 6}
+
+
+def test_track4_summary_uses_npz_terrain_metadata_without_monolith_csv(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    _write_cyclic_paths(
+        run_dir,
+        anchor_indices=[0, 2],
+        path_anchor_idx=[0, 0, 2, 2, 0, 2],
+        path_indices=[[0, 1], [0, 1], [2, 1], [2, 1], [0, 1], [2, 1]],
+        path_is_hot=[True, True, False, False, True, False],
+        closed_loop=[True, True, True, True, True, True],
+        work_integral=[10.0, 12.0, 42.0, 55.0, 11.0, 48.0],
+        terrain_labels=["Bridge", "Tightrope", "Void"],
+    )
+
+    summary = summarize_track4_traversal(run_dir)
+
+    assert summary["status"] == "OK"
+    assert summary["terrain_evidence_basis"] == "path_touched"
+    assert set(summary["primary_zone_summary"]) == {"Bridge", "Tightrope", "Void"}
+    assert summary["primary_bridge_vs_void"]["work_integral_gap"] > 0.05
 
 
 def test_track4_evaluator_rejects_legacy_warning_only_bridge_void_gap():

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -11,17 +10,6 @@ import pytest
 
 from core.complete_pipeline import _build_article_metadata_row, parse_timestamp_to_utc
 from core.metric_fusion import calculate_unified_metric
-
-
-@pytest.fixture
-def tmp_path(request):
-    root = Path.cwd() / ".pytest_local_tmp"
-    root.mkdir(parents=True, exist_ok=True)
-    case_dir = root / request.node.name
-    if case_dir.exists():
-        shutil.rmtree(case_dir, ignore_errors=True)
-    case_dir.mkdir(parents=True, exist_ok=True)
-    return case_dir
 
 
 def test_build_article_metadata_row_preserves_rich_article_fields():

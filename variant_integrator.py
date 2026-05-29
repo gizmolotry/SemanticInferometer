@@ -6,6 +6,12 @@ BELIEF TRANSFORMER INTEGRATION PROTOCOL (v1.2)
 Implements "Endogenous Stress-Testing" by generating scientific variants
 from raw V-Layer inputs.
 
+LEGACY STATUS:
+This script is retained for historical variant replay only. It is not the
+canonical experiment or ablation entrypoint for ASTER v3.2+, and it still
+assumes older raw-embedding contracts in multiple paths. New ablation work
+should flow through `core/master_ablation.py`.
+
 CORE LOGIC:
 1. Intercepts RAW 768d embeddings (before Kernel distortion).
 2. Modifies geometry (Whitening, Phase Space Fusion).

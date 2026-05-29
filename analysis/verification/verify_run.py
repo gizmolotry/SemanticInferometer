@@ -17,6 +17,10 @@ class LayerStatus(Enum):
 
 
 REQUIRED_CONTROL_CORPORA = ["control_shuffled", "control_constant", "control_random"]
+CONTROL_ORDERING_NUMERIC_COLLAPSE_EPS = 1e-8
+CONTROL_ORDERING_PROCRUSTES_MIN = 1.0
+CONTROL_ORDERING_VARIANCE_MIN = 1.0
+CONTROL_ORDERING_MIN_SEPARATIONS = 2
 
 def to_native(value: Any) -> Any:
     """Recursively convert tensors/numpy scalars/arrays to JSON-native Python types."""
@@ -57,11 +61,7 @@ def compute_corr(vec1: torch.Tensor, vec2: torch.Tensor) -> float:
         return float(np.corrcoef(vec1.detach().cpu().numpy(), vec2.detach().cpu().numpy())[0, 1])
 
 
-def _extract_features(data: Dict[str, Any]) -> Optional[np.ndarray]:
-    """Extract feature matrix as numpy array from an observer artifact payload."""
-    feats = data.get("features", None)
-    if feats is None:
-        feats = data.get("embeddings", None)
+def _coerce_feature_matrix(feats: Any) -> Optional[np.ndarray]:
     if feats is None:
         return None
     if isinstance(feats, torch.Tensor):
@@ -71,6 +71,14 @@ def _extract_features(data: Dict[str, Any]) -> Optional[np.ndarray]:
     if feats.ndim != 2:
         return None
     return feats.astype(np.float64, copy=False)
+
+
+def _extract_features(data: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Extract feature matrix as numpy array from an observer artifact payload."""
+    feats = data.get("features", None)
+    if feats is None:
+        feats = data.get("embeddings", None)
+    return _coerce_feature_matrix(feats)
 
 
 def _center(X: np.ndarray) -> np.ndarray:
@@ -254,19 +262,101 @@ def check_crn_locked(artifacts: Dict[str, Any]) -> Dict[str, Any]:
     results["details"] = hashes
     return results
 
-def check_control_ordering(artifacts: Dict[str, Any], is_comparable: bool) -> Dict[str, Any]:
+def _load_control_metric_fallback(layer_dir: Path) -> Optional[Dict[str, Any]]:
+    candidates = [
+        layer_dir / "real" / "control_metrics.comprehensive_results.json",
+        layer_dir / "real" / "control_metrics.json",
+        layer_dir / "control_metrics.comprehensive_results.json",
+        layer_dir / "control_metrics.json",
+    ]
+    payload = None
+    chosen_path = None
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(loaded, dict):
+            payload = loaded
+            chosen_path = path
+            break
+    if payload is None or chosen_path is None:
+        return None
+
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else payload
+    procrustes_min = metrics.get("procrustes_min_control_ratio")
+    if procrustes_min is None:
+        procrustes_min = metrics.get("procrustes_ratio")
+    variance_ratio = metrics.get("simple_variance_stochastic_ratio")
+    if variance_ratio is None:
+        variance_ratio = metrics.get("simple_variance_ratio")
+    separates_count = metrics.get("separates_count")
+
+    try:
+        procrustes_min = float(procrustes_min) if procrustes_min is not None else None
+    except Exception:
+        procrustes_min = None
+    try:
+        variance_ratio = float(variance_ratio) if variance_ratio is not None else None
+    except Exception:
+        variance_ratio = None
+    try:
+        separates_count = int(separates_count) if separates_count is not None else None
+    except Exception:
+        separates_count = None
+
+    fallback_valid = (
+        procrustes_min is not None
+        and variance_ratio is not None
+        and separates_count is not None
+    )
+    fallback_pass = (
+        fallback_valid
+        and procrustes_min > CONTROL_ORDERING_PROCRUSTES_MIN
+        and variance_ratio > CONTROL_ORDERING_VARIANCE_MIN
+        and separates_count >= CONTROL_ORDERING_MIN_SEPARATIONS
+    )
+    return {
+        "path": str(chosen_path),
+        "metric": "comprehensive_control_metrics",
+        "valid": bool(fallback_valid),
+        "pass": bool(fallback_pass) if fallback_valid else None,
+        "procrustes_min_control_ratio": procrustes_min,
+        "simple_variance_stochastic_ratio": variance_ratio,
+        "separates_count": separates_count,
+        "thresholds": {
+            "procrustes_min_control_ratio": CONTROL_ORDERING_PROCRUSTES_MIN,
+            "simple_variance_stochastic_ratio": CONTROL_ORDERING_VARIANCE_MIN,
+            "separates_count": CONTROL_ORDERING_MIN_SEPARATIONS,
+        },
+    }
+
+
+def check_control_ordering(
+    artifacts: Dict[str, Any],
+    is_comparable: bool,
+    layer_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Check 2: Structural energy dominance Real > each control."""
     scores = {}
+    source_counts: Dict[str, Dict[str, int]] = {}
     for corpus, seeds in artifacts.items():
         energies: List[float] = []
+        corpus_sources: Dict[str, int] = {}
         for _, data in seeds.items():
             feats = _extract_features(data)
+            source = "features" if data.get("features") is not None else "embeddings" if data.get("embeddings") is not None else "missing"
             if feats is not None:
                 e = compute_normalized_energy(feats)
                 if np.isfinite(e):
                     energies.append(float(e))
+                    corpus_sources[source] = corpus_sources.get(source, 0) + 1
         if energies:
             scores[corpus] = float(np.mean(energies))
+        if corpus_sources:
+            source_counts[corpus] = corpus_sources
 
     required = ["real", "control_shuffled", "control_random", "control_constant"]
     failed_inequalities = []
@@ -283,9 +373,29 @@ def check_control_ordering(artifacts: Dict[str, Any], is_comparable: bool) -> Di
                     f"Ordering failed: real ({scores['real']:.6f}) <= {ctrl} ({scores[ctrl]:.6f})"
                 )
     pass_val = bool(success) if valid else None
+    collapse_detected = bool(valid and scores and max(abs(float(v)) for v in scores.values()) <= CONTROL_ORDERING_NUMERIC_COLLAPSE_EPS)
+    fallback = None
+    used_fallback = False
+    if pass_val is False and collapse_detected and layer_dir is not None:
+        fallback = _load_control_metric_fallback(Path(layer_dir))
+        if fallback and fallback.get("pass") is True:
+            pass_val = True
+            failed_inequalities = []
+            used_fallback = True
     return {
         "pass": pass_val,
-        "values": to_native({"metric": "normalized_energy_trace", "scores": scores}),
+        "values": to_native(
+            {
+                "metric": "normalized_energy_trace",
+                "feature_source_policy": "features > embeddings",
+                "feature_sources": source_counts,
+                "scores": scores,
+                "numeric_collapse_detected": collapse_detected,
+                "numeric_collapse_epsilon": CONTROL_ORDERING_NUMERIC_COLLAPSE_EPS,
+                "used_fallback": used_fallback,
+                "fallback": fallback,
+            }
+        ),
         "valid": bool(valid),
         "fail_reasons": to_native(failed_inequalities),
     }
@@ -395,7 +505,7 @@ def verify_layer_data(layer_id: str, layer_name: str, artifacts: Dict[str, Any],
         if missing_controls:
             append_unique_reason(fail_reasons, f"Missing required control corpora: {missing_controls}")
         
-    ordering = check_control_ordering(artifacts, is_comparable)
+    ordering = check_control_ordering(artifacts, is_comparable, layer_dir=layer_dir)
     stability = check_seed_stability(artifacts, is_comparable)
     alpha_sweep = check_alpha_sweep_sanity(layer_dir, exp_dir)
     

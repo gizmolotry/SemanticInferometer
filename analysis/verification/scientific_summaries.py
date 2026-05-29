@@ -72,6 +72,27 @@ def _std_or_none(values: Iterable[float]) -> Optional[float]:
     return float(np.std(vals)) if vals.size else None
 
 
+def _entropy_summary_from_counts(counts: Iterable[int]) -> Dict[str, Optional[float]]:
+    vals = np.asarray([float(v) for v in counts if int(v) > 0], dtype=float)
+    if vals.size <= 0:
+        return {
+            "entropy": None,
+            "max_entropy": None,
+            "entropy_norm": None,
+            "category_count": 0,
+        }
+    probs = vals / vals.sum()
+    entropy = float(-np.sum(probs * np.log(probs)))
+    max_entropy = float(np.log(vals.size)) if vals.size > 1 else 0.0
+    entropy_norm = float(entropy / max_entropy) if max_entropy > 0.0 else 0.0
+    return {
+        "entropy": entropy,
+        "max_entropy": max_entropy,
+        "entropy_norm": entropy_norm,
+        "category_count": int(vals.size),
+    }
+
+
 def _bridge_void_from_zone_summary(
     zone_summary: Dict[str, Dict[str, Any]],
     *,
@@ -94,9 +115,11 @@ def _bridge_void_from_zone_summary(
             bridge_void["work_integral_gap"] = float(void["mean_work_integral"]) - float(bridge["mean_work_integral"])
         closed_gap = bridge_void.get("closed_loop_rate_gap")
         work_gap = bridge_void.get("work_integral_gap")
-        if closed_gap is not None and closed_gap <= min_semantic_gap:
+        closed_pass = closed_gap is not None and closed_gap > min_semantic_gap
+        work_pass = work_gap is not None and work_gap > min_semantic_gap
+        if closed_gap is not None and not closed_pass and not work_pass:
             failures.append("bridge/void closed-loop gap below minimum semantic effect size")
-        if work_gap is not None and work_gap <= min_semantic_gap:
+        if work_gap is not None and not work_pass and not closed_pass:
             failures.append("bridge/void work-integral gap below minimum semantic effect size")
     else:
         failures.append("bridge/void comparison unavailable for this run")
@@ -136,6 +159,215 @@ def _load_article_records(run_dir: Path) -> Dict[int, Dict[str, Any]]:
             merged.update(row)
 
     return article_map
+
+
+def _load_hidden_label_map(run_dir: Path) -> Dict[int, str]:
+    candidates = [
+        run_dir / "labels" / "hidden_groups.csv",
+        run_dir / "hidden_groups.csv",
+    ]
+    label_columns = (
+        "group_topic",
+        "group",
+        "label",
+        "ground_truth_label",
+        "perspective_tag",
+        "cluster",
+        "cluster_label",
+    )
+    id_columns = ("article_id", "index", "idx", "article_index")
+    for path in candidates:
+        if not path.exists():
+            continue
+        label_map: Dict[int, str] = {}
+        for row in _safe_csv_rows(path):
+            article_idx = None
+            for col in id_columns:
+                article_idx = _to_int(row.get(col))
+                if article_idx is not None:
+                    break
+            if article_idx is None:
+                continue
+            label = None
+            for col in label_columns:
+                raw = row.get(col)
+                if raw is not None and str(raw).strip():
+                    label = str(raw).strip()
+                    break
+            if label:
+                label_map[int(article_idx)] = label
+        if label_map:
+            return label_map
+    return {}
+
+
+def _row_work_value(row: Dict[str, Any]) -> Optional[float]:
+    for key in (
+        "w_actual",
+        "work_integral",
+        "walker_mean_action",
+        "mean_work_integral",
+        "d_spectral",
+    ):
+        value = _to_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _cliffs_delta(a_values: Iterable[float], b_values: Iterable[float]) -> Optional[float]:
+    a = [float(v) for v in a_values if v is not None and math.isfinite(float(v))]
+    b = [float(v) for v in b_values if v is not None and math.isfinite(float(v))]
+    if not a or not b:
+        return None
+    wins = 0
+    losses = 0
+    for av in a:
+        for bv in b:
+            if av > bv:
+                wins += 1
+            elif av < bv:
+                losses += 1
+    return float((wins - losses) / float(len(a) * len(b)))
+
+
+def summarize_terrain_incremental_signal(
+    run_dir: Path,
+    *,
+    min_pair_count: int = 3,
+    min_work_gap_lift: float = 0.10,
+) -> Dict[str, Any]:
+    """Test whether terrain explains traversal work beyond planted labels.
+
+    The validation target is deliberately narrow: among article pairs sharing the
+    same hidden/synthetic label, pairs that cross terrain zones should show a
+    larger traversal-work gap than pairs that stay in one terrain zone. This is
+    not a final semantic proof, but it is a useful anti-circularity check for
+    synthetic-label NMI results.
+    """
+    run_dir = Path(run_dir)
+    article_map = _load_article_records(run_dir)
+    label_map = _load_hidden_label_map(run_dir)
+    failures: List[str] = []
+    warnings: List[str] = []
+
+    if not article_map:
+        failures.append("article telemetry missing")
+    if not label_map:
+        failures.append("hidden/planted labels missing")
+
+    records: List[Dict[str, Any]] = []
+    for idx, label in sorted(label_map.items()):
+        row = article_map.get(int(idx), {})
+        zone = str(row.get("zone", "")).strip()
+        work = _row_work_value(row)
+        if not zone or work is None:
+            continue
+        records.append(
+            {
+                "article_idx": int(idx),
+                "hidden_label": str(label),
+                "terrain_zone": zone,
+                "work": float(work),
+            }
+        )
+
+    labels = sorted({row["hidden_label"] for row in records})
+    zones = sorted({row["terrain_zone"] for row in records})
+    label_zone_counts: Dict[str, Dict[str, int]] = {}
+    for row in records:
+        label_zone_counts.setdefault(row["hidden_label"], {})
+        label_zone_counts[row["hidden_label"]][row["terrain_zone"]] = (
+            label_zone_counts[row["hidden_label"]].get(row["terrain_zone"], 0) + 1
+        )
+    mixed_label_count = sum(1 for zone_counts in label_zone_counts.values() if len(zone_counts) >= 2)
+
+    same_zone_gaps: List[float] = []
+    different_zone_gaps: List[float] = []
+    pair_rows: List[Dict[str, Any]] = []
+    by_label: Dict[str, List[Dict[str, Any]]] = {}
+    for row in records:
+        by_label.setdefault(row["hidden_label"], []).append(row)
+    for label, label_records in sorted(by_label.items()):
+        for i, left in enumerate(label_records):
+            for right in label_records[i + 1:]:
+                gap = abs(float(left["work"]) - float(right["work"]))
+                same_zone = left["terrain_zone"] == right["terrain_zone"]
+                if same_zone:
+                    same_zone_gaps.append(gap)
+                else:
+                    different_zone_gaps.append(gap)
+                pair_rows.append(
+                    {
+                        "hidden_label": label,
+                        "left_article_idx": left["article_idx"],
+                        "right_article_idx": right["article_idx"],
+                        "left_zone": left["terrain_zone"],
+                        "right_zone": right["terrain_zone"],
+                        "same_terrain_zone": same_zone,
+                        "work_gap": float(gap),
+                    }
+                )
+
+    same_mean = _mean_or_none(same_zone_gaps)
+    different_mean = _mean_or_none(different_zone_gaps)
+    lift = (
+        float(different_mean - same_mean)
+        if same_mean is not None and different_mean is not None
+        else None
+    )
+    ratio = (
+        float(different_mean / max(same_mean, 1e-12))
+        if same_mean is not None and different_mean is not None
+        else None
+    )
+    cliffs_delta = _cliffs_delta(different_zone_gaps, same_zone_gaps)
+
+    if len(records) < 3:
+        failures.append("fewer than three labeled articles have terrain and work telemetry")
+    if len(labels) < 2:
+        failures.append("fewer than two hidden labels available")
+    if len(zones) < 2:
+        failures.append("fewer than two terrain zones available")
+    if mixed_label_count <= 0:
+        failures.append("no hidden label contains multiple terrain zones")
+    if len(same_zone_gaps) < min_pair_count:
+        failures.append("insufficient same-label same-terrain pairs")
+    if len(different_zone_gaps) < min_pair_count:
+        failures.append("insufficient same-label cross-terrain pairs")
+    if lift is None:
+        failures.append("terrain work-gap lift unavailable")
+    elif lift <= min_work_gap_lift:
+        failures.append("cross-terrain work-gap lift below threshold")
+
+    if label_zone_counts and all(len(counts) == 1 for counts in label_zone_counts.values()):
+        warnings.append("hidden labels are perfectly nested in terrain zones; terrain adds no within-label test")
+
+    return {
+        "status": "OK" if not failures else "INVALID",
+        "run_dir": str(run_dir),
+        "evidence_basis": "same_hidden_label_pair_work_gap_by_terrain",
+        "work_basis": "MONOLITH_DATA.w_actual_or_work_fallback",
+        "n_labeled_articles": len(label_map),
+        "n_usable_articles": len(records),
+        "hidden_label_count": len(labels),
+        "terrain_zone_count": len(zones),
+        "mixed_label_count": mixed_label_count,
+        "label_zone_counts": label_zone_counts,
+        "same_label_same_terrain_pair_count": len(same_zone_gaps),
+        "same_label_cross_terrain_pair_count": len(different_zone_gaps),
+        "mean_same_terrain_work_gap": same_mean,
+        "mean_cross_terrain_work_gap": different_mean,
+        "cross_minus_same_work_gap": lift,
+        "cross_over_same_work_gap_ratio": ratio,
+        "cliffs_delta_cross_gt_same": cliffs_delta,
+        "threshold_min_pair_count": int(min_pair_count),
+        "threshold_min_work_gap_lift": float(min_work_gap_lift),
+        "pair_rows": pair_rows,
+        "safe_for_thesis_claim": not failures,
+        "failure_reasons": failures,
+        "warnings": warnings,
+    }
 
 
 def _iter_observer_delta_records(run_dir: Path) -> List[Dict[str, Any]]:
@@ -266,10 +498,13 @@ def summarize_observer_relativity(run_dir: Path, *, coord_epsilon: float = 1e-6,
 def _resolve_anchor_article_index(path_anchor_value: int, anchor_indices: np.ndarray) -> Optional[int]:
     if anchor_indices.size == 0:
         return None
-    if 0 <= path_anchor_value < int(anchor_indices.shape[0]):
-        return int(anchor_indices[path_anchor_value])
+    # Current Track 4 exports path_anchor_idx as the article index itself.
+    # Preserve ordinal-index fallback for older artifacts, but prefer exact
+    # membership so anchor article 1 is not misread as anchor_indices[1].
     if path_anchor_value in set(int(v) for v in anchor_indices.tolist()):
         return int(path_anchor_value)
+    if 0 <= path_anchor_value < int(anchor_indices.shape[0]):
+        return int(anchor_indices[path_anchor_value])
     return None
 
 
@@ -338,6 +573,25 @@ def summarize_track4_traversal(
     path_anchor_idx = np.asarray(npz["path_anchor_idx"], dtype=int).reshape(-1)
     anchor_indices = np.asarray(npz["anchor_indices"], dtype=int).reshape(-1)
     path_is_hot = np.asarray(npz["path_is_hot"], dtype=bool).reshape(-1) if "path_is_hot" in npz.files else None
+    path_feature_basis = (
+        np.asarray(npz["path_feature_basis"], dtype=object).reshape(-1)
+        if "path_feature_basis" in npz.files
+        else None
+    )
+    path_proposal_mode = (
+        np.asarray(npz["path_proposal_mode"], dtype=object).reshape(-1)
+        if "path_proposal_mode" in npz.files
+        else None
+    )
+    terrain_labels_from_npz: List[str] = []
+    if "anchor_selection_metadata" in npz.files:
+        metadata_values = np.asarray(npz["anchor_selection_metadata"], dtype=object).reshape(-1)
+        if metadata_values.size:
+            try:
+                metadata = json.loads(str(metadata_values[0]))
+                terrain_labels_from_npz = [str(label) for label in metadata.get("terrain_labels", [])]
+            except Exception:
+                terrain_labels_from_npz = []
     path_indices = None
     if "path_indices" in npz.files:
         raw_path_indices = np.asarray(npz["path_indices"], dtype=object)
@@ -385,6 +639,16 @@ def summarize_track4_traversal(
             "total": float(np.sum(finite_flux)) if finite_flux.size else 0.0,
             "max": float(np.max(finite_flux)) if finite_flux.size else None,
         }
+        markov_status = str(markov_summary.get("status", "")).upper()
+        bridge_count = _to_int(markov_summary.get("bridge_count")) or 0
+        void_count = _to_int(markov_summary.get("void_count")) or 0
+        if markov_status == "OK" and bridge_count > 0 and void_count > 0 and float(reactive_flux_summary["total"]) <= 0.0:
+            failures.append("track 4 Markov bridge/void reactive flux is zero")
+        if markov_status == "OK" and bridge_count > 0 and void_count > 0:
+            if markov_summary.get("bridge_to_void_reachable") is False:
+                failures.append("track 4 metric graph has no directed Bridge-to-Void route")
+            if markov_summary.get("void_to_bridge_reachable") is False:
+                warnings.append("track 4 metric graph has no directed Void-to-Bridge return route")
 
     if work.size == 0:
         failures.append("track 4 exported zero paths")
@@ -410,16 +674,19 @@ def summarize_track4_traversal(
         zone = None
         if anchor_article_idx is not None and anchor_article_idx in article_map:
             zone = str(article_map[anchor_article_idx].get("zone", "")).strip() or None
+        if not zone and anchor_article_idx is not None and 0 <= int(anchor_article_idx) < len(terrain_labels_from_npz):
+            zone = str(terrain_labels_from_npz[int(anchor_article_idx)]).strip() or None
         touched_zones: List[str] = []
         if path_indices is not None and idx < len(path_indices):
             raw_path = np.atleast_1d(np.asarray(path_indices[idx], dtype=int)).reshape(-1).tolist()
-            touched_zones = sorted(
-                {
-                    str(article_map.get(path_idx, {}).get("zone", "")).strip()
-                    for path_idx in raw_path
-                    if str(article_map.get(path_idx, {}).get("zone", "")).strip()
-                }
-            )
+            touched = set()
+            for path_idx in raw_path:
+                path_zone = str(article_map.get(path_idx, {}).get("zone", "")).strip()
+                if not path_zone and 0 <= int(path_idx) < len(terrain_labels_from_npz):
+                    path_zone = str(terrain_labels_from_npz[int(path_idx)]).strip()
+                if path_zone:
+                    touched.add(path_zone)
+            touched_zones = sorted(touched)
 
         anchor_key = str(anchor_article_idx) if anchor_article_idx is not None else f"unknown:{idx}"
         stats = anchor_stats.setdefault(
@@ -491,14 +758,39 @@ def summarize_track4_traversal(
     if path_is_hot is not None and (hot_count == 0 or cold_count == 0):
         failures.append("track 4 did not preserve both hot and cold walkers")
 
+    feature_basis_counts: Dict[str, int] = {}
+    if path_feature_basis is not None:
+        for value in path_feature_basis.tolist():
+            key = str(value)
+            feature_basis_counts[key] = feature_basis_counts.get(key, 0) + 1
+    proposal_mode_counts: Dict[str, int] = {}
+    if path_proposal_mode is not None:
+        for value in path_proposal_mode.tolist():
+            key = str(value)
+            proposal_mode_counts[key] = proposal_mode_counts.get(key, 0) + 1
+
     unique_path_shapes = 0
+    path_shape_entropy_summary = _entropy_summary_from_counts([])
+    path_edge_entropy_summary = _entropy_summary_from_counts([])
+    path_node_counts: List[float] = []
+    path_edge_counts: List[float] = []
     if path_indices is not None:
-        unique_path_shapes = len(
-            {
-                tuple(np.atleast_1d(np.asarray(path, dtype=int)).reshape(-1).tolist())
-                for path in path_indices
-            }
-        )
+        path_tuples: List[tuple[int, ...]] = [
+            tuple(int(node) for node in np.atleast_1d(np.asarray(path, dtype=int)).reshape(-1).tolist())
+            for path in path_indices
+        ]
+        unique_path_shapes = len(set(path_tuples))
+        shape_counts: Dict[tuple[int, ...], int] = {}
+        edge_counts: Dict[tuple[int, int], int] = {}
+        for path_tuple in path_tuples:
+            shape_counts[path_tuple] = shape_counts.get(path_tuple, 0) + 1
+            path_node_counts.append(float(len(path_tuple)))
+            path_edge_counts.append(float(max(len(path_tuple) - 1, 0)))
+            for left, right in zip(path_tuple, path_tuple[1:]):
+                edge = (int(left), int(right))
+                edge_counts[edge] = edge_counts.get(edge, 0) + 1
+        path_shape_entropy_summary = _entropy_summary_from_counts(shape_counts.values())
+        path_edge_entropy_summary = _entropy_summary_from_counts(edge_counts.values())
         if unique_path_shapes <= 1:
             failures.append("all Track 4 paths collapse to one repeated index trace")
 
@@ -540,7 +832,18 @@ def summarize_track4_traversal(
         "closed_loop_rate": float(closed_loop.mean()) if closed_loop.size else None,
         "hot_count": hot_count,
         "cold_count": cold_count,
+        "feature_basis_counts": feature_basis_counts,
+        "proposal_mode_counts": proposal_mode_counts,
         "unique_path_shape_count": unique_path_shapes if path_indices is not None else None,
+        "path_shape_entropy": path_shape_entropy_summary["entropy"],
+        "path_shape_entropy_norm": path_shape_entropy_summary["entropy_norm"],
+        "path_shape_category_count": path_shape_entropy_summary["category_count"],
+        "path_edge_entropy": path_edge_entropy_summary["entropy"],
+        "path_edge_entropy_norm": path_edge_entropy_summary["entropy_norm"],
+        "path_edge_category_count": path_edge_entropy_summary["category_count"],
+        "mean_path_node_count": _mean_or_none(path_node_counts),
+        "mean_path_edge_count": _mean_or_none(path_edge_counts),
+        "median_path_edge_count": _median_or_none(path_edge_counts),
         "per_anchor": anchor_rows,
         "zone_summary": zone_summary,
         "anchor_zone_summary": zone_summary,

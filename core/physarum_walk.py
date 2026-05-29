@@ -15,6 +15,7 @@ Legacy path:
 """
 
 import os
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,6 +23,36 @@ import torch
 
 from .hadamard_fusion import ConformalMetric
 from .thermo_config import ThermodynamicConfig
+
+TRACK4_PROPOSAL_MODES = {
+    "metric_softmax",
+    "stress_biased",
+    "committor_guided",
+    "deterministic_low_cost",
+}
+
+
+def _normalize_proposal_mode(mode: Optional[str]) -> str:
+    normalized = str(mode or "metric_softmax").strip().lower().replace("-", "_")
+    aliases = {
+        "default": "metric_softmax",
+        "baseline": "metric_softmax",
+        "current": "metric_softmax",
+        "softmax": "metric_softmax",
+        "metric": "metric_softmax",
+        "stress": "stress_biased",
+        "stress_bias": "stress_biased",
+        "committor": "committor_guided",
+        "tpt": "committor_guided",
+        "low_cost": "deterministic_low_cost",
+        "deterministic": "deterministic_low_cost",
+        "greedy": "deterministic_low_cost",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in TRACK4_PROPOSAL_MODES:
+        valid = ", ".join(sorted(TRACK4_PROPOSAL_MODES))
+        raise ValueError(f"Unknown Track 4 proposal_mode={mode!r}; expected one of: {valid}")
+    return normalized
 
 def _to_float_tensor(value: Optional[torch.Tensor], reference: torch.Tensor) -> Optional[torch.Tensor]:
     if value is None:
@@ -145,6 +176,35 @@ def _safe_quantile(values: List[float], q: float, default: float) -> float:
     if finite.size == 0:
         return float(default)
     return float(np.quantile(finite, q))
+
+
+def _unit_interval_tensor(values: torch.Tensor) -> torch.Tensor:
+    values = torch.nan_to_num(values.detach().to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if values.numel() <= 0:
+        return values
+    lo = torch.min(values)
+    hi = torch.max(values)
+    span = (hi - lo).clamp(min=1e-9)
+    if float((hi - lo).item()) <= 1e-9:
+        return torch.zeros_like(values)
+    return ((values - lo) / span).clamp(0.0, 1.0)
+
+
+def _zone_from_density_stress(density: float, stress: float) -> str:
+    if density >= 0.5 and stress < 0.5:
+        return "Bridge"
+    if density >= 0.5 and stress >= 0.5:
+        return "Swamp"
+    if density < 0.5 and stress < 0.5:
+        return "Tightrope"
+    return "Void"
+
+
+def _safe_solve(matrix: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    try:
+        return np.linalg.solve(matrix, rhs)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(matrix, rhs, rcond=None)[0]
 
 
 def _legacy_observer_penalty(
@@ -298,11 +358,17 @@ class SemanticWalker:
         metric_stress: Optional[torch.Tensor] = None,
         article_coords_2d: Optional[torch.Tensor] = None,
         thermo_config: Optional[ThermodynamicConfig] = None,
+        gradients: Optional[torch.Tensor] = None,
+        u_axis: Optional[torch.Tensor] = None,
     ):
         self.embeddings = embeddings.detach().to(dtype=torch.float32)
         self.kernel = rks_basis
         self.temperature = float(temperature)
         self.thermo_config = thermo_config or ThermodynamicConfig()
+        self.gradients = _to_float_tensor(gradients, self.embeddings)
+        if self.gradients is None:
+            self.gradients = self.embeddings - self.embeddings.mean(dim=0, keepdim=True)
+        self.u_axis = _to_float_tensor(u_axis, self.embeddings)
         self.track3_density = _reduce_density(track3_density, self.embeddings)
         self.z_coordinates = _to_float_tensor(z_coordinates, self.embeddings)
         self.metric_stress = _to_float_tensor(metric_stress, self.embeddings)
@@ -318,32 +384,448 @@ class SemanticWalker:
         elif self.z_coordinates.ndim > 1:
             self.z_coordinates = self.z_coordinates.norm(dim=-1)
         self.article_coords_2d = _to_float_tensor(article_coords_2d, self.embeddings)
+        self._last_catalyst_selection: Dict[str, Any] = {}
+
+    def _selection_coords(self) -> torch.Tensor:
+        if self.article_coords_2d is not None and self.article_coords_2d.ndim == 2 and self.article_coords_2d.shape[0] == self.embeddings.shape[0]:
+            return self.article_coords_2d
+        if self.embeddings.shape[1] >= 2:
+            return self.embeddings[:, :2]
+        if self.embeddings.shape[1] == 1:
+            zeros = torch.zeros((self.embeddings.shape[0], 1), device=self.embeddings.device, dtype=torch.float32)
+            return torch.cat([self.embeddings[:, :1], zeros], dim=1)
+        return torch.zeros((self.embeddings.shape[0], 2), device=self.embeddings.device, dtype=torch.float32)
+
+    def _terrain_fields(self) -> Dict[str, Any]:
+        density = _unit_interval_tensor(self.track3_density.reshape(-1))
+        stress = _unit_interval_tensor(torch.abs(self.metric_stress.reshape(-1)))
+        n_articles = int(self.embeddings.shape[0])
+        if density.shape[0] != n_articles:
+            density = torch.zeros(n_articles, device=self.embeddings.device, dtype=torch.float32)
+        if stress.shape[0] != n_articles:
+            stress = torch.zeros(n_articles, device=self.embeddings.device, dtype=torch.float32)
+
+        labels = [
+            _zone_from_density_stress(float(density[idx].item()), float(stress[idx].item()))
+            for idx in range(n_articles)
+        ]
+        zone_scores = torch.zeros(n_articles, device=self.embeddings.device, dtype=torch.float32)
+        for idx, label in enumerate(labels):
+            d = density[idx]
+            s = stress[idx]
+            if label == "Bridge":
+                score = d * (1.0 - s)
+            elif label == "Swamp":
+                score = d * s
+            elif label == "Tightrope":
+                score = (1.0 - d) * (1.0 - s)
+            else:
+                score = (1.0 - d) * s
+            zone_scores[idx] = torch.clamp(score, min=0.0, max=1.0)
+        return {
+            "density": density,
+            "stress": stress,
+            "labels": labels,
+            "zone_scores": zone_scores,
+        }
+
+    def _candidate_distance_score(self, candidate: int, selected: List[int], coords: torch.Tensor) -> float:
+        if not selected:
+            return 1.0
+        selected_tensor = torch.as_tensor(selected, device=coords.device, dtype=torch.long)
+        distances = torch.norm(coords[int(candidate)].unsqueeze(0) - coords[selected_tensor], p=2, dim=1)
+        max_span = torch.norm(coords.max(dim=0).values - coords.min(dim=0).values, p=2).clamp(min=1e-6)
+        return float((distances.min() / max_span).clamp(0.0, 1.0).item())
+
+    def _pick_zone_candidate(
+        self,
+        zone: str,
+        labels: List[str],
+        zone_scores: torch.Tensor,
+        coords: torch.Tensor,
+        selected: List[int],
+        *,
+        distance_weight: float = 0.35,
+    ) -> Optional[int]:
+        candidates = [idx for idx, label in enumerate(labels) if label == zone and idx not in selected]
+        if not candidates:
+            return None
+        best_idx = None
+        best_score = -1.0
+        for idx in candidates:
+            score = (1.0 - distance_weight) * float(zone_scores[idx].item())
+            score += distance_weight * self._candidate_distance_score(idx, selected, coords)
+            if score > best_score:
+                best_score = score
+                best_idx = int(idx)
+        return best_idx
+
+    def _compute_base_friction(self, weights: torch.Tensor) -> torch.Tensor:
+        fused_grad = torch.matmul(weights, self.gradients)
+        if self.u_axis is not None:
+            axis = self.u_axis.to(device=weights.device, dtype=torch.float32)
+            grad_magnitude = torch.abs((fused_grad * axis.unsqueeze(0)).sum(dim=-1))
+        else:
+            grad_magnitude = torch.norm(fused_grad, p=2, dim=-1)
+        grad_magnitude = torch.clamp(grad_magnitude, max=1000.0)
+        density = 1.0 / (1.0 + grad_magnitude)
+        density = torch.clamp(density, min=float(self.thermo_config.density_clamp_min))
+        return 1.0 / density
+
+    def _compute_effective_friction(self, base_friction: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(base_friction, min=0.0, max=1000.0)
+
+    def compute_work_integral(
+        self,
+        trajectory_weights: torch.Tensor,
+        precomputed_step_work: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compatibility helper for older stability tests and offline diagnostics.
+
+        Operates in the bot-weight simplex using the current embedding/gradient
+        payload, while keeping friction finite in low-density voids.
+        """
+        positions = torch.matmul(trajectory_weights, self.embeddings)
+        deltas = positions[1:] - positions[:-1]
+        step_distances = torch.norm(deltas, p=2, dim=-1)
+
+        if precomputed_step_work is not None:
+            step_work = precomputed_step_work
+        else:
+            midpoint_weights = (trajectory_weights[1:] + trajectory_weights[:-1]) / 2.0
+            base_friction = self._compute_base_friction(midpoint_weights)
+            terrain_friction = self._compute_effective_friction(base_friction)
+            step_work = terrain_friction * step_distances
+
+        work = step_work.sum(dim=0)
+        path_length = step_distances.sum(dim=0)
+        spectral_distance = torch.norm(positions[-1] - positions[0], p=2, dim=-1)
+        divergence_ratio = work / spectral_distance.clamp(min=1e-6)
+        return work, path_length, spectral_distance, divergence_ratio
 
     def select_catalysts(self) -> List[int]:
         n_articles = int(self.embeddings.shape[0])
         if n_articles <= 0:
+            self._last_catalyst_selection = {
+                "policy": "zone_constrained_farthest_first_v1",
+                "coverage_status": "NO_ARTICLES",
+                "selected_indices": [],
+                "selected_zones": [],
+                "available_zone_counts": {},
+            }
             return []
         if n_articles <= 3:
+            terrain = self._terrain_fields()
+            selected = list(range(n_articles))
+            self._last_catalyst_selection = {
+                "policy": "zone_constrained_farthest_first_v1",
+                "coverage_status": "LIMITED_SMALL_CORPUS",
+                "selected_indices": selected,
+                "selected_zones": [terrain["labels"][idx] for idx in selected],
+                "available_zone_counts": {
+                    zone: int(terrain["labels"].count(zone))
+                    for zone in sorted(set(terrain["labels"]))
+                },
+                "density": [float(terrain["density"][idx].item()) for idx in selected],
+                "stress": [float(terrain["stress"][idx].item()) for idx in selected],
+                "terrain_labels": terrain["labels"],
+            }
             return list(range(n_articles))
-        if self.article_coords_2d is None:
-            return [0, n_articles // 2, n_articles - 1]
-
-        influence = torch.abs(self.metric_stress) * self.track3_density
-        working = influence.clone()
-        max_xy = self.article_coords_2d.max(dim=0).values
-        min_xy = self.article_coords_2d.min(dim=0).values
-        exclusion_radius = float(torch.norm(max_xy - min_xy).item()) * 0.25
-        if exclusion_radius <= 0.0:
-            exclusion_radius = 1.0
-
+        target_count = min(3, n_articles)
+        coords = self._selection_coords()
+        terrain = self._terrain_fields()
+        labels: List[str] = terrain["labels"]
+        zone_scores: torch.Tensor = terrain["zone_scores"]
+        available_zone_counts = {
+            zone: int(labels.count(zone))
+            for zone in sorted(set(labels))
+        }
         catalysts: List[int] = []
-        for _ in range(min(3, n_articles)):
-            idx = int(torch.argmax(working).item())
-            catalysts.append(idx)
-            anchor_xy = self.article_coords_2d[idx]
-            dists = torch.norm(self.article_coords_2d - anchor_xy, p=2, dim=1)
-            working[dists < exclusion_radius] = 0.0
+
+        required_priority = ["Void", "Bridge"]
+        for zone in required_priority:
+            if len(catalysts) >= target_count:
+                break
+            picked = self._pick_zone_candidate(zone, labels, zone_scores, coords, catalysts, distance_weight=0.25)
+            if picked is not None:
+                catalysts.append(picked)
+
+        remaining_zones = [
+            zone for zone in ("Swamp", "Tightrope", "Void", "Bridge")
+            if zone in available_zone_counts and zone not in {labels[idx] for idx in catalysts}
+        ]
+        while len(catalysts) < target_count and remaining_zones:
+            best_zone = None
+            best_candidate = None
+            best_score = -1.0
+            for zone in remaining_zones:
+                candidate = self._pick_zone_candidate(zone, labels, zone_scores, coords, catalysts, distance_weight=0.45)
+                if candidate is None:
+                    continue
+                score = 0.6 * float(zone_scores[candidate].item())
+                score += 0.4 * self._candidate_distance_score(candidate, catalysts, coords)
+                if score > best_score:
+                    best_score = score
+                    best_zone = zone
+                    best_candidate = candidate
+            if best_candidate is None or best_zone is None:
+                break
+            catalysts.append(int(best_candidate))
+            remaining_zones = [zone for zone in remaining_zones if zone != best_zone]
+
+        while len(catalysts) < target_count:
+            remaining = [idx for idx in range(n_articles) if idx not in catalysts]
+            if not remaining:
+                break
+            if catalysts:
+                remaining_tensor = torch.as_tensor(remaining, device=coords.device, dtype=torch.long)
+                selected = coords[torch.as_tensor(catalysts, device=coords.device, dtype=torch.long)]
+                distances = torch.cdist(coords[remaining_tensor], selected, p=2)
+                candidate = int(remaining[int(torch.argmax(distances.min(dim=1).values).item())])
+            else:
+                candidate = int(torch.argmax(zone_scores).item())
+            catalysts.append(candidate)
+
+        selected_zones = [labels[idx] for idx in catalysts]
+        required_present = all(zone not in available_zone_counts or zone in selected_zones for zone in required_priority)
+        distinct_available = min(target_count, len(available_zone_counts))
+        coverage_status = "OK"
+        if len(set(selected_zones)) < distinct_available or not required_present:
+            coverage_status = "LIMITED_ZONE_COVERAGE"
+        self._last_catalyst_selection = {
+            "policy": "zone_constrained_farthest_first_v1",
+            "coverage_status": coverage_status,
+            "selected_indices": [int(idx) for idx in catalysts],
+            "selected_zones": selected_zones,
+            "available_zone_counts": available_zone_counts,
+            "density": [float(terrain["density"][idx].item()) for idx in catalysts],
+            "stress": [float(terrain["stress"][idx].item()) for idx in catalysts],
+            "terrain_labels": labels,
+        }
         return catalysts
+
+    def _build_transition_matrix(self, neighbors: torch.Tensor, metric_distance_matrix: torch.Tensor) -> np.ndarray:
+        n_articles = int(self.embeddings.shape[0])
+        transition = np.zeros((n_articles, n_articles), dtype=np.float64)
+        temperature = max(float(self.temperature), 1e-6)
+        for row_idx in range(n_articles):
+            candidate_tensor = neighbors[row_idx]
+            if candidate_tensor.numel() == 0:
+                transition[row_idx, row_idx] = 1.0
+                continue
+            candidate_indices = candidate_tensor.detach().cpu().numpy().astype(np.int64)
+            costs = metric_distance_matrix[row_idx, candidate_tensor].detach().cpu().numpy().astype(np.float64)
+            logits = np.exp(-np.clip(costs / temperature, 0.0, 50.0))
+            total = float(np.sum(logits))
+            if not np.isfinite(total) or total <= 0.0:
+                transition[row_idx, row_idx] = 1.0
+                continue
+            transition[row_idx, candidate_indices] = logits / total
+        return transition
+
+    def _mfpt_to_target(self, transition: np.ndarray, target_indices: np.ndarray) -> np.ndarray:
+        n_articles = transition.shape[0]
+        mfpt = np.full(n_articles, np.nan, dtype=np.float64)
+        if target_indices.size == 0:
+            return mfpt
+        target_mask = np.zeros(n_articles, dtype=bool)
+        target_mask[target_indices] = True
+        mfpt[target_mask] = 0.0
+        interior = np.where(~target_mask)[0]
+        if interior.size == 0:
+            return mfpt
+        pii = transition[np.ix_(interior, interior)]
+        matrix = np.eye(interior.size, dtype=np.float64) - pii
+        rhs = np.ones(interior.size, dtype=np.float64)
+        mfpt[interior] = np.maximum(_safe_solve(matrix, rhs), 0.0)
+        return mfpt
+
+    def _dominant_flux_path(
+        self,
+        net_flux: np.ndarray,
+        source_indices: np.ndarray,
+        sink_indices: np.ndarray,
+    ) -> List[int]:
+        if source_indices.size == 0 or sink_indices.size == 0:
+            return []
+        node_flux = np.sum(net_flux, axis=1)
+        source = int(source_indices[int(np.argmax(node_flux[source_indices]))])
+        sinks = set(int(idx) for idx in sink_indices.tolist())
+        path = [source]
+        visited = {source}
+        current = source
+        for _ in range(max(1, net_flux.shape[0])):
+            if current in sinks:
+                break
+            row = net_flux[current].copy()
+            for seen in visited:
+                row[seen] = 0.0
+            next_idx = int(np.argmax(row))
+            if float(row[next_idx]) <= 0.0:
+                break
+            path.append(next_idx)
+            visited.add(next_idx)
+            current = next_idx
+            if current in sinks:
+                break
+        return path
+
+    def _has_directed_reachability(
+        self,
+        transition: np.ndarray,
+        source_indices: np.ndarray,
+        sink_indices: np.ndarray,
+    ) -> bool:
+        if source_indices.size == 0 or sink_indices.size == 0:
+            return False
+        adjacency = transition > 0.0
+        sinks = set(int(idx) for idx in sink_indices.tolist())
+        frontier = [int(idx) for idx in source_indices.tolist()]
+        visited = set(frontier)
+        while frontier:
+            current = frontier.pop()
+            if current in sinks:
+                return True
+            for next_idx in np.flatnonzero(adjacency[current]):
+                nxt = int(next_idx)
+                if nxt not in visited:
+                    visited.add(nxt)
+                    frontier.append(nxt)
+        return False
+
+    def _compute_markov_observables(
+        self,
+        neighbors: torch.Tensor,
+        metric_distance_matrix: torch.Tensor,
+        terrain_labels: List[str],
+    ) -> Dict[str, Any]:
+        n_articles = int(self.embeddings.shape[0])
+        transition = self._build_transition_matrix(neighbors, metric_distance_matrix)
+        bridge_indices = np.asarray([idx for idx, label in enumerate(terrain_labels) if label == "Bridge"], dtype=np.int32)
+        void_indices = np.asarray([idx for idx, label in enumerate(terrain_labels) if label == "Void"], dtype=np.int32)
+        bridge_to_void_reachable = self._has_directed_reachability(transition, bridge_indices, void_indices)
+        void_to_bridge_reachable = self._has_directed_reachability(transition, void_indices, bridge_indices)
+        empty_float = np.full(n_articles, np.nan, dtype=np.float32)
+        if bridge_indices.size == 0 or void_indices.size == 0:
+            return {
+                "status": "NO_BOUNDARY_SETS",
+                "committor_to_void": empty_float,
+                "mfpt_to_bridge": empty_float.copy(),
+                "mfpt_to_void": empty_float.copy(),
+                "reactive_flux_edges": np.empty((0, 2), dtype=np.int32),
+                "reactive_flux_values": np.empty((0,), dtype=np.float32),
+                "reactive_flux_node_throughput": np.zeros(n_articles, dtype=np.float32),
+                "dominant_reactive_path_indices": np.empty((0,), dtype=np.int32),
+                "bridge_indices": bridge_indices,
+                "void_indices": void_indices,
+                "summary": {
+                    "status": "NO_BOUNDARY_SETS",
+                    "bridge_count": int(bridge_indices.size),
+                    "void_count": int(void_indices.size),
+                    "bridge_to_void_reachable": bool(bridge_to_void_reachable),
+                    "void_to_bridge_reachable": bool(void_to_bridge_reachable),
+                    "reactive_flux_total": 0.0,
+                    "dominant_reactive_path_length": 0,
+                },
+            }
+
+        boundary = np.concatenate([bridge_indices, void_indices]).astype(np.int32)
+        boundary_mask = np.zeros(n_articles, dtype=bool)
+        boundary_mask[boundary] = True
+        q = np.zeros(n_articles, dtype=np.float64)
+        q[void_indices] = 1.0
+        interior = np.where(~boundary_mask)[0]
+        if interior.size:
+            pii = transition[np.ix_(interior, interior)]
+            pib = transition[np.ix_(interior, boundary)]
+            matrix = np.eye(interior.size, dtype=np.float64) - pii
+            rhs = pib @ q[boundary]
+            q[interior] = _safe_solve(matrix, rhs)
+        q = np.clip(np.nan_to_num(q, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+        mfpt_to_bridge = self._mfpt_to_target(transition, bridge_indices)
+        mfpt_to_void = self._mfpt_to_target(transition, void_indices)
+
+        stationary = np.ones(n_articles, dtype=np.float64) / max(n_articles, 1)
+        for _ in range(500):
+            next_stationary = stationary @ transition
+            if np.max(np.abs(next_stationary - stationary)) <= 1e-10:
+                stationary = next_stationary
+                break
+            stationary = next_stationary
+        stationary = np.clip(np.nan_to_num(stationary, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+        if float(stationary.sum()) > 0.0:
+            stationary = stationary / stationary.sum()
+
+        q_backward_approx = 1.0 - q
+        raw_flux = stationary[:, None] * transition * q_backward_approx[:, None] * q[None, :]
+        net_flux = np.maximum(raw_flux - raw_flux.T, 0.0)
+        edge_rows, edge_cols = np.nonzero(net_flux > 0.0)
+        edge_values = net_flux[edge_rows, edge_cols]
+        if edge_values.size:
+            order = np.argsort(edge_values)[::-1]
+            edge_rows = edge_rows[order]
+            edge_cols = edge_cols[order]
+            edge_values = edge_values[order]
+        flux_edges = np.stack([edge_rows, edge_cols], axis=1).astype(np.int32) if edge_values.size else np.empty((0, 2), dtype=np.int32)
+        node_throughput = (net_flux.sum(axis=0) + net_flux.sum(axis=1)).astype(np.float32)
+        dominant_path = self._dominant_flux_path(net_flux, bridge_indices, void_indices)
+
+        finite_void_mfpt = mfpt_to_void[np.isfinite(mfpt_to_void)]
+        finite_bridge_mfpt = mfpt_to_bridge[np.isfinite(mfpt_to_bridge)]
+        summary = {
+            "status": "OK",
+            "bridge_count": int(bridge_indices.size),
+            "void_count": int(void_indices.size),
+            "committor_mean": float(np.mean(q)) if q.size else None,
+            "mfpt_to_bridge_mean": float(np.mean(finite_bridge_mfpt)) if finite_bridge_mfpt.size else None,
+            "mfpt_to_void_mean": float(np.mean(finite_void_mfpt)) if finite_void_mfpt.size else None,
+            "reactive_flux_total": float(np.sum(edge_values)) if edge_values.size else 0.0,
+            "reactive_flux_edge_count": int(edge_values.size),
+            "dominant_reactive_path_length": int(len(dominant_path)),
+            "dominant_reactive_path_indices": [int(idx) for idx in dominant_path],
+            "transition_temperature": float(max(float(self.temperature), 1e-6)),
+            "bridge_to_void_reachable": bool(bridge_to_void_reachable),
+            "void_to_bridge_reachable": bool(void_to_bridge_reachable),
+        }
+        return {
+            "status": "OK",
+            "committor_to_void": q.astype(np.float32),
+            "mfpt_to_bridge": mfpt_to_bridge.astype(np.float32),
+            "mfpt_to_void": mfpt_to_void.astype(np.float32),
+            "reactive_flux_edges": flux_edges,
+            "reactive_flux_values": edge_values.astype(np.float32),
+            "reactive_flux_node_throughput": node_throughput,
+            "dominant_reactive_path_indices": np.asarray(dominant_path, dtype=np.int32),
+            "bridge_indices": bridge_indices,
+            "void_indices": void_indices,
+            "summary": summary,
+        }
+
+    def _markov_supports_bridge_void_flux(self, markov_observables: Dict[str, Any]) -> bool:
+        summary = markov_observables.get("summary") or {}
+        if str(markov_observables.get("status", "")).upper() != "OK":
+            return False
+        if int(summary.get("bridge_count") or 0) <= 0 or int(summary.get("void_count") or 0) <= 0:
+            return False
+        if summary.get("bridge_to_void_reachable") is False:
+            return False
+        return float(summary.get("reactive_flux_total") or 0.0) > 0.0
+
+    def _connectivity_repair_candidates(self, requested_k: int, n_articles: int) -> List[int]:
+        max_k = max(1, int(n_articles) - 1)
+        requested = min(max(int(requested_k), 1), max_k)
+        raw = [
+            requested + 1,
+            max(requested + 1, 8),
+            max(requested + 1, 10),
+            max(requested + 1, int(np.ceil(0.25 * max_k))),
+            max(requested + 1, int(np.ceil(0.50 * max_k))),
+            max_k,
+        ]
+        candidates = sorted({min(max(int(k), 1), max_k) for k in raw if int(k) > requested})
+        return candidates
 
     def _simulate_anchor(
         self,
@@ -358,8 +840,21 @@ class SemanticWalker:
         hot_temperature_multiplier: float,
         rng: np.random.Generator,
         s_max: float,
+        proposal_mode: str = "metric_softmax",
+        committor_to_void: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
+        proposal_mode = _normalize_proposal_mode(proposal_mode)
         walker_runs: List[Dict[str, Any]] = []
+        stress_unit = _unit_interval_tensor(torch.abs(self.metric_stress.reshape(-1)))
+        committor_arr: Optional[np.ndarray] = None
+        if committor_to_void is not None:
+            candidate = np.asarray(committor_to_void, dtype=np.float64).reshape(-1)
+            if candidate.shape[0] == self.embeddings.shape[0]:
+                committor_arr = np.clip(
+                    np.nan_to_num(candidate, nan=0.5, posinf=1.0, neginf=0.0),
+                    0.0,
+                    1.0,
+                )
 
         for walker_idx in range(max(int(n_walkers), 1)):
             is_hot = walker_idx < 2
@@ -381,14 +876,33 @@ class SemanticWalker:
                 step_delta = metric_distance_matrix[current_idx, candidate_tensor].detach().cpu().numpy()
                 logits = np.exp(-np.clip(step_delta / current_temp, 0.0, 50.0))
                 anchor_dist = metric_distance_matrix[anchor_idx, candidate_tensor].detach().cpu().numpy()
-                if in_retreat:
-                    logits *= np.exp(-np.clip(float(gamma) * anchor_dist, 0.0, 50.0))
-                prob_sum = float(logits.sum())
-                if not np.isfinite(prob_sum) or prob_sum <= 0.0:
-                    break
+                proposal_note = proposal_mode
+                if proposal_mode == "deterministic_low_cost":
+                    effective_cost = np.asarray(step_delta, dtype=np.float64)
+                    if in_retreat:
+                        effective_cost = effective_cost + float(gamma) * np.asarray(anchor_dist, dtype=np.float64)
+                    next_idx = int(candidate_indices[int(np.argmin(effective_cost))])
+                else:
+                    if proposal_mode == "stress_biased" and not in_retreat:
+                        candidate_stress = stress_unit[candidate_tensor].detach().cpu().numpy().astype(np.float64)
+                        logits *= np.exp(np.clip(1.25 * candidate_stress, -5.0, 5.0))
+                    elif proposal_mode == "committor_guided" and committor_arr is not None and not in_retreat:
+                        q_current = float(committor_arr[current_idx])
+                        q_candidates = committor_arr[candidate_indices.astype(np.int64)]
+                        if np.isfinite(q_current) and np.isfinite(q_candidates).any():
+                            direction = 1.0 if q_current < 0.5 else -1.0
+                            logits *= np.exp(np.clip(1.75 * direction * (q_candidates - q_current), -5.0, 5.0))
+                    elif proposal_mode == "committor_guided" and committor_arr is None:
+                        proposal_note = "committor_guided_no_boundary_fallback"
 
-                probs = logits / prob_sum
-                next_idx = int(rng.choice(candidate_indices, p=probs))
+                    if in_retreat:
+                        logits *= np.exp(-np.clip(float(gamma) * anchor_dist, 0.0, 50.0))
+                    prob_sum = float(logits.sum())
+                    if not np.isfinite(prob_sum) or prob_sum <= 0.0:
+                        break
+
+                    probs = logits / prob_sum
+                    next_idx = int(rng.choice(candidate_indices, p=probs))
                 step_work = float(metric_distance_matrix[current_idx, next_idx].item())
                 cumulative_work += step_work
                 max_anchor_distance = max(max_anchor_distance, float(metric_distance_matrix[anchor_idx, next_idx].item()))
@@ -409,6 +923,7 @@ class SemanticWalker:
                         "euclidean_distance": float(euclidean_distance_matrix[current_idx, next_idx].item()),
                         "density_midpoint": float(rho_mid),
                         "shear_projection": float(shear_projection),
+                        "proposal_mode": proposal_note,
                         "memory_integral": 0.0,
                         "event_active": bool(in_retreat),
                         "event_severity": float(step_work / max(s_max, 1e-6)),
@@ -433,6 +948,7 @@ class SemanticWalker:
                     "work_integral": float(cumulative_work),
                     "spectral_distance": float(max_anchor_distance),
                     "divergence_ratio": float(cumulative_work / max(max_anchor_distance, 1e-6)),
+                    "proposal_mode": proposal_mode,
                     "step_diagnostics": step_diagnostics,
                 }
             )
@@ -462,6 +978,7 @@ class SemanticWalker:
             "final_position": self.embeddings[selected["path_indices"][-1]].detach().clone(),
             "step_diagnostics": selected["step_diagnostics"],
             "closed_loop": bool(selected["closed_loop"]),
+            "proposal_mode": proposal_mode,
             "all_runs": walker_runs,
         }
 
@@ -471,6 +988,8 @@ class SemanticWalker:
         path_anchor_idx: List[int],
         path_is_hot: List[bool],
         output_dir: Optional[str],
+        markov_observables: Optional[Dict[str, Any]] = None,
+        feature_basis: str = "track2",
     ) -> None:
         if not output_dir or not swarm_records:
             return
@@ -479,8 +998,25 @@ class SemanticWalker:
         path_indices = [np.asarray(record.get("path_indices", []), dtype=np.int32) for record in swarm_records]
         work_integral = np.asarray([float(record["work_integral"]) for record in swarm_records], dtype=np.float32)
         closed_loop = np.asarray([bool(record["closed_loop"]) for record in swarm_records], dtype=np.bool_)
+        path_proposal_mode = np.asarray(
+            [str(record.get("proposal_mode", "metric_softmax")) for record in swarm_records],
+            dtype=object,
+        )
+        path_feature_basis = np.asarray(
+            [str(record.get("feature_basis", feature_basis)) for record in swarm_records],
+            dtype=object,
+        )
         path_anchor_idx_arr = np.asarray([int(idx) for idx in path_anchor_idx], dtype=np.int32)
         path_is_hot_arr = np.asarray([bool(flag) for flag in path_is_hot], dtype=np.bool_)
+        selection = self._last_catalyst_selection or {}
+        terrain_labels = [str(label) for label in selection.get("terrain_labels", [])]
+        path_anchor_terrain = np.asarray(
+            [
+                terrain_labels[int(idx)] if terrain_labels and 0 <= int(idx) < len(terrain_labels) else ""
+                for idx in path_anchor_idx
+            ],
+            dtype=object,
+        )
 
         anchor_index_to_runs: Dict[int, List[Dict[str, Any]]] = {}
         for record, anchor_idx, is_hot in zip(swarm_records, path_anchor_idx, path_is_hot):
@@ -489,6 +1025,13 @@ class SemanticWalker:
             anchor_index_to_runs.setdefault(int(anchor_idx), []).append(mechanical_record)
 
         anchor_indices = np.asarray(sorted(anchor_index_to_runs.keys()), dtype=np.int32)
+        anchor_terrain_label = np.asarray(
+            [
+                terrain_labels[int(idx)] if terrain_labels and 0 <= int(idx) < len(terrain_labels) else ""
+                for idx in anchor_indices.tolist()
+            ],
+            dtype=object,
+        )
         anchor_summaries: List[str] = []
         for anchor_idx in anchor_indices.tolist():
             anchor_runs = anchor_index_to_runs.get(anchor_idx, [])
@@ -501,17 +1044,54 @@ class SemanticWalker:
                 f"{cold_survived}/{max(len(cold_runs), 1)} Cold Walkers Closed Loop"
             )
 
-        np.savez_compressed(
-            os.path.join(output_dir, "cyclic_paths.npz"),
-            path_xyz=np.array(path_xyz, dtype=object),
-            path_indices=np.array(path_indices, dtype=object),
-            work_integral=work_integral,
-            closed_loop=closed_loop,
-            path_anchor_idx=path_anchor_idx_arr,
-            path_is_hot=path_is_hot_arr,
-            anchor_indices=anchor_indices,
-            anchor_summary=np.array(anchor_summaries, dtype=object),
-        )
+        os.makedirs(output_dir, exist_ok=True)
+        save_payload: Dict[str, Any] = {
+            "path_xyz": np.array(path_xyz, dtype=object),
+            "path_indices": np.array(path_indices, dtype=object),
+            "work_integral": work_integral,
+            "closed_loop": closed_loop,
+            "path_proposal_mode": path_proposal_mode,
+            "path_feature_basis": path_feature_basis,
+            "path_anchor_idx": path_anchor_idx_arr,
+            "path_is_hot": path_is_hot_arr,
+            "anchor_indices": anchor_indices,
+            "anchor_summary": np.array(anchor_summaries, dtype=object),
+            "anchor_terrain_label": anchor_terrain_label,
+            "path_anchor_terrain_label": path_anchor_terrain,
+            "anchor_selection_policy": np.asarray(
+                [str(selection.get("policy", "zone_constrained_farthest_first_v1"))],
+                dtype=object,
+            ),
+            "anchor_selection_metadata": np.asarray(
+                [json.dumps(selection, sort_keys=True)],
+                dtype=object,
+            ),
+        }
+        if markov_observables:
+            for key in (
+                "committor_to_void",
+                "mfpt_to_bridge",
+                "mfpt_to_void",
+                "reactive_flux_edges",
+                "reactive_flux_values",
+                "reactive_flux_node_throughput",
+                "dominant_reactive_path_indices",
+                "bridge_indices",
+                "void_indices",
+            ):
+                if key in markov_observables:
+                    save_payload[key] = markov_observables[key]
+            save_payload["track4_markov_status"] = np.asarray(
+                [str(markov_observables.get("status", "UNKNOWN"))],
+                dtype=object,
+            )
+
+        np.savez_compressed(os.path.join(output_dir, "cyclic_paths.npz"), **save_payload)
+        if markov_observables:
+            summary = dict(markov_observables.get("summary") or {})
+            summary.setdefault("status", str(markov_observables.get("status", "UNKNOWN")))
+            with open(os.path.join(output_dir, "track4_markov_summary.json"), "w", encoding="utf-8") as handle:
+                json.dump(summary, handle, indent=2, sort_keys=True)
 
     def run_stress_triggered_cyclic_walk(
         self,
@@ -521,7 +1101,11 @@ class SemanticWalker:
         k_neighbors: int = 10,
         start_seed: Optional[int] = None,
         output_dir: Optional[str] = None,
+        proposal_mode: str = "metric_softmax",
+        adaptive_tpt_connectivity: bool = False,
+        feature_basis: str = "track2",
     ) -> Dict[str, Any]:
+        proposal_mode = _normalize_proposal_mode(proposal_mode)
         n_articles = int(self.embeddings.shape[0])
         if n_articles == 0:
             return {
@@ -530,20 +1114,86 @@ class SemanticWalker:
                 "swarm_anchor_idx": [],
                 "swarm_is_hot": [],
                 "anchor_summaries": [],
+                "proposal_mode": proposal_mode,
+                "effective_k_neighbors": 0,
             }
 
         rng = np.random.default_rng(int(start_seed) if start_seed is not None else 0)
-        neighbors, metric_distance_matrix, euclidean_distance_matrix, shear_vectors = _build_metric_graph(
-            embeddings=self.embeddings,
-            rho=self.track3_density,
-            scalar_stress=self.metric_stress,
-            k_neighbors=k_neighbors,
-        )
-        s_max = _metric_horizon(metric_distance_matrix, neighbors, default=1.0)
-        if s_max <= 0.0:
-            s_max = 1.0
+        effective_k_neighbors = min(max(int(k_neighbors), 1), max(n_articles - 1, 1))
+
+        def _build_graph_and_markov(k_value: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, Dict[str, Any]]:
+            local_neighbors, local_metric_distance_matrix, local_euclidean_distance_matrix, local_shear_vectors = _build_metric_graph(
+                embeddings=self.embeddings,
+                rho=self.track3_density,
+                scalar_stress=self.metric_stress,
+                k_neighbors=k_value,
+            )
+            local_s_max = _metric_horizon(local_metric_distance_matrix, local_neighbors, default=1.0)
+            if local_s_max <= 0.0:
+                local_s_max = 1.0
+            local_markov = self._compute_markov_observables(
+                neighbors=local_neighbors,
+                metric_distance_matrix=local_metric_distance_matrix,
+                terrain_labels=terrain_labels,
+            )
+            local_markov.setdefault("summary", {})
+            local_markov["summary"]["requested_k_neighbors"] = int(k_neighbors)
+            local_markov["summary"]["effective_k_neighbors"] = int(k_value)
+            local_markov["summary"]["adaptive_tpt_connectivity"] = bool(adaptive_tpt_connectivity)
+            return (
+                local_neighbors,
+                local_metric_distance_matrix,
+                local_euclidean_distance_matrix,
+                local_shear_vectors,
+                float(local_s_max),
+                local_markov,
+            )
 
         catalyst_indices = self.select_catalysts()[:3]
+        selection = self._last_catalyst_selection or {}
+        terrain_labels = list(selection.get("terrain_labels") or self._terrain_fields()["labels"])
+        (
+            neighbors,
+            metric_distance_matrix,
+            euclidean_distance_matrix,
+            shear_vectors,
+            s_max,
+            markov_observables,
+        ) = _build_graph_and_markov(effective_k_neighbors)
+        if adaptive_tpt_connectivity and not self._markov_supports_bridge_void_flux(markov_observables):
+            initial_summary = dict(markov_observables.get("summary") or {})
+            for candidate_k in self._connectivity_repair_candidates(effective_k_neighbors, n_articles):
+                (
+                    candidate_neighbors,
+                    candidate_metric_distance_matrix,
+                    candidate_euclidean_distance_matrix,
+                    candidate_shear_vectors,
+                    candidate_s_max,
+                    candidate_markov,
+                ) = _build_graph_and_markov(candidate_k)
+                if self._markov_supports_bridge_void_flux(candidate_markov):
+                    neighbors = candidate_neighbors
+                    metric_distance_matrix = candidate_metric_distance_matrix
+                    euclidean_distance_matrix = candidate_euclidean_distance_matrix
+                    shear_vectors = candidate_shear_vectors
+                    s_max = candidate_s_max
+                    markov_observables = candidate_markov
+                    effective_k_neighbors = int(candidate_k)
+                    markov_observables["summary"]["connectivity_repair_applied"] = True
+                    markov_observables["summary"]["initial_markov_summary"] = initial_summary
+                    break
+            else:
+                markov_observables.setdefault("summary", {})
+                markov_observables["summary"]["connectivity_repair_applied"] = False
+                markov_observables["summary"]["connectivity_repair_failed"] = True
+                markov_observables["summary"]["initial_markov_summary"] = initial_summary
+        else:
+            markov_observables.setdefault("summary", {})
+            markov_observables["summary"]["connectivity_repair_applied"] = False
+            markov_observables["summary"]["connectivity_repair_failed"] = False
+        markov_observables["summary"]["requested_k_neighbors"] = int(k_neighbors)
+        markov_observables["summary"]["effective_k_neighbors"] = int(effective_k_neighbors)
+        markov_observables["summary"]["adaptive_tpt_connectivity"] = bool(adaptive_tpt_connectivity)
         swarm_records: List[Dict[str, Any]] = []
         swarm_anchor_idx: List[int] = []
         swarm_is_hot: List[bool] = []
@@ -562,6 +1212,8 @@ class SemanticWalker:
                 hot_temperature_multiplier=5.0,
                 rng=rng,
                 s_max=s_max,
+                proposal_mode=proposal_mode,
+                committor_to_void=markov_observables.get("committor_to_void"),
             )["all_runs"]
 
             hot_survived = 0
@@ -573,6 +1225,8 @@ class SemanticWalker:
                         "path_indices": np.asarray(run["path_indices"], dtype=np.int32),
                         "work_integral": float(run["work_integral"]),
                         "closed_loop": bool(run["closed_loop"]),
+                        "proposal_mode": str(run.get("proposal_mode", proposal_mode)),
+                        "feature_basis": str(feature_basis),
                     }
                 )
                 swarm_anchor_idx.append(int(anchor_idx))
@@ -586,14 +1240,32 @@ class SemanticWalker:
                 f"{hot_survived}/2 Hot Walkers Tunneled | {cold_survived}/3 Cold Walkers Closed Loop"
             )
 
-        self._export_cyclic_paths(swarm_records, swarm_anchor_idx, swarm_is_hot, output_dir)
+        self._export_cyclic_paths(
+            swarm_records,
+            swarm_anchor_idx,
+            swarm_is_hot,
+            output_dir,
+            markov_observables=markov_observables,
+            feature_basis=feature_basis,
+        )
         return {
             "catalyst_indices": catalyst_indices,
+            "catalyst_zones": [terrain_labels[int(idx)] for idx in catalyst_indices if 0 <= int(idx) < len(terrain_labels)],
+            "catalyst_selection": selection,
             "swarm_records": swarm_records,
             "swarm_anchor_idx": swarm_anchor_idx,
             "swarm_is_hot": swarm_is_hot,
             "anchor_summaries": anchor_summaries,
             "cognitive_horizon": float(s_max),
+            "proposal_mode": proposal_mode,
+            "feature_basis": str(feature_basis),
+            "requested_k_neighbors": int(k_neighbors),
+            "effective_k_neighbors": int(effective_k_neighbors),
+            "adaptive_tpt_connectivity": bool(adaptive_tpt_connectivity),
+            "markov_observables": {
+                "status": markov_observables.get("status"),
+                "summary": markov_observables.get("summary", {}),
+            },
         }
 
     def compute_corpus_walk(
@@ -606,7 +1278,11 @@ class SemanticWalker:
         hot_temperature_multiplier: float = 5.0,
         start_seed: Optional[int] = None,
         output_dir: Optional[str] = None,
+        proposal_mode: str = "metric_softmax",
+        adaptive_tpt_connectivity: bool = False,
+        feature_basis: str = "track2",
     ) -> Dict[str, Any]:
+        proposal_mode = _normalize_proposal_mode(proposal_mode)
         n_articles = int(self.embeddings.shape[0])
         if n_articles == 0:
             empty = torch.empty((0, 0), dtype=torch.float32)
@@ -643,6 +1319,7 @@ class SemanticWalker:
                 hot_temperature_multiplier=hot_temperature_multiplier,
                 rng=rng,
                 s_max=s_max,
+                proposal_mode=proposal_mode,
             )
             for article_idx in range(n_articles)
         ]
@@ -665,6 +1342,8 @@ class SemanticWalker:
                     "raw_state": "closed_loop" if bool(record["closed_loop"]) else "open_loop",
                     "closed_loop": bool(record["closed_loop"]),
                     "work_integral": float(record["work_integral"]),
+                    "proposal_mode": str(record.get("proposal_mode", proposal_mode)),
+                    "feature_basis": str(feature_basis),
                     "steps": int(max_steps),
                 }
             )
@@ -675,6 +1354,8 @@ class SemanticWalker:
                     "path_xyz": record["path_xyz"],
                     "work_integral": float(record["work_integral"]),
                     "closed_loop": bool(record["closed_loop"]),
+                    "proposal_mode": str(record.get("proposal_mode", proposal_mode)),
+                    "feature_basis": str(feature_basis),
                     "step_diagnostics": record["step_diagnostics"],
                 }
             )
@@ -693,6 +1374,9 @@ class SemanticWalker:
             k_neighbors=k_neighbors,
             start_seed=start_seed,
             output_dir=output_dir,
+            proposal_mode=proposal_mode,
+            adaptive_tpt_connectivity=adaptive_tpt_connectivity,
+            feature_basis=feature_basis,
         )
         return {
             "walker_output": walker_output,
@@ -702,8 +1386,16 @@ class SemanticWalker:
             "path_records": path_records,
             "step_diagnostics": step_diagnostics,
             "catalyst_indices": anchor_swarm.get("catalyst_indices", []),
+            "catalyst_zones": anchor_swarm.get("catalyst_zones", []),
+            "catalyst_selection": anchor_swarm.get("catalyst_selection", {}),
             "anchor_summaries": anchor_swarm.get("anchor_summaries", []),
             "cognitive_horizon": float(s_max),
+            "proposal_mode": proposal_mode,
+            "feature_basis": str(feature_basis),
+            "adaptive_tpt_connectivity": bool(adaptive_tpt_connectivity),
+            "requested_k_neighbors": anchor_swarm.get("requested_k_neighbors", int(k_neighbors)),
+            "effective_k_neighbors": anchor_swarm.get("effective_k_neighbors", int(k_neighbors)),
+            "markov_observables": anchor_swarm.get("markov_observables", {}),
         }
 
 
@@ -724,6 +1416,9 @@ def compute_corpus_walker_resistance(
     thermo_config: Optional[ThermodynamicConfig] = None,
     start_seed: Optional[int] = None,
     output_dir: Optional[str] = None,
+    proposal_mode: str = "metric_softmax",
+    adaptive_tpt_connectivity: bool = False,
+    feature_basis: str = "track2",
 ) -> Dict[str, Any]:
     walker = SemanticWalker(
         embeddings=embeddings,
@@ -744,6 +1439,9 @@ def compute_corpus_walker_resistance(
         hot_temperature_multiplier=hot_temperature_multiplier,
         start_seed=start_seed,
         output_dir=output_dir,
+        proposal_mode=proposal_mode,
+        adaptive_tpt_connectivity=adaptive_tpt_connectivity,
+        feature_basis=feature_basis,
     )
 
 

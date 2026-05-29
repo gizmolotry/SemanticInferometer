@@ -17,8 +17,9 @@ import math
 import os
 import re
 import sys
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse
 from functools import lru_cache
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, callback_context, dcc, html, no_update
+from flask import abort, request, send_file
 import plotly.graph_objects as go
 try:
     import torch
@@ -71,6 +73,115 @@ PALETTE = {
 ROOT = REPO_ROOT
 
 
+def _focused_proof_marker_path() -> Path:
+    return ROOT / "outputs" / "thesis_validation" / "focused" / "current_bundle.json"
+
+
+def _focused_bundle_required_files() -> tuple[str, ...]:
+    return (
+        "focused_proof_status.json",
+        "focused_proof_bundle.json",
+        "scientific_validation_summary.json",
+        "claim_matrix.json",
+        "ablation_matrix.json",
+        "observer_relativity_summary.json",
+        "track4_traversal_summary.json",
+    )
+
+
+def _is_complete_focused_bundle_dir(path: Optional[Path]) -> bool:
+    if not isinstance(path, Path) or not path.exists() or not path.is_dir():
+        return False
+    return all((path / name).exists() for name in _focused_bundle_required_files())
+
+
+def _focused_bundle_status_is_success(path: Path) -> bool:
+    status_path = path / "focused_proof_status.json"
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("status", "")).lower() == "success"
+
+
+def _focused_acceptance_is_safe(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    acceptance = payload.get("evidence_acceptance")
+    if isinstance(acceptance, dict):
+        return bool(acceptance.get("safe_for_focused_defense", False))
+    return False
+
+
+def _focused_acceptance_profile(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "unknown"
+    acceptance = payload.get("evidence_acceptance")
+    if isinstance(acceptance, dict):
+        profile = str(acceptance.get("claim_profile", "") or "").strip()
+        if profile:
+            return profile
+    return "unknown"
+
+
+def _focused_bundle_is_safe_for_default(path: Path) -> bool:
+    """Require explicit focused-claim acceptance before Dash auto-selects a bundle."""
+    payloads: List[dict] = []
+    for name in ("focused_proof_status.json", "focused_proof_bundle.json"):
+        candidate = path / name
+        if not candidate.exists():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return any(_focused_acceptance_is_safe(payload) for payload in payloads)
+
+
+def _validate_focused_proof_marker(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    marker_status = str(payload.get("status", "") or "").strip().lower()
+    if marker_status and marker_status != "success":
+        return {}
+    artifact_root_text = str(payload.get("artifact_root", "") or "").strip()
+    artifact_root = Path(artifact_root_text) if artifact_root_text else None
+    if not artifact_root or not artifact_root.exists() or not artifact_root.is_dir():
+        return {}
+    evidence_dir_text = str(payload.get("evidence_dir", "") or "").strip()
+    evidence_dir = Path(evidence_dir_text) if evidence_dir_text else None
+    if not _is_complete_focused_bundle_dir(evidence_dir):
+        return {}
+    if not _focused_bundle_status_is_success(evidence_dir):
+        return {}
+    # A stale marker from an earlier wrapper version can say "success" even when
+    # the focused defense claims failed. Require explicit acceptance either on
+    # the marker itself or inside the completed bundle/status payloads.
+    marker_acceptance = payload.get("evidence_acceptance")
+    if isinstance(marker_acceptance, dict) and not _focused_acceptance_is_safe(payload):
+        return {}
+    if not (_focused_acceptance_is_safe(payload) or _focused_bundle_is_safe_for_default(evidence_dir)):
+        return {}
+    hydrated = dict(payload)
+    hydrated["focused_claim_profile"] = _focused_acceptance_profile(payload)
+    return hydrated
+
+
+def _load_focused_proof_marker() -> dict:
+    marker_path = _focused_proof_marker_path()
+    if not marker_path.exists():
+        return {}
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        return _validate_focused_proof_marker(payload)
+    except Exception:
+        return {}
+
+
 def _is_run_directory(path: Path) -> bool:
     if not path.is_dir():
         return False
@@ -87,7 +198,9 @@ def _root_has_run_directory(path: Path) -> bool:
     try:
         if _is_run_directory(path):
             return True
-        for child in path.rglob("*"):
+        # Keep Dash import/startup responsive even when outputs contains many
+        # historical proof runs and observer universes.
+        for child in islice(path.rglob("*"), 5000):
             if child.is_dir() and _is_run_directory(child):
                 return True
     except Exception:
@@ -96,11 +209,15 @@ def _root_has_run_directory(path: Path) -> bool:
 
 
 def _discover_artifact_roots() -> List[Path]:
+    marker = _load_focused_proof_marker()
     explicit_roots = [
         ROOT / "experiments_20260221_175416" / "synthetic",
         ROOT / "outputs" / "experiments" / "runs",
         ROOT / "outputs",
     ]
+    marker_root = Path(marker["artifact_root"]) if isinstance(marker, dict) and marker.get("artifact_root") else None
+    if marker_root and marker_root.exists():
+        explicit_roots.insert(0, marker_root)
     patterns = (
         "experiments_*/synthetic",
         "experiments/experiments_*/synthetic",
@@ -126,7 +243,36 @@ def _discover_artifact_roots() -> List[Path]:
             seen.add(key)
             candidate_roots.append(explicit)
     viable = [p for p in candidate_roots if _root_has_run_directory(p)]
-    viable.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def _coverage_priority(path: Path) -> tuple:
+        resolved = path.resolve()
+        parts = tuple(part.lower() for part in resolved.parts)
+        is_runs_root = parts[-3:] == ("outputs", "experiments", "runs") if len(parts) >= 3 else False
+        is_synthetic_root = resolved.name.lower() == "synthetic"
+        is_outputs_root = resolved == (ROOT / "outputs").resolve()
+        return (
+            0 if is_runs_root else 1,
+            0 if is_synthetic_root else 1,
+            1 if is_outputs_root else 0,
+            len(parts),
+        )
+
+    coverage_roots: List[Path] = []
+    for root in sorted(viable, key=_coverage_priority):
+        resolved = root.resolve()
+        if any(resolved != kept.resolve() and resolved.is_relative_to(kept.resolve()) for kept in coverage_roots):
+            continue
+        coverage_roots.append(root)
+
+    viable = coverage_roots
+    marker_root_key = str(marker_root.resolve()) if marker_root and marker_root.exists() else None
+    viable.sort(
+        key=lambda p: (
+            1 if marker_root_key and str(p.resolve()) == marker_root_key else 0,
+            float(p.stat().st_mtime),
+        ),
+        reverse=True,
+    )
     return viable
 
 
@@ -293,6 +439,9 @@ def _hydrate_artifact_state(run_key: Optional[str], artifact_state: Optional[dic
     view_articles = view_state.get("articles")
     if isinstance(view_articles, list) and view_articles:
         hydrated["articles"] = view_articles
+    view_paths = view_state.get("walker_paths")
+    if isinstance(view_paths, list):
+        hydrated["walker_paths"] = view_paths
 
     if run_dir:
         if not _is_number(metrics.get("walker_mean_action")):
@@ -322,6 +471,52 @@ def _load_run_manifest(run_dir: Path) -> dict:
         return {}
 
 
+def _normalize_preferred_dash_entry(payload: Any, run_dir: Path) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    kind = str(payload.get("kind", payload.get("role", "")) or "").strip().lower()
+    kind = kind.replace("-", "_").replace(" ", "_")
+    prefer_default = bool(payload.get("prefer_dash_default", False))
+    if kind not in {"focused_proof", "proof_bundle", "focused_proof_bundle"} and not prefer_default:
+        return {}
+    artifact = str(payload.get("artifact", payload.get("html", "")) or "").strip()
+    if not artifact:
+        return {}
+    artifact_path = run_dir / artifact
+    if not artifact_path.exists():
+        return {}
+    view_state = str(payload.get("view_state", "") or "").strip() or None
+    return {
+        "kind": "focused_proof" if kind in {"focused_proof", "proof_bundle", "focused_proof_bundle"} else kind,
+        "artifact": artifact,
+        "view_state": view_state,
+        "prefer_dash_default": True,
+        "observer_focus": payload.get("observer_focus", {}) if isinstance(payload.get("observer_focus"), dict) else {},
+    }
+
+
+def _load_preferred_dash_entry(run_dir: Path, run_manifest: dict) -> dict:
+    if isinstance(run_manifest, dict):
+        embedded = _normalize_preferred_dash_entry(run_manifest.get("preferred_dash_entry"), run_dir)
+        if embedded:
+            return embedded
+        rel_manifest = str(run_manifest.get("dash_entry_manifest", "") or "").strip()
+        if rel_manifest:
+            candidate = run_dir / rel_manifest.replace("/", "\\")
+            if candidate.exists():
+                external = _normalize_preferred_dash_entry(_safe_json(candidate, {}), run_dir)
+                if external:
+                    return external
+    for name in ("MONOLITH.focused_proof.json", "MONOLITH.dash_entry.json"):
+        candidate = run_dir / name
+        if not candidate.exists():
+            continue
+        external = _normalize_preferred_dash_entry(_safe_json(candidate, {}), run_dir)
+        if external:
+            return external
+    return {}
+
+
 def _safe_json(path: Path, default):
     try:
         return json.loads(_safe_read_text(path))
@@ -348,6 +543,40 @@ def _safe_payload(path: Optional[Path]) -> dict:
     except Exception:
         return {}
     return _cached_payload(str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _contract_fingerprint(run_dir: Path) -> Tuple[Tuple[str, int, int], ...]:
+    """Stat fingerprint for files that can change Dash contract state."""
+    tracked = set(REQUIRED_CONSUMER_ARTIFACTS) | set(OPTIONAL_CONSUMER_ARTIFACTS)
+    tracked.update(
+        {
+            "track4_animation_manifest.json",
+            "track4_traversal_summary.json",
+            "track5_summary.json",
+            "leaf_artifact_inventory.json",
+            "relativity_deltas.json",
+        }
+    )
+    pieces: List[Tuple[str, int, int]] = []
+    for rel in sorted(str(item).replace("\\", "/") for item in tracked):
+        path = run_dir / rel.replace("/", os.sep)
+        try:
+            stat = path.stat()
+            pieces.append((rel, int(stat.st_mtime_ns), int(stat.st_size)))
+        except Exception:
+            pieces.append((rel, -1, -1))
+    return tuple(pieces)
+
+
+@lru_cache(maxsize=128)
+def _cached_consumer_contract(run_dir_str: str, fingerprint: Tuple[Tuple[str, int, int], ...]):
+    _ = fingerprint
+    return evaluate_consumer_contract(Path(run_dir_str))
+
+
+def _consumer_contract(run_dir: Path):
+    resolved = Path(run_dir).resolve()
+    return _cached_consumer_contract(str(resolved), _contract_fingerprint(resolved))
 
 
 def _is_number(val) -> bool:
@@ -604,18 +833,117 @@ def _is_synthetic_placeholder_blob(blob: Any) -> bool:
 
 
 def _artifact_iframe(src_doc: str) -> html.Iframe:
-    import time
-    # Force a unique key on every render by combining the content hash with a timestamp.
-    # This busts the browser's internal iframe cache.
+    # Use a stable key so ordinary Dash callbacks do not reload the heavy
+    # MONOLITH iframe and freeze active Plotly interactions.
     content_hash = hashlib.sha1(src_doc.encode("utf-8", errors="ignore")).hexdigest()[:12]
-    iframe_key = f"{content_hash}_{int(time.time() * 1000)}"
     return html.Iframe(
-        key=iframe_key,
+        key=f"artifact_{content_hash}",
         srcDoc=src_doc,
         sandbox="allow-scripts",
         referrerPolicy="no-referrer",
         style={"width": "100%", "height": "100%", "border": "0"},
     )
+
+
+def _artifact_iframe_from_file(path: Path, run_key: str, variant_name: str, observer_value: str) -> html.Iframe:
+    """Mount a MONOLITH artifact by URL instead of serializing its full HTML through Dash JSON."""
+    try:
+        stat = path.stat()
+        identity = f"{run_key}|{variant_name}|{observer_value}|{stat.st_mtime_ns}|{stat.st_size}"
+    except Exception:
+        identity = f"{run_key}|{variant_name}|{observer_value}|{path}"
+    content_hash = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    query = urlencode({"run": run_key, "variant": variant_name, "observer": observer_value})
+    return html.Iframe(
+        key=f"artifact_file_{content_hash}",
+        src=f"/artifact-html?{query}",
+        sandbox="allow-scripts allow-same-origin",
+        referrerPolicy="no-referrer",
+        style={"width": "100%", "height": "100%", "border": "0"},
+    )
+
+
+def _artifact_iframe_auto() -> html.Iframe:
+    return html.Iframe(
+        key="artifact_auto_from_parent_url",
+        src="/artifact-html-auto",
+        sandbox="allow-scripts allow-same-origin",
+        referrerPolicy="same-origin",
+        style={"width": "100%", "height": "100%", "border": "0"},
+    )
+
+
+def _live_leaf_artifact_inventory(run_dir: Path, existing: Optional[dict]) -> dict:
+    existing = dict(existing or {}) if isinstance(existing, dict) else {}
+    key_artifacts = {
+        "monolith_html": run_dir / "MONOLITH.html",
+        "monolith_csv": run_dir / "MONOLITH_DATA.csv",
+        "view_state": run_dir / "MONOLITH.view_state.json",
+        "observer_manifest": run_dir / "observer_manifest.json",
+        "relativity_deltas": run_dir / "relativity_deltas.json",
+        "observer_recenter_summary": run_dir / "observer_recenter_summary.json",
+        "observer_relativity_summary": run_dir / "observer_relativity_summary.json",
+        "observer_atlas_bundle": run_dir / "observer_atlas_bundle.json",
+        "observer_slice_transport_summary": run_dir / "observer_slice_transport_summary.json",
+        "track4_traversal_summary": run_dir / "track4_traversal_summary.json",
+        "track5_summary": run_dir / "track5_summary.json",
+        "validation_json": run_dir / "validation.json",
+        "verification_report": run_dir / "verification_report.json",
+        "control_metrics": run_dir / "control_metrics.json",
+        "ablation_summary": run_dir / "ablation_summary.json",
+        "walker_states": run_dir / "walker_states.json",
+        "walker_paths": run_dir / "walker_paths.npz",
+        "cyclic_paths": run_dir / "cyclic_paths.npz",
+        "features": run_dir / "features.npy",
+        "integrated_vectors": run_dir / "integrated_vectors.npy",
+    }
+    live_presence = {name: path.exists() for name, path in key_artifacts.items()}
+    merged_presence = dict(existing.get("presence") or {})
+    merged_presence.update(live_presence)
+    observer_cache = run_dir / "relativity_cache"
+    observer_dirs = sorted([p.name for p in run_dir.glob("observer_*") if p.is_dir()])
+    existing.update(
+        {
+            "status": existing.get("status") or "OK",
+            "run_dir": str(run_dir),
+            "artifacts": {name: str(path) for name, path in key_artifacts.items()},
+            "presence": merged_presence,
+            "artifact_count_present": int(sum(1 for present in merged_presence.values() if present)),
+            "artifact_count_total": int(len(merged_presence)),
+            "observer_directory_count": len(observer_dirs),
+            "observer_directories": observer_dirs,
+            "relativity_cache_state_files": len(list(observer_cache.glob("state_*.json"))) if observer_cache.exists() else 0,
+            "relativity_cache_delta_files": len(list(observer_cache.glob("delta_*.json"))) if observer_cache.exists() else 0,
+            "relativity_cache_observer_payloads": len(list(observer_cache.glob("observer_*.pt"))) if observer_cache.exists() else 0,
+            "live_recomputed": True,
+        }
+    )
+    return existing
+
+
+def _track4_manifest_with_summary_fallback(run_dir: Path, existing: Optional[dict]) -> dict:
+    existing = dict(existing or {}) if isinstance(existing, dict) else {}
+    if existing and str(existing.get("status", "") or "").upper() != "NO_DATA":
+        return existing
+    summary = _safe_json(run_dir / "track4_traversal_summary.json", {})
+    if not summary:
+        return existing
+    fallback = dict(existing)
+    path_count = summary.get("path_count")
+    anchor_count = summary.get("anchor_count") or summary.get("unique_anchor_article_count")
+    fallback.update(
+        {
+            "status": str(summary.get("status", "OK") or "OK").upper(),
+            "source": "track4_traversal_summary.json",
+            "path_count": path_count,
+            "anchor_count": anchor_count,
+            "closed_loop_rate": summary.get("closed_loop_rate"),
+            "supports_anchor_swarm_reveal": bool((path_count or 0) and (anchor_count or 0)),
+            "supports_audit_micro_animation": bool((path_count or 0) and (anchor_count or 0)),
+            "supports_stepwise_path_animation": bool((path_count or 0) and (run_dir / "cyclic_paths.npz").exists()),
+        }
+    )
+    return fallback
 
 
 def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
@@ -643,7 +971,7 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
             "group_matrix": {},
         }
 
-    diag = evaluate_consumer_contract(run_dir)
+    diag = _consumer_contract(run_dir)
     paths = {k: (str(v) if v else "NOT FOUND") for k, v in diag.paths.items()}
     errors: List[str] = list(diag.schema_errors)
     missing_required = list(diag.missing_required_artifacts)
@@ -726,6 +1054,16 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     if gm_path is None:
         gm_errors = []
 
+    track5_summary = _safe_json(run_dir / "track5_summary.json", {}) if run_dir else {}
+    track4_animation_manifest = _safe_json(run_dir / "track4_animation_manifest.json", {}) if run_dir else {}
+    observer_recenter_summary = _safe_json(run_dir / "observer_recenter_summary.json", {}) if run_dir else {}
+    observer_atlas_bundle = _load_observer_atlas_bundle(run_dir) if run_dir else {}
+    observer_atlas_readiness = _atlas_readiness(observer_atlas_bundle, observer_id)
+    leaf_artifact_inventory = _safe_json(run_dir / "leaf_artifact_inventory.json", {}) if run_dir else {}
+    if run_dir:
+        track4_animation_manifest = _track4_manifest_with_summary_fallback(run_dir, track4_animation_manifest)
+        leaf_artifact_inventory = _live_leaf_artifact_inventory(run_dir, leaf_artifact_inventory)
+
     # Optional artifacts can degrade panels but should not hard-fail gating.
     optional_schema_errors = hidden_errors + gs_errors + gm_errors
     status = "OK" if (diag.contract_ok and len(missing_required) == 0) else "INVALID_SCHEMA"
@@ -745,6 +1083,12 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
         "hidden_groups": hidden_rows,
         "group_summaries": group_summaries,
         "group_matrix": group_matrix,
+        "track5_summary": track5_summary,
+        "track4_animation_manifest": track4_animation_manifest,
+        "observer_recenter_summary": observer_recenter_summary,
+        "observer_atlas_bundle": observer_atlas_bundle,
+        "observer_atlas_readiness": observer_atlas_readiness,
+        "leaf_artifact_inventory": leaf_artifact_inventory,
     }
 
 
@@ -874,8 +1218,16 @@ def _collect_run_dirs(artifact_root: Optional[Path]) -> List[Path]:
     run_dirs: List[Path] = []
     seen: set[str] = set()
     try:
+        try:
+            scan_limit = int(os.environ.get("DASH_RUN_DIR_SCAN_LIMIT", "12000").strip())
+        except Exception:
+            scan_limit = 12000
+        scan_limit = max(250, scan_limit)
         candidates = [artifact_root]
-        candidates.extend(p for p in artifact_root.rglob("*") if p.is_dir())
+        for marker in ("MONOLITH_DATA.csv", "MONOLITH.html", "baseline_meta.json"):
+            for hit in islice(artifact_root.rglob(marker), scan_limit):
+                candidates.append(hit.parent)
+        candidates.extend(islice((p for p in artifact_root.rglob("*") if p.is_dir()), scan_limit))
         for d in candidates:
             if not _is_run_directory(d):
                 continue
@@ -890,15 +1242,63 @@ def _collect_run_dirs(artifact_root: Optional[Path]) -> List[Path]:
     return run_dirs
 
 
+def _suite_completion_state(run_dir: Path) -> Dict[str, Any]:
+    """Return whether a leaf belongs to a completed suite manifest.
+
+    During a long focused proof run, early leaves can already contain enough
+    artifacts to render in Dash while the sibling controls/branches are still
+    running. Those partial leaves are useful for inspection but should not become
+    the auto-selected screenshot default.
+    """
+    run_dir = Path(run_dir)
+    for parent in [run_dir, *run_dir.parents]:
+        manifest_path = parent / "experiment_manifest.json"
+        if not manifest_path.exists():
+            continue
+        payload = _safe_json(manifest_path, {})
+        config = payload.get("config", {}) if isinstance(payload, dict) else {}
+        experiments = payload.get("experiments", []) if isinstance(payload, dict) else []
+        if not isinstance(config, dict) or not isinstance(experiments, list):
+            return {
+                "applicable": True,
+                "complete": False,
+                "manifest": str(manifest_path),
+                "reason": "malformed suite manifest",
+            }
+        kernels = list(config.get("kernels") or [])
+        channels = list(config.get("channels") or [])
+        corpora = list(config.get("corpora") or [])
+        expected = len(kernels) * max(1, len(channels)) * len(corpora)
+        if expected <= 0:
+            return {
+                "applicable": False,
+                "complete": True,
+                "manifest": str(manifest_path),
+                "reason": "manifest has no suite matrix",
+            }
+        successful = sum(1 for item in experiments if isinstance(item, dict) and item.get("status") == "success")
+        return {
+            "applicable": True,
+            "complete": successful >= expected,
+            "manifest": str(manifest_path),
+            "expected_successes": expected,
+            "observed_successes": successful,
+        }
+    return {"applicable": False, "complete": True}
+
+
 def _run_selection_health(run_dir: Path) -> Dict[str, Any]:
+    suite_state = _suite_completion_state(run_dir)
     try:
-        diag = evaluate_consumer_contract(run_dir)
+        diag = _consumer_contract(run_dir)
     except Exception:
         return {
             "score": 0,
             "contract_ok": False,
             "verification_status": LayerStatus.UNVERIFIED.value,
             "schema_errors": ["contract evaluation failed"],
+            "suite_complete": bool(suite_state.get("complete", True)),
+            "suite_state": suite_state,
         }
 
     verification_status = str(diag.verification_status or LayerStatus.UNVERIFIED.value).upper()
@@ -911,6 +1311,8 @@ def _run_selection_health(run_dir: Path) -> Dict[str, Any]:
     elif len(diag.missing_required_artifacts) == 0:
         score = 1
     else:
+        score = 0
+    if suite_state.get("applicable") and not suite_state.get("complete", False):
         score = 0
     corpus_name = str(run_dir.name).lower()
     if corpus_name == "real":
@@ -929,6 +1331,8 @@ def _run_selection_health(run_dir: Path) -> Dict[str, Any]:
         "contract_ok": bool(diag.contract_ok),
         "verification_status": verification_status,
         "schema_errors": list(diag.schema_errors),
+        "suite_complete": bool(suite_state.get("complete", True)),
+        "suite_state": suite_state,
     }
 
 
@@ -938,9 +1342,22 @@ def _preferred_run_key(index: dict) -> str:
     if not run_keys:
         return ""
 
+    marker = _load_focused_proof_marker()
+    has_safe_focused_marker = bool(marker)
+    preferred_run_key = str(marker.get("preferred_run_key", "")).strip()
+    if preferred_run_key and preferred_run_key in runs:
+        return preferred_run_key
+    preferred_run_id = str(marker.get("preferred_run_id", "")).strip()
+    if preferred_run_id:
+        for run_key in run_keys:
+            if f"/{preferred_run_id}/" in f"/{run_key}/":
+                return run_key
+
     ranked = sorted(
         run_keys,
         key=lambda rk: (
+            int(bool((runs.get(rk, {}) or {}).get("selection_suite_complete", True))),
+            int((runs.get(rk, {}) or {}).get("selection_focus_priority", 0)) if has_safe_focused_marker else 0,
             int((runs.get(rk, {}) or {}).get("selection_score", 0)),
             int((runs.get(rk, {}) or {}).get("selection_root_priority", 0)),
             int((runs.get(rk, {}) or {}).get("selection_model_priority", 0)),
@@ -1008,6 +1425,27 @@ def _preferred_variant(variants: List[str]) -> str:
     return variants[0]
 
 
+def _resolve_primary_variant(run_manifest: dict, variants: List[str], preferred_dash_entry: Optional[dict] = None) -> str:
+    candidate_names: List[str] = []
+    if isinstance(preferred_dash_entry, dict):
+        candidate_names.append(str(preferred_dash_entry.get("artifact", "")))
+    if isinstance(run_manifest, dict):
+        candidate_names.append(str(run_manifest.get("primary_artifact", "")))
+    for candidate in candidate_names:
+        selected = str(candidate or "").strip()
+        if selected and selected in variants:
+            return selected
+    return _preferred_variant(variants)
+
+
+def _run_primary_variant(run: dict) -> str:
+    variants = list(run.get("variants", ["MONOLITH.html"])) if isinstance(run, dict) else ["MONOLITH.html"]
+    selected = str((run or {}).get("primary_variant", "") or "").strip()
+    if selected and selected in variants:
+        return selected
+    return _preferred_variant(variants)
+
+
 def _infer_run_metrics(run_dir: Path, summary_item: dict) -> dict:
     item = dict(summary_item or {})
     validation = _safe_json(run_dir / "validation.json", {}) if (run_dir / "validation.json").exists() else {}
@@ -1066,7 +1504,7 @@ def _find_bool_key(blob: dict, keys: List[str]) -> Optional[bool]:
 def load_verification_state(run_key: Optional[str], verification_source: Optional[str] = "auto") -> dict:
     summary_csv, report_json = _resolve_verification_pair(run_key, verification_source)
     run_dir = _resolve_run_dir(run_key)
-    contract_diag = evaluate_consumer_contract(run_dir) if run_dir and run_dir.exists() else None
+    contract_diag = _consumer_contract(run_dir) if run_dir and run_dir.exists() else None
     if not report_json and contract_diag and contract_diag.paths.get("verification_report.json"):
         report_json = contract_diag.paths.get("verification_report.json")
     if not summary_csv and contract_diag and contract_diag.paths.get("verification_summary.csv"):
@@ -1116,8 +1554,8 @@ def load_verification_state(run_key: Optional[str], verification_source: Optiona
                 except Exception:
                     total += 1
 
-    survival_pct = None
-    friction = None
+    survival_pct = 100.0 if total == 0 else None
+    friction = 0.0 if total == 0 else None
     if total > 0:
         failures = broken + trapped
         survival_pct = max(0.0, 100.0 * (1.0 - (failures / float(total))))
@@ -1359,6 +1797,109 @@ def _load_relativity_delta_bundle(run_dir: Path, observer_id: int) -> dict:
     return {}
 
 
+def _load_observer_atlas_bundle(run_dir: Path) -> dict:
+    bundle_path = run_dir / "observer_atlas_bundle.json"
+    if not bundle_path.exists():
+        return {}
+    bundle = _safe_json(bundle_path, {})
+    if not isinstance(bundle, dict):
+        return {}
+    bundle["_path"] = str(bundle_path)
+    return bundle
+
+
+def _atlas_source_stale(bundle: dict) -> List[str]:
+    stale: List[str] = []
+    source_artifacts = bundle.get("source_artifacts", {}) if isinstance(bundle.get("source_artifacts"), dict) else {}
+    fingerprints = source_artifacts.get("fingerprints", {}) if isinstance(source_artifacts.get("fingerprints"), dict) else {}
+    for name, fingerprint in fingerprints.items():
+        if not isinstance(fingerprint, dict):
+            continue
+        path = Path(str(fingerprint.get("path", "")))
+        if not path.exists():
+            stale.append(f"{name}: missing source")
+            continue
+        try:
+            stat = path.stat()
+        except Exception as exc:
+            stale.append(f"{name}: stat failed ({exc})")
+            continue
+        expected_size = fingerprint.get("size")
+        expected_mtime = fingerprint.get("mtime_ns")
+        try:
+            expected_size_int = int(str(expected_size))
+        except Exception:
+            expected_size_int = None
+        try:
+            expected_mtime_int = int(str(expected_mtime))
+        except Exception:
+            expected_mtime_int = None
+        if expected_size_int is not None and int(stat.st_size) != expected_size_int:
+            stale.append(f"{name}: size changed")
+        if expected_mtime_int is not None and int(stat.st_mtime_ns) != expected_mtime_int:
+            stale.append(f"{name}: mtime changed")
+        expected_sha256 = fingerprint.get("sha256")
+        if expected_sha256:
+            try:
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != str(expected_sha256):
+                    stale.append(f"{name}: sha256 changed")
+            except Exception as exc:
+                stale.append(f"{name}: sha256 failed ({exc})")
+    return stale
+
+
+def _atlas_slices(bundle: dict) -> List[dict]:
+    slices = bundle.get("slices") if isinstance(bundle.get("slices"), list) else []
+    return [row for row in slices if isinstance(row, dict)]
+
+
+def _atlas_routes(bundle: dict) -> List[dict]:
+    routes = bundle.get("routes") if isinstance(bundle.get("routes"), list) else []
+    return [row for row in routes if isinstance(row, dict)]
+
+
+def _atlas_readiness(bundle: dict, observer_id: Optional[int]) -> dict:
+    if not bundle:
+        return {"status": "MISSING", "reasons": ["observer_atlas_bundle.json missing"]}
+    reasons: List[str] = []
+    if bundle.get("bundle_type") != "observer_atlas_bundle":
+        reasons.append("observer atlas bundle_type invalid")
+    slices = _atlas_slices(bundle)
+    routes = _atlas_routes(bundle)
+    slice_ids = {str(row.get("slice_id", "")) for row in slices}
+    if not slices:
+        reasons.append("observer atlas has no slices")
+    if not routes:
+        reasons.append("observer atlas has no routes")
+    if observer_id is not None and f"observer_{observer_id}" not in slice_ids:
+        reasons.append(f"observer atlas missing slice observer_{observer_id}")
+    stale_reasons = _atlas_source_stale(bundle)
+    reasons.extend(stale_reasons)
+    metrics = bundle.get("metrics", {}) if isinstance(bundle.get("metrics"), dict) else {}
+    mean_excess = metrics.get("mean_excess_holonomy_action")
+    if _is_number(mean_excess) and float(mean_excess) <= 0:
+        reasons.append("observer atlas excess holonomy is nonpositive")
+    if reasons:
+        status = "STALE" if stale_reasons else ("MISSING" if not bundle or "missing" in " ".join(reasons).lower() else "NON_COMPARABLE")
+    else:
+        status = "OK"
+    return {
+        "status": status,
+        "reasons": reasons,
+        "path": bundle.get("_path"),
+        "slice_count": len(slices),
+        "route_count": len(routes),
+        "mean_holonomy_action": metrics.get("mean_holonomy_action"),
+        "mean_null_holonomy_action": metrics.get("mean_null_holonomy_action"),
+        "mean_excess_holonomy_action": metrics.get("mean_excess_holonomy_action"),
+        "observer_id": observer_id,
+    }
+
+
 def _ablation_candidates(run_key: Optional[str]) -> List[Path]:
     candidates: List[Path] = []
     run_dir = _resolve_run_dir(run_key)
@@ -1578,6 +2119,143 @@ def _fmt_metric(value: Any, digits: int = 3) -> str:
     return "n/a"
 
 
+def _fmt_yes_no(value: Any) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "n/a"
+
+
+def _build_leaf_artifact_readout_bits(contract: dict) -> Dict[str, List[str]]:
+    track5_summary = contract.get("track5_summary", {}) if isinstance(contract.get("track5_summary"), dict) else {}
+    track4_manifest = contract.get("track4_animation_manifest", {}) if isinstance(contract.get("track4_animation_manifest"), dict) else {}
+    recenter_summary = contract.get("observer_recenter_summary", {}) if isinstance(contract.get("observer_recenter_summary"), dict) else {}
+    atlas_readiness = contract.get("observer_atlas_readiness", {}) if isinstance(contract.get("observer_atlas_readiness"), dict) else {}
+    inventory = contract.get("leaf_artifact_inventory", {}) if isinstance(contract.get("leaf_artifact_inventory"), dict) else {}
+
+    run_score_bits: List[str] = []
+    coverage_bits: List[str] = []
+    provenance_bits: List[str] = []
+
+    track5_mode = str(track5_summary.get("track5_assembly_mode", "") or "").strip()
+    track5_geometry = str(track5_summary.get("preferred_geometry_source", "") or "").strip()
+    track5_status = str(track5_summary.get("status", "") or "").strip().upper()
+    if track5_mode or track5_geometry or track5_status:
+        mode_label = track5_mode or (track5_status.lower() if track5_status else "unknown")
+        if track5_geometry and track5_geometry != "none":
+            mode_label = f"{mode_label}/{track5_geometry}"
+        run_score_bits.append(f"T5 mode={mode_label}")
+    if "uses_integrated_geometry" in track5_summary:
+        coverage_bits.append(f"T5 integrated={_fmt_yes_no(track5_summary.get('uses_integrated_geometry'))}")
+    if "safe_for_thesis_claim" in track5_summary:
+        provenance_bits.append(f"t5_safe={_fmt_yes_no(track5_summary.get('safe_for_thesis_claim'))}")
+    if track5_geometry:
+        provenance_bits.append(f"t5_geom={track5_geometry}")
+
+    track4_status = str(track4_manifest.get("status", "") or "").strip().upper()
+    if track4_manifest:
+        anim_caps: List[str] = []
+        if bool(track4_manifest.get("supports_anchor_swarm_reveal")):
+            anim_caps.append("swarm")
+        if bool(track4_manifest.get("supports_audit_micro_animation")):
+            anim_caps.append("audit")
+        if bool(track4_manifest.get("supports_stepwise_path_animation")):
+            anim_caps.append("stepwise")
+        if anim_caps or track4_status:
+            run_score_bits.append(f"T4 anim={'+'.join(anim_caps) if anim_caps else track4_status.lower()}")
+        path_count = track4_manifest.get("path_count")
+        anchor_count = track4_manifest.get("anchor_count")
+        if _is_number(path_count) or _is_number(anchor_count):
+            coverage_bits.append(
+                f"T4 loops={int(path_count) if _is_number(path_count) else 'n/a'}/{int(anchor_count) if _is_number(anchor_count) else 'n/a'}"
+            )
+        if _is_number(track4_manifest.get("closed_loop_rate")):
+            coverage_bits.append(f"T4 closed={_fmt_metric(float(track4_manifest.get('closed_loop_rate')) * 100.0)}%")
+        provenance_bits.append(f"t4_stepwise={_fmt_yes_no(track4_manifest.get('supports_stepwise_path_animation'))}")
+
+    inventory_present = inventory.get("artifact_count_present")
+    inventory_total = inventory.get("artifact_count_total")
+    if _is_number(inventory_present) and _is_number(inventory_total):
+        coverage_bits.append(f"leaf={int(inventory_present)}/{int(inventory_total)}")
+    observer_dir_count = inventory.get("observer_directory_count")
+    observer_payload_count = inventory.get("relativity_cache_observer_payloads")
+    observer_state_count = inventory.get("relativity_cache_state_files")
+    observer_delta_count = inventory.get("relativity_cache_delta_files")
+    observer_cache_count = None
+    if _is_number(observer_state_count) and _is_number(observer_delta_count):
+        observer_cache_count = min(int(observer_state_count), int(observer_delta_count))
+    elif _is_number(observer_state_count):
+        observer_cache_count = int(observer_state_count)
+    elif _is_number(observer_delta_count):
+        observer_cache_count = int(observer_delta_count)
+    if _is_number(observer_payload_count):
+        payload_ready = int(observer_payload_count)
+        observer_cache_count = max(int(observer_cache_count or 0), payload_ready)
+    if _is_number(observer_dir_count) or observer_cache_count is not None:
+        coverage_bits.append(
+            f"observer_cache={observer_cache_count if observer_cache_count is not None else 'n/a'}/{int(observer_dir_count) if _is_number(observer_dir_count) else 'n/a'}"
+        )
+    if _is_number(observer_payload_count) and observer_cache_count is not None and int(observer_payload_count) != int(observer_cache_count):
+        coverage_bits.append(
+            f"observer_payloads={int(observer_payload_count)}/{int(observer_dir_count) if _is_number(observer_dir_count) else 'n/a'}"
+        )
+    if atlas_readiness:
+        atlas_status = str(atlas_readiness.get("status", "") or "").strip().lower()
+        route_count = atlas_readiness.get("route_count")
+        slice_count = atlas_readiness.get("slice_count")
+        if _is_number(route_count) or _is_number(slice_count):
+            coverage_bits.append(
+                f"atlas={int(route_count) if _is_number(route_count) else 'n/a'}r/{int(slice_count) if _is_number(slice_count) else 'n/a'}s"
+            )
+        if atlas_status:
+            provenance_bits.append(f"atlas_status={atlas_status}")
+        mean_excess = atlas_readiness.get("mean_excess_holonomy_action")
+        if _is_number(mean_excess):
+            provenance_bits.append(f"atlas_holonomy={_fmt_metric(mean_excess)}")
+    recenter_status = str(recenter_summary.get("status", "") or "").strip().upper()
+    if recenter_summary:
+        observer_count = recenter_summary.get("observer_count")
+        ok_count = recenter_summary.get("ok_count")
+        if _is_number(ok_count) or _is_number(observer_count):
+            coverage_bits.append(
+                f"observer_recenter={int(ok_count) if _is_number(ok_count) else 'n/a'}/{int(observer_count) if _is_number(observer_count) else 'n/a'}"
+            )
+        path_match_count = recenter_summary.get("path_start_match_observer_count")
+        if _is_number(path_match_count) or _is_number(observer_count):
+            coverage_bits.append(
+                f"recenter_path_starts={int(path_match_count) if _is_number(path_match_count) else 'n/a'}/{int(observer_count) if _is_number(observer_count) else 'n/a'}"
+            )
+        replay_count = recenter_summary.get("replay_path_observer_count")
+        if _is_number(replay_count):
+            coverage_bits.append(f"observer_replays={int(replay_count)}")
+        if recenter_status:
+            provenance_bits.append(f"recenter_status={recenter_status.lower()}")
+        z_policy = str(recenter_summary.get("z_origin_policy", "") or "").strip()
+        if z_policy:
+            provenance_bits.append(f"recenter_z={z_policy}")
+        local_track = recenter_summary.get("local_track_recompute")
+        if isinstance(local_track, dict):
+            local_ok = local_track.get("ok_count", local_track.get("fresh_recompute_count"))
+            local_total = local_track.get("observer_count")
+            if _is_number(local_ok) or _is_number(local_total):
+                coverage_bits.append(
+                    f"observer_local_tracks={int(local_ok) if _is_number(local_ok) else 'n/a'}/{int(local_total) if _is_number(local_total) else 'n/a'}"
+                )
+            frame = str(local_track.get("coordinate_frame", "") or "").strip()
+            if frame:
+                provenance_bits.append(f"observer_track_frame={frame}")
+            fallback_count = local_track.get("global_validation_fallback_count")
+            if _is_number(fallback_count):
+                provenance_bits.append(f"observer_track_fallback={int(fallback_count)}")
+
+    return {
+        "run_score": run_score_bits,
+        "coverage": coverage_bits,
+        "provenance": provenance_bits,
+    }
+
+
 def _panel_status_style(status: str) -> Dict[str, str]:
     status_upper = str(status or "").upper()
     if status_upper == "OK":
@@ -1692,6 +2370,11 @@ def _compute_track_snapshot(
         if isinstance(observer_state, dict) and isinstance(observer_state.get("metrics"), dict):
             observer_metrics = observer_state.get("metrics", {}) or {}
     observer_track_nmi = observer_metrics.get("observer_track_nmi", {}) if isinstance(observer_metrics.get("observer_track_nmi"), dict) else {}
+    observer_track_metrics = (
+        observer_metrics.get("observer_track_metrics", {})
+        if isinstance(observer_metrics.get("observer_track_metrics"), dict)
+        else {}
+    )
     snapshot: Dict[str, Dict[str, Any]] = {}
 
     def _base_track(track_key: str) -> Dict[str, Any]:
@@ -1706,24 +2389,54 @@ def _compute_track_snapshot(
         if observer_value.startswith("article:") and _is_number(obs_nmi):
             item["nmi"] = float(obs_nmi)
             item["source"] = f"observer_state.metrics.observer_track_nmi.{track_key}"
+        local_metrics = observer_track_metrics.get(track_key)
+        if observer_value.startswith("article:") and isinstance(local_metrics, dict):
+            item["status"] = str(local_metrics.get("status", item.get("status")) or item.get("status"))
+            item["source"] = str(
+                local_metrics.get(
+                    "source",
+                    f"observer_state.metrics.observer_track_metrics.{track_key}",
+                )
+                or f"observer_state.metrics.observer_track_metrics.{track_key}"
+            )
+            if _is_number(local_metrics.get("nmi")):
+                item["nmi"] = float(local_metrics.get("nmi"))
+            if _is_number(local_metrics.get("ari")):
+                item["ari"] = float(local_metrics.get("ari"))
+            for key in (
+                "recomputed",
+                "coordinate_frame",
+                "input_source",
+                "global_validation_fallback",
+                "signal",
+                "bonds",
+                "cracks",
+            ):
+                if key in local_metrics:
+                    item[key] = local_metrics.get(key)
         return item
 
     snapshot["T1"] = _base_track("T1")
     snapshot["T1.5"] = _base_track("T1.5")
-    if _is_number(artifact_metrics.get("spectral_signal")):
+    if "signal" not in snapshot["T1.5"] and _is_number(artifact_metrics.get("spectral_signal")):
         snapshot["T1.5"]["signal"] = float(artifact_metrics.get("spectral_signal"))
     snapshot["T2"] = _base_track("T2")
-    t3_canonical = _has_canonical_t3_payload(run_dir)
+    t3_has_metrics = any(
+        _is_number(artifact_metrics.get(key))
+        for key in ("dirichlet_bonds", "dirichlet_cracks")
+    )
+    t3_canonical = _has_canonical_t3_payload(run_dir) or t3_has_metrics
     snapshot["T3"] = _base_track("T3")
-    if not t3_canonical:
+    t3_local_recompute = bool(snapshot["T3"].get("recomputed"))
+    if not t3_canonical and not t3_local_recompute:
         snapshot["T3"]["status"] = "missing"
         snapshot["T3"]["source"] = "missing"
         snapshot["T3"]["nmi"] = None
         snapshot["T3"]["ari"] = None
     else:
-        if _is_number(artifact_metrics.get("dirichlet_bonds")):
+        if "bonds" not in snapshot["T3"] and _is_number(artifact_metrics.get("dirichlet_bonds")):
             snapshot["T3"]["bonds"] = int(float(artifact_metrics.get("dirichlet_bonds")))
-        if _is_number(artifact_metrics.get("dirichlet_cracks")):
+        if "cracks" not in snapshot["T3"] and _is_number(artifact_metrics.get("dirichlet_cracks")):
             snapshot["T3"]["cracks"] = int(float(artifact_metrics.get("dirichlet_cracks")))
 
     t4_exists = bool(run_dir and ((run_dir / "walker_paths.npz").exists() or (run_dir / "walker_states.json").exists() or (run_dir / "walker_work_integrals.npy").exists()))
@@ -1994,6 +2707,10 @@ def _build_run_observers_and_rows(run: dict) -> Tuple[List[dict], Dict[int, dict
 def build_artifact_index() -> dict:
     all_run_dirs: List[Path] = []
     metrics_by_root: Dict[str, Dict[str, dict]] = {}
+    focused_marker = _load_focused_proof_marker()
+    focused_preferred_key = str(focused_marker.get("preferred_run_key", "") or "").strip()
+    focused_preferred_id = str(focused_marker.get("preferred_run_id", "") or "").strip()
+    focused_claim_profile = str(focused_marker.get("focused_claim_profile", "") or "").strip()
     for root in ARTIFACT_ROOTS:
         run_dirs = _collect_run_dirs(root)
         all_run_dirs.extend(run_dirs)
@@ -2006,6 +2723,7 @@ def build_artifact_index() -> dict:
                 by_key[key] = item
         metrics_by_root[str(root)] = by_key
 
+    all_run_dirs = [path for path in all_run_dirs if path.exists()]
     all_run_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     runs: Dict[str, dict] = {}
@@ -2021,10 +2739,18 @@ def build_artifact_index() -> dict:
         variants = [str(a.get("html", "")).strip() for a in manifest_artifacts if isinstance(a, dict) and str(a.get("html", "")).strip()]
         if not variants:
             variants = _collect_variant_names(run_dir)
+        preferred_dash_entry = _load_preferred_dash_entry(run_dir, run_manifest)
+        preferred_dash_artifact = str(preferred_dash_entry.get("artifact", "") or "").strip()
+        if preferred_dash_artifact and preferred_dash_artifact not in variants:
+            variants.insert(0, preferred_dash_artifact)
         primary_metrics = run_manifest.get("primary_metrics", {}) if isinstance(run_manifest, dict) else {}
         if item.get("nmi") is None and _is_number(primary_metrics.get("synthesis_nmi")):
             item["nmi"] = float(primary_metrics.get("synthesis_nmi"))
         selection_health = _run_selection_health(run_dir)
+        marker_selects_run = bool(focused_marker) and (
+            (focused_preferred_key and focused_preferred_key == run_key)
+            or (focused_preferred_id and f"/{focused_preferred_id}/" in f"/{run_key}/")
+        )
         run = {
             "run_key": run_key,
             "kernel": str(item.get("kernel", "unknown")),
@@ -2034,14 +2760,19 @@ def build_artifact_index() -> dict:
             "run_dir": run_dir,
             "artifact_root": run_dir.parent,
             "variants": variants,
-            "primary_variant": _preferred_variant(variants),
+            "primary_variant": _resolve_primary_variant(run_manifest, variants, preferred_dash_entry),
             "article_meta_path": run_dir / "article_metadata.json",
             "monolith_data_path": run_dir / "MONOLITH_DATA.csv",
             "observer_manifest_path": run_dir / "observer_manifest.json",
             "observer_manifest": {},
             "observer_artifacts": {},
             "run_manifest": run_manifest if isinstance(run_manifest, dict) else {},
+            "preferred_dash_entry": preferred_dash_entry,
+            "focused_claim_profile": focused_claim_profile if marker_selects_run else "",
+            "selection_focus_priority": 1 if (preferred_dash_artifact or marker_selects_run) else 0,
+            "selection_focus_source": "current_focused_bundle" if marker_selects_run else ("dash_entry" if preferred_dash_artifact else ""),
             "selection_score": int(selection_health.get("score", 0)),
+            "selection_suite_complete": bool(selection_health.get("suite_complete", True)),
             "selection_root_priority": _run_source_priority(run_dir),
             "selection_model_priority": _run_model_priority(run_dir),
             "selection_corpus_priority": int(selection_health.get("corpus_priority", 0)),
@@ -2151,6 +2882,8 @@ def resolve_artifact(run_key: str, variant_name: str, observer_value: str) -> Op
                 if p.exists():
                     found_path = p
                     break
+        if not found_path:
+            return None
     
     if not found_path:
         variant_path = run_dir / selected_variant
@@ -2228,6 +2961,17 @@ def build_empty_index_fallback() -> html.Pre:
     )
 
 
+def _component_key(component, default: str = "content") -> str:
+    key = getattr(component, "key", None)
+    if key is not None:
+        return str(key)
+    if isinstance(component, dict):
+        kwargs = component.get("kwargs")
+        if isinstance(kwargs, dict) and kwargs.get("key") is not None:
+            return str(kwargs.get("key"))
+    return default
+
+
 def _transition_wrapper(content, transition_style: str):
     transition_css = "fadeInFast 0.28s ease-out"
     overlay_style = {}
@@ -2241,16 +2985,87 @@ def _transition_wrapper(content, transition_style: str):
         transition_css = "jitterIn 0.22s steps(2,end)"
     return html.Div(
         [html.Div(style={"position": "absolute", "inset": 0, "pointerEvents": "none", **overlay_style}), content],
+        key=f"transition_{_component_key(content)}_{transition_style}",
         style={"width": "100%", "height": "100%", "position": "relative", "animation": transition_css},
     )
 
 
 app = Dash(__name__, external_stylesheets=[dbc.themes.CYBORG], title="Artifact Viewer")
 
+
+@app.server.route("/artifact-html")
+def serve_artifact_html():
+    run_key = str(request.args.get("run", "") or "")
+    variant_name = str(request.args.get("variant", "MONOLITH.html") or "MONOLITH.html")
+    observer_value = str(request.args.get("observer", "global") or "global")
+    artifact_path = resolve_artifact(run_key, variant_name, observer_value)
+    if artifact_path is None or not artifact_path.exists() or not artifact_path.is_file():
+        abort(404)
+    try:
+        resolved = artifact_path.resolve()
+        allowed_roots = [ROOT.resolve()]
+        for root in ARTIFACT_ROOTS:
+            try:
+                allowed_roots.append(Path(root).resolve())
+            except Exception:
+                continue
+        if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+            abort(403)
+    except Exception:
+            abort(403)
+    return send_file(resolved, mimetype="text/html; charset=utf-8")
+
+
+@app.server.route("/artifact-html-auto")
+def serve_artifact_html_auto():
+    try:
+        referrer_query = parse_qs(urlparse(str(request.referrer or "")).query)
+    except Exception:
+        referrer_query = {}
+    run_key = str((referrer_query.get("run_key") or referrer_query.get("run") or [DEFAULT_RUN])[0] or DEFAULT_RUN)
+    if run_key not in INDEX.get("runs", {}):
+        run_key = DEFAULT_RUN
+    variant_name = str((referrer_query.get("variant_a") or [DEFAULT_PRIMARY_VARIANT])[0] or DEFAULT_PRIMARY_VARIANT)
+    observer_value = str((referrer_query.get("observer") or ["global"])[0] or "global").strip()
+    observer_uid = str((referrer_query.get("observer_uid") or [""])[0] or "").strip()
+    observer_from_uid = _observer_value_from_uid(run_key, observer_uid)
+    obs_values = [o.get("value") for o in INDEX.get("observers_by_run", {}).get(run_key, []) if isinstance(o, dict)]
+    if observer_from_uid and observer_from_uid in obs_values:
+        observer_value = observer_from_uid
+    elif observer_value not in obs_values:
+        observer_value = "global"
+    artifact_path = resolve_artifact(run_key, variant_name, observer_value)
+    if artifact_path is None or not artifact_path.exists() or not artifact_path.is_file():
+        abort(404)
+    try:
+        resolved = artifact_path.resolve()
+        allowed_roots = [ROOT.resolve()]
+        for root in ARTIFACT_ROOTS:
+            try:
+                allowed_roots.append(Path(root).resolve())
+            except Exception:
+                continue
+        if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+            abort(403)
+    except Exception:
+        abort(403)
+    return send_file(resolved, mimetype="text/html; charset=utf-8")
+
 RUN_OPTIONS = _run_options_from_index(INDEX)
 DEFAULT_RUN = INDEX["default_run"]
 DEFAULT_VARIANTS = INDEX["runs"].get(DEFAULT_RUN, {}).get("variants", ["MONOLITH.html"])
-DEFAULT_PRIMARY_VARIANT = _preferred_variant(DEFAULT_VARIANTS)
+DEFAULT_PRIMARY_VARIANT = _run_primary_variant(INDEX["runs"].get(DEFAULT_RUN, {}))
+
+
+def _initial_artifact_children():
+    if DEFAULT_RUN:
+        return _transition_wrapper(_artifact_iframe_auto(), "fade")
+    return build_terminal_fallback("global", DEFAULT_RUN, DEFAULT_PRIMARY_VARIANT, 0)
+
+
+def _initial_physical_path_readout() -> str:
+    artifact_path = resolve_artifact(DEFAULT_RUN, DEFAULT_PRIMARY_VARIANT, "global") if DEFAULT_RUN else None
+    return f"PHYSICAL PATH: {artifact_path}" if artifact_path is not None and artifact_path.exists() else "PHYSICAL PATH: INITIALIZING..."
 
 app.layout = dbc.Container(
     fluid=True,
@@ -2287,7 +3102,7 @@ app.layout = dbc.Container(
                         ),
                         html.Div(
                             id="physical-path-readout",
-                            children="PHYSICAL PATH: INITIALIZING...",
+                            children=_initial_physical_path_readout(),
                             style={"color": PALETTE["cyan"], "fontSize": "0.68rem", "wordBreak": "break-all", "marginBottom": "8px", "fontWeight": "700"},
                         ),
                         dbc.Button("Reindex", id="reindex-btn", color="info", size="sm", style={"width": "100%", "marginBottom": "6px"}),
@@ -2304,7 +3119,11 @@ app.layout = dbc.Container(
                             children=[
                                 dcc.RadioItems(
                                     id="view-mode",
-                                    options=[{"label": "Global", "value": "global"}, {"label": "Observer", "value": "observer"}],
+                                    options=[
+                                        {"label": "Global", "value": "global"},
+                                        {"label": "Observer", "value": "observer"},
+                                        {"label": "Atlas", "value": "atlas"},
+                                    ],
                                     value="global",
                                 ),
                                 dcc.RadioItems(
@@ -2399,7 +3218,7 @@ app.layout = dbc.Container(
                                     id="artifact-loading",
                                     type="default",
                                     color=PALETTE["cyan"],
-                                    children=[html.Div(id="artifact-container", style={"height": "100vh", "width": "100%"})],
+                                    children=[html.Div(id="artifact-container", children=_initial_artifact_children(), style={"height": "100vh", "width": "100%"})],
                                 ),
                                 html.Div(id="watermark-overlay", style={"display": "none"}),
                             ],
@@ -2424,18 +3243,22 @@ app.layout = dbc.Container(
 )
 def reindex_runs(n_clicks: Optional[int], current_run: Optional[str]):
     global ARTIFACT_ROOTS, PRIMARY_ARTIFACT_ROOT, INDEX, RUN_OPTIONS, DEFAULT_RUN, DEFAULT_VARIANTS, DEFAULT_PRIMARY_VARIANT
+    _cached_consumer_contract.cache_clear()
     ARTIFACT_ROOTS = _discover_artifact_roots()
     PRIMARY_ARTIFACT_ROOT = ARTIFACT_ROOTS[0] if ARTIFACT_ROOTS else None
     INDEX = build_artifact_index()
     RUN_OPTIONS = _run_options_from_index(INDEX)
     DEFAULT_RUN = INDEX.get("default_run", "")
     DEFAULT_VARIANTS = INDEX.get("runs", {}).get(DEFAULT_RUN, {}).get("variants", ["MONOLITH.html"])
-    DEFAULT_PRIMARY_VARIANT = _preferred_variant(DEFAULT_VARIANTS)
+    DEFAULT_PRIMARY_VARIANT = _run_primary_variant(INDEX.get("runs", {}).get(DEFAULT_RUN, {}))
 
     option_values = [opt["value"] for opt in RUN_OPTIONS]
     current_run_blob = INDEX.get("runs", {}).get(current_run or "", {})
+    default_run_blob = INDEX.get("runs", {}).get(DEFAULT_RUN or "", {})
     current_run_healthy = bool(current_run_blob.get("contract_ok")) or str(current_run_blob.get("selection_verification_status", "")).upper() == LayerStatus.NON_COMPARABLE.value
-    if current_run in option_values and current_run_healthy:
+    default_has_focus = int(default_run_blob.get("selection_focus_priority", 0)) > 0
+    current_has_focus = int(current_run_blob.get("selection_focus_priority", 0)) > 0
+    if current_run in option_values and current_run_healthy and not (default_has_focus and not current_has_focus):
         run_value = current_run
     else:
         run_value = DEFAULT_RUN if DEFAULT_RUN in option_values else (option_values[0] if option_values else "")
@@ -2459,21 +3282,26 @@ def reindex_runs(n_clicks: Optional[int], current_run: Optional[str]):
     State("variant-b-dropdown", "value"),
     State("observer-dropdown", "value"),
 )
-def refresh_variants(run_key: str, search: Optional[str], _index_revision: int, current_a: str, current_b: str, current_observer: str):
+def refresh_variants(run_key: str, search: Optional[str], *args):
+    if len(args) == 4:
+        _index_revision, current_a, current_b, current_observer = args
+    elif len(args) == 3:
+        current_a, current_b, current_observer = args
+        _index_revision = 0
+    else:
+        raise TypeError("refresh_variants expected 3 or 4 trailing arguments")
     try:
         qs = parse_qs((search or "").lstrip("?"))
     except Exception:
         qs = {}
-    embedded_raw = str((qs.get("embedded") or ["0"])[0]).strip().lower()
-    embedded = embedded_raw in {"1", "true", "on", "yes"}
-    requested_run = str((qs.get("run_key") or [run_key])[0] or run_key)
+    requested_run = str((qs.get("run_key") or qs.get("run") or [run_key])[0] or run_key)
     effective_run_key = requested_run if requested_run in INDEX.get("runs", {}) else run_key
     run = INDEX["runs"].get(effective_run_key, {})
     variants = run.get("variants", ["MONOLITH.html"])
     if not variants:
         variants = ["MONOLITH.html"]
     opts = [{"label": v, "value": v} for v in variants]
-    preferred_variant = _preferred_variant(variants)
+    preferred_variant = _run_primary_variant(run)
     requested_variant_a = str((qs.get("variant_a") or [""])[0] or "").strip()
     requested_variant_b = str((qs.get("variant_b") or [""])[0] or "").strip()
     a = current_a if current_a in variants else preferred_variant
@@ -2485,16 +3313,13 @@ def refresh_variants(run_key: str, search: Optional[str], _index_revision: int, 
     obs_opts = INDEX["observers_by_run"].get(effective_run_key, [{"label": "Global Mean", "value": "global"}])
     obs_values = [o["value"] for o in obs_opts]
     observer = current_observer if current_observer in obs_values else "global"
-    if not embedded:
-        requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
-        requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
-        observer_from_uid = _observer_value_from_uid(effective_run_key, requested_uid)
-        if observer_from_uid and observer_from_uid in obs_values:
-            observer = observer_from_uid
-        elif requested_observer in obs_values:
-            observer = requested_observer
-    else:
-        observer = "global"
+    requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
+    requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+    observer_from_uid = _observer_value_from_uid(effective_run_key, requested_uid)
+    if observer_from_uid and observer_from_uid in obs_values:
+        observer = observer_from_uid
+    elif requested_observer in obs_values:
+        observer = requested_observer
     return opts, a, opts, b, obs_opts, observer
 
 
@@ -2517,26 +3342,24 @@ def apply_url_state(search: Optional[str], run_options, current_run):
         return no_update, no_update, no_update, no_update
 
     run_values = [o.get("value") for o in (run_options or []) if isinstance(o, dict)]
-    requested_run = str((qs.get("run_key") or [current_run])[0] or current_run)
+    requested_run = str((qs.get("run_key") or qs.get("run") or [current_run])[0] or current_run)
     run_value = requested_run if requested_run in run_values else current_run
-    embedded_raw = str((qs.get("embedded") or ["0"])[0]).strip().lower()
-    embedded = embedded_raw in {"1", "true", "on", "yes"}
-
     observer = "global"
-    if not embedded:
-        observer = str((qs.get("observer") or ["global"])[0] or "global")
-        observer_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
-        observer_from_uid = _observer_value_from_uid(run_value, observer_uid)
-        if observer_from_uid:
-            observer = observer_from_uid
+    observer = str((qs.get("observer") or ["global"])[0] or "global")
+    observer_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+    observer_from_uid = _observer_value_from_uid(run_value, observer_uid)
+    if observer_from_uid:
+        observer = observer_from_uid
     view_mode = str((qs.get("view_mode") or ["global"])[0] or "global").lower()
-    if view_mode not in {"global", "observer"}:
-        view_mode = "global"
+    if view_mode not in {"global", "observer", "atlas"}:
+        view_mode = "observer" if observer != "global" else "global"
+    elif observer != "global" and view_mode != "atlas":
+        view_mode = "observer"
     compare_raw = str((qs.get("compare") or ["0"])[0]).strip().lower()
     compare_values = ["on"] if compare_raw in {"1", "true", "on", "yes"} else []
+    embedded_raw = str((qs.get("embedded") or ["0"])[0]).strip().lower()
+    embedded = embedded_raw in {"1", "true", "on", "yes"}
     if embedded:
-        observer = "global"
-        view_mode = "global"
         compare_values = []
     return run_value, observer, view_mode, compare_values
 
@@ -2548,6 +3371,8 @@ def apply_url_state(search: Optional[str], run_options, current_run):
     prevent_initial_call=True,
 )
 def sync_view_mode_with_observer(observer_value: Optional[str], current_view_mode: Optional[str]):
+    if str(current_view_mode or "").strip().lower() == "atlas":
+        return no_update
     observer_text = str(observer_value or "global").strip()
     next_view_mode = "global" if observer_text == "global" else "observer"
     if str(current_view_mode or "").strip().lower() == next_view_mode:
@@ -2774,6 +3599,7 @@ def update_gallery_progress(observer_value: str, observer_options):
     Input("observer-dropdown", "value"),
     Input("view-mode", "value"),
     Input("run-dropdown", "value"),
+    Input("url", "search"),
     Input("variant-a-dropdown", "value"),
     Input("variant-b-dropdown", "value"),
     Input("verification-source", "value"),
@@ -2790,6 +3616,7 @@ def render_dashboard(
     observer_value: str,
     view_mode: str,
     run_key: str,
+    url_search: Optional[str],
     variant_a: str,
     variant_b: str,
     verification_source: str,
@@ -2802,7 +3629,35 @@ def render_dashboard(
     label_values: List[str],
     _index_revision: int,
 ):
-    return _render_dashboard_impl(
+    trigger_id = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    if url_search:
+        try:
+            qs = parse_qs(str(url_search or "").lstrip("?"))
+        except Exception:
+            qs = {}
+        requested_run = str((qs.get("run_key") or qs.get("run") or [run_key])[0] or run_key)
+        if requested_run in INDEX.get("runs", {}):
+            run_key = requested_run
+        requested_observer = str((qs.get("observer") or [""])[0] or "").strip()
+        requested_uid = str((qs.get("observer_uid") or [""])[0] or "").strip()
+        observer_from_uid = _observer_value_from_uid(run_key, requested_uid)
+        obs_values = [o.get("value") for o in INDEX.get("observers_by_run", {}).get(run_key, []) if isinstance(o, dict)]
+        if observer_from_uid and observer_from_uid in obs_values:
+            observer_value = observer_from_uid
+        elif requested_observer in obs_values:
+            observer_value = requested_observer
+        requested_view_mode = str((qs.get("view_mode") or [view_mode])[0] or view_mode).lower()
+        if requested_view_mode == "atlas":
+            view_mode = "atlas"
+        elif str(observer_value or "global") != "global":
+            view_mode = "observer"
+        elif requested_view_mode in {"global", "observer"}:
+            view_mode = requested_view_mode
+    # The artifact iframe is mounted by URL, not by serializing the whole HTML
+    # through Dash. Reloading it is now cheap and much safer than preserving an
+    # empty initial container when Dash fires static control inputs first.
+    preserve_artifact_container = False
+    outputs = _render_dashboard_impl(
         run_key=run_key,
         observer_value=observer_value,
         variant_a=variant_a,
@@ -2818,7 +3673,10 @@ def render_dashboard(
         failure_overlay_values=failure_overlay_values,
         label_column=label_column,
         label_values=label_values,
+        include_physical_path=True,
+        preserve_artifact_container=preserve_artifact_container,
     )
+    return outputs
 
 
 def _extract_survival_rate(html_text: str) -> Optional[float]:
@@ -2861,7 +3719,7 @@ def _compute_gate_presentation(
         badge_text = "[NON-COMPARABLE]"
     else:
         badge_text = "[UNVERIFIED]"
-    watermark_visible = badge_text in {"[INVALID SCHEMA]", "[MISSING ARTIFACTS]", "[NON-COMPARABLE]"}
+    watermark_visible = badge_text in {"[INVALID SCHEMA]", "[MISSING ARTIFACTS]", "[NON-COMPARABLE]", "[UNVERIFIED]"}
     return {
         "claims_enabled": claims_enabled,
         "badge_text": badge_text,
@@ -2876,12 +3734,34 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
     label_source = str(matrix_blob.get("label_source", "unknown")) if isinstance(matrix_blob, dict) else "unknown"
 
     fig = go.Figure()
-    def _disabled_figure(title: str, reason: str):
+
+    def _panel_meta(
+        status: str,
+        reason: str,
+        *,
+        filtered_groups: Optional[List[str]] = None,
+        finite_off_diag_count: int = 0,
+        off_diag_span: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "panel": "empathy_gap",
+            "status": status,
+            "reason": reason,
+            "label_column": label_col or "group",
+            "label_source": label_source,
+            "group_count": int(len(groups)) if groups else 0,
+            "filtered_group_count": int(len(filtered_groups or [])),
+            "finite_off_diag_count": int(finite_off_diag_count),
+            "off_diag_span": None if off_diag_span is None else float(off_diag_span),
+        }
+
+    def _disabled_figure(title: str, reason: str, *, meta: Optional[Dict[str, Any]] = None):
         fig.update_layout(
             template="plotly_dark",
             margin={"l": 30, "r": 10, "t": 30, "b": 30},
             title=title,
             annotations=[{"text": reason, "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5, "showarrow": False}],
+            meta=meta or _panel_meta("disabled", reason),
         )
         return fig
 
@@ -2899,16 +3779,34 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
     fm = [[float(matrix[i][j]) for j in filtered_idx] for i in filtered_idx]
     arr = np.asarray(fm, dtype=float)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
-        return _disabled_figure("Empathy Gap (disabled)", "group_matrix shape is invalid")
+        return _disabled_figure(
+            "Empathy Gap (disabled)",
+            "group_matrix shape is invalid",
+            meta=_panel_meta("disabled", "group_matrix shape is invalid", filtered_groups=fg),
+        )
     off_diag_mask = ~np.eye(arr.shape[0], dtype=bool)
     off_diag = arr[off_diag_mask]
     finite_off_diag = off_diag[np.isfinite(off_diag)]
     if finite_off_diag.size <= 0:
-        return _disabled_figure("Empathy Gap (disabled)", "group_matrix has no finite off-diagonal values")
-    if np.nanmax(finite_off_diag) - np.nanmin(finite_off_diag) <= 1e-9:
         return _disabled_figure(
             "Empathy Gap (disabled)",
-            f"uniform off-diagonal costs from {label_source}; panel suppressed because it carries no structure",
+            "group_matrix has no finite off-diagonal values",
+            meta=_panel_meta("disabled", "group_matrix has no finite off-diagonal values", filtered_groups=fg),
+        )
+    off_diag_span = float(np.nanmax(finite_off_diag) - np.nanmin(finite_off_diag))
+    finite_count = int(finite_off_diag.size)
+    if off_diag_span <= 1e-9:
+        reason = f"uniform off-diagonal costs from {label_source}; panel suppressed because it carries no structure"
+        return _disabled_figure(
+            "Empathy Gap (disabled)",
+            reason,
+            meta=_panel_meta(
+                "disabled",
+                reason,
+                filtered_groups=fg,
+                finite_off_diag_count=finite_count,
+                off_diag_span=off_diag_span,
+            ),
         )
 
     fig.add_trace(
@@ -2916,8 +3814,15 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
             z=fm,
             x=fg,
             y=fg,
+            customdata=np.full(arr.shape, label_source, dtype=object),
             colorscale="Viridis",
             colorbar={"title": "Cost"},
+            hovertemplate=(
+                "From %{y}<br>"
+                "To %{x}<br>"
+                "Directed cost: %{z:.4f}<br>"
+                "Source: %{customdata}<extra></extra>"
+            ),
         )
     )
     fig.update_layout(
@@ -2926,6 +3831,13 @@ def _build_empathy_figure(contract: dict, label_col: Optional[str], label_values
         title="Empathy Gap Matrix (Directed Cost)",
         xaxis_title=label_col or "Group",
         yaxis_title="Observer Group",
+        meta=_panel_meta(
+            "active",
+            "nonuniform directed group costs",
+            filtered_groups=fg,
+            finite_off_diag_count=finite_count,
+            off_diag_span=off_diag_span,
+        ),
     )
     return fig
 
@@ -3053,6 +3965,262 @@ def _build_group_panel(contract: dict, label_col: Optional[str], label_values: O
     )
 
 
+def _build_atlas_panel(contract: dict, observer_value: str):
+    readiness = contract.get("observer_atlas_readiness", {}) if isinstance(contract.get("observer_atlas_readiness"), dict) else {}
+    status = str(readiness.get("status", "MISSING") or "MISSING").upper()
+    bundle = contract.get("observer_atlas_bundle", {}) if isinstance(contract.get("observer_atlas_bundle"), dict) else {}
+    metrics = bundle.get("metrics", {}) if isinstance(bundle.get("metrics"), dict) else {}
+    reasons = readiness.get("reasons") if isinstance(readiness.get("reasons"), list) else []
+    body: List[Any] = [
+        html.Div(
+            f"Observer: {observer_value} | slices={readiness.get('slice_count', 'n/a')} | routes={readiness.get('route_count', 'n/a')}",
+            style={"color": PALETTE["cyan"], "fontSize": "0.74rem"},
+        ),
+        html.Div(
+            style={"display": "grid", "gridTemplateColumns": "repeat(2, minmax(0, 1fr))", "gap": "8px"},
+            children=[
+                _metric_tile("Holonomy", metrics.get("mean_holonomy_action", readiness.get("mean_holonomy_action")), "Mean noncommuting path action"),
+                _metric_tile("Null Holonomy", metrics.get("mean_null_holonomy_action", readiness.get("mean_null_holonomy_action")), "Translation/null calibrated baseline"),
+                _metric_tile("Excess", metrics.get("mean_excess_holonomy_action", readiness.get("mean_excess_holonomy_action")), "Real minus null path distortion"),
+                _metric_tile("Routes", readiness.get("route_count"), "Rendered semantic/observer path loops"),
+            ],
+        ),
+    ]
+    if reasons:
+        body.append(
+            html.Div(
+                "Disabled: " + "; ".join(map(str, reasons[:4])),
+                style={"color": PALETTE["amber"], "fontSize": "0.74rem", "lineHeight": "1.3"},
+            )
+        )
+    source_path = readiness.get("path") or (bundle.get("_path") if isinstance(bundle, dict) else None)
+    if source_path:
+        body.append(html.Div(f"Source: {source_path}", style={"color": PALETTE["dim"], "fontSize": "0.7rem", "wordBreak": "break-all"}))
+    return _panel_shell(
+        "Observer Atlas",
+        "Atlas shows whether semantic travel and observer switching commute across observer-conditioned charts.",
+        status,
+        body,
+    )
+
+
+def _atlas_empty_figure(title: str, reason: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark",
+        title=title,
+        annotations=[
+            {
+                "text": reason,
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.5,
+                "y": 0.5,
+                "showarrow": False,
+                "font": {"color": PALETTE["amber"], "size": 16},
+            }
+        ],
+        margin={"l": 0, "r": 0, "t": 45, "b": 0},
+        meta={"panel": "observer_atlas", "status": "disabled", "reason": reason},
+    )
+    return fig
+
+
+def _slice_nodes_by_id(bundle: dict) -> Dict[str, dict]:
+    return {
+        str(row.get("slice_id")): row
+        for row in (bundle.get("slices") if isinstance(bundle.get("slices"), list) else [])
+        if isinstance(row, dict)
+    }
+
+
+def _node_arrays(slice_payload: dict) -> Tuple[List[float], List[float], List[float], List[str]]:
+    nodes = slice_payload.get("nodes") if isinstance(slice_payload.get("nodes"), list) else []
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+    labels: List[str] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if not (_is_number(node.get("x")) and _is_number(node.get("y"))):
+            continue
+        xs.append(float(node.get("x")))
+        ys.append(float(node.get("y")))
+        zs.append(float(node.get("z")) if _is_number(node.get("z")) else 0.0)
+        labels.append(f"article:{node.get('article_idx', node.get('row_index', 'n/a'))}<br>{node.get('label', '')}<br>zone={node.get('zone', 'n/a')}")
+    return xs, ys, zs, labels
+
+
+def _route_points(route: dict, key: str) -> Tuple[List[float], List[float], List[float]]:
+    leg = route.get(key) if isinstance(route.get(key), dict) else {}
+    points = leg.get("points") if isinstance(leg.get("points"), list) else []
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        if not (_is_number(point[0]) and _is_number(point[1])):
+            continue
+        xs.append(float(point[0]))
+        ys.append(float(point[1]))
+        zs.append(float(point[2] if len(point) > 2 and _is_number(point[2]) else 0.0))
+    return xs, ys, zs
+
+
+def _coerce_route_point(point: Any) -> Optional[Tuple[float, float, float]]:
+    if not isinstance(point, (list, tuple)) or len(point) < 2:
+        return None
+    if not (_is_number(point[0]) and _is_number(point[1])):
+        return None
+    return (
+        float(point[0]),
+        float(point[1]),
+        float(point[2] if len(point) > 2 and _is_number(point[2]) else 0.0),
+    )
+
+
+def _build_atlas_figure(contract: dict, observer_value: str) -> go.Figure:
+    readiness = contract.get("observer_atlas_readiness", {}) if isinstance(contract.get("observer_atlas_readiness"), dict) else {}
+    bundle = contract.get("observer_atlas_bundle", {}) if isinstance(contract.get("observer_atlas_bundle"), dict) else {}
+    status = str(readiness.get("status", "MISSING") or "MISSING").upper()
+    if status != "OK":
+        reason = "; ".join(map(str, readiness.get("reasons", [])[:3])) if readiness.get("reasons") else "Observer Atlas artifact unavailable."
+        return _atlas_empty_figure("Observer Atlas unavailable", reason)
+
+    fig = go.Figure()
+    slices = _slice_nodes_by_id(bundle)
+    for slice_id, slice_payload in slices.items():
+        xs, ys, zs, labels = _node_arrays(slice_payload)
+        if not xs:
+            continue
+        role = str(slice_payload.get("role", "observer"))
+        opacity = 0.24 if role in {"global", "null"} else 0.58
+        color = PALETTE["dim"] if role == "global" else (PALETTE["amber"] if role == "null" else PALETTE["cyan"])
+        fig.add_trace(
+            go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="markers",
+                name=f"slice:{slice_id}",
+                text=labels,
+                hovertemplate="%{text}<extra></extra>",
+                marker={"size": 3.5, "color": color, "opacity": opacity},
+            )
+        )
+
+    routes = _atlas_routes(bundle)
+    routes = sorted(
+        routes,
+        key=lambda row: -float(row.get("excess_holonomy_action") or row.get("holonomy_action") or 0.0),
+    )[:8]
+    for route_i, route in enumerate(routes):
+        semantic = _route_points(route, "semantic_first")
+        observer = _route_points(route, "observer_first")
+        label = f"{route.get('source_article_idx')} -> {route.get('target_article_idx')} | {route.get('source_slice')} -> {route.get('target_slice')}"
+        if semantic[0]:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=semantic[0],
+                    y=semantic[1],
+                    z=semantic[2],
+                    mode="lines+markers",
+                    name=f"semantic-first {route_i}",
+                    text=[label] * len(semantic[0]),
+                    hovertemplate=(
+                        "%{text}<br>semantic-first action="
+                        + str(route.get("semantic_first", {}).get("action"))
+                        + "<br>excess holonomy="
+                        + str(route.get("excess_holonomy_action"))
+                        + "<extra></extra>"
+                    ),
+                    line={"color": PALETTE["amber"], "width": 7},
+                    marker={"size": 4, "color": PALETTE["amber"]},
+                )
+            )
+        if observer[0]:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=observer[0],
+                    y=observer[1],
+                    z=observer[2],
+                    mode="lines+markers",
+                    name=f"observer-first {route_i}",
+                    text=[label] * len(observer[0]),
+                    hovertemplate=(
+                        "%{text}<br>observer-first action="
+                        + str(route.get("observer_first", {}).get("action"))
+                        + "<br>relative holonomy="
+                        + str(route.get("relative_holonomy"))
+                        + "<extra></extra>"
+                    ),
+                    line={"color": PALETTE["cyan"], "width": 7},
+                    marker={"size": 4, "color": PALETTE["cyan"]},
+                )
+            )
+        closed = route.get("closed_loop_points") if isinstance(route.get("closed_loop_points"), list) else []
+        if closed:
+            coerced_points = [_coerce_route_point(p) for p in closed]
+            valid_points = [p for p in coerced_points if p is not None]
+            xs = [p[0] for p in valid_points]
+            ys = [p[1] for p in valid_points]
+            zs = [p[2] for p in valid_points]
+            if xs:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=xs,
+                        y=ys,
+                        z=zs,
+                        mode="lines",
+                        name=f"holonomy loop {route_i}",
+                        hovertemplate=f"{label}<br>closed observer-slice loop<extra></extra>",
+                        line={"color": "rgba(255,255,255,0.45)", "width": 3, "dash": "dot"},
+                    )
+                )
+
+    fig.update_layout(
+        template="plotly_dark",
+        title=f"Observer Atlas: {observer_value}",
+        scene={
+            "xaxis_title": "semantic chart x",
+            "yaxis_title": "semantic chart y",
+            "zaxis_title": "terrain / chart z",
+            "bgcolor": "#020208",
+        },
+        margin={"l": 0, "r": 0, "t": 45, "b": 0},
+        uirevision="observer-atlas",
+        legend={"orientation": "h", "y": 0.02, "x": 0.02},
+        meta={"panel": "observer_atlas", "status": "active", "route_count": len(routes)},
+    )
+    return fig
+
+
+def _build_atlas_container(contract: dict, observer_value: str):
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("Observer Atlas", style={"color": PALETTE["text"], "fontWeight": "800", "fontSize": "1rem"}),
+                    html.Div(
+                        "Semantic-first and observer-first routes through overlapping observer charts. The gap is the holonomy evidence.",
+                        style={"color": PALETTE["dim"], "fontSize": "0.8rem"},
+                    ),
+                ],
+                style={"position": "absolute", "zIndex": 2, "left": "18px", "top": "14px", "padding": "10px 12px", "border": f"1px solid {PALETTE['grid']}", "borderRadius": "10px", "background": "rgba(2,2,8,0.82)"},
+            ),
+            dcc.Graph(
+                id="observer-atlas-graph",
+                figure=_build_atlas_figure(contract, observer_value),
+                style={"height": "100vh", "width": "100%"},
+                config={"displayModeBar": True, "responsive": True},
+            ),
+        ],
+        style={"height": "100vh", "width": "100%", "position": "relative", "background": "#020208"},
+    )
+
+
 def _build_relativity_panel(contract: dict, observer_value: str, delta_mode: str, translation_mode_values: List[str]):
     if observer_value == "global":
         return _panel_shell(
@@ -3156,6 +4324,8 @@ def _render_dashboard_impl(
     failure_overlay_values: List[str],
     label_column: Optional[str],
     label_values: List[str],
+    include_physical_path: bool = False,
+    preserve_artifact_container: bool = False,
 ):
     if not INDEX["run_keys"] or not run_key:
         empty = build_empty_index_fallback()
@@ -3173,11 +4343,13 @@ def _render_dashboard_impl(
         detail = f"artifact_roots={INDEX.get('artifact_root_count', 0)} | primary={INDEX.get('artifact_root') or 'NOT FOUND'}"
         empty_fig = go.Figure()
         empty_fig.update_layout(template="plotly_dark", title="Empathy Gap Matrix (unavailable)")
-        return (
+        legacy_tuple = (
             empty,
             "Artifact: NOT FOUND",
             "Run Score | n/a",
             "Article Metrics: n/a",
+        )
+        remainder = (
             _track_status_component({k: "unknown" for k in TRACK_MARKERS}),
             _track_delta_component({k: "unknown" for k in TRACK_MARKERS}, {k: "unknown" for k in TRACK_MARKERS}),
             "Observer Artifact Coverage: n/a",
@@ -3199,10 +4371,17 @@ def _render_dashboard_impl(
             "",
             {"display": "none"},
         )
+        if include_physical_path:
+            return legacy_tuple + ("PHYSICAL PATH: n/a",) + remainder
+        return legacy_tuple + remainder
 
     run = INDEX["runs"].get(run_key, {})
     compare_enabled = compare_enabled_values is not None and "on" in compare_enabled_values
-    effective_observer = "global" if view_mode == "global" else observer_value
+    atlas_view_active = str(view_mode or "").strip().lower() == "atlas"
+    if atlas_view_active:
+        compare_enabled = False
+    observer_render_active = str(observer_value or "").startswith("article:")
+    effective_observer = observer_value if observer_render_active else ("global" if view_mode == "global" else observer_value)
     contract = load_contract_state(run_key, effective_observer)
     contract_status = contract.get("status", "INVALID_SCHEMA")
     contract_errors = contract.get("errors", [])
@@ -3210,57 +4389,78 @@ def _render_dashboard_impl(
     missing_required = contract.get("missing_required_artifacts", [])
     missing_optional = contract.get("missing_optional_artifacts", [])
     baseline_meta = contract.get("baseline_meta", {}) or {}
-    contract_global = load_contract_state(run_key, "global") if (run_key and view_mode == "observer" and observer_value.startswith("article:")) else contract
+    contract_global = load_contract_state(run_key, "global") if (run_key and observer_render_active) else contract
 
-    if view_mode == "observer" and observer_value.startswith("article:"):
+    if observer_render_active:
         p_a = resolve_artifact(run_key, variant_a, "global") if run_key else None
         p_b = resolve_artifact(run_key, variant_b, observer_value) if run_key else None
     else:
         p_a = resolve_artifact(run_key, variant_a, effective_observer) if run_key else None
         p_b = resolve_artifact(run_key, variant_b, effective_observer) if run_key else None
 
-    text_a = _safe_read_text(p_a) if (p_a and p_a.exists()) else ""
-    text_b = _safe_read_text(p_b) if (p_b and p_b.exists()) else ""
+    should_mount_a = (
+        not preserve_artifact_container
+        and p_a is not None
+        and p_a.exists()
+        and (compare_enabled or not observer_render_active)
+    )
+    should_mount_b = (
+        not preserve_artifact_container
+        and p_b is not None
+        and p_b.exists()
+        and (compare_enabled or observer_render_active)
+    )
 
-    if text_a:
-        c_a = _transition_wrapper(_artifact_iframe(text_a), transition_style)
+    if preserve_artifact_container:
+        c_a = no_update
+    elif should_mount_a and p_a is not None:
+        c_a = _transition_wrapper(_artifact_iframe_from_file(p_a, run_key, variant_a, "global" if observer_render_active else effective_observer), transition_style)
     else:
         c_a = build_terminal_fallback(effective_observer, run_key, variant_a, gallery_tick)
 
     if compare_enabled:
-        if text_b:
-            c_b = _transition_wrapper(_artifact_iframe(text_b), transition_style)
+        if preserve_artifact_container:
+            container = no_update
         else:
-            c_b = build_terminal_fallback(effective_observer, run_key, variant_b, gallery_tick)
-        container = dbc.Row(
-            className="g-0",
-            style={"height": "90vh"},
-            children=[
-                dbc.Col([html.Div("Variant A", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_a, style={"height": "calc(90vh - 28px)"})], width=6),
-                dbc.Col([html.Div("Variant B", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_b, style={"height": "calc(90vh - 28px)"})], width=6),
-            ],
-        )
+            if should_mount_b and p_b is not None:
+                c_b = _transition_wrapper(_artifact_iframe_from_file(p_b, run_key, variant_b, observer_value if observer_render_active else effective_observer), transition_style)
+            else:
+                c_b = build_terminal_fallback(effective_observer, run_key, variant_b, gallery_tick)
+            container = dbc.Row(
+                className="g-0",
+                style={"height": "90vh"},
+                children=[
+                    dbc.Col([html.Div("Variant A", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_a, style={"height": "calc(90vh - 28px)"})], width=6),
+                    dbc.Col([html.Div("Variant B", style={"color": PALETTE["cyan"], "padding": "4px 8px"}), html.Div(c_b, style={"height": "calc(90vh - 28px)"})], width=6),
+                ],
+            )
         path_text = f"A: {p_a if p_a else 'NOT FOUND'} | B: {p_b if p_b else 'NOT FOUND'}"
     else:
         single_view_path = p_a
         single_view = c_a
-        if view_mode == "observer" and observer_value.startswith("article:"):
-            if p_b and p_b.exists() and text_b:
+        if observer_render_active:
+            if p_b and p_b.exists():
                 single_view_path = p_b
-                single_view = _transition_wrapper(_artifact_iframe(text_b), transition_style)
+                if should_mount_b:
+                    single_view = _transition_wrapper(_artifact_iframe_from_file(p_b, run_key, variant_b, observer_value), transition_style)
             else:
                 single_view_path = None
-                single_view = build_terminal_fallback(observer_value, run_key, variant_b, gallery_tick)
+                single_view = no_update if preserve_artifact_container else build_terminal_fallback(observer_value, run_key, variant_b, gallery_tick)
         container = single_view
         path_text = f"Artifact: {single_view_path if single_view_path else 'NOT FOUND'}"
 
-    graph_observer_a = "global" if (view_mode == "observer" and observer_value.startswith("article:")) else effective_observer
+    if atlas_view_active and not preserve_artifact_container:
+        container = _transition_wrapper(_build_atlas_container(contract, effective_observer), transition_style)
+        atlas_ready = contract.get("observer_atlas_readiness", {}) if isinstance(contract.get("observer_atlas_readiness"), dict) else {}
+        path_text = f"Atlas: {atlas_ready.get('status', 'MISSING')} | {atlas_ready.get('path', 'observer_atlas_bundle.json NOT FOUND')}"
+
+    graph_observer_a = "global" if observer_render_active else effective_observer
     graph_observer_b = effective_observer
     raw_state_a = contract_global.get("baseline_state", {}) if graph_observer_a == "global" else contract_global.get("observer_state", {})
     raw_state_b = contract.get("baseline_state", {}) if graph_observer_b == "global" else contract.get("observer_state", {})
     artifact_state_a = _hydrate_artifact_state(run_key, raw_state_a, p_a)
     artifact_state_b = _hydrate_artifact_state(run_key, raw_state_b, p_b)
-    artifact_state = artifact_state_b if (view_mode == "observer" and observer_value.startswith("article:")) else artifact_state_a
+    artifact_state = artifact_state_b if observer_render_active else artifact_state_a
     artifact_metrics = artifact_state.get("metrics", {}) if isinstance(artifact_state, dict) else {}
 
     run_score = f"Run Score | kernel={run.get('kernel', 'unknown')} seed={run.get('seed', 'unknown')} NMI={run.get('nmi', 'n/a')} ARI={run.get('ari', 'n/a')}"
@@ -3298,11 +4498,14 @@ def _render_dashboard_impl(
         except Exception:
             pass
 
-    snapshot_a = _compute_track_snapshot(run_key, artifact_state_a, contract_global, "global" if view_mode == "observer" and observer_value.startswith("article:") else effective_observer)
+    snapshot_a = _compute_track_snapshot(run_key, artifact_state_a, contract_global, "global" if observer_render_active else effective_observer)
     snapshot_b = _compute_track_snapshot(run_key, artifact_state_b, contract, effective_observer)
-    primary_snapshot = snapshot_b if (view_mode == "observer" and observer_value.startswith("article:")) else snapshot_a
+    primary_snapshot = snapshot_b if observer_render_active else snapshot_a
     track_readout = _track_status_component(primary_snapshot)
     track_compare_readout = _track_delta_component(snapshot_a, snapshot_b)
+    leaf_bits = _build_leaf_artifact_readout_bits(contract)
+    if leaf_bits.get("run_score"):
+        run_score += " | " + " | ".join(leaf_bits["run_score"])
     found_a, total_a = _artifact_coverage(run_key, variant_a) if run_key else (0, 0)
     found_b, total_b = _artifact_coverage(run_key, variant_b) if run_key else (0, 0)
     if compare_enabled:
@@ -3312,6 +4515,8 @@ def _render_dashboard_impl(
         )
     else:
         coverage_text = f"Observer Artifact Coverage (Variant A): {found_a}/{total_a}" if total_a > 0 else "Observer Artifact Coverage: n/a"
+    if leaf_bits.get("coverage"):
+        coverage_text += " | " + " | ".join(leaf_bits["coverage"])
 
     state = load_verification_state(run_key, verification_source)
     verification_status = str(state.get("verification_status", "UNVERIFIED")).upper()
@@ -3330,6 +4535,13 @@ def _render_dashboard_impl(
     if compare_enabled:
         surv_a = snapshot_a.get("T4", {}).get("survival")
         surv_b = snapshot_b.get("T4", {}).get("survival")
+        if not (_is_number(surv_a) and _is_number(surv_b)):
+            text_a = _safe_read_text(p_a) if p_a is not None and p_a.exists() else ""
+            text_b = _safe_read_text(p_b) if p_b is not None and p_b.exists() else ""
+            extracted_a = _extract_survival_rate(text_a)
+            extracted_b = _extract_survival_rate(text_b)
+            surv_a = extracted_a if extracted_a is not None else surv_a
+            surv_b = extracted_b if extracted_b is not None else surv_b
         if _is_number(surv_a) and _is_number(surv_b) and abs(float(surv_a) - float(surv_b)) > 0.20:
             type2_dissonance = True
 
@@ -3345,11 +4557,11 @@ def _render_dashboard_impl(
         badge_style = dict(base_badge, color="#FF2A00", border="1px solid #FF2A00", backgroundColor="rgba(255,42,0,0.12)", boxShadow="0 0 12px rgba(255,42,0,0.4)", animation="glitchFlash 0.9s steps(2,end) infinite")
 
     if claims_enabled:
-        t1 = f"System 1: Verification gate passed | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))}"
+        t1 = f"System 1: Topologic Integrity | verification gate passed | seed_stability={_fmt_pass(state.get('seed_stability'))} | crn_locked={_fmt_pass(state.get('crn_locked'))}"
         t2 = f"System 2: Geometric Friction = {_fmt_metric(state.get('geometric_friction'))} (broken={state.get('n_broken', 0)}, trapped={state.get('n_trapped', 0)})"
         t3 = f"System 2: Survival % = {_fmt_metric(state.get('survival_pct'))}%"
     elif badge_text == "[UNVERIFIED]":
-        t1 = "System 1: Verification bundle is pending; provenance is present but the formal gate has not been finalized for this leaf."
+        t1 = "System 1: Claims disabled (verification bundle pending; provenance is present but the formal gate has not been finalized for this leaf)."
         t2 = "System 2: Geometric Friction = " + (
             f"{_fmt_metric(state.get('geometric_friction'))} (telemetry present, interpret as provisional)"
             if _is_number(state.get("geometric_friction"))
@@ -3378,19 +4590,16 @@ def _render_dashboard_impl(
     ctrl = load_control_state(run_key)
     ablation_text = _build_ablation_panel(ab)
     control_text = _build_control_panel(ctrl)
-
-    provenance_line = (
-        " | ".join(
-            [
-                f"weights={baseline_meta.get('weights_hash', 'n/a')}",
-                f"dataset={baseline_meta.get('dataset_hash', 'n/a')}",
-                f"kernel={baseline_meta.get('kernel_params', 'n/a')}",
-                f"rks_dim={baseline_meta.get('rks_dim', 'n/a')}",
-                f"seed={baseline_meta.get('crn_seed', 'n/a')}",
-                f"alpha={baseline_meta.get('alpha', 'n/a')}",
-            ]
-        )
-    )
+    provenance_parts = [
+        f"weights={baseline_meta.get('weights_hash', 'n/a')}",
+        f"dataset={baseline_meta.get('dataset_hash', 'n/a')}",
+        f"kernel={baseline_meta.get('kernel_params', 'n/a')}",
+        f"rks_dim={baseline_meta.get('rks_dim', 'n/a')}",
+        f"seed={baseline_meta.get('crn_seed', 'n/a')}",
+        f"alpha={baseline_meta.get('alpha', 'n/a')}",
+    ]
+    provenance_parts.extend(leaf_bits.get("provenance", []))
+    provenance_line = " | ".join(provenance_parts)
 
     hidden_rows = contract.get("hidden_groups", []) or []
     if hidden_rows:
@@ -3409,12 +4618,18 @@ def _render_dashboard_impl(
             hidden_detail += f" | missing_optional_artifacts={','.join(sanitized_missing_optional)}"
 
     relativity_panel = _build_relativity_panel(contract, effective_observer, delta_mode, translation_mode_values or [])
-    group_panel = _build_group_panel(contract, label_column, label_values or [])
+    group_panel = html.Div(
+        [
+            _build_group_panel(contract, label_column, label_values or []),
+            html.Div(style={"height": "8px"}),
+            _build_atlas_panel(contract, effective_observer),
+        ]
+    )
     empathy_fig = _build_empathy_figure(contract, label_column, label_values or [])
 
     watermark_visible = bool(gate.get("watermark_visible"))
     if watermark_visible:
-        watermark_text = badge_text.strip("[]")
+        watermark_text = "UNVERIFIED / EXPLORATORY"
         watermark_style = {
             "display": "flex",
             "position": "fixed",
@@ -3436,12 +4651,11 @@ def _render_dashboard_impl(
 
     physical_path = str(single_view_path.resolve()) if (not compare_enabled and single_view_path) else (f"A: {p_a.resolve() if p_a else 'n/a'} | B: {p_b.resolve() if p_b else 'n/a'}")
 
-    return (
+    legacy_tuple = (
         container,
         path_text,
         run_score,
         article_metric_text,
-        f"PHYSICAL PATH: {physical_path}",
         track_readout,
         track_compare_readout,
         coverage_text,
@@ -3463,6 +4677,9 @@ def _render_dashboard_impl(
         watermark_text,
         watermark_style,
     )
+    if include_physical_path:
+        return legacy_tuple[:4] + (f"PHYSICAL PATH: {physical_path}",) + legacy_tuple[4:]
+    return legacy_tuple
 
 
 if __name__ == "__main__":

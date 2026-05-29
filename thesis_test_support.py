@@ -283,6 +283,191 @@ def write_monolith_data(path: Path, *, collapsed: bool = False) -> None:
     )
 
 
+def write_hidden_groups(path: Path, labels: Dict[int, str]) -> None:
+    write_csv(
+        path,
+        [
+            {"article_id": int(article_id), "group_topic": str(label)}
+            for article_id, label in sorted(labels.items())
+        ],
+        fieldnames=["article_id", "group_topic"],
+    )
+
+
+def write_synthetic_terrain_incremental_fixture(run_dir: Path) -> None:
+    rows = []
+    labels: Dict[int, str] = {}
+    specs = [
+        ("ClusterA", "Bridge", 10.0, 0.90, 0.10),
+        ("ClusterA", "Bridge", 11.0, 0.88, 0.12),
+        ("ClusterA", "Bridge", 12.0, 0.86, 0.14),
+        ("ClusterA", "Void", 40.0, 0.10, 0.92),
+        ("ClusterA", "Void", 41.0, 0.12, 0.90),
+        ("ClusterA", "Void", 42.0, 0.14, 0.88),
+        ("ClusterB", "Swamp", 20.0, 0.82, 0.80),
+        ("ClusterB", "Swamp", 21.0, 0.80, 0.78),
+        ("ClusterB", "Swamp", 22.0, 0.78, 0.76),
+        ("ClusterB", "Tightrope", 50.0, 0.18, 0.20),
+        ("ClusterB", "Tightrope", 51.0, 0.20, 0.18),
+        ("ClusterB", "Tightrope", 52.0, 0.22, 0.16),
+    ]
+    for idx, (label, zone, work, density, stress) in enumerate(specs):
+        labels[idx] = label
+        rows.append(
+            {
+                "index": idx,
+                "bt_uid": f"s{idx}",
+                "title": f"{label} {zone} {idx}",
+                "zone": zone,
+                "density": density,
+                "stress": stress,
+                "w_actual": work,
+                "x": float(idx),
+                "y": float(idx % 3),
+            }
+        )
+    write_csv(
+        run_dir / "MONOLITH_DATA.csv",
+        rows,
+        fieldnames=["index", "bt_uid", "title", "zone", "density", "stress", "w_actual", "x", "y"],
+    )
+    write_hidden_groups(run_dir / "labels" / "hidden_groups.csv", labels)
+
+
+def write_track4_observer_state_action_summary(path: Path) -> None:
+    rows = []
+    for kernel in ("rbf", "matern", "imq"):
+        rows.extend(
+            [
+                {
+                    "run_name": f"real_{kernel}_full_20260521",
+                    "summary_path": str(path.parent / f"real_{kernel}" / "track4_action_summary.json"),
+                    "corpus": "real",
+                    "kernel": kernel,
+                    "ablation": "full",
+                    "observer_state_mode": "enabled",
+                    "mean_action": 12.0,
+                    "mean_observer_transport_penalty": 3.0,
+                    "mean_hysteresis_penalty": 1.2,
+                    "observer_simplex_contract_supported": True,
+                },
+                {
+                    "run_name": f"control_random_{kernel}_full_20260521",
+                    "summary_path": str(path.parent / f"control_random_{kernel}" / "track4_action_summary.json"),
+                    "corpus": "control_random",
+                    "kernel": kernel,
+                    "ablation": "full",
+                    "observer_state_mode": "enabled",
+                    "mean_action": 6.0,
+                    "mean_observer_transport_penalty": 1.0,
+                    "mean_hysteresis_penalty": 0.4,
+                    "observer_simplex_contract_supported": True,
+                },
+                {
+                    "run_name": f"control_shuffled_{kernel}_shuffled_20260521",
+                    "summary_path": str(path.parent / f"control_shuffled_{kernel}" / "track4_action_summary.json"),
+                    "corpus": "control_shuffled",
+                    "kernel": kernel,
+                    "ablation": "shuffled",
+                    "observer_state_mode": "shuffled",
+                    "mean_action": 5.0,
+                    "mean_observer_transport_penalty": 0.8,
+                    "mean_hysteresis_penalty": 0.3,
+                    "observer_simplex_contract_supported": True,
+                },
+                {
+                    "run_name": f"real_{kernel}_observer_disabled_20260521",
+                    "summary_path": str(path.parent / f"real_{kernel}_observer_disabled" / "track4_action_summary.json"),
+                    "corpus": "real",
+                    "kernel": kernel,
+                    "ablation": "observer_disabled",
+                    "observer_state_mode": "disabled",
+                    "mean_action": 8.0,
+                    "mean_observer_transport_penalty": 0.0,
+                    "mean_hysteresis_penalty": 0.0,
+                    "observer_simplex_contract_supported": True,
+                },
+                {
+                    "run_name": f"real_{kernel}_zero_hysteresis_20260521",
+                    "summary_path": str(path.parent / f"real_{kernel}_zero_hysteresis" / "track4_action_summary.json"),
+                    "corpus": "real",
+                    "kernel": kernel,
+                    "ablation": "zero_hysteresis",
+                    "observer_state_mode": "zero_hysteresis",
+                    "mean_action": 9.0,
+                    "mean_observer_transport_penalty": 2.5,
+                    "mean_hysteresis_penalty": 0.0,
+                    "observer_simplex_contract_supported": True,
+                },
+            ]
+        )
+    payload = {
+        "schema_version": "1.0",
+        "summary_type": "track4_observer_state_ablation",
+        "claim_scope": "exploratory_track4",
+        "safe_for_thesis_claim": True,
+        "pass": True,
+        "thesis_safe": True,
+        "row_count": len(rows),
+        "rows": rows,
+        "required_kernels": ["rbf", "matern", "imq"],
+        "kernels_present": ["rbf", "matern", "imq"],
+        "missing_required_kernels": [],
+        "required_kernels_present": True,
+        "observer_simplex_row_count": 6,
+        "observer_simplex_contract_supported": True,
+        "comparisons": {
+            "real_vs_control": {
+                "mean_action": {"real": 12.0, "control": 6.0, "gap": 6.0, "ratio": 2.0},
+                "mean_observer_transport_penalty": {"real": 3.0, "control": 1.0, "gap": 2.0, "ratio": 3.0},
+                "mean_hysteresis_penalty": {"real": 1.2, "control": 0.4, "gap": 0.8, "ratio": 3.0},
+            }
+        },
+        "baseline_comparisons": {
+            "observer_disabled": {
+                "mean_observer_transport_penalty": {
+                    "full_real": 3.0,
+                    "baseline": 0.0,
+                    "gap_vs_full_real": -3.0,
+                    "ratio_full_real_over_baseline": None,
+                }
+            },
+            "zero_hysteresis": {
+                "mean_hysteresis_penalty": {
+                    "full_real": 1.2,
+                    "baseline": 0.0,
+                    "gap_vs_full_real": -1.2,
+                    "ratio_full_real_over_baseline": None,
+                }
+            },
+            "shuffled": {
+                "mean_hysteresis_penalty": {
+                    "full_real": 1.2,
+                    "baseline": 0.3,
+                    "gap_vs_full_real": -0.9,
+                    "ratio_full_real_over_baseline": 4.0,
+                }
+            },
+        },
+        "claim_evaluation": {
+            "claim_id": "track4_observer_state_action_separation",
+            "claim_scope": "exploratory_track4",
+            "pass": True,
+            "thesis_safe": True,
+            "safe_for_thesis_claim": True,
+            "failure_reasons": [],
+            "required_kernels_present": True,
+            "observer_simplex_contract_supported": True,
+            "real_control_separation_pass": True,
+            "shuffled_hysteresis_baseline_pass": True,
+            "observer_disabled_transport_baseline_pass": True,
+            "point_estimate": 2.0,
+            "effect_direction": "real_observer_state_action_gt_controls",
+        },
+    }
+    write_json(path, payload)
+
+
 def write_suite_manifest(
     path: Path,
     *,
@@ -463,6 +648,19 @@ def build_canonical_fixture(
             kernels=kernels,
             seeds=seeds,
         )
+        for kernel in kernels:
+            for seed in seeds:
+                write_synthetic_terrain_incremental_fixture(
+                    synthetic_dir / "synthetic" / f"{kernel}_seed{seed}"
+                )
+
+    write_track4_observer_state_action_summary(
+        root
+        / "outputs"
+        / "track4_action_graph"
+        / "fixture_observer_state"
+        / "track4_observer_state_ablation_summary.json"
+    )
 
     return {
         "root": root,
