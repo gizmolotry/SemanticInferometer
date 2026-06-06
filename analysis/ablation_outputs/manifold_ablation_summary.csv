@@ -1,0 +1,5 @@
+stress_mode,zone_rule,n_rows,scalar_min,scalar_max,scalar_bin_coverage,missing_zone_count,Bridge,Swamp,Tightrope,Void
+raw_l2,fixed_0_5_threshold,80,11.768210392863795,37.42307240431121,0.125,2,0,54,0,26
+raw_l2,median_threshold,80,11.768210392863795,37.42307240431121,0.125,0,18,22,22,18
+normalized_l2,fixed_0_5_threshold,80,0.1630232013454157,0.908756810841195,0.875,0,22,32,10,16
+normalized_l2,median_threshold,80,0.1630232013454157,0.908756810841195,0.875,0,18,22,22,18

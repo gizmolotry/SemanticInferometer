@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
-import shutil
+import json
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+import analysis.MONOLITH_VIZ as monolith_viz
 from analysis.MONOLITH_VIZ import (
     PROBE_LABELS,
     ExperimentData,
@@ -26,17 +28,6 @@ from core.dirichlet_fusion import SharedRKSBasis
 
 def _require_plotly() -> None:
     pytest.importorskip("plotly")
-
-
-@pytest.fixture
-def tmp_path(request):
-    root = Path.cwd() / ".pytest_local_tmp"
-    root.mkdir(parents=True, exist_ok=True)
-    case_dir = root / request.node.name
-    if case_dir.exists():
-        shutil.rmtree(case_dir, ignore_errors=True)
-    case_dir.mkdir(parents=True, exist_ok=True)
-    return case_dir
 
 
 def _make_experiment(tmp_path: Path, spectral_probe_magnitudes: np.ndarray | None) -> ExperimentData:
@@ -143,6 +134,98 @@ def test_rupture_inputs_collapse_to_phantom_render_contract(monkeypatch):
     assert "Ideological Shear" in names, names
 
 
+def test_track4_path_hover_includes_cyclic_telemetry():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.2], [1.0, 0.5, 0.4]], dtype=float)
+    walker_paths = {
+        0: np.array(
+            [
+                [0.0, 0.0, 0.2],
+                [0.2, 0.1, 0.3],
+                [0.6, 0.3, 0.5],
+            ],
+            dtype=float,
+        )
+    }
+    phantom_verdicts = [
+        {"verdict": "PHANTOM", "walker_state": "success"},
+        {"verdict": "HONEST", "walker_state": "success"},
+    ]
+    diagnostics = {
+        0: {
+            "work_integral": 12.345,
+            "closed_loop": True,
+            "walker_kind": "hot",
+            "anchor_terrain": "Bridge",
+            "path_length": 1.75,
+        }
+    }
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        walker_path_diagnostics=diagnostics,
+        article_metadata=[{"title": "Anchor Article"}, {"title": "Target Article"}],
+    )
+
+    hover_blobs = []
+    for trace in traces:
+        for attr in ("text", "hovertext"):
+            value = getattr(trace, attr, None)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                hover_blobs.append(value)
+            else:
+                hover_blobs.extend(str(item) for item in value)
+    hover_blob = "\n".join(hover_blobs)
+
+    assert "Work integral: 12.345" in hover_blob
+    assert "Closed loop: true" in hover_blob
+    assert "Walker class: hot" in hover_blob
+    assert "Anchor terrain: Bridge" in hover_blob
+    assert "Path steps: 2" in hover_blob
+
+
+def test_track4_fallback_paths_remain_hoverable_without_diagnostics():
+    _require_plotly()
+    positions_3d = np.array([[0.0, 0.0, 0.1], [1.0, 0.0, 0.2]], dtype=float)
+    walker_paths = {
+        0: np.array([[0.0, 0.0, 0.1], [0.5, 0.0, 0.2], [1.0, 0.0, 0.3]], dtype=float)
+    }
+    phantom_verdicts = [
+        {"verdict": "PHANTOM", "walker_state": "success"},
+        {"verdict": "HONEST", "walker_state": "success"},
+    ]
+
+    traces = render_phantom_paths_3d(
+        phantom_verdicts=phantom_verdicts,
+        positions_3d=positions_3d,
+        walker_paths=walker_paths,
+        walker_path_diagnostics=None,
+    )
+
+    path_traces = [t for t in traces if str(getattr(t, "name", "")) == "Phantom Path"]
+    assert path_traces
+    assert all(str(getattr(t, "hoverinfo", "")) == "text" for t in path_traces)
+    assert all("%{text}<extra></extra>" in str(getattr(t, "hovertemplate", "")) for t in path_traces)
+
+
+def test_monolith_defaults_keep_ranked_track4_paths_visible_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert "show_phantom_paths: bool = True" in source
+    assert 'os.environ.get("MONOLITH_SHOW_GLOBAL_PATHS", "1")' in source
+
+
+def test_synthesis_mode_respects_renderer_hidden_ribbon_metadata():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert 'existing_meta["synthesis_default_visible"] = False' in source
+    assert "tMeta.synthesis_default_visible === false" in source
+
+
 def test_missing_logits_keeps_t1_nmi_unavailable_via_function():
     _require_plotly()
     n = 6
@@ -198,6 +281,26 @@ def test_load_experiment_data_recovers_spectral_evr_from_checkpoint(monkeypatch,
     assert np.array_equal(exp.spectral_dipole_valid, dipole_valid)
 
 
+def test_load_experiment_data_fails_fast_on_contract_violation(tmp_path):
+    exp_dir = tmp_path / "matern" / "seed_42"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    np.save(exp_dir / "features.npy", np.array([[0.1, 0.2]], dtype=float))
+
+    with pytest.raises(RuntimeError, match="CRITICAL CONTRACT VIOLATION"):
+        load_experiment_data(exp_dir)
+
+
+def test_load_experiment_data_legacy_bypass_requires_explicit_env(monkeypatch, tmp_path):
+    exp_dir = tmp_path / "matern" / "seed_42"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    np.save(exp_dir / "features.npy", np.array([[0.1, 0.2]], dtype=float))
+    monkeypatch.setenv("MONOLITH_ALLOW_CONTRACT_BYPASS", "1")
+
+    exp = load_experiment_data(exp_dir)
+
+    assert exp.n_articles == 1
+
+
 def test_persisted_track_nmi_overrides_proxy_recompute():
     _require_plotly()
     n = 6
@@ -231,6 +334,8 @@ def test_mode_specific_camera_presets_are_applied(monkeypatch, tmp_path):
     eye_ana = tuple(float(fig_ana.layout.scene.camera.eye[k]) for k in ("x", "y", "z"))
     eye_dia = tuple(float(fig_dia.layout.scene.camera.eye[k]) for k in ("x", "y", "z"))
     assert len({eye_syn, eye_ana, eye_dia}) >= 2
+    for eye in (eye_syn, eye_ana, eye_dia):
+        assert max(abs(v) for v in eye) <= 1.75
 
     for html_blob, expected_mode in ((html_syn, "synthesis"), (html_ana, "analysis"), (html_dia, "diagnostics")):
         assert f'var currentMode = "{expected_mode}";' in html_blob
@@ -251,6 +356,13 @@ def test_synthesis_shell_uses_instrument_panel_and_layer_toggles(monkeypatch, tm
     assert "VIEW CONTRACT" not in html_syn
     assert "Show shear diagnostics" not in html_syn
     assert 'var SECONDARY_MODES_ENABLED = false;' in html_syn
+    assert "var cockpitReady = Plotly.newPlot" in html_syn
+    assert "cockpitReady.then(initializeAfterPlotReady)" in html_syn
+    assert "toggle-phantom-ribbons').checked : true" in html_syn
+    assert "function scheduleTrack4HoverUpdate(anchorIdx)" in html_syn
+    assert "window.requestAnimationFrame(flushHoverAnchor)" in html_syn
+    assert "window.setTimeout(flushHoverAnchor, 16)" in html_syn
+    assert "animate: false, showContext: true" in html_syn
     assert "â†”" not in html_syn
 
 
@@ -276,6 +388,53 @@ def test_synthesis_product_html_includes_analysis_button_but_not_diagnostics_but
     assert 'var SECONDARY_MODES_ENABLED = true;' in html_syn
 
 
+def test_track4_path_segments_are_hoverable_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert "Segment coding: length drives width, opacity, and lift" in source
+    assert "hovertemplate='%{text}<extra></extra>'" in source
+
+
+def test_track4_anchor_loop_stats_are_aggregated_once_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert source.count('stats["count"] += 1.0') == 1
+    assert source.count('stats["work_total"] += float(work_score)') == 1
+
+
+def test_track4_swarm_highlight_uses_segment_index_cache_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert "function ensureTrack4SegmentIndex" in source
+    assert "function getTrack4SegmentTraceIndices" in source
+    assert "var contextBudget = 80;" in source
+    assert "var traceIndices = getTrack4SegmentTraceIndices(gd, target, showContext);" in source
+
+
+def test_track4_inline_audit_panel_mount_exists_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert '<div id="hero-audit-panel"></div>' in source
+    assert "function renderTrack4AuditPanel(anchorPayload)" in source
+    assert "document.getElementById('hero-audit-panel')" in source
+
+
+def test_track4_anchor_click_routes_to_audit_popup_and_inline_panel_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert "function extractTrack4AnchorPoint(evt)" in source
+    assert "cockpitEl.on('plotly_click', function(evt)" in source
+    assert "openTrack4Audit(point.customdata);" in source
+
+
+def test_article_dash_bridge_uses_article_observer_query_shape_in_source():
+    source = Path("analysis/MONOLITH_VIZ.py").read_text(encoding="utf-8")
+
+    assert "qs.set('observer', 'article:' + String(Math.floor(articleRef.idx)));" in source
+    assert "qs.set('view_mode', 'observer');" in source
+    assert "qs.set('observer_uid', String(articleRef.uid));" in source
+
+
 def test_article_hitbox_trace_uses_large_click_target():
     _require_plotly()
     positions = np.array([[0.0, 0.0, 0.1], [1.0, 1.0, 0.2]], dtype=float)
@@ -289,6 +448,27 @@ def test_article_hitbox_trace_uses_large_click_target():
     hitbox = next(t for t in traces if getattr(t, "name", "") == "article_hitbox")
     hitbox_sizes = np.asarray(hitbox.marker.size, dtype=float)
     assert hitbox_sizes.min() >= 18.0
+
+
+def test_article_visual_trace_uses_lightweight_customdata():
+    _require_plotly()
+    positions = np.array([[0.0, 0.0, 0.1], [1.0, 1.0, 0.2]], dtype=float)
+    traces = render_data_points_3d(
+        positions=positions,
+        spectral_evr=np.array([0.8, 0.7], dtype=float),
+        sizes=np.array([4.0, 6.0], dtype=float),
+        hover_texts=["a", "b"],
+        article_popup_htmls=["<div>" + ("payload" * 50) + "</div>", "<div>b</div>"],
+        article_uids=["uid-a", "uid-b"],
+        phantom_verdicts=[{"verdict": "HONEST"}, {"verdict": "PHANTOM"}],
+    )
+
+    hitbox = next(t for t in traces if getattr(t, "name", "") == "article_hitbox")
+    visual = next(t for t in traces if getattr(t, "name", "") == "Articles")
+
+    assert "popup_html" in hitbox.customdata[0]
+    assert visual.customdata[0] == {"idx": 0, "uid": "uid-a"}
+    assert "popup_html" not in visual.customdata[0]
 
 
 def test_path_invalid_points_are_filtered_not_origin_injected():
@@ -870,6 +1050,8 @@ def test_focused_observer_render_uses_relativity_cache_geometry(monkeypatch, tmp
 
     assert not np.allclose(base_x, focus_x)
     assert not np.allclose(base_y, focus_y)
+    assert focus_x[1] == pytest.approx(0.0, abs=1e-9)
+    assert focus_y[1] == pytest.approx(0.0, abs=1e-9)
 
     focus_html = focus_output.read_text(encoding="utf-8")
     assert "OBSERVER FOCUS | article:1" in focus_html
@@ -878,6 +1060,98 @@ def test_focused_observer_render_uses_relativity_cache_geometry(monkeypatch, tmp
     assert "axis=17.5deg" in focus_html
     assert "Observer Probe Sim" in focus_html
     assert "Observer Coord Delta" in focus_html
+
+    base_state = json.loads(base_output.with_suffix(".view_state.json").read_text(encoding="utf-8"))
+    focus_state = json.loads(focus_output.with_suffix(".view_state.json").read_text(encoding="utf-8"))
+
+    assert base_state["observer_focus"]["idx"] is None
+    assert focus_state["observer_focus"]["idx"] == 1
+    focus_article = next(row for row in focus_state["articles"] if row["idx"] == 1)
+    assert focus_article["x"] == pytest.approx(0.0, abs=1e-9)
+    assert focus_article["y"] == pytest.approx(0.0, abs=1e-9)
+
+    focus_path = next(row for row in focus_state["walker_paths"] if row["article_idx"] == 1)
+    base_path = next(row for row in base_state["walker_paths"] if row["article_idx"] == 1)
+    assert focus_path["path_space"] == "rendered_synthesis"
+    assert focus_path["start_x"] == pytest.approx(0.0, abs=1e-9)
+    assert focus_path["start_y"] == pytest.approx(0.0, abs=1e-9)
+    focus_articles_by_idx = {int(row["idx"]): row for row in focus_state["articles"]}
+    for path_row in focus_state["walker_paths"]:
+        owner = focus_articles_by_idx[int(path_row["article_idx"])]
+        assert path_row["start_x"] == pytest.approx(owner["x"], abs=1e-9)
+        assert path_row["start_y"] == pytest.approx(owner["y"], abs=1e-9)
+        assert path_row["start_z"] == pytest.approx(owner["z"], abs=1e-9)
+    assert not np.allclose(
+        [base_path["start_x"], base_path["start_y"]],
+        [focus_path["start_x"], focus_path["start_y"]],
+    )
+
+
+def test_focused_observer_render_records_replayed_track4_path(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    rel_dir = exp.experiment_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    (rel_dir / "state_1.json").write_text(
+        """
+{
+  "observer_id": 1,
+  "articles": [
+    {"index": 0, "observer_x": -2.0, "observer_y": 0.4, "observer_z": 0.1, "coord_delta": 1.7},
+    {"index": 1, "observer_x": 0.0, "observer_y": 0.0, "observer_z": 0.4, "coord_delta": 0.0},
+    {"index": 2, "observer_x": 1.8, "observer_y": 1.1, "observer_z": -0.2, "coord_delta": 1.2},
+    {"index": 3, "observer_x": 2.9, "observer_y": 1.7, "observer_z": -0.5, "coord_delta": 2.4}
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    replay_calls = []
+
+    def fake_recompute(exp_arg, focus_idx, walker_paths_raw):
+        replay_calls.append((exp_arg, focus_idx, set(walker_paths_raw.keys())))
+        return {
+            "path_xyz": np.array(
+                [
+                    [9.0, 9.0, 9.0],
+                    [9.5, 8.5, 8.0],
+                    [10.0, 7.5, 7.0],
+                ],
+                dtype=float,
+            ),
+            "step_diagnostics": [{"accepted": True}],
+            "work_integral": 12.25,
+            "state": "success",
+            "replay_steps": 10,
+        }
+
+    monkeypatch.setattr(monolith_viz, "_recompute_focused_observer_track4", fake_recompute)
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    focus_output = tmp_path / "observer_focus_replay.html"
+
+    create_monolith_cockpit(
+        exp=exp,
+        output_path=focus_output,
+        physics_mode="synthesis",
+        observer_idx=1,
+        show_terrain=False,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=True,
+        show_hott=False,
+    )
+
+    assert replay_calls
+    assert replay_calls[0][1] == 1
+    focus_state = json.loads(focus_output.with_suffix(".view_state.json").read_text(encoding="utf-8"))
+    focus_path = next(row for row in focus_state["walker_paths"] if row["article_idx"] == 1)
+    assert focus_path["focused_observer_replay"] is True
+    assert focus_path["n_points"] == 3
+    assert focus_path["start_x"] == pytest.approx(0.0, abs=1e-9)
+    assert focus_path["start_y"] == pytest.approx(0.0, abs=1e-9)
+    assert np.isfinite(float(focus_path["end_x"]))
+    assert np.isfinite(float(focus_path["end_y"]))
 
 
 def test_recompute_focused_observer_track4_uses_payload_replay(tmp_path):
@@ -926,6 +1200,74 @@ def test_recompute_focused_observer_track4_uses_payload_replay(tmp_path):
     )
 
 
+def test_recompute_focused_observer_track4_passes_observer_conditioned_arguments(monkeypatch, tmp_path):
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    exp.antagonism = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 3.0, 0.0],
+            [0.0, 0.0, 0.0, 4.0],
+        ],
+        dtype=float,
+    )
+    cls_per_bot = torch.arange(4 * 8 * 4, dtype=torch.float32).reshape(4, 8, 4) / 10.0
+    basis = SharedRKSBasis(input_dim=4, output_dim=8, seed=23, kernel_type="rbf")
+    basis.set_sigma(1.0)
+    torch.save(
+        {
+            "cls_per_bot": cls_per_bot.numpy(),
+            "rks_basis_state": _serialize_rks_basis_state(basis),
+        },
+        exp.experiment_dir / "observer_42.pt",
+    )
+
+    long_base_path = np.column_stack(
+        [
+            np.linspace(0.0, 1.0, 90),
+            np.linspace(1.0, 0.0, 90),
+            np.linspace(0.2, 0.8, 90),
+        ]
+    )
+    walker_paths = dict(exp.walker_paths)
+    walker_paths[2] = long_base_path
+    captured = {}
+
+    import core.physarum_walk as physarum_walk
+
+    def fake_compute_walker_resistance(**kwargs):
+        captured.update(kwargs)
+        return {
+            "path_xyz": torch.tensor(
+                [[0.0, 0.0, 0.0], [0.4, 0.2, 0.1], [0.8, 0.3, 0.2]],
+                dtype=torch.float32,
+            ),
+            "step_diagnostics": [{"accepted": True}],
+            "work_integral": 5.75,
+            "state": "success",
+        }
+
+    monkeypatch.setattr(physarum_walk, "compute_walker_resistance", fake_compute_walker_resistance)
+
+    replay = _recompute_focused_observer_track4(exp, 2, walker_paths)
+
+    assert replay is not None
+    assert replay["replay_steps"] == 64
+    assert captured["n_steps"] == 64
+    assert captured["n_walkers"] == 20
+    assert captured["observer_cost_strength"] == pytest.approx(1.0)
+    assert torch.allclose(captured["cls_per_bot"], cls_per_bot[2])
+    assert torch.allclose(captured["observer_axis"], cls_per_bot[2].mean(dim=0))
+    assert torch.allclose(captured["u_axis"], torch.tensor(exp.antagonism[2], dtype=torch.float32))
+    assert isinstance(captured["rks_basis"], SharedRKSBasis)
+    assert captured["rks_basis"].input_dim == 4
+    assert captured["rks_basis"].output_dim == 8
+    assert captured["rks_basis"].kernel_type == "rbf"
+    assert tuple(captured["rks_basis"].omega.shape) == (4, 8)
+    assert np.asarray(replay["path_xyz"], dtype=float).shape == (3, 3)
+    assert replay["work_integral"] == pytest.approx(5.75)
+
+
 def test_focused_observer_render_falls_back_to_global_z_when_observer_z_collapses(monkeypatch, tmp_path):
     _require_plotly()
     exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
@@ -965,6 +1307,46 @@ def test_focused_observer_render_falls_back_to_global_z_when_observer_z_collapse
     assert float(np.ptp(article_z)) > 1e-3
 
 
+def test_focused_observer_render_preserves_canonical_relief_when_observer_z_is_tiny(monkeypatch, tmp_path):
+    _require_plotly()
+    exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
+    rel_dir = exp.experiment_dir / "relativity_cache"
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    (rel_dir / "state_0.json").write_text(
+        """
+{
+  "observer_id": 0,
+  "articles": [
+    {"index": 0, "observer_x": -2.0, "observer_y": 0.0, "observer_z": 0.010},
+    {"index": 1, "observer_x": -0.5, "observer_y": 0.9, "observer_z": 0.014},
+    {"index": 2, "observer_x": 1.0, "observer_y": 1.1, "observer_z": 0.018},
+    {"index": 3, "observer_x": 2.5, "observer_y": 1.8, "observer_z": 0.022}
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
+    monkeypatch.delenv("MONOLITH_OBSERVER_TERRAIN_Z", raising=False)
+    focus_output = tmp_path / "observer_focus_canonical_relief.html"
+    focus_fig = create_monolith_cockpit(
+        exp=exp,
+        output_path=focus_output,
+        physics_mode="synthesis",
+        observer_idx=0,
+        show_terrain=True,
+        show_fog=False,
+        show_walkers=False,
+        show_phantom_paths=False,
+        show_hott=False,
+    )
+
+    article_trace = next(t for t in focus_fig.data if str(getattr(t, "name", "")) == "Articles")
+    article_z = np.asarray(article_trace.z, dtype=float)
+    assert float(np.ptp(article_z)) > 0.1
+
+
 def test_dash_embed_html_prefers_live_dash_and_keeps_local_observer_fallback_hint(monkeypatch, tmp_path):
     _require_plotly()
     exp = _make_experiment(tmp_path, spectral_probe_magnitudes=None)
@@ -985,8 +1367,11 @@ def test_dash_embed_html_prefers_live_dash_and_keeps_local_observer_fallback_hin
     assert "probeDashReachable" in html_text
     assert "observer_' + String(Math.floor(articleRef.idx)) + '/MONOLITH.html" in html_text
     assert "frame.src = dashUrl.origin + '/?' + qs.toString();" in html_text
+    assert "qs.set('observer', 'article:' + String(Math.floor(articleRef.idx)));" in html_text
+    assert "qs.set('view_mode', 'observer');" in html_text
     assert "qs.set('variant_a', DASH_VARIANT_NAME);" in html_text
     assert "qs.set('variant_b', DASH_VARIANT_NAME);" in html_text
+    assert '<div id="hero-audit-panel"></div>' in html_text
 
 
 def test_render_terrain_surface_keeps_concave_center_connected():
@@ -1022,6 +1407,51 @@ def test_render_terrain_surface_keeps_concave_center_connected():
     assert Xi is not None and Yi is not None and Zi is not None
     center_idx = np.unravel_index(np.nanargmin((Xi ** 2) + (Yi ** 2)), Xi.shape)
     assert np.isfinite(Zi[center_idx]), Zi[center_idx]
+
+
+def test_render_terrain_surface_void_morphology_does_not_promote_boundary_walls():
+    _require_plotly()
+    pytest.importorskip("scipy")
+    positions_xy = np.array(
+        [
+            [-2.8, 1.2],
+            [-2.3, 1.6],
+            [-1.3, 1.8],
+            [0.4, 1.9],
+            [2.5, 1.3],
+            [2.0, -0.2],
+            [1.8, -1.2],
+            [0.8, -2.0],
+            [-0.4, -2.4],
+            [-1.5, -1.6],
+            [-2.4, -0.4],
+            [-1.0, 0.1],
+            [0.0, 0.0],
+            [0.8, 0.3],
+        ],
+        dtype=float,
+    )
+    energy = np.array([0.1, 0.2, 0.35, 0.5, 0.7, 0.9, 1.1, 0.8, 0.45, 0.3, 0.2, 0.55, 0.65, 0.75])
+    positions_3d = np.column_stack([positions_xy, energy])
+
+    _, Xi, Yi, Zi, _, _ = render_terrain_surface(
+        positions_3d=positions_3d,
+        energy_values=energy,
+        grid_resolution=90,
+        terrain_density=np.linspace(0.15, 0.95, len(positions_xy), dtype=float),
+        terrain_stress=np.linspace(0.05, 0.9, len(positions_xy), dtype=float),
+    )
+
+    assert Xi is not None and Yi is not None and Zi is not None
+    finite = np.isfinite(Zi)
+    edge_finite = (
+        np.count_nonzero(np.isfinite(Zi[0, :]))
+        + np.count_nonzero(np.isfinite(Zi[-1, :]))
+        + np.count_nonzero(np.isfinite(Zi[:, 0]))
+        + np.count_nonzero(np.isfinite(Zi[:, -1]))
+    )
+    assert edge_finite == 0
+    assert float(np.mean(finite)) > 0.10
 
 
 def test_render_terrain_surface_ignores_far_path_support_for_occupancy():
@@ -1076,14 +1506,21 @@ def test_synthesis_default_hides_spectral_axis_vectors(monkeypatch, tmp_path):
     exp.spectral_probe_magnitudes = np.tile(np.linspace(-1.0, 1.0, 8, dtype=float), (exp.n_articles, 1))
     output_path = tmp_path / "no_vectors.html"
     monkeypatch.setenv("MONOLITH_FAST_SYNTHESIS_ONLY", "1")
-    fig = create_monolith_cockpit(
-        exp=exp,
-        output_path=output_path,
-        physics_mode="synthesis",
-        show_terrain=False,
-        show_fog=False,
-        show_walkers=False,
-        show_phantom_paths=True,
-        show_hott=False,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+            module=r"sklearn\\.decomposition\\._pca",
+        )
+        fig = create_monolith_cockpit(
+            exp=exp,
+            output_path=output_path,
+            physics_mode="synthesis",
+            show_terrain=False,
+            show_fog=False,
+            show_walkers=False,
+            show_phantom_paths=True,
+            show_hott=False,
+        )
     assert not any(str(getattr(t, "name", "")).startswith("Vector: ") for t in fig.data)

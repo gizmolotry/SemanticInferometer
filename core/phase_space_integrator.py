@@ -50,6 +50,12 @@ from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 
 from .pca_removal import fit_whitening_matrix, apply_whitening_fixed
+from .pipeline_config import (
+    TRACK5_ASSEMBLY_MODE_CONCATENATE,
+    TRACK5_ASSEMBLY_MODE_HADAMARD,
+    TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN,
+    normalize_track5_assembly_mode,
+)
 from .thermo_config import ThermodynamicConfig
 
 
@@ -162,6 +168,9 @@ class IntegratorConfig:
 
     # Whether to project to unit sphere
     project_to_sphere: bool = True
+
+    # Track 5 assembly defaults to legacy concatenation unless a caller opts in.
+    track5_assembly_mode: str = TRACK5_ASSEMBLY_MODE_CONCATENATE
 
 
 # =============================================================================
@@ -363,6 +372,7 @@ class PhaseSpaceIntegrator:
         walker: Optional[torch.Tensor] = None,          # [N, D_rks] (MCMC projected)
         article_ids: Optional[List[str]] = None,
         use_hadamard_fusion: bool = False,              # ASTER v3.2: Hadamard kernel product
+        track5_assembly_mode: Optional[str] = None,
     ) -> List[IntegratedParticle]:
         """
         Integrate all tracks into IntegratedParticles.
@@ -416,11 +426,18 @@ class PhaseSpaceIntegrator:
                 print(f"[WARN] Track '{name}' has no scaling params, using raw values")
                 scaled_tracks[name] = tensor
 
+        pre_gain_tracks = dict(scaled_tracks)
+
         # Apply gain to ensure force tracks are visible
         position_tracks = {k: scaled_tracks.get(k) for k in ['logits', 'hologram', 'blinker']}
         force_tracks = {k: scaled_tracks.get(k) for k in ['antagonism', 'walker']}
         boosted_force = self._apply_force_gain(position_tracks, force_tracks)
         scaled_tracks.update(boosted_force)
+
+        assembly_mode = self._resolve_track5_assembly_mode(
+            track5_assembly_mode=track5_assembly_mode,
+            use_hadamard_fusion=use_hadamard_fusion,
+        )
 
         # ASTER v3.2: Hadamard Kernel Product Fusion
         # Instead of concatenating Track 2 + Track 1.5 + Track 3, we:
@@ -428,7 +445,7 @@ class PhaseSpaceIntegrator:
         #   2. Conformal scaling: distances scaled by Track 3 variance
         #   3. Spectral embedding: recover vector space for Walker
         hadamard_diagnostics = None
-        if use_hadamard_fusion:
+        if assembly_mode == TRACK5_ASSEMBLY_MODE_HADAMARD:
             thermo_config = ThermodynamicConfig()
             t2 = scaled_tracks.get('hologram')
             t15 = scaled_tracks.get('antagonism')
@@ -465,6 +482,26 @@ class PhaseSpaceIntegrator:
                 scaled_tracks['blinker'] = None
             else:
                 print("[WARN] Hadamard fusion requested but Track 2 or Track 1.5 missing, falling back to concatenation")
+        elif assembly_mode == TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN:
+            t2 = pre_gain_tracks.get('hologram')
+            t15 = pre_gain_tracks.get('antagonism')
+            t3 = pre_gain_tracks.get('blinker')
+
+            if t2 is not None and t15 is not None:
+                from .hadamard_fusion import compute_strict_riemannian_fusion, HadamardFusionConfig
+
+                print("[PhaseSpaceIntegrator] Applying strict Riemannian Track 5 assembly...")
+                fused_hologram, hadamard_diagnostics = compute_strict_riemannian_fusion(
+                    t2,
+                    t15,
+                    t3,
+                    config=HadamardFusionConfig(output_dim=t2.shape[-1]),
+                )
+                scaled_tracks['hologram'] = fused_hologram
+                scaled_tracks['antagonism'] = None
+                scaled_tracks['blinker'] = None
+            else:
+                print("[WARN] Strict Riemannian assembly requested but Track 2 or Track 1.5 missing, falling back to concatenation")
 
         # Concatenate in canonical order with dimension validation
         # Note: When use_hadamard_fusion=True, antagonism and blinker are None (already fused into hologram)
@@ -591,6 +628,25 @@ class PhaseSpaceIntegrator:
             particles.append(particle)
 
         return particles
+
+    def _resolve_track5_assembly_mode(
+        self,
+        *,
+        track5_assembly_mode: Optional[str],
+        use_hadamard_fusion: bool,
+    ) -> str:
+        """Resolve the explicit Track 5 mode while preserving legacy boolean callers."""
+        if track5_assembly_mode is not None:
+            return normalize_track5_assembly_mode(
+                track5_assembly_mode,
+                default=TRACK5_ASSEMBLY_MODE_CONCATENATE,
+            )
+        if use_hadamard_fusion:
+            return TRACK5_ASSEMBLY_MODE_HADAMARD
+        return normalize_track5_assembly_mode(
+            self.config.track5_assembly_mode,
+            default=TRACK5_ASSEMBLY_MODE_CONCATENATE,
+        )
 
     def compute_phantom_differential(
         self,

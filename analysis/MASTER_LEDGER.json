@@ -1,0 +1,9 @@
+{
+  "rbf_seed42": {
+    "type1": false,
+    "type2": 1.0,
+    "nmi": 0.7123805298491227,
+    "ari": 0.417812262798347,
+    "path": "outputs\\experiments\\runs\\experiments_20260225_034558\\synthetic\\rbf_seed42"
+  }
+}

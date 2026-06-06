@@ -1,0 +1,416 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║      BELIEF TRANSFORMER 12-MONTH SCRAPER - DEPLOYMENT GUIDE          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+QUICK START (5 MINUTES TO FIRST SCRAPE)
+═══════════════════════════════════════════════════════════════════════
+
+1. Extract the archive on your machine:
+   
+   cd /path/to/belief-transformer/V3/
+   tar -xzf belief_ingest_complete.tar.gz
+   cd belief_ingest
+
+2. Run setup script:
+   
+   bash setup.sh
+   
+   This will:
+   - Check Python version
+   - Install all dependencies
+   - Create directory structure
+   - Run test suite
+   - Ask about optional Playwright installation
+
+3. Quick test (1 week):
+   
+   python scrape_12_months.py --start 2024-12-15 --end 2024-12-21
+   
+   Should complete in 5-10 minutes
+   Output: ~50-100 articles in data/processed/
+
+4. Production run (12 months):
+   
+   python scrape_12_months.py
+   
+   Expected: 4-8 hours, 20,000-40,000 articles
+
+
+FILES INCLUDED
+═══════════════════════════════════════════════════════════════════════
+
+Core Pipeline:
+  scrape_12_months.py         - Production scraper with checkpointing
+  gdelt_historical_fetcher.py - GDELT API wrapper
+  content_extractor.py        - Multi-strategy content extraction
+  ingest.py                   - General ingestion pipeline
+  config.py                   - Configuration settings
+  
+Utilities:
+  utils/helpers.py            - Deduplication, text processing, metrics
+  
+Testing:
+  test.py                     - Test suite
+  examples.py                 - Usage examples
+  
+Setup:
+  setup.sh                    - One-command setup script
+  requirements.txt            - Python dependencies
+  
+Documentation:
+  README.md                   - Comprehensive documentation
+  QUICKREF.txt                - Quick reference card
+  WORKFLOW.txt                - Workflow diagrams
+  DEPLOY.txt                  - This file
+
+
+SYSTEM REQUIREMENTS
+═══════════════════════════════════════════════════════════════════════
+
+Python:     3.8+ (tested on 3.9, 3.10, 3.11)
+RAM:        4GB minimum, 8GB recommended
+Disk:       10GB for 12-month dataset
+Network:    Stable internet (residential is fine)
+OS:         Linux, macOS, Windows (WSL)
+
+
+INSTALLATION OPTIONS
+═══════════════════════════════════════════════════════════════════════
+
+Option 1: Automatic (Recommended)
+  bash setup.sh
+
+Option 2: Manual
+  pip install --break-system-packages aiohttp feedparser trafilatura \
+      newspaper3k beautifulsoup4 lxml readability-lxml pandas xxhash \
+      structlog jsonlines python-dateutil aiohttp-retry
+  
+  # Optional for JS-heavy sites
+  pip install --break-system-packages playwright
+  playwright install chromium
+  
+  mkdir -p data/{raw,processed,cache} logs utils sources
+  python test.py
+
+
+USAGE PATTERNS
+═══════════════════════════════════════════════════════════════════════
+
+Quick Test (1 Week)
+  python scrape_12_months.py --start 2024-12-15 --end 2024-12-21
+  
+  Expected: 5-10 minutes, ~50-100 articles
+
+Full Production (12 Months)
+  python scrape_12_months.py
+  
+  Expected: 4-8 hours, ~20,000-40,000 articles
+  
+  If interrupted:
+  python scrape_12_months.py --resume
+
+Custom Date Range
+  python scrape_12_months.py --start 2024-01-01 --end 2024-06-30
+
+Acquisition Study (Pre/Post Windows)
+  # Pre-acquisition
+  python scrape_12_months.py --start 2018-01-01 --end 2019-06-30 \
+      --output data/processed/irish_pre
+  
+  # Post-acquisition  
+  python scrape_12_months.py --start 2019-07-01 --end 2020-12-31 \
+      --output data/processed/irish_post
+
+
+POST-PROCESSING
+═══════════════════════════════════════════════════════════════════════
+
+Merge Batch Files
+  cat data/processed/batch_*.jsonl > articles_12mo.jsonl
+
+Count Articles
+  wc -l articles_12mo.jsonl
+
+Top Publishers
+  cat articles_12mo.jsonl | jq -r '.publisher' | \
+      sort | uniq -c | sort -rn | head -20
+
+Articles by Month
+  cat articles_12mo.jsonl | jq -r '.published_at[:7]' | \
+      sort | uniq -c
+
+Average Sentiment by Publisher
+  cat articles_12mo.jsonl | \
+      jq -r '[.publisher, .sentiment_score] | @tsv' | \
+      awk '{sum[$1]+=$2; count[$1]++} END {
+          for (p in sum) print p, sum[p]/count[p]
+      }' | sort -k2 -n
+
+
+INTEGRATION WITH BELIEF TRANSFORMER V2
+═══════════════════════════════════════════════════════════════════════
+
+After scraping completes:
+
+1. Merge batches
+   cd belief_ingest
+   cat data/processed/batch_*.jsonl > articles_12mo.jsonl
+
+2. Copy to V2
+   cp articles_12mo.jsonl ../../V2/data/raw/
+
+3. Compute θ fingerprints
+   cd ../../V2
+   python -m belief_transformer.compute_embeddings \
+       --input data/raw/articles_12mo.jsonl \
+       --output data/embeddings/
+
+4. Analyze stance distributions
+   python -m belief_transformer.analyze_stances \
+       --embeddings data/embeddings/ \
+       --output results/
+
+
+MONITORING PROGRESS
+═══════════════════════════════════════════════════════════════════════
+
+The scraper provides real-time progress updates:
+
+  [Batch 15/52] 2024-04-01 to 2024-04-07
+    ✓ Fetched 412 articles from GDELT
+    ✓ Extracted 389 articles
+    ✓ Written to batch_0015_20240401-20240407.jsonl
+    Progress: 28.8% | Elapsed: 2.1h | Remaining: ~5.2h
+
+Progress is saved to checkpoint.json after each batch.
+Safe to interrupt (Ctrl+C) and resume later.
+
+
+CHECKPOINTING SYSTEM
+═══════════════════════════════════════════════════════════════════════
+
+Automatic checkpoints after each batch enable:
+- Resuming after interruptions (network, power, etc.)
+- Pausing to free up resources
+- Distributed processing (run batches on different machines)
+
+Checkpoint file: data/cache/checkpoint.json
+
+To resume:
+  python scrape_12_months.py --resume
+
+To start fresh (ignoring checkpoint):
+  rm data/cache/checkpoint.json
+  python scrape_12_months.py
+
+
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════
+
+Common Issues:
+
+1. Missing pandas
+   Error: ModuleNotFoundError: No module named 'pandas'
+   Fix:   pip install pandas --break-system-packages
+
+2. High extraction failure rate (>30%)
+   Check: cat articles.jsonl | jq '.extraction_method' | sort | uniq -c
+   Fix:   Install playwright for JS-heavy sites
+          pip install playwright --break-system-packages
+          playwright install chromium
+
+3. Memory issues
+   Symptoms: Process killed, slow performance
+   Fix:      Reduce batch size
+             python scrape_12_months.py --batch-days 3
+
+4. Network timeouts
+   Symptoms: Many "fetch_failed" in logs
+   Fix:      Increase timeout in config.py
+             REQUEST_TIMEOUT = 60  # was 30
+
+5. GDELT connection issues
+   Test:  python -c "from gdelt_historical_fetcher import *; \
+              import asyncio; asyncio.run(test())"
+   Fix:   Check internet connection, retry later
+
+
+PERFORMANCE OPTIMIZATION
+═══════════════════════════════════════════════════════════════════════
+
+Default settings are optimized for residential internet.
+
+For faster scraping (server/datacenter):
+
+Edit config.py:
+  MAX_CONCURRENT_ARTICLES = 200    # was 100
+  REQUEST_TIMEOUT = 15             # was 30
+  BATCH_SIZE = 1000                # was 500
+
+Run with smaller batches:
+  python scrape_12_months.py --batch-days 3
+
+For slower/unreliable connections:
+
+Edit config.py:
+  MAX_CONCURRENT_ARTICLES = 50     # was 100
+  REQUEST_TIMEOUT = 60             # was 30
+  RETRY_ATTEMPTS = 5               # was 3
+
+
+EXPECTED PERFORMANCE
+═══════════════════════════════════════════════════════════════════════
+
+Throughput:
+  - Residential internet: 50-100 articles/minute
+  - Datacenter: 100-200 articles/minute
+
+12-Month Scrape (Strict Filtering):
+  - Articles: ~20,000-40,000
+  - Time: 4-8 hours (residential), 2-4 hours (datacenter)
+  - Output size: ~2-4 GB
+
+12-Month Scrape (Lenient Filtering):
+  - Articles: ~40,000-80,000
+  - Time: 8-16 hours (residential), 4-8 hours (datacenter)
+  - Output size: ~4-8 GB
+
+
+QUALITY ASSURANCE
+═══════════════════════════════════════════════════════════════════════
+
+Run test suite before production:
+  python test.py
+
+Check extraction quality:
+  # View sample articles
+  cat data/processed/batch_0001*.jsonl | jq '.[0]' | less
+  
+  # Check extraction methods
+  cat data/processed/batch_*.jsonl | \
+      jq -r '.extraction_method' | \
+      sort | uniq -c
+  
+  Expected distribution (roughly):
+    ~60-70% trafilatura
+    ~20-30% newspaper3k
+    ~5-10% readability
+    ~1-5% playwright
+
+Check topic relevance:
+  # Verify Gaza/Israel keywords
+  cat data/processed/batch_*.jsonl | \
+      jq -r '.title' | \
+      grep -i -E 'gaza|israel|hamas|palestinian' | \
+      wc -l
+
+
+DIRECTORY STRUCTURE
+═══════════════════════════════════════════════════════════════════════
+
+After setup and first run:
+
+belief_ingest/
+├── scrape_12_months.py              ← Main scraper
+├── gdelt_historical_fetcher.py      ← GDELT API
+├── content_extractor.py             ← Content extraction
+├── config.py                        ← Settings
+├── ingest.py                        ← General pipeline
+├── test.py                          ← Tests
+├── examples.py                      ← Examples
+├── setup.sh                         ← Setup script
+├── requirements.txt                 ← Dependencies
+├── README.md                        ← Full docs
+├── QUICKREF.txt                     ← Quick reference
+├── WORKFLOW.txt                     ← Workflows
+├── DEPLOY.txt                       ← This file
+├── utils/
+│   ├── __init__.py
+│   └── helpers.py                   ← Utilities
+├── data/
+│   ├── cache/
+│   │   ├── checkpoint.json          ← Resume state
+│   │   ├── seen_urls_12mo.txt       ← Dedup cache
+│   │   └── gdelt/                   ← GDELT cache
+│   │       ├── 20240101000000.json
+│   │       └── ...
+│   └── processed/
+│       ├── batch_0001_20240101-20240107.jsonl
+│       ├── batch_0002_20240108-20240114.jsonl
+│       └── ...
+└── logs/
+    └── scraper.log
+
+
+GETTING HELP
+═══════════════════════════════════════════════════════════════════════
+
+1. Check documentation
+   - README.md for comprehensive guide
+   - QUICKREF.txt for common commands
+   - WORKFLOW.txt for visual diagrams
+
+2. Run diagnostics
+   - python test.py
+   - Check logs: tail -f logs/*.log
+   - View checkpoint: cat data/cache/checkpoint.json
+
+3. Common checks
+   - Dependencies: pip list | grep -E 'aiohttp|pandas|trafilatura'
+   - Python version: python --version
+   - Disk space: df -h
+   - Network: ping data.gdeltproject.org
+
+
+BEST PRACTICES
+═══════════════════════════════════════════════════════════════════════
+
+1. Always test first
+   Run 1-week test before 12-month production scrape
+
+2. Monitor progress
+   Check checkpoint.json periodically
+   Review logs for errors
+
+3. Validate output
+   Check first batch for quality before running full scrape
+   jq '.title' data/processed/batch_0001*.jsonl | head
+
+4. Use checkpoints
+   Don't delete checkpoint.json until scrape is complete
+   Keep for resuming after interruptions
+
+5. Backup data
+   Copy batch files to backup location periodically
+   cp data/processed/batch_*.jsonl /backup/location/
+
+
+NEXT STEPS
+═══════════════════════════════════════════════════════════════════════
+
+After reading this guide:
+
+1. Extract archive
+   tar -xzf belief_ingest_complete.tar.gz
+   cd belief_ingest
+
+2. Run setup
+   bash setup.sh
+
+3. Quick test
+   python scrape_12_months.py --start 2024-12-15 --end 2024-12-21
+
+4. Review output
+   cat data/processed/batch_0001*.jsonl | jq '.' | less
+
+5. Production run
+   python scrape_12_months.py
+
+6. Integrate with V2
+   cat data/processed/batch_*.jsonl > articles_12mo.jsonl
+   cp articles_12mo.jsonl ../../V2/data/raw/
+
+
+═══════════════════════════════════════════════════════════════════════
+                    READY TO SCRAPE! GOOD LUCK!
+═══════════════════════════════════════════════════════════════════════

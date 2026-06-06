@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 import types
 from pathlib import Path
@@ -20,6 +19,7 @@ def _install_dash_stubs() -> None:
             self.args = args
             self.kwargs = kwargs
             self.layout = None
+            self.server = types.SimpleNamespace(route=lambda *a, **k: (lambda func: func))
 
         def callback(self, *args, **kwargs):
             def _decorator(func):
@@ -60,6 +60,7 @@ def _install_dash_stubs() -> None:
 
     go_mod.Figure = _DummyFigure
     go_mod.Heatmap = lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
+    go_mod.Scatter3d = lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
 
     plotly_mod = types.ModuleType("plotly")
     plotly_mod.graph_objects = go_mod
@@ -72,18 +73,6 @@ try:
 except ModuleNotFoundError:
     _install_dash_stubs()
     from analysis import isolated_dash_prototype as dash_mod
-
-
-@pytest.fixture
-def tmp_path(request):
-    """Workspace-local tmp_path override for restricted Windows temp directories."""
-    root = Path.cwd() / ".pytest_local_tmp"
-    root.mkdir(parents=True, exist_ok=True)
-    case_dir = root / request.node.name
-    if case_dir.exists():
-        shutil.rmtree(case_dir, ignore_errors=True)
-    case_dir.mkdir(parents=True, exist_ok=True)
-    return case_dir
 
 
 def _write_json(path: Path, payload: dict) -> None:

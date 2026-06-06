@@ -1,0 +1,85 @@
+{
+  "snapshot_name": "2026-03-08_98d8992_honest_matern_walker_axes_freeze",
+  "created_at_utc": "2026-03-08T19:18:24.323046+00:00",
+  "viz_code_commit": "98d8992",
+  "command": "python -m analysis.MONOLITH_VIZ outputs/honest_matern --mode synthesis -o outputs/honest_matern/MONOLITH_DEBUG_freeze_final.html",
+  "source": {
+    "html": "outputs/honest_matern/MONOLITH_DEBUG_freeze_final.html",
+    "log": "outputs/honest_matern/MONOLITH_DEBUG_freeze_final.log",
+    "input_dir": "outputs/honest_matern"
+  },
+  "snapshot_files": {
+    "html": {
+      "file": "MONOLITH_DEBUG_freeze_final.html",
+      "bytes": 1969274,
+      "sha256": "14f6959205be9250bca4e21cb547c430c204ff9d681d750c80009ff75b549e9f"
+    },
+    "log": {
+      "file": "MONOLITH_DEBUG_freeze_final.log",
+      "bytes": 6816,
+      "sha256": "d2832f784824f14b89decd23150935e7f164267068f9ae8a72962c4cf8392491"
+    },
+    "viz_runtime": {
+      "file": "MONOLITH_VIZ_runtime.py",
+      "bytes": 226614,
+      "sha256": "9f3443f4795c97c4ab4a36c07e4e70ef132e97885571871d18044ad02eff678d"
+    },
+    "viz_git": {
+      "file": "MONOLITH_VIZ_git.py",
+      "bytes": 226614,
+      "sha256": "9f3443f4795c97c4ab4a36c07e4e70ef132e97885571871d18044ad02eff678d"
+    }
+  },
+  "inputs": [
+    {
+      "file": "MONOLITH_DATA.csv",
+      "bytes": 22287,
+      "sha256": "4c1b71ef0f98e657790c53779814f9ef44a998f6a1986d539fe0487e9824adf7"
+    },
+    {
+      "file": "phantom_verdicts.json",
+      "bytes": 16643,
+      "sha256": "d143c00d9f359151b5d8055f57f4e78f90f2b7ff29e822b66945920d0b3bf07c"
+    },
+    {
+      "file": "walker_states.json",
+      "bytes": 12167,
+      "sha256": "286f4ef4139cde3fb5729b9ed09d88d169286dba1d8473f5d1c18048f03c30ba"
+    },
+    {
+      "file": "spectral_probe_magnitudes.npy",
+      "bytes": 2688,
+      "sha256": "7aa34e939c08f7310d330249e0378fc8844e1d365c85f7f71b02deb4a02de20b"
+    },
+    {
+      "file": "spectral_u_axis.npy",
+      "bytes": 491648,
+      "sha256": "686e2def18f659b9da3951ba9bbbb043a108904e6e3a1f45603fbd343f076226"
+    },
+    {
+      "file": "features.npy",
+      "bytes": 655488,
+      "sha256": "8e86f2d5187f3ee71404306f63ad9a860f835b0ac4b227cfdc2ad99da75f9554"
+    },
+    {
+      "file": "validation.json",
+      "bytes": 587,
+      "sha256": "e85ed6c0c72fbcb0fae1a857142da81ec9785646945ae05b96454fbfd2d2d1e7"
+    },
+    {
+      "file": "run_meta.json",
+      "bytes": 367,
+      "sha256": "36d1077c96d152aab75ae803f09a91b63778559ad865dcf7ad1d3ecd7a896cb7"
+    },
+    {
+      "file": "variance_tracking.json",
+      "bytes": 846,
+      "sha256": "2547041979601d95d1128bd377a65f24d9c895e02c5a95f74f1e7333b43dbcf8"
+    },
+    {
+      "file": "walker_paths.npz",
+      "bytes": 89391525,
+      "sha256": "881130ec09ad356114132a9b22e56a08d11e1269a777b26a870b60218eaeb278"
+    }
+  ]
+}

@@ -4,6 +4,7 @@ import sys
 import json
 import numpy as np
 from pathlib import Path
+import pytest
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent))
@@ -16,8 +17,7 @@ def test_nmi():
     # Load synthetic corpus
     corpus_path = Path("sythgen/high_quality_articles.jsonl")
     if not corpus_path.exists():
-        print(f"ERROR: Corpus not found at {corpus_path}")
-        return
+        pytest.skip(f"Corpus not found at {corpus_path}")
 
     articles = []
     ground_truth = {}
@@ -70,8 +70,7 @@ def test_nmi():
 
     # Check if features are collapsed
     if features.std() < 0.01:
-        print("\n[ERROR] Features collapsed (std < 0.01) - kernel collapse!")
-        return
+        pytest.fail("Features collapsed (std < 0.01) - kernel collapse!")
 
     # Cluster and compute NMI
     from sklearn.cluster import KMeans
@@ -86,8 +85,7 @@ def test_nmi():
             valid_indices.append(i)
 
     if len(valid_indices) < 5:
-        print(f"\n[WARNING] Only {len(valid_indices)} articles with ground truth")
-        return
+        pytest.skip(f"Only {len(valid_indices)} articles with ground truth")
 
     # Map labels to integers
     label_set = list(set(true_labels))
@@ -114,8 +112,7 @@ def test_nmi():
         print("PARTIAL - NMI >= 0.3 but below target")
     else:
         print("FAILED - NMI < 0.3, kernel likely collapsed")
-
-    return nmi, ari
+    assert nmi >= 0.5, f"Expected NMI >= 0.5, got {nmi:.3f} (ARI={ari:.3f})"
 
 if __name__ == "__main__":
     test_nmi()

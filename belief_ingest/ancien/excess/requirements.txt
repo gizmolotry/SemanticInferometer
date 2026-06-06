@@ -1,0 +1,32 @@
+# Core
+aiohttp>=3.9.0
+asyncio>=3.4.3
+python-dateutil>=2.8.2
+
+# RSS & Feed Parsing
+feedparser>=6.0.10
+aiohttp-retry>=2.8.3
+
+# Content Extraction
+trafilatura>=1.6.3
+newspaper3k>=0.2.8
+beautifulsoup4>=4.12.0
+lxml>=4.9.3
+readability-lxml>=0.8.1
+
+# Heavy Fallback
+playwright>=1.40.0
+
+# Data Processing
+pandas>=2.0.0
+xxhash>=3.4.0
+
+# Monitoring & Logging
+tqdm>=4.66.0
+structlog>=23.2.0
+
+# Storage
+jsonlines>=4.0.0
+
+# Optional: GDELT BigQuery (requires Google Cloud setup)
+# google-cloud-bigquery>=3.11.0

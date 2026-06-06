@@ -4,6 +4,34 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 
+TRACK5_ASSEMBLY_MODE_HADAMARD = "hadamard"
+TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN = "strict_riemannian"
+TRACK5_ASSEMBLY_MODE_CONCATENATE = "concatenate"
+
+
+def normalize_track5_assembly_mode(
+    mode: Any,
+    *,
+    default: str = TRACK5_ASSEMBLY_MODE_HADAMARD,
+) -> str:
+    """Map user/config variants onto the supported Track 5 assembly modes."""
+    normalized_default = str(default or TRACK5_ASSEMBLY_MODE_HADAMARD).strip().lower()
+    text = str(mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": normalized_default,
+        "hadamard": TRACK5_ASSEMBLY_MODE_HADAMARD,
+        "hadamard_strict": TRACK5_ASSEMBLY_MODE_HADAMARD,
+        "strict_riemannian": TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN,
+        "riemannian": TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN,
+        "riemannian_strict": TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN,
+        "strict": TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN,
+        "concat": TRACK5_ASSEMBLY_MODE_CONCATENATE,
+        "concatenate": TRACK5_ASSEMBLY_MODE_CONCATENATE,
+        "none": TRACK5_ASSEMBLY_MODE_CONCATENATE,
+    }
+    return aliases.get(text, normalized_default)
+
+
 @dataclass(frozen=True)
 class PipelineRuntimeConfig:
     """Single source of truth for pipeline runtime knobs consumed by runners."""
@@ -20,6 +48,7 @@ class PipelineRuntimeConfig:
     geometry_mode: str = "rks"
     kernel_type: str = "matern"
     mix_in_rkhs: bool = False
+    track5_assembly_mode: str = TRACK5_ASSEMBLY_MODE_HADAMARD
 
     projection_dim: int = 256
     apply_pca_to_cls: bool = True
@@ -50,6 +79,10 @@ class PipelineRuntimeConfig:
             geometry_mode=str(mode_config.get("geometry_mode", cls.geometry_mode)),
             kernel_type=str(kernel_override or mode_config.get("kernel_type", cls.kernel_type)),
             mix_in_rkhs=bool(mode_config.get("mix_in_rkhs", cls.mix_in_rkhs)),
+            track5_assembly_mode=normalize_track5_assembly_mode(
+                mode_config.get("track5_assembly_mode", cls.track5_assembly_mode),
+                default=cls.track5_assembly_mode,
+            ),
             projection_dim=int(mode_config.get("projection_dim", cls.projection_dim)),
             apply_pca_to_cls=bool(mode_config.get("apply_pca_to_cls", cls.apply_pca_to_cls)),
             dirichlet_rks_dim=int(mode_config.get("dirichlet_rks_dim", cls.dirichlet_rks_dim)),
@@ -70,6 +103,10 @@ class PipelineRuntimeConfig:
             "geometry_mode": self.geometry_mode,
             "kernel_type": self.kernel_type,
             "mix_in_rkhs": self.mix_in_rkhs,
+            "track5_assembly_mode": normalize_track5_assembly_mode(
+                self.track5_assembly_mode,
+                default=TRACK5_ASSEMBLY_MODE_HADAMARD,
+            ),
             "pca_remove": self.use_pca_removal,
             "dirichlet_rks_dim": self.dirichlet_rks_dim,
             "dirichlet_n_observers": self.dirichlet_n_observers,

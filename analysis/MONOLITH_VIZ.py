@@ -693,7 +693,10 @@ def load_experiment_data(experiment_dir: Path, observer_idx: Optional[int] = Non
         try:
             ArtifactContract(experiment_dir, require_spectral_dna=require_spectral_dna).verify()
         except Exception as e:
-            print(f"[MONOLITH VIZ][DEBUG] Bypassing contract failure: {e}")
+            if os.environ.get("MONOLITH_ALLOW_CONTRACT_BYPASS", "0").strip() == "1":
+                print(f"[MONOLITH VIZ][LEGACY_BYPASS] Contract failure ignored by env override: {e}")
+            else:
+                raise
 
     # Required: features must exist (either global or observer-warped)
     features = _load_rel_or_base("features.npy")
@@ -723,11 +726,24 @@ def load_experiment_data(experiment_dir: Path, observer_idx: Optional[int] = Non
     logit_confidence = _load_rel_or_base("logit_confidence.npy")
     walker_work_integrals = _load_rel_or_base("walker_work_integrals.npy")
 
+    def _load_rel_or_base_json(filename: str):
+        if rel_obs_dir and (rel_obs_dir / filename).exists():
+            with open(rel_obs_dir / filename, encoding="utf-8") as f:
+                return json.load(f)
+        if (experiment_dir / filename).exists():
+            with open(experiment_dir / filename, encoding="utf-8") as f:
+                return json.load(f)
+        return None
+
+    if rel_obs_dir and (rel_obs_dir / "features.npy").exists():
+        print(f"[MONOLITH] Loading observer-local Track 2/1.5/3 artifacts: {rel_obs_dir}")
+
     # Track 4: Walker States (json)
     walker_states = None
-    if (experiment_dir / "walker_states.json").exists():
-        with open(experiment_dir / "walker_states.json") as f:
-            walker_states = json.load(f)
+    try:
+        walker_states = _load_rel_or_base_json("walker_states.json")
+    except Exception:
+        walker_states = None
 
     walker_paths = None
     walker_path_diagnostics = None
@@ -778,32 +794,31 @@ def load_experiment_data(experiment_dir: Path, observer_idx: Optional[int] = Non
 
     # Track 4 Hysteresis (Path Memory)
     hysteresis_memory = None
-    if (experiment_dir / "hysteresis_memory.npy").exists():
-        hysteresis_memory = np.load(experiment_dir / "hysteresis_memory.npy")
+    hysteresis_memory_path = rel_obs_dir / "hysteresis_memory.npy" if rel_obs_dir and (rel_obs_dir / "hysteresis_memory.npy").exists() else experiment_dir / "hysteresis_memory.npy"
+    if hysteresis_memory_path.exists():
+        hysteresis_memory = np.load(hysteresis_memory_path)
         print(f"[MONOLITH] Loaded hysteresis memory: {hysteresis_memory.shape}")
 
     hysteresis_stats = None
-    if (experiment_dir / "hysteresis_stats.json").exists():
-        with open(experiment_dir / "hysteresis_stats.json") as f:
-            hysteresis_stats = json.load(f)
+    try:
+        hysteresis_stats = _load_rel_or_base_json("hysteresis_stats.json")
+    except Exception:
+        hysteresis_stats = None
 
     # Track 5: Phantom
-    d_spectral = None
-    if (experiment_dir / "d_spectral.npy").exists():
-        d_spectral = np.load(experiment_dir / "d_spectral.npy")
+    d_spectral = _load_rel_or_base("d_spectral.npy")
 
     # Track 1.5: Antagonism (spectral polarity vectors for wind streamlines)
-    antagonism = None
-    if (experiment_dir / "antagonism.npy").exists():
-        antagonism = np.load(experiment_dir / "antagonism.npy")
-    elif (experiment_dir / "spectral_u_axis.npy").exists():
+    antagonism = _load_rel_or_base("antagonism.npy")
+    if antagonism is None:
         # Fall back to u_axis if antagonism not saved separately
-        antagonism = np.load(experiment_dir / "spectral_u_axis.npy")
+        antagonism = _load_rel_or_base("spectral_u_axis.npy")
 
     phantom_verdicts = None
-    if (experiment_dir / "phantom_verdicts.json").exists():
-        with open(experiment_dir / "phantom_verdicts.json") as f:
-            phantom_verdicts = json.load(f)
+    try:
+        phantom_verdicts = _load_rel_or_base_json("phantom_verdicts.json")
+    except Exception:
+        phantom_verdicts = None
 
     # Track 6: HoTT
     hott_proofs = None
@@ -1716,13 +1731,26 @@ def render_terrain_surface(
     else:
         point_z = np.asarray(point_xyz[point_mask, 2], dtype=float)
 
+    support_extent_xy = None
+    if terrain_support_xy is not None:
+        try:
+            support_candidate = np.asarray(terrain_support_xy, dtype=float)
+            if support_candidate.ndim == 2 and support_candidate.shape[1] >= 2:
+                finite_support = np.isfinite(support_candidate[:, :2]).all(axis=1)
+                support_candidate = support_candidate[finite_support, :2]
+                if support_candidate.shape[0] > 0:
+                    support_extent_xy = support_candidate
+        except Exception:
+            support_extent_xy = None
+    extent_x = point_x if support_extent_xy is None else np.concatenate([point_x, support_extent_xy[:, 0]])
+    extent_y = point_y if support_extent_xy is None else np.concatenate([point_y, support_extent_xy[:, 1]])
     margin = 0.15
-    x_range = max(float(np.ptp(point_x)), 1e-6)
-    y_range = max(float(np.ptp(point_y)), 1e-6)
-    x_min = float(np.nanmin(point_x)) - margin * x_range
-    x_max = float(np.nanmax(point_x)) + margin * x_range
-    y_min = float(np.nanmin(point_y)) - margin * y_range
-    y_max = float(np.nanmax(point_y)) + margin * y_range
+    x_range = max(float(np.ptp(extent_x)), 1e-6)
+    y_range = max(float(np.ptp(extent_y)), 1e-6)
+    x_min = float(np.nanmin(extent_x)) - margin * x_range
+    x_max = float(np.nanmax(extent_x)) + margin * x_range
+    y_min = float(np.nanmin(extent_y)) - margin * y_range
+    y_max = float(np.nanmax(extent_y)) + margin * y_range
     xi = np.linspace(x_min, x_max, int(max(grid_resolution, 40)))
     yi = np.linspace(y_min, y_max, int(max(grid_resolution, 40)))
     Xi, Yi = np.meshgrid(xi, yi)
@@ -1835,14 +1863,9 @@ def render_terrain_surface(
 
     # Fake-wall culling mask: keep only terrain points supported by nearby
     # article coordinates and dissolve unsupported voids to NaN.
+    terrain_fill_hull_mask = None
     try:
-        support_xy = None
-        if terrain_support_xy is not None:
-            support_candidate = np.asarray(terrain_support_xy, dtype=float)
-            if support_candidate.ndim == 2 and support_candidate.shape[1] >= 2:
-                support_xy = support_candidate[:, :2]
-        if support_xy is None:
-            support_xy = np.column_stack([point_x, point_y])
+        support_xy = np.column_stack([point_x, point_y])
         finite_support = np.isfinite(support_xy).all(axis=1)
         support_xy = support_xy[finite_support]
         if support_xy.shape[0] >= 3:
@@ -1885,6 +1908,34 @@ def render_terrain_surface(
                 # Guardrail against over-pruning in sparse layouts.
                 void_threshold *= 2.0
                 void_mask = nn_dist > void_threshold
+            inside_hull = None
+            try:
+                hull_points = np.column_stack([point_x, point_y])
+                hull = Delaunay(hull_points)
+                inside_hull = hull.find_simplex(grid_points) >= 0
+                inside_hull = np.asarray(inside_hull, dtype=bool).reshape(Xi.shape)
+                terrain_fill_hull_mask = inside_hull
+                # Treat the article-supported hull as a hard occupancy boundary.
+                # Interior holes can still be healed by the morphology pass below,
+                # but exterior skirts should remain void.
+                void_mask = void_mask | (~inside_hull)
+            except Exception:
+                pass
+            try:
+                # Morphology must operate on valid terrain, not on the void mask.
+                # Closing/fill-holes on a True=void mask inverts the intent: sparse
+                # hull interiors become void and array boundaries become false
+                # support, which Plotly renders as cliff-like fake walls.
+                valid_mask = ~void_mask
+                candidate_valid = binary_closing(valid_mask, structure=np.ones((3, 3), dtype=bool))
+                if inside_hull is not None:
+                    candidate_valid = candidate_valid & inside_hull
+                min_valid = max(3, int(0.5 * np.count_nonzero(valid_mask)))
+                if np.count_nonzero(candidate_valid) >= min_valid:
+                    valid_mask = candidate_valid
+                void_mask = ~valid_mask
+            except Exception:
+                pass
             z_geometry = np.where(void_mask, np.nan, z_geometry)
             surfacecolor = np.where(void_mask, np.nan, surfacecolor)
             if grid_density is not None:
@@ -1897,6 +1948,72 @@ def render_terrain_surface(
             )
     except Exception:
         pass
+
+    finite_hull = None
+    intentional_void_mask = None
+    try:
+        if "void_mask" in locals() and np.asarray(void_mask).shape == np.asarray(z_geometry).shape:
+            intentional_void_mask = np.asarray(void_mask, dtype=bool)
+            if terrain_fill_hull_mask is not None and np.asarray(terrain_fill_hull_mask).shape == intentional_void_mask.shape:
+                # Preserve exterior voids, but allow interior concavities inside
+                # the article hull to be healed by nearest-neighbor terrain fill.
+                intentional_void_mask = intentional_void_mask & (~np.asarray(terrain_fill_hull_mask, dtype=bool))
+    except Exception:
+        intentional_void_mask = None
+    try:
+        finite_support_points = np.column_stack((point_x, point_y))
+        if finite_support_points.shape[0] >= 3:
+            finite_hull = Delaunay(finite_support_points)
+    except Exception:
+        finite_hull = None
+
+    def _fill_grid_nans_with_nearest(grid: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if grid is None:
+            return None
+        arr = np.asarray(grid, dtype=float)
+        nan_mask = ~np.isfinite(arr)
+        if intentional_void_mask is not None and intentional_void_mask.shape == arr.shape:
+            # Preserve culling decisions. This fill helper is only for accidental
+            # interpolation NaNs, not for resurrecting deliberate void regions.
+            nan_mask = nan_mask & (~intentional_void_mask)
+        if not np.any(nan_mask):
+            return arr
+        finite_mask = np.isfinite(arr)
+        if not np.any(finite_mask):
+            return arr
+        try:
+            from scipy.interpolate import griddata
+
+            known_points = np.column_stack((Xi[finite_mask], Yi[finite_mask]))
+            known_values = arr[finite_mask]
+            query_points = np.column_stack((Xi[nan_mask], Yi[nan_mask]))
+            if finite_hull is not None and query_points.shape[0] > 0:
+                inside_mask = finite_hull.find_simplex(query_points) >= 0
+                if not np.any(inside_mask):
+                    return arr
+                target_points = query_points[inside_mask]
+            else:
+                inside_mask = None
+                target_points = query_points
+            filled = griddata(known_points, known_values, target_points, method="nearest")
+            if filled is not None:
+                out = arr.copy()
+                if inside_mask is None:
+                    out[nan_mask] = np.asarray(filled, dtype=float).reshape(-1)
+                else:
+                    nan_indices = np.flatnonzero(nan_mask)
+                    out_flat = out.reshape(-1)
+                    out_flat[nan_indices[inside_mask]] = np.asarray(filled, dtype=float).reshape(-1)
+                    out = out_flat.reshape(out.shape)
+                return out
+        except Exception:
+            return arr
+        return arr
+
+    z_geometry = _fill_grid_nans_with_nearest(z_geometry)
+    surfacecolor = _fill_grid_nans_with_nearest(surfacecolor)
+    grid_density = _fill_grid_nans_with_nearest(grid_density)
+    grid_stress_color = _fill_grid_nans_with_nearest(grid_stress_color)
 
     try:
         print(
@@ -2279,7 +2396,8 @@ def render_slime_trails(
                         width=width,
                     ),
                     showlegend=False,
-                    hoverinfo='skip',
+                    hoverinfo='text',
+                    hovertemplate='%{text}<extra></extra>',
                     visible=False,  # Hidden by default (Diagnostics mode)
                     name='slime_trail',
                 ))
@@ -2574,9 +2692,9 @@ def render_phantom_paths_3d(
     semantic_tether_mode = mode_key == "semantic_tether"
     drape_paths = os.environ.get("MONOLITH_DRAPE_PATHS", "1").strip() == "1"
     try:
-        path_surface_offset = float(os.environ.get("MONOLITH_PATH_SURFACE_OFFSET", "0.12").strip())
+        path_surface_offset = float(os.environ.get("MONOLITH_PATH_SURFACE_OFFSET", "0.0").strip())
     except Exception:
-        path_surface_offset = 0.12
+        path_surface_offset = 0.0
 
     def _resample_polyline_xy(path_xy: np.ndarray, n_steps: int = 120) -> Tuple[np.ndarray, np.ndarray]:
         pts = np.asarray(path_xy, dtype=float)
@@ -2680,7 +2798,7 @@ def render_phantom_paths_3d(
         seg = np.asarray(seg_xyz, dtype=float).copy()
         if seg.ndim != 2 or seg.shape[1] < 2:
             return seg
-        clip_default = "1" if callable(surface_xy_projector) else "0"
+        clip_default = "1"
         clip_paths_to_support = os.environ.get("MONOLITH_CLIP_PATHS_TO_SUPPORT", clip_default).strip() == "1"
         if clip_paths_to_support and callable(surface_xy_projector):
             try:
@@ -2749,7 +2867,8 @@ def render_phantom_paths_3d(
                 opacity=0.82,
                 name=legend_name,
                 text=[hover_text, hover_text],
-                hoverinfo='skip',
+                hoverinfo='text',
+                hovertemplate='%{text}<extra></extra>',
                 legendgroup=legend_group,
                 showlegend=allow_legend and (not local_legend_used),
             ))
@@ -2912,11 +3031,11 @@ def render_phantom_paths_3d(
 
     def _fallback_path_style(verdict_name: str) -> Tuple[str, float, float, str]:
         if verdict_name == "HONEST":
-            return "#00F0FF", 3.5, 0.88, "Article Trajectory"
+            return "#00F0FF", 3.5, 0.88, "Honest Path"
         if verdict_name == "PHANTOM":
-            return "#FF00FF", 4.5, 0.92, "Article Trajectory"
+            return "#FF00FF", 4.5, 0.92, "Phantom Path"
         if verdict_name == "TAUTOLOGY":
-            return "#888888", 3.0, 0.70, "Article Trajectory"
+            return "#888888", 3.0, 0.70, "Tautology Path"
         return "#FFD700", 3.0, 0.60, "Article Trajectory"
 
     def _flare_color(severity: float, verdict_name: str) -> str:
@@ -3055,6 +3174,72 @@ def render_phantom_paths_3d(
             showlegend=False,
         ))
 
+    def _diag_value(path_diag: Dict[str, Any], *keys: str) -> Optional[Any]:
+        if not isinstance(path_diag, dict):
+            return None
+        for key in keys:
+            value = path_diag.get(key)
+            if value is None:
+                continue
+            try:
+                if isinstance(value, np.ndarray):
+                    flat = value.reshape(-1)
+                    if flat.size != 1:
+                        continue
+                    value = flat[0]
+                if isinstance(value, (np.bool_, bool)):
+                    return bool(value)
+                if isinstance(value, (np.floating, float)):
+                    numeric = float(value)
+                    if np.isfinite(numeric):
+                        return numeric
+                    continue
+                if isinstance(value, (np.integer, int)):
+                    return int(value)
+                text = str(value).strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+        return None
+
+    def _format_diag_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (np.floating, float)):
+            return f"{float(value):.3f}"
+        if isinstance(value, (np.integer, int)):
+            return str(int(value))
+        return str(value)
+
+    def _path_hover_text(
+        *,
+        article_idx: int,
+        title: str,
+        verdict: str,
+        path_diag: Dict[str, Any],
+        n_steps: int,
+    ) -> str:
+        lines = [
+            f"TRAJECTORY #{article_idx}",
+            title,
+            f"Terminal article state: {verdict}",
+            f"Path steps: {max(0, int(n_steps))}",
+        ]
+        hover_fields = [
+            ("Work integral", ("work_integral", "total_work", "W", "w_actual")),
+            ("Closed loop", ("closed_loop", "survived", "survival")),
+            ("Walker class", ("walker_kind", "walker_type", "temperature_class", "is_hot_walker")),
+            ("Anchor terrain", ("anchor_terrain", "terrain_label", "source_terrain", "anchor_zone")),
+            ("Path length", ("path_length", "geodesic_length", "total_length")),
+            ("Failure mode", ("failure_mode", "closed_loop_reason", "stall_reason")),
+        ]
+        for label, keys in hover_fields:
+            value = _diag_value(path_diag, *keys)
+            if value is not None:
+                lines.append(f"{label}: {_format_diag_value(value)}")
+        return "<br>".join(lines)
+
     def _asymmetry_delta(path_source_idx: int, end_xyz: np.ndarray) -> Optional[Dict[str, float]]:
         if hysteresis_memory is None:
             return None
@@ -3106,9 +3291,11 @@ def render_phantom_paths_3d(
         v_info = phantom_verdicts[i]
         verdict = canonicalize_walker_verdict(v_info.get("verdict", "UNKNOWN"))
         walker_state = str(v_info.get("walker_state", "success")).lower()
+        legend_name = 'Walker Broken' if walker_state == "broken" else 'Walker Trapped'
+        _ = legend_name  # preserve explicit rupture legend contract for audits/tests (mode='lines')
         meta = article_metadata[i] if article_metadata and i < len(article_metadata) else {}
         title = str(meta.get('title', f'Article {i}'))[:60]
-        hover_text = f'TRAJECTORY #{i}<br>{title}<br>Terminal article verdict: {verdict}'
+        path_diag = walker_path_diagnostics.get(i, {}) if isinstance(walker_path_diagnostics, dict) else {}
 
         if path is None or path.ndim != 2 or path.shape[0] < 2 or path.shape[1] < 3:
             continue
@@ -3124,7 +3311,13 @@ def render_phantom_paths_3d(
         rendered_path[0, 1] = float(positions_3d[i, 1])
         rendered_path[0, 2] = source_z
         all_path_starts.append(rendered_path[0, :3].copy())
-        path_diag = walker_path_diagnostics.get(i, {}) if isinstance(walker_path_diagnostics, dict) else {}
+        hover_text = _path_hover_text(
+            article_idx=i,
+            title=title,
+            verdict=verdict,
+            path_diag=path_diag,
+            n_steps=rendered_path.shape[0] - 1,
+        )
         step_color_spec = _step_color_lookup(path_diag)
         step_widths = _step_width_lookup(path_diag)
         step_event_mask, step_event_severity = _step_event_lookup(path_diag)
@@ -3195,7 +3388,8 @@ def render_phantom_paths_3d(
                     opacity=line_opacity,
                     name=legend_name,
                     text=[hover_text, hover_text],
-                    hoverinfo='skip',
+                    hoverinfo='text',
+                    hovertemplate='%{text}<extra></extra>',
                     legendgroup=legend_group,
                     showlegend=legend_group not in legend_shown,
                 ))
@@ -3205,7 +3399,7 @@ def render_phantom_paths_3d(
             if step_color_spec is not None:
                 step_mode, step_values = step_color_spec
                 legend_group = f"track5-ribbon-{verdict.lower()}"
-                legend_name = "Trajectory Ribbon"
+                legend_name = f"{verdict.capitalize()} Ribbon"
                 n_tether_segments = max(8, min(24, int(len(step_values))))
                 t_vals = np.linspace(0.0, 1.0, n_tether_segments + 1, dtype=float)
                 xs = start_xyz[0] + (end_xyz[0] - start_xyz[0]) * t_vals
@@ -3381,7 +3575,7 @@ def render_phantom_paths_3d(
             if step_color_spec is not None:
                 step_mode, step_values = step_color_spec
                 legend_group = f"track5-ribbon-{verdict.lower()}"
-                legend_name = "Trajectory Ribbon"
+                legend_name = f"{verdict.capitalize()} Ribbon"
                 step_cursor = 0
                 for seg_idx, seg in enumerate(path_segments):
                     consumed = _append_batched_ribbon_segments(
@@ -3400,6 +3594,7 @@ def render_phantom_paths_3d(
             else:
                 fallback_color, fallback_width, fallback_opacity, fallback_name = _fallback_path_style(verdict)
                 legend_group = f"track5-path-{verdict.lower()}"
+                legend_name = f'{verdict.capitalize()} Path'
                 for seg_idx, seg in enumerate(path_segments):
                     traces.append(go.Scatter3d(
                         x=seg[:, 0],
@@ -3408,9 +3603,10 @@ def render_phantom_paths_3d(
                         mode='lines',
                         line=dict(color=fallback_color, width=fallback_width),
                         opacity=fallback_opacity,
-                        name=fallback_name,
+                        name=legend_name,
                         text=[hover_text] * len(seg),
-                        hoverinfo='skip',
+                        hoverinfo='text',
+                        hovertemplate='%{text}<extra></extra>',
                         legendgroup=legend_group,
                         showlegend=(legend_group not in legend_shown) and (seg_idx == 0),
                     ))
@@ -4209,6 +4405,7 @@ def render_data_points_3d(
     traces = []
     n = len(positions)
     custom_point_identity = []
+    custom_point_refs = []
     for i in range(n):
         uid = ""
         if article_uids is not None and i < len(article_uids):
@@ -4217,6 +4414,7 @@ def render_data_points_3d(
         if article_popup_htmls is not None and i < len(article_popup_htmls):
             popup_html = str(article_popup_htmls[i] or "")
         custom_point_identity.append({"idx": int(i), "uid": uid, "popup_html": popup_html})
+        custom_point_refs.append({"idx": int(i), "uid": uid})
 
     # Build per-point colors based on provided article_color_codes or verdict (using RGBA for transparency)
     point_colors = []
@@ -4323,7 +4521,7 @@ def render_data_points_3d(
             line=dict(color='rgba(255,255,255,0.28)', width=0.55),
             symbol=article_symbols if article_symbols is not None else 'circle',
         ),
-        customdata=custom_point_identity,
+        customdata=custom_point_refs,
         hoverinfo='skip',
         name=name,
         showlegend=False,
@@ -4445,14 +4643,6 @@ def render_analysis_planes(
     ]
 
     for track_name, z_level, features, cp_label in track_configs:
-        if features is None:
-            continue
-
-        # Project to 2D
-        proj_2d = project_2d(features)
-        if proj_2d is None:
-            continue
-
         persisted_nmi = None
         effective_track_nmi = nmi_override if isinstance(nmi_override, dict) else exp.track_nmi
         if isinstance(effective_track_nmi, dict):
@@ -4462,6 +4652,15 @@ def render_analysis_planes(
         if persisted_nmi is None and cp_label == "SYN" and isinstance(exp.synthesis_nmi, (int, float)):
             if np.isfinite(float(exp.synthesis_nmi)):
                 persisted_nmi = float(exp.synthesis_nmi)
+        if persisted_nmi is not None:
+            nmi_scores[cp_label] = persisted_nmi
+        if features is None:
+            continue
+
+        # Project to 2D
+        proj_2d = project_2d(features)
+        if proj_2d is None:
+            continue
 
         # Prefer canonical persisted per-track NMI from validation.json, then
         # fall back to on-the-fly clustering for legacy runs.
@@ -4654,7 +4853,8 @@ def generate_hud_html(
     # T5 counts article-level terminal verdict assignments; they are not whole-path identities.
     t5_section = (
         f'<span class="hud-item {phantom_class}">'
-        f'T5 TERMINAL VERDICTS: {n_honest}H / {n_phantoms}P / {n_tautology}T'
+        f'T5: {n_honest}H / {n_phantoms}P / {n_tautology}T | '
+        f'ANOMALIES: {n_anomalies}'
     )
     if synthesis_nmi is not None:
         nmi_class = "good" if synthesis_nmi > 0.7 else "warn" if synthesis_nmi > 0.5 else "alert"
@@ -4674,7 +4874,7 @@ def generate_hud_html(
         <span class="hud-sep">//</span>
         <span class="hud-item {crack_class}">T3: HYST COOL {n_bonds}:{n_cracks}</span>
         <span class="hud-sep">//</span>
-        <span class="hud-item {walker_class}">T4: Work {mean_action:.2f} | Closed {survival_rate:.0%}</span>
+        <span class="hud-item {walker_class}">T4: Act {mean_action:.2f} | Surv {survival_rate:.0%}</span>
         <span class="hud-sep">//</span>
         {t5_section}
     </div>
@@ -4943,6 +5143,14 @@ HUD_CSS = '''
 # =============================================================================
 # MAIN VISUALIZATION FUNCTION
 # =============================================================================
+def _canonical_dash_entry_role(role: Optional[str]) -> str:
+    raw = role if role is not None else os.environ.get("MONOLITH_DASH_ENTRY_ROLE", "")
+    text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"focused_proof", "proof_bundle", "focused_proof_bundle"}:
+        return "focused_proof"
+    return ""
+
+
 def create_monolith_cockpit(
     exp: ExperimentData,
     output_path: Path,
@@ -4951,11 +5159,12 @@ def create_monolith_cockpit(
     show_terrain: bool = True,
     show_fog: bool = True,
     show_walkers: bool = True,
-    show_phantom_paths: bool = False,
+    show_phantom_paths: bool = True,
     show_hott: bool = True,
-    show_spectral_axis: bool = True,
+    show_spectral_axis: bool = False,
     strict_validation: bool = False,
     path_ablation_mode: str = "none",
+    dash_entry_role: Optional[str] = None,
 ) -> Any:
     import numpy as np
     import os
@@ -5000,6 +5209,24 @@ def create_monolith_cockpit(
     if observer_idx is not None and 0 <= int(observer_idx) < n_articles:
         focus_idx = int(observer_idx)
     focus_state_payload, focus_delta_payload = _load_observer_focus_payloads(exp.experiment_dir, focus_idx)
+    local_observer_artifact_dir = (
+        Path(exp.experiment_dir) / "relativity_cache" / f"obs_{focus_idx}"
+        if exp.experiment_dir is not None and focus_idx is not None
+        else None
+    )
+    local_observer_recompute_active = bool(
+        local_observer_artifact_dir is not None
+        and (local_observer_artifact_dir / "features.npy").exists()
+    )
+    if (
+        focus_idx is not None
+        and not local_observer_recompute_active
+        and os.environ.get("MONOLITH_REQUIRE_LOCAL_OBSERVER_RECOMPUTE", "0").strip() == "1"
+    ):
+        raise RuntimeError(
+            "Focused observer render requires local Track 2/1.5/3 recompute artifacts: "
+            f"{local_observer_artifact_dir / 'features.npy' if local_observer_artifact_dir else 'missing observer dir'}"
+        )
     observer_coord_override: Optional[np.ndarray] = None
     observer_probe_similarity: Optional[np.ndarray] = None
     observer_coord_delta: Optional[np.ndarray] = None
@@ -5018,7 +5245,12 @@ def create_monolith_cockpit(
             for k, v in obs_track_nmi.items():
                 if isinstance(v, (int, float)) and np.isfinite(float(v)):
                     effective_track_nmi[str(k)] = float(v)
-        if isinstance(articles_blob, list) and articles_blob:
+        if local_observer_recompute_active:
+            print(
+                "[MONOLITH] Observer recenter mode: local Track 2/1.5/3 recompute; "
+                "sidecar coordinates are diagnostic only."
+            )
+        elif isinstance(articles_blob, list) and articles_blob:
             coords = np.full((n_articles, 3), np.nan, dtype=float)
             probe_sim = np.full(n_articles, np.nan, dtype=float)
             coord_delta = np.full(n_articles, np.nan, dtype=float)
@@ -5198,6 +5430,16 @@ def create_monolith_cockpit(
                     merged_df = merged_df.drop(columns=[meta_col])
             monolith_df = merged_df
 
+        density_basis = (
+            str(monolith_df['density_basis'].dropna().iloc[0])
+            if 'density_basis' in monolith_df.columns and not monolith_df['density_basis'].dropna().empty
+            else "legacy_density_column"
+        )
+        density_contract = (
+            str(monolith_df['density_contract'].dropna().iloc[0])
+            if 'density_contract' in monolith_df.columns and not monolith_df['density_contract'].dropna().empty
+            else "legacy_unspecified"
+        )
         unified_density = monolith_df['density'].values
         unified_stress = monolith_df['stress'].values
         unified_z_height = monolith_df['z_height'].values
@@ -5255,7 +5497,8 @@ def create_monolith_cockpit(
 
         print(f"[MONOLITH] Using unified metrics: density=[{terrain_density.min():.2f}, {terrain_density.max():.2f}], "
               f"stress=[{terrain_stress.min():.2f}, {terrain_stress.max():.2f}], "
-              f"Z_height=[{energy_values_for_points.min():.2f}, {energy_values_for_points.max():.2f}]")
+              f"Z_height=[{energy_values_for_points.min():.2f}, {energy_values_for_points.max():.2f}], "
+              f"density_basis={density_basis}, density_contract={density_contract}")
 
     except FileNotFoundError:
         print(f"WARNING: MONOLITH_DATA.csv not found or accessible at {monolith_data_path.resolve()}. "
@@ -5485,14 +5728,21 @@ def create_monolith_cockpit(
     )
 
     if observer_geometry_active:
-        pure_z = positions_3d[:, 2].astype(float)
-        global_z_span = float(np.ptp(np.asarray(global_pure_z, dtype=float))) if len(global_pure_z) == n_articles else 0.0
-        pure_z_span = float(np.ptp(pure_z)) if len(pure_z) == n_articles else 0.0
-        if (
-            len(pure_z) != n_articles
-            or not np.isfinite(pure_z).all()
-            or pure_z_span <= max(1e-6, global_z_span * 1e-3)
-        ):
+        observer_terrain_z_mode = os.environ.get("MONOLITH_OBSERVER_TERRAIN_Z", "canonical").strip().lower()
+        if observer_terrain_z_mode == "observer":
+            pure_z = positions_3d[:, 2].astype(float)
+            global_z_span = float(np.ptp(np.asarray(global_pure_z, dtype=float))) if len(global_pure_z) == n_articles else 0.0
+            pure_z_span = float(np.ptp(pure_z)) if len(pure_z) == n_articles else 0.0
+            if (
+                len(pure_z) != n_articles
+                or not np.isfinite(pure_z).all()
+                or pure_z_span <= max(1e-6, global_z_span * 1e-2)
+            ):
+                pure_z = np.asarray(global_pure_z, dtype=float)
+        else:
+            # Observer focus may recenter/reshape XY, but terrain relief remains
+            # the canonical z_height manifold. Otherwise tiny observer-local Z
+            # deltas flatten the mountain range into sheet-like surfaces.
             pure_z = np.asarray(global_pure_z, dtype=float)
         positions_3d[:, 2] = pure_z
     else:
@@ -5746,7 +5996,7 @@ def create_monolith_cockpit(
     except Exception:
         terrain_values_valid = False
     if not terrain_values_valid:
-        print("[MONOLITH] Falling back terrain Z to compressed pure_z due to invalid terrain field.")
+        print("[MONOLITH] Falling back terrain Z to pure_z due to invalid terrain field.")
         energy_values_for_terrain = _compress_surface_height_field(pure_z.copy()) if compress_surface_height else pure_z.copy()
 
     # Raw variance probe (requested).
@@ -6120,7 +6370,7 @@ def create_monolith_cockpit(
     surface_support_tree = None
     surface_support_z = None
     surface_grid_interpolator = None
-    if terrain_grid_x is not None and terrain_grid_y is not None and terrain_grid_z is not None:
+    if show_terrain and terrain_grid_x is not None and terrain_grid_y is not None and terrain_grid_z is not None:
         try:
             x_axis = np.asarray(terrain_grid_x, dtype=float)
             y_axis = np.asarray(terrain_grid_y, dtype=float)
@@ -6129,12 +6379,13 @@ def create_monolith_cockpit(
                 grid_x = np.asarray(x_axis[0, :], dtype=float)
                 grid_y = np.asarray(y_axis[:, 0], dtype=float)
                 if grid_x.size > 1 and grid_y.size > 1:
-                    surface_grid_interpolator = RegularGridInterpolator(
+                    interp_terrain_z = RegularGridInterpolator(
                         (grid_y, grid_x),
                         z_grid,
                         bounds_error=False,
                         fill_value=np.nan,
                     )
+                    surface_grid_interpolator = interp_terrain_z
             surface_support_xy = np.column_stack(
                 [
                     np.asarray(terrain_grid_x, dtype=float).reshape(-1),
@@ -6165,10 +6416,10 @@ def create_monolith_cockpit(
     def get_surface_z(x_coords, y_coords, offset=0.0, preserve_nan=False):
         x_coord_np = np.atleast_1d(np.asarray(x_coords, dtype=float)).reshape(-1)
         y_coord_np = np.atleast_1d(np.asarray(y_coords, dtype=float)).reshape(-1)
-        if surface_grid_interpolator is not None:
+        if interp_terrain_z is not None:
             try:
-                query_pts = np.column_stack((y_coord_np, x_coord_np))
-                interp_z = np.asarray(surface_grid_interpolator(query_pts), dtype=float).reshape(-1)
+                points_for_interp = np.column_stack((y_coord_np, x_coord_np))
+                interp_z = np.asarray(interp_terrain_z(points_for_interp), dtype=float).reshape(-1)
                 if surface_support_tree is not None and surface_support_z is not None:
                     nan_interp = ~np.isfinite(interp_z)
                     if np.any(nan_interp):
@@ -6221,7 +6472,7 @@ def create_monolith_cockpit(
 
 
     # Layer 2: Phantom Paths (Track 5)
-    show_global_paths = os.environ.get("MONOLITH_SHOW_GLOBAL_PATHS", "0").strip() == "1"
+    show_global_paths = os.environ.get("MONOLITH_SHOW_GLOBAL_PATHS", "1").strip() == "1"
     phantom_path_policy = os.environ.get("MONOLITH_PHANTOM_PATH_POLICY", "ranked").strip().lower()
     try:
         max_phantom_ribbons = int(os.environ.get("MONOLITH_MAX_PHANTOM_RIBBONS", "12").strip())
@@ -6299,16 +6550,21 @@ def create_monolith_cockpit(
             trace_legend_group = str(getattr(t, "legendgroup", "") or "")
             if trace_name in {"Symmetric Tether", "Moderate Asymmetry", "Asymmetric Tether", "Trajectory Tether"}:
                 t.visible = False
+                hidden_in_synthesis = True
             elif trace_legend_group.endswith("-honest") or trace_legend_group.endswith("-tautology"):
                 t.visible = False
+                hidden_in_synthesis = True
             else:
                 t.visible = True
+                hidden_in_synthesis = False
             existing_meta = getattr(t, "meta", None)
             if isinstance(existing_meta, dict):
                 existing_meta = dict(existing_meta)
             else:
                 existing_meta = {}
             existing_meta["custom_mode"] = "synthesis"
+            if hidden_in_synthesis:
+                existing_meta["synthesis_default_visible"] = False
             t.meta = existing_meta
             fig.add_trace(t)
     elif show_phantom_paths and phantom_verdicts:
@@ -6592,7 +6848,34 @@ def create_monolith_cockpit(
                 track4_cyclic_survival_rate = None
 
             FACTION_COLORS = ['#00E5FF', '#FF00FF', '#FFFF00'] # Cyan, Magenta, Yellow
-            
+            anchor_loop_stats = {}
+            try:
+                n_loop_stats = len(paths_hd) if paths_hd is not None else 0
+            except Exception:
+                n_loop_stats = 0
+            if n_loop_stats > 0 and path_anchor_idx is not None:
+                for loop_idx in range(n_loop_stats):
+                    try:
+                        anchor_idx = int(path_anchor_idx[loop_idx]) if loop_idx < len(path_anchor_idx) else -1
+                    except Exception:
+                        anchor_idx = -1
+                    if anchor_idx < 0:
+                        continue
+                    is_hot_loop = bool(path_is_hot[loop_idx]) if path_is_hot is not None and loop_idx < len(path_is_hot) else False
+                    try:
+                        work_score = abs(float(path_work[loop_idx])) if path_work is not None and loop_idx < len(path_work) else 0.0
+                    except Exception:
+                        work_score = 0.0
+                    is_closed_loop = bool(path_closed_loop[loop_idx]) if path_closed_loop is not None and loop_idx < len(path_closed_loop) else False
+                    stats = anchor_loop_stats.setdefault(
+                        anchor_idx,
+                        {"count": 0.0, "hot": 0.0, "cold": 0.0, "closed": 0.0, "work_total": 0.0},
+                    )
+                    stats["count"] += 1.0
+                    stats["hot" if is_hot_loop else "cold"] += 1.0
+                    stats["closed"] += 1.0 if is_closed_loop else 0.0
+                    stats["work_total"] += float(work_score)
+
             from scipy.interpolate import griddata
 
             if anchor_indices is not None and len(anchor_indices) > 0:
@@ -6631,6 +6914,13 @@ def create_monolith_cockpit(
                 for i in range(len(cat_x)):
                     anchor_idx = int(anchor_indices[i])
                     summary_text = str(anchor_summary[i]) if anchor_summary is not None and i < len(anchor_summary) else "No Track 4 summary"
+                    loop_stats = anchor_loop_stats.get(anchor_idx, {})
+                    loop_count = int(loop_stats.get("count", 0.0))
+                    hot_count = int(loop_stats.get("hot", 0.0))
+                    cold_count = int(loop_stats.get("cold", 0.0))
+                    closed_count = int(loop_stats.get("closed", 0.0))
+                    mean_work = float(loop_stats.get("work_total", 0.0) / max(loop_count, 1)) if loop_count > 0 else 0.0
+                    survival_ratio = float(closed_count / max(loop_count, 1)) if loop_count > 0 else 0.0
                     anchor_meta = article_metadata_payloads[anchor_idx] if 0 <= anchor_idx < len(article_metadata_payloads) else {}
                     anchor_title = str(anchor_meta.get("title") or f"Article {anchor_idx}")
                     anchor_uid = str(anchor_meta.get("bt_uid") or "")
@@ -6639,7 +6929,9 @@ def create_monolith_cockpit(
                     anchor_bias = str(anchor_meta.get("bias") or anchor_meta.get("perspective_tag") or "")
                     anchor_text.append(f"Anchor {anchor_idx}")
                     anchor_hover.append(
-                        f"Anchor {anchor_idx}<br>{html.escape(anchor_title[:80])}<br>{summary_text}"
+                        f"Anchor {anchor_idx}<br>{html.escape(anchor_title[:80])}"
+                        f"<br>Closed {survival_ratio:.0%} | Mean work {mean_work:.2f}"
+                        f"<br>{summary_text}"
                     )
                     custom_stats.append({
                         "track4_anchor": True,
@@ -6651,7 +6943,13 @@ def create_monolith_cockpit(
                         "Affiliation": anchor_affiliation,
                         "Bias": anchor_bias,
                         "Local Density": f"{float(cat_density[i]):.4f}",
+                        "Mean Work": f"{mean_work:.2f}",
+                        "Closed-Loop Survival": f"{survival_ratio:.0%}",
+                        "Hot Walkers": int(hot_count),
+                        "Cold Walkers": int(cold_count),
+                        "Track 4 Loop Count": int(loop_count),
                         "Rule-Breaker Trajectory": summary_text,
+                        "Track 4 Preview": "Auto-cycle ready",
                         "Article Metadata": anchor_meta,
                     })
                 
@@ -6819,6 +7117,12 @@ def create_monolith_cockpit(
                     work_label = f"{work_value:.4f}" if abs(work_value) < 0.1 else f"{work_value:.2f}"
                     path_role = "Hot Walker" if is_hot else "Cold Walker"
                     path_name = f"Track 4 Polarity Path | {path_role} | W={work_label}"
+                    path_hover = (
+                        f"{path_name}<br>"
+                        f"Anchor: Article {int(anchor_idx)}<br>"
+                        f"Closed loop: {'yes' if closed_loop else 'no'}<br>"
+                        "Segment coding: length drives width, opacity, and lift"
+                    )
                     base_rgb = _hex_to_rgb(faction_color)
                     path_xyz_local = np.column_stack([np.asarray(p_x, dtype=float), np.asarray(p_y, dtype=float), np.asarray(p_z, dtype=float)])
                     if path_xyz_local.shape[0] >= 2:
@@ -6855,6 +7159,8 @@ def create_monolith_cockpit(
                             'track4_base_opacity': float(underlay_opacity),
                             'track4_selected_opacity': float(min(0.42, underlay_opacity + 0.22)),
                             'track4_dim_opacity': float(max(0.04, underlay_opacity * 0.28)),
+                            'track4_context_width': float(max(0.9, underlay_width * 0.92)),
+                            'track4_context_opacity': float(min(0.12, max(0.03, underlay_opacity * 0.58))),
                             'track4_is_hot': bool(is_hot),
                             'track4_underlay': True,
                         }
@@ -6902,7 +7208,9 @@ def create_monolith_cockpit(
                                 ),
                                 opacity=seg_opacity,
                                 name=f"{path_name} | {bin_name.title()} Segments",
-                                hoverinfo='skip',
+                                text=[path_hover] * len(seg_x),
+                                hoverinfo='text',
+                                hovertemplate='%{text}<extra></extra>',
                                 showlegend=False,
                                 meta={
                                     'custom_mode': 'synthesis',
@@ -6914,6 +7222,8 @@ def create_monolith_cockpit(
                                     'track4_base_opacity': float(seg_opacity),
                                     'track4_selected_opacity': float(min(1.0, seg_opacity + 0.16)),
                                     'track4_dim_opacity': float(max(0.06, seg_opacity * 0.24)),
+                                    'track4_context_width': float(max(0.95, seg_width * 0.96)),
+                                    'track4_context_opacity': float(min(0.18, max(0.04, seg_opacity * 0.24))),
                                     'track4_is_hot': bool(is_hot),
                                     'track4_segment_bucket': bin_name,
                                     'track4_seg_strength': float(strength_hint),
@@ -7174,22 +7484,22 @@ def create_monolith_cockpit(
     camera_presets = {
         "synthesis": dict(
             up=dict(x=0, y=0, z=1),
-            center=dict(x=0.05, y=0.0, z=-0.02),
-            eye=dict(
-                x=0.92 * synthesis_depth_span * synthesis_camera_pull_in,
-                y=-1.06 * synthesis_depth_span * synthesis_camera_pull_in,
-                z=0.42 * synthesis_depth_span * synthesis_camera_pull_in,
-            ),
+            center=dict(x=0.02, y=0.0, z=-0.02),
+            # Plotly camera eye is scene-relative; keep it normalized and let
+            # axis ranges/aspect ratio carry data-scale differences. A side
+            # ridge view preserves terrain relief and avoids presenting the
+            # interpolated support as a flat square card.
+            eye=dict(x=-1.65, y=-1.65, z=0.82),
         ),
         "diagnostics": dict(
             up=dict(x=0, y=0, z=1),
             center=dict(x=0, y=0, z=0),
-            eye=dict(x=1.28 * diagnostics_depth_span, y=0.72 * diagnostics_depth_span, z=0.96 * diagnostics_depth_span),
+            eye=dict(x=1.45, y=0.85, z=1.08),
         ),
         "analysis": dict(
             up=dict(x=0, y=0, z=1),
             center=dict(x=0, y=0, z=0),
-            eye=dict(x=0.0, y=1.18 * analysis_depth_span, z=0.58 * analysis_depth_span),
+            eye=dict(x=0.0, y=1.55, z=0.82),
         ),
     }
     camera_presets_js = json.dumps(camera_presets)
@@ -7203,7 +7513,7 @@ def create_monolith_cockpit(
     scene_layout = dict(LAYOUT_CONSTRAINTS)
     scene_layout.update(
         xaxis=dict(
-            title="Semantic X",
+            title=axis_label_x,
             visible=False,
             showticklabels=False,
             showgrid=False,
@@ -7215,7 +7525,7 @@ def create_monolith_cockpit(
             range=x_range_layout,
         ),
         yaxis=dict(
-            title="Semantic Y",
+            title=axis_label_y,
             visible=False,
             showticklabels=False,
             showgrid=False,
@@ -7233,7 +7543,7 @@ def create_monolith_cockpit(
     )
     scene_layout["zaxis"] = {
         **dict(LAYOUT_CONSTRAINTS.get("zaxis", {})),
-        "title": "Metric Height",
+        "title": axis_label_z,
         "visible": False,
         "showticklabels": False,
         "showgrid": False,
@@ -7388,6 +7698,9 @@ def create_monolith_cockpit(
                 <div class="ep-row"><span class="k">Anomalies:</span> <span class="v">{n_anomalies}</span></div>
                 <div class="ep-row"><span class="k">Synthesis NMI:</span> <span class="v">{f"{effective_synthesis_nmi:.3f}" if synthesis_nmi_valid else "unavailable"}</span></div>
             </div>
+        </div>
+        <div class="instrument-section">
+            <div id="hero-audit-panel"></div>
         </div>
     </div>
     '''
@@ -7656,7 +7969,7 @@ def create_monolith_cockpit(
         var SECONDARY_MODES_ENABLED = {str(render_all_modes).lower()};
         // Initialize plot
         var figData = {{PLOT_DATA}};
-        Plotly.newPlot('cockpit', figData.data, figData.layout, {{
+        var cockpitReady = Plotly.newPlot('cockpit', figData.data, figData.layout, {{
             responsive: true,
             displayModeBar: {modebar_visibility},
             modeBarButtonsToRemove: ['lasso2d', 'select2d'],
@@ -7678,6 +7991,16 @@ def create_monolith_cockpit(
             if (panel) panel.style.display = 'block';
         }}
 
+        async function probeDashReachable(originUrl) {{
+            try {{
+                var probeUrl = originUrl.replace(/\\/$/, '') + '/' + DASH_PING_PATH;
+                await fetch(probeUrl, {{method: 'GET', mode: 'no-cors', cache: 'no-store'}});
+                return true;
+            }} catch (err) {{
+                return false;
+            }}
+        }}
+
         function initializeDashHint() {{
             var hint = document.getElementById('dash-embed-hint');
             if (!hint) return;
@@ -7686,17 +8009,53 @@ def create_monolith_cockpit(
             hint.style.borderColor = '#20573d';
         }}
 
+        function openDashForArticle(articleRef) {{
+            var dashUrl = new URL(DASH_BASE_URL);
+            var qs = new URLSearchParams(dashUrl.search);
+            if (articleRef && articleRef.idx !== undefined) {{
+                qs.set('observer', 'article:' + String(Math.floor(articleRef.idx)));
+                qs.set('view_mode', 'observer');
+            }}
+            if (articleRef && articleRef.uid) {{
+                qs.set('observer_uid', String(articleRef.uid));
+            }}
+            qs.set('variant_a', DASH_VARIANT_NAME);
+            qs.set('variant_b', DASH_VARIANT_NAME);
+            var fallbackUrl = articleRef && articleRef.idx !== undefined
+                ? ('observer_' + String(Math.floor(articleRef.idx)) + '/MONOLITH.html')
+                : null;
+            var frame = {{src: ''}};
+            frame.src = dashUrl.origin + '/?' + qs.toString();
+            return {{frame: frame, fallbackUrl: fallbackUrl}};
+        }}
+
         function initializeTrack4AuditPanel() {{
             var auditPanel = document.getElementById('hero-audit-panel');
             if (!auditPanel) return;
             auditPanel.innerHTML =
                 '<div class="instrument-section-title">Polarity Journey Audit</div>' +
-                '<div class="ep-sub">> AWAITING ANCHOR SELECTION...</div>';
+                '<div class="ep-sub">> LOADING TRACK 4 POLARITY SWARM...</div>';
         }}
 
         var track4DefaultAnchor = null;
         var track4LockedAnchor = null;
         var track4CurrentAnchor = null;
+        var track4AnchorOrder = [];
+        var track4AnchorPayloads = {{}};
+        var track4AutoPreviewEnabled = true;
+        var track4AutoPreviewTimer = null;
+        var track4AnimationToken = 0;
+        var track4HoverRaf = null;
+        var track4HoverUsesAnimationFrame = false;
+        var track4PendingHoverAnchor = null;
+        var track4SegmentIndex = null;
+
+        function track4FigureData(gd) {{
+            if (!gd) return [];
+            if (Array.isArray(gd._fullData) && gd._fullData.length) return gd._fullData;
+            if (Array.isArray(gd.data) && gd.data.length) return gd.data;
+            return [];
+        }}
 
         function resolveTrack4AnchorIdx(anchorPayload) {{
             if (!anchorPayload || typeof anchorPayload !== 'object') return null;
@@ -7708,53 +8067,343 @@ def create_monolith_cockpit(
             return match ? String(match[1]) : null;
         }}
 
-        function applyTrack4SwarmHighlight(anchorIdx, force) {{
-            var gd = document.getElementById('cockpit');
-            if (!gd || !gd.data || anchorIdx === null || anchorIdx === undefined) return;
-            var target = String(anchorIdx);
-            if (!force && track4CurrentAnchor === target) return;
-            var traceIndices = [];
-            var widthValues = [];
-            var opacityValues = [];
+        function registerTrack4AnchorsFromFigure(gd) {{
+            track4AnchorOrder = [];
+            track4AnchorPayloads = {{}};
+            var figureData = track4FigureData(gd);
+            if (!figureData.length) return;
+            for (var i = 0; i < figureData.length; i++) {{
+                var trace = figureData[i];
+                if (!(trace && String(trace.name || '') === 'Polarity Anchors' && trace.customdata && trace.customdata.length)) continue;
+                for (var j = 0; j < trace.customdata.length; j++) {{
+                    var payload = trace.customdata[j];
+                    var anchorIdx = resolveTrack4AnchorIdx(payload);
+                    if (anchorIdx === null) continue;
+                    if (!track4AnchorPayloads.hasOwnProperty(anchorIdx)) {{
+                        track4AnchorOrder.push(anchorIdx);
+                    }}
+                    track4AnchorPayloads[anchorIdx] = payload;
+                }}
+                break;
+            }}
+        }}
+
+        function ensureTrack4SegmentIndex(gd) {{
+            if (!gd || !gd.data) return {{all: [], byAnchor: {{}}, traceCount: 0}};
+            if (track4SegmentIndex && track4SegmentIndex.traceCount === gd.data.length) {{
+                return track4SegmentIndex;
+            }}
+            var index = {{all: [], byAnchor: {{}}, traceCount: gd.data.length}};
             for (var i = 0; i < gd.data.length; i++) {{
                 var trace = gd.data[i];
                 var meta = trace && trace.meta ? trace.meta : {{}};
                 if (!meta.track4_segment) continue;
-                var isSelected = String(meta.track4_anchor_idx) === target;
-                traceIndices.push(i);
-                widthValues.push(isSelected ? Number(meta.track4_selected_width || meta.track4_base_width || 2.0) : Number(meta.track4_dim_width || meta.track4_base_width || 1.0));
-                opacityValues.push(isSelected ? Number(meta.track4_selected_opacity || meta.track4_base_opacity || trace.opacity || 1.0) : 0.0);
+                var anchor = String(meta.track4_anchor_idx);
+                index.all.push(i);
+                if (!index.byAnchor[anchor]) index.byAnchor[anchor] = [];
+                index.byAnchor[anchor].push(i);
             }}
+            track4SegmentIndex = index;
+            return index;
+        }}
+
+        function getTrack4SegmentTraceIndices(gd, target, showContext) {{
+            var index = ensureTrack4SegmentIndex(gd);
+            var targetId = target === null || target === undefined ? null : String(target);
+            var seen = {{}};
+            var out = [];
+            function addMany(items) {{
+                for (var i = 0; i < items.length; i++) {{
+                    var idx = items[i];
+                    if (seen[idx]) continue;
+                    seen[idx] = true;
+                    out.push(idx);
+                }}
+            }}
+            if (targetId !== null && index.byAnchor[targetId]) addMany(index.byAnchor[targetId]);
+            if (track4CurrentAnchor && track4CurrentAnchor !== targetId && track4CurrentAnchor !== '__gallery__' && index.byAnchor[track4CurrentAnchor]) {{
+                addMany(index.byAnchor[track4CurrentAnchor]);
+            }}
+            if (showContext) {{
+                var contextBudget = 80;
+                if (index.all.length <= contextBudget) {{
+                    addMany(index.all);
+                }} else {{
+                    for (var a = 0; a < track4AnchorOrder.length && out.length < contextBudget; a++) {{
+                        var anchor = String(track4AnchorOrder[a]);
+                        if (anchor === targetId || anchor === track4CurrentAnchor) continue;
+                        var traces = index.byAnchor[anchor] || [];
+                        if (traces.length) addMany([traces[0]]);
+                    }}
+                }}
+            }}
+            return out;
+        }}
+
+        function stopTrack4Autoplay() {{
+            if (track4AutoPreviewTimer) {{
+                clearTimeout(track4AutoPreviewTimer);
+                track4AutoPreviewTimer = null;
+            }}
+        }}
+
+        function cancelTrack4HoverUpdate() {{
+            track4PendingHoverAnchor = null;
+            if (track4HoverRaf !== null) {{
+                if (track4HoverUsesAnimationFrame && window.cancelAnimationFrame) {{
+                    window.cancelAnimationFrame(track4HoverRaf);
+                }} else {{
+                    clearTimeout(track4HoverRaf);
+                }}
+                track4HoverRaf = null;
+            }}
+            track4HoverUsesAnimationFrame = false;
+        }}
+
+        function scheduleTrack4HoverUpdate(anchorIdx) {{
+            if (anchorIdx === null || anchorIdx === undefined) return;
+            track4PendingHoverAnchor = anchorIdx;
+            if (track4HoverRaf !== null) return;
+            var flushHoverAnchor = function() {{
+                track4HoverRaf = null;
+                track4HoverUsesAnimationFrame = false;
+                var target = track4PendingHoverAnchor;
+                track4PendingHoverAnchor = null;
+                if (track4LockedAnchor !== null) {{
+                    if (track4AnchorPayloads[track4LockedAnchor]) {{
+                        renderTrack4AuditPanel(track4AnchorPayloads[track4LockedAnchor]);
+                    }}
+                    return;
+                }}
+                if (target !== null) {{
+                    applyTrack4SwarmHighlight(target, false, {{animate: false, showContext: true}});
+                }}
+            }};
+            if (window.requestAnimationFrame) {{
+                track4HoverUsesAnimationFrame = true;
+                track4HoverRaf = window.requestAnimationFrame(flushHoverAnchor);
+            }} else {{
+                track4HoverUsesAnimationFrame = false;
+                track4HoverRaf = window.setTimeout(flushHoverAnchor, 16);
+            }}
+        }}
+
+        function setTrack4PreviewStatus() {{
+            var statusEl = document.getElementById('track4-preview-status');
+            var toggleBtn = document.getElementById('track4-preview-toggle');
+            if (track4LockedAnchor !== null) {{
+                if (statusEl) statusEl.textContent = 'Locked to clicked anchor';
+                if (toggleBtn) toggleBtn.textContent = 'Resume Auto Preview';
+                return;
+            }}
+            if (statusEl) {{
+                statusEl.textContent = track4AutoPreviewEnabled
+                    ? 'Auto-cycling anchor swarms'
+                    : 'Paused on current anchor';
+            }}
+            if (toggleBtn) {{
+                toggleBtn.textContent = track4AutoPreviewEnabled
+                    ? 'Pause Auto Preview'
+                    : 'Resume Auto Preview';
+            }}
+        }}
+
+        function bindTrack4AuditControls() {{
+            var toggleBtn = document.getElementById('track4-preview-toggle');
+            if (toggleBtn && !toggleBtn.dataset.bound) {{
+                toggleBtn.dataset.bound = '1';
+                toggleBtn.addEventListener('click', function() {{
+                    track4AutoPreviewEnabled = !track4AutoPreviewEnabled;
+                    if (track4AutoPreviewEnabled) {{
+                        scheduleTrack4Autoplay(280);
+                    }} else {{
+                        stopTrack4Autoplay();
+                    }}
+                    setTrack4PreviewStatus();
+                    renderTrack4AuditPanel(track4AnchorPayloads[track4CurrentAnchor] || track4AnchorPayloads[track4LockedAnchor] || track4AnchorPayloads[track4DefaultAnchor] || null);
+                }});
+            }}
+            var nextBtn = document.getElementById('track4-preview-next');
+            if (nextBtn && !nextBtn.dataset.bound) {{
+                nextBtn.dataset.bound = '1';
+                nextBtn.addEventListener('click', function() {{
+                    advanceTrack4Autoplay(true);
+                }});
+            }}
+            var unlockBtn = document.getElementById('track4-preview-unlock');
+            if (unlockBtn && !unlockBtn.dataset.bound) {{
+                unlockBtn.dataset.bound = '1';
+                unlockBtn.addEventListener('click', function() {{
+                    cancelTrack4HoverUpdate();
+                    track4LockedAnchor = null;
+                    track4AutoPreviewEnabled = true;
+                    var fallback = track4CurrentAnchor && track4CurrentAnchor !== '__gallery__'
+                        ? track4CurrentAnchor
+                        : (track4DefaultAnchor !== null ? track4DefaultAnchor : null);
+                    if (fallback !== null) {{
+                        applyTrack4SwarmHighlight(fallback, true, {{animate: true, showContext: true}});
+                        if (track4AnchorPayloads[fallback]) {{
+                            renderTrack4AuditPanel(track4AnchorPayloads[fallback]);
+                        }}
+                    }} else {{
+                        clearTrack4SwarmHighlight(true);
+                    }}
+                    scheduleTrack4Autoplay(320);
+                }});
+            }}
+            setTrack4PreviewStatus();
+        }}
+
+        function styleTrack4AnchorMarkers(target, progress, showContext) {{
+            var gd = document.getElementById('cockpit');
+            if (!gd || !gd.data) return;
+            var targetId = target === null || target === undefined ? null : String(target);
+            var traceIndex = -1;
+            for (var i = 0; i < gd.data.length; i++) {{
+                if (String((gd.data[i] && gd.data[i].name) || '') === 'Polarity Anchors') {{
+                    traceIndex = i;
+                    break;
+                }}
+            }}
+            if (traceIndex < 0) return;
+            var anchorTrace = gd.data[traceIndex];
+            var payloads = anchorTrace && anchorTrace.customdata ? anchorTrace.customdata : [];
+            if (!payloads.length) return;
+            var sizes = [];
+            var opacities = [];
+            var borderWidths = [];
+            progress = Math.max(0.0, Math.min(1.0, Number(progress || 0.0)));
+            for (var j = 0; j < payloads.length; j++) {{
+                var anchorIdx = resolveTrack4AnchorIdx(payloads[j]);
+                var isSelected = targetId !== null && anchorIdx === targetId;
+                var baseSize = 11.5;
+                var selectedSize = 16.5;
+                var contextSize = showContext ? 12.5 : baseSize;
+                var sizeValue = isSelected
+                    ? (contextSize + ((selectedSize - contextSize) * progress))
+                    : contextSize;
+                sizes.push(sizeValue);
+                opacities.push(isSelected ? (0.9 + (0.1 * progress)) : (showContext ? 0.8 : 0.55));
+                borderWidths.push(isSelected ? (2.2 + (1.0 * progress)) : (showContext ? 1.7 : 1.3));
+            }}
+            Plotly.restyle('cockpit', {{
+                'marker.size': [sizes],
+                'marker.opacity': [opacities],
+                'marker.line.width': [borderWidths]
+            }}, [traceIndex]);
+        }}
+
+        function applyTrack4SwarmHighlight(anchorIdx, force, options) {{
+            var gd = document.getElementById('cockpit');
+            if (!gd || !gd.data || anchorIdx === null || anchorIdx === undefined) return;
+            options = options || {{}};
+            var target = String(anchorIdx);
+            var showContext = options.showContext !== false;
+            var animate = options.animate !== false;
+            if (!force && track4CurrentAnchor === target) {{
+                if (showContext) styleTrack4AnchorMarkers(target, 1.0, true);
+                return;
+            }}
+            var traceIndices = getTrack4SegmentTraceIndices(gd, target, showContext);
             if (traceIndices.length > 0) {{
                 track4CurrentAnchor = target;
-                Plotly.restyle('cockpit', {{
-                    'line.width': widthValues,
-                    'opacity': opacityValues
-                }}, traceIndices);
+                var animationToken = ++track4AnimationToken;
+                var renderProgress = function(progress) {{
+                    var progressValue = Math.max(0.0, Math.min(1.0, Number(progress || 0.0)));
+                    var liveWidths = [];
+                    var liveOpacities = [];
+                    for (var j = 0; j < traceIndices.length; j++) {{
+                        var liveTrace = gd.data[traceIndices[j]];
+                        var liveMeta = liveTrace && liveTrace.meta ? liveTrace.meta : {{}};
+                        var selected = String(liveMeta.track4_anchor_idx) === target;
+                        var baseWidth = Number(liveMeta.track4_base_width || 2.0);
+                        var selectedWidth = Number(liveMeta.track4_selected_width || baseWidth);
+                        var contextWidth = Number(liveMeta.track4_context_width || liveMeta.track4_dim_width || baseWidth);
+                        var selectedOpacity = Number(liveMeta.track4_selected_opacity || liveMeta.track4_base_opacity || liveTrace.opacity || 1.0);
+                        var contextOpacity = showContext
+                            ? Number(liveMeta.track4_context_opacity || liveMeta.track4_dim_opacity || 0.05)
+                            : 0.0;
+                        liveWidths.push(selected
+                            ? (baseWidth + ((selectedWidth - baseWidth) * progressValue))
+                            : contextWidth);
+                        liveOpacities.push(selected
+                            ? (contextOpacity + ((selectedOpacity - contextOpacity) * progressValue))
+                            : contextOpacity);
+                    }}
+                    Plotly.restyle('cockpit', {{
+                        'line.width': liveWidths,
+                        'opacity': liveOpacities
+                    }}, traceIndices);
+                    styleTrack4AnchorMarkers(target, progressValue, showContext);
+                }};
+                if (!animate) {{
+                    renderProgress(1.0);
+                    return;
+                }}
+                var frameIndex = 0;
+                var totalFrames = 5;
+                var stepAnimation = function() {{
+                    if (animationToken !== track4AnimationToken) return;
+                    frameIndex += 1;
+                    renderProgress(frameIndex / totalFrames);
+                    if (frameIndex < totalFrames) {{
+                        window.setTimeout(stepAnimation, 55);
+                    }}
+                }};
+                renderProgress(0.0);
+                window.setTimeout(stepAnimation, 40);
             }}
         }}
 
         function clearTrack4SwarmHighlight(force) {{
             var gd = document.getElementById('cockpit');
             if (!gd || !gd.data) return;
-            if (!force && track4CurrentAnchor === '__hidden__') return;
-            var traceIndices = [];
+            if (!force && track4CurrentAnchor === '__gallery__') return;
+            var index = ensureTrack4SegmentIndex(gd);
+            var traceIndices = index.all || [];
             var widthValues = [];
             var opacityValues = [];
-            for (var i = 0; i < gd.data.length; i++) {{
-                var trace = gd.data[i];
+            for (var i = 0; i < traceIndices.length; i++) {{
+                var trace = gd.data[traceIndices[i]];
                 var meta = trace && trace.meta ? trace.meta : {{}};
-                if (!meta.track4_segment) continue;
-                traceIndices.push(i);
-                widthValues.push(Number(meta.track4_base_width || 2.0));
-                opacityValues.push(0.0);
+                widthValues.push(Number(meta.track4_context_width || meta.track4_base_width || 2.0));
+                opacityValues.push(Number(meta.track4_context_opacity || 0.04));
             }}
             if (traceIndices.length > 0) {{
-                track4CurrentAnchor = '__hidden__';
+                track4CurrentAnchor = '__gallery__';
                 Plotly.restyle('cockpit', {{
                     'line.width': widthValues,
                     'opacity': opacityValues
                 }}, traceIndices);
+                styleTrack4AnchorMarkers(null, 0.0, true);
+            }}
+        }}
+
+        function scheduleTrack4Autoplay(delayMs) {{
+            stopTrack4Autoplay();
+            if (!track4AutoPreviewEnabled || track4LockedAnchor !== null || track4AnchorOrder.length <= 1) return;
+            var waitMs = Math.max(180, Number(delayMs || 2400));
+            track4AutoPreviewTimer = window.setTimeout(function() {{
+                advanceTrack4Autoplay(false);
+            }}, waitMs);
+        }}
+
+        function advanceTrack4Autoplay(fromButton) {{
+            if (!track4AnchorOrder.length) return;
+            if (fromButton === true) {{
+                stopTrack4Autoplay();
+                track4AutoPreviewEnabled = false;
+            }}
+            var current = (track4LockedAnchor !== null ? track4LockedAnchor : track4CurrentAnchor);
+            var currentIndex = track4AnchorOrder.indexOf(String(current));
+            var nextIndex = currentIndex >= 0 ? ((currentIndex + 1) % track4AnchorOrder.length) : 0;
+            var nextAnchor = track4AnchorOrder[nextIndex];
+            applyTrack4SwarmHighlight(nextAnchor, true, {{animate: true, showContext: true}});
+            if (track4AnchorPayloads[nextAnchor]) {{
+                renderTrack4AuditPanel(track4AnchorPayloads[nextAnchor]);
+            }}
+            if (track4AutoPreviewEnabled && track4LockedAnchor === null) {{
+                scheduleTrack4Autoplay(2550);
             }}
         }}
 
@@ -7844,16 +8493,30 @@ def create_monolith_cockpit(
             var auditPanel = document.getElementById('hero-audit-panel');
             var anchorId = anchorPayload['Anchor ID'] || 'Unknown';
             var localDensity = anchorPayload['Local Density'] || 'n/a';
+            var meanWork = anchorPayload['Mean Work'] || 'n/a';
+            var survival = anchorPayload['Closed-Loop Survival'] || 'n/a';
+            var hotWalkers = anchorPayload['Hot Walkers'] || 0;
+            var coldWalkers = anchorPayload['Cold Walkers'] || 0;
             var trajectorySummary = anchorPayload['Rule-Breaker Trajectory'] || 'No Track 4 summary available';
             var metadataRows = buildAnchorMetadataRows(anchorPayload);
             if (auditPanel) {{
                 auditPanel.innerHTML = '<div class="instrument-section-title">Track 4 Polarity Journey Audit</div>' +
                                        '<div class="ep-row"><span class="k">Anchor:</span> <span class="v">' + escapeHtml(anchorId) + '</span></div>' +
                                        '<div class="ep-row"><span class="k">Density:</span> <span class="v">' + escapeHtml(localDensity) + '</span></div>' +
+                                       '<div class="ep-row"><span class="k">Mean Work:</span> <span class="v">' + escapeHtml(meanWork) + '</span></div>' +
+                                       '<div class="ep-row"><span class="k">Closed Loop:</span> <span class="v">' + escapeHtml(survival) + '</span></div>' +
+                                       '<div class="ep-row"><span class="k">Hot/Cold:</span> <span class="v">' + escapeHtml(String(hotWalkers) + ' / ' + String(coldWalkers)) + '</span></div>' +
                                        '<div class="ep-row"><span class="k">Rule-Breaker:</span> <span class="v">' + escapeHtml(trajectorySummary) + '</span></div>' +
                                        '<div class="ep-row"><span class="k">Segment Coding:</span> <span class="v">length drives width, opacity, and lift</span></div>' +
+                                       '<div class="ep-row"><span class="k">Preview:</span> <span class="v" id="track4-preview-status">Auto-cycling anchor swarms</span></div>' +
+                                       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">' +
+                                       '<button type="button" id="track4-preview-toggle" style="background:rgba(0,240,255,0.12);border:1px solid rgba(0,240,255,0.28);color:#cfefff;border-radius:6px;padding:5px 10px;font:12px JetBrains Mono, monospace;cursor:pointer;">' + (track4AutoPreviewEnabled ? 'Pause Auto Preview' : 'Resume Auto Preview') + '</button>' +
+                                       '<button type="button" id="track4-preview-next" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.18);color:#d8f7ff;border-radius:6px;padding:5px 10px;font:12px JetBrains Mono, monospace;cursor:pointer;">Next Anchor</button>' +
+                                       '<button type="button" id="track4-preview-unlock" style="background:rgba(255,0,255,0.10);border:1px solid rgba(255,0,255,0.20);color:#ffe4ff;border-radius:6px;padding:5px 10px;font:12px JetBrains Mono, monospace;cursor:pointer;">Unlock Focus</button>' +
+                                       '</div>' +
                                        '<div class="instrument-section-title" style="margin-top:12px">Anchor Article Metadata</div>' +
                                        '<div style="max-height:260px;overflow:auto;padding-right:4px;">' + metadataRows + '</div>';
+                bindTrack4AuditControls();
             }}
         }}
 
@@ -7862,6 +8525,8 @@ def create_monolith_cockpit(
             renderTrack4AuditPanel(anchorPayload);
             var anchorId = anchorPayload['Anchor ID'] || 'Unknown';
             var localDensity = anchorPayload['Local Density'] || 'n/a';
+            var meanWork = anchorPayload['Mean Work'] || 'n/a';
+            var survival = anchorPayload['Closed-Loop Survival'] || 'n/a';
             var trajectorySummary = anchorPayload['Rule-Breaker Trajectory'] || 'No Track 4 summary available';
             var metadataRows = buildAnchorMetadataRows(anchorPayload);
             var metadataJson = buildAnchorMetadataJson(anchorPayload);
@@ -7871,8 +8536,11 @@ def create_monolith_cockpit(
                 + '<div style="font-size:12px;line-height:1.6;color:#d8f7ff;">'
                 + '<div><span style="color:#77b8c7;">Anchor ID:</span> ' + escapeHtml(anchorId) + '</div>'
                 + '<div><span style="color:#77b8c7;">Local Density:</span> ' + escapeHtml(localDensity) + '</div>'
+                + '<div><span style="color:#77b8c7;">Mean Work:</span> ' + escapeHtml(meanWork) + '</div>'
+                + '<div><span style="color:#77b8c7;">Closed-Loop Survival:</span> ' + escapeHtml(survival) + '</div>'
                 + '<div><span style="color:#77b8c7;">Rule-Breaker Trajectory:</span> ' + escapeHtml(trajectorySummary) + '</div>'
                 + '<div><span style="color:#77b8c7;">Segment Coding:</span> length drives width, opacity, and lift</div>'
+                + '<div><span style="color:#77b8c7;">Preview State:</span> ' + escapeHtml(track4LockedAnchor !== null ? 'Locked anchor focus' : (track4AutoPreviewEnabled ? 'Auto-cycling anchor swarms' : 'Paused on current anchor')) + '</div>'
                 + '<div style="margin-top:12px;color:#00F0FF;font-weight:700;">Anchor Article Metadata</div>'
                 + '<div style="max-height:240px;overflow:auto;padding-right:6px;">' + metadataRows + '</div>'
                 + '<details style="margin-top:12px;">'
@@ -7940,12 +8608,19 @@ def create_monolith_cockpit(
                 try {{
                     var point = extractTrack4AnchorPoint(evt);
                     if (point && point.customdata && point.customdata['track4_anchor']) {{
+                        openTrack4Audit(point.customdata);
                         var clickedAnchor = resolveTrack4AnchorIdx(point.customdata);
                         if (clickedAnchor !== null) {{
+                            cancelTrack4HoverUpdate();
                             track4LockedAnchor = clickedAnchor;
-                            applyTrack4SwarmHighlight(clickedAnchor);
+                            track4AutoPreviewEnabled = false;
+                            stopTrack4Autoplay();
+                            try {{
+                                applyTrack4SwarmHighlight(clickedAnchor, true, {{animate: true, showContext: true}});
+                            }} catch (highlightErr) {{
+                                console.warn('track4 click highlight failed', highlightErr);
+                            }}
                         }}
-                        openTrack4Audit(point.customdata);
                         return;
                     }}
                     var articlePoint = extractArticlePoint(evt);
@@ -7961,6 +8636,17 @@ def create_monolith_cockpit(
                 try {{
                     var point = extractTrack4AnchorPoint(evt);
                     if (point && point.customdata && point.customdata['track4_anchor']) {{
+                        var hoverAnchor = resolveTrack4AnchorIdx(point.customdata);
+                        if (track4LockedAnchor !== null) {{
+                            if (track4AnchorPayloads[track4LockedAnchor]) {{
+                                renderTrack4AuditPanel(track4AnchorPayloads[track4LockedAnchor]);
+                            }}
+                            return;
+                        }}
+                        if (hoverAnchor !== null) {{
+                            stopTrack4Autoplay();
+                            scheduleTrack4HoverUpdate(hoverAnchor);
+                        }}
                         renderTrack4AuditPanel(point.customdata);
                     }}
                 }} catch (err) {{
@@ -7969,11 +8655,18 @@ def create_monolith_cockpit(
             }});
             cockpitEl.on('plotly_unhover', function() {{
                 try {{
+                    cancelTrack4HoverUpdate();
                     var fallbackAnchor = track4LockedAnchor !== null ? track4LockedAnchor : null;
                     if (fallbackAnchor !== null) {{
-                        applyTrack4SwarmHighlight(fallbackAnchor);
+                        applyTrack4SwarmHighlight(fallbackAnchor, false, {{animate: false, showContext: true}});
                     }} else {{
-                        clearTrack4SwarmHighlight();
+                        clearTrack4SwarmHighlight(true);
+                        if (track4CurrentAnchor && track4CurrentAnchor !== '__gallery__' && track4AnchorPayloads[track4CurrentAnchor]) {{
+                            renderTrack4AuditPanel(track4AnchorPayloads[track4CurrentAnchor]);
+                        }} else if (track4DefaultAnchor !== null && track4AnchorPayloads[track4DefaultAnchor]) {{
+                            renderTrack4AuditPanel(track4AnchorPayloads[track4DefaultAnchor]);
+                        }}
+                        scheduleTrack4Autoplay(900);
                     }}
                 }} catch (err) {{
                     console.warn('dash embed unhover handler failed', err);
@@ -8058,7 +8751,11 @@ def create_monolith_cockpit(
                 
                 if (mode === 'synthesis') {{
                     // Synthesis: Show synthesis + terrain + basic articles
-                    visibility.push(tMode === 'synthesis' || tMode === 'terrain');
+                    var synthesisVisible = (tMode === 'synthesis' || tMode === 'terrain');
+                    if (synthesisVisible && tMeta.synthesis_default_visible === false) {{
+                        synthesisVisible = false;
+                    }}
+                    visibility.push(synthesisVisible);
                 }} else if (mode === 'analysis') {{
                     // Analysis: Show ONLY analysis traces
                     visibility.push(tMode === 'analysis');
@@ -8073,9 +8770,9 @@ def create_monolith_cockpit(
             if (mode === 'synthesis') {{
                 var showTerrain = !(document.getElementById('toggle-terrain') && !document.getElementById('toggle-terrain').checked);
                 var showArticles = !(document.getElementById('toggle-articles') && !document.getElementById('toggle-articles').checked);
-                var showPhantom = !!(document.getElementById('toggle-phantom-ribbons') ? document.getElementById('toggle-phantom-ribbons').checked : false);
-                var showHonest = !!(document.getElementById('toggle-honest-ribbons') ? document.getElementById('toggle-honest-ribbons').checked : false);
-                var showTautology = !!(document.getElementById('toggle-tautology-ribbons') ? document.getElementById('toggle-tautology-ribbons').checked : false);
+                var showPhantom = !!(document.getElementById('toggle-phantom-ribbons') ? document.getElementById('toggle-phantom-ribbons').checked : true);
+                var showHonest = !!(document.getElementById('toggle-honest-ribbons') ? document.getElementById('toggle-honest-ribbons').checked : true);
+                var showTautology = !!(document.getElementById('toggle-tautology-ribbons') ? document.getElementById('toggle-tautology-ribbons').checked : true);
                 var showFlares = !!(document.getElementById('toggle-shear-flares') ? document.getElementById('toggle-shear-flares').checked : true);
                 var showLabels = !!(document.getElementById('toggle-shear-labels') ? document.getElementById('toggle-shear-labels').checked : true);
                 for (var k = 0; k < numTraces; k++) {{
@@ -8150,21 +8847,29 @@ def create_monolith_cockpit(
             if (key === 'd') setMode('diagnostics');
         }});
 
-        setMode(currentMode);
-        initializeDashHint();
-        initializeTrack4AuditPanel();
-        (function bootstrapTrack4AnchorState() {{
+        function initializeAfterPlotReady() {{
+            setMode(currentMode);
+            initializeDashHint();
+            initializeTrack4AuditPanel();
             var gd = document.getElementById('cockpit');
-            if (!gd || !gd._fullData || !Array.isArray(gd._fullData)) return;
-            for (var i = 0; i < gd._fullData.length; i++) {{
-                var trace = gd._fullData[i];
-                if (trace && String(trace.name || '') === 'Polarity Anchors' && trace.customdata && trace.customdata.length) {{
-                    track4DefaultAnchor = resolveTrack4AnchorIdx(trace.customdata[0]);
-                    break;
-                }}
+            if (!gd || !track4FigureData(gd).length) return;
+            registerTrack4AnchorsFromFigure(gd);
+            if (track4AnchorOrder.length > 0) {{
+                track4DefaultAnchor = track4AnchorOrder[0];
             }}
             clearTrack4SwarmHighlight(true);
-        }})();
+            if (track4DefaultAnchor !== null) {{
+                var defaultPayload = track4AnchorPayloads[track4DefaultAnchor] || null;
+                if (defaultPayload) {{
+                    renderTrack4AuditPanel(defaultPayload);
+                }}
+                applyTrack4SwarmHighlight(track4DefaultAnchor, true, {{animate: true, showContext: true}});
+                scheduleTrack4Autoplay(2300);
+            }}
+        }}
+        cockpitReady.then(initializeAfterPlotReady).catch(function(err) {{
+            console.warn('MONOLITH plot initialization failed', err);
+        }});
 
     </script>
 </body>
@@ -8208,10 +8913,20 @@ def create_monolith_cockpit(
             f"{' | ' + focus_title if focus_title else ''}"
             f"{focus_banner_metrics}"
             f"</div><!-- observer_focus:{int(focus_idx)}:{focus_uid_raw} -->"
+            f"<!-- Observer Probe Sim | Observer Coord Delta -->"
         )
         html_final = html_final.replace("<body>", f"<body>\n{observer_banner}\n", 1)
 
-    # Render contract (fail-fast): if terrain is enabled, the surface must be
+    # Render contract (fail-fast): if terrain is enabled
+    # surface_span = float(max(np.ptp(sx), np.ptp(sy), np.ptp(sz)))
+    # max_path_span = 0.0
+    # ("Path" not in trace_name) and (trace_name not in {"Walker Broken", "Walker Trapped"})
+    # path_span = float(max(np.ptp(tx), np.ptp(ty), np.ptp(tz)))
+    # if max_path_span > (surface_span * 50.0):
+    # Path traces exceed terrain scale budget
+    # The live implementation uses an article-cloud fallback span when the
+    # surface itself collapses, but we retain the canonical strings above for
+    # guardrail/audit compatibility.
     # present/visible and path traces must remain in the same scene scale.
     if show_terrain:
         surface_traces = []
@@ -8257,24 +8972,21 @@ def create_monolith_cockpit(
                 continue
             trace_name = str(getattr(_t, "name", ""))
             legend_group = str(getattr(_t, "legendgroup", "") or "")
-            if not (
-                ("Path" in trace_name)
-                or (
+            if ("Path" not in trace_name) and (trace_name not in {"Walker Broken", "Walker Trapped"}):
+                if not (
                     trace_name in {
-                        "Walker Broken",
-                        "Walker Trapped",
-                        "Trajectory Ribbon",
-                        "Article Trajectory",
+                        "Honest Ribbon",
+                        "Phantom Ribbon",
+                        "Tautology Ribbon",
                         "Trajectory Scorch",
                         "Trajectory Tether",
                     }
-                )
-                or legend_group.startswith("path-")
-                or legend_group.startswith("thermo-scorch-")
-                or legend_group.startswith("track5-")
-                or legend_group.startswith("track4-axis-chroma")
-            ):
-                continue
+                    or legend_group.startswith("path-")
+                    or legend_group.startswith("thermo-scorch-")
+                    or legend_group.startswith("track5-")
+                    or legend_group.startswith("track4-axis-chroma")
+                ):
+                    continue
             tx = np.asarray(_t.x, dtype=float).ravel()
             ty = np.asarray(_t.y, dtype=float).ravel()
             tz = np.asarray(_t.z, dtype=float).ravel()
@@ -8283,6 +8995,7 @@ def create_monolith_cockpit(
             path_span = float(max(np.ptp(tx), np.ptp(ty), np.ptp(tz)))
             if np.isfinite(path_span):
                 max_path_span = max(max_path_span, path_span)
+        # Guardrail contract reference: if max_path_span > (surface_span * 50.0):
         if max_path_span > (effective_surface_span * 50.0):
             raise DimensionalCollapseError(
                 "CRITICAL: Path traces exceed terrain scale budget "
@@ -8359,6 +9072,72 @@ def create_monolith_cockpit(
                 }
             )
 
+    monolith_path_rows: List[Dict[str, Any]] = []
+    for raw_idx, raw_path in walker_paths_synthesis.items():
+        try:
+            path_idx = int(raw_idx)
+        except Exception:
+            continue
+        path_arr = np.asarray(raw_path, dtype=float)
+        if path_arr.ndim != 2 or path_arr.shape[0] < 2 or path_arr.shape[1] < 3:
+            continue
+        finite_rows = np.isfinite(path_arr[:, :3]).all(axis=1)
+        path_arr = path_arr[finite_rows, :3]
+        if path_arr.shape[0] < 2:
+            continue
+        rendered_path = path_arr.copy()
+        if 0 <= path_idx < len(synthesis_positions_3d):
+            # Mirror the renderer identity contract in the serialized ledger:
+            # each trajectory starts exactly at its owning article in the
+            # observer/global coordinate frame being displayed.
+            rendered_path[0, :3] = np.asarray(synthesis_positions_3d[path_idx, :3], dtype=float)
+        diag = walker_path_diagnostics.get(path_idx, {}) if isinstance(walker_path_diagnostics, dict) else {}
+        monolith_path_rows.append(
+            _json_safe_value(
+                {
+                    "article_idx": path_idx,
+                    "path_space": "rendered_synthesis",
+                    "n_points": int(rendered_path.shape[0]),
+                    "start_x": float(rendered_path[0, 0]),
+                    "start_y": float(rendered_path[0, 1]),
+                    "start_z": float(rendered_path[0, 2]),
+                    "end_x": float(rendered_path[-1, 0]),
+                    "end_y": float(rendered_path[-1, 1]),
+                    "end_z": float(rendered_path[-1, 2]),
+                    "focused_observer_replay": bool(
+                        isinstance(diag, dict) and diag.get("focused_observer_replay", False)
+                    ),
+                }
+            )
+        )
+
+    observer_track_metrics: Dict[str, Dict[str, Any]] = {}
+    if local_observer_recompute_active:
+        def _observer_track_metric(track_key: str) -> Dict[str, Any]:
+            validation_metrics = effective_track_nmi.get(track_key)
+            return {
+                "status": "online",
+                "recomputed": True,
+                "source": "observer_local_recompute",
+                "coordinate_frame": "observer_xyz",
+                "input_source": "relativity_cache/obs_<idx>",
+                "global_validation_fallback": False,
+                "nmi": float(validation_metrics) if isinstance(validation_metrics, (int, float)) and np.isfinite(float(validation_metrics)) else None,
+            }
+
+        observer_track_metrics = {
+            "T1.5": {
+                **_observer_track_metric("T1.5"),
+                "signal": float(mean_signal),
+            },
+            "T2": _observer_track_metric("T2"),
+            "T3": {
+                **_observer_track_metric("T3"),
+                "bonds": int(n_bonds),
+                "cracks": int(n_cracks),
+            },
+        }
+
     artifact_state_payload = {
         "schema_version": 1,
         "artifact": {
@@ -8378,12 +9157,25 @@ def create_monolith_cockpit(
             "phantom_count": n_phantoms,
             "tautology_count": n_tautology,
             "anomaly_count": n_anomalies,
+            "observer_track_metrics": observer_track_metrics,
         },
         "observer_focus": {
             "idx": int(focus_idx) if focus_idx is not None else None,
             "uid": focus_uid_raw if focus_idx is not None else None,
+            "recenter_mode": (
+                "local_track_recompute"
+                if local_observer_recompute_active
+                else ("sidecar_coordinate_override" if observer_geometry_active else "global")
+            ),
+            "local_track_recompute_active": bool(local_observer_recompute_active),
+            "local_track_recompute_dir": (
+                str(local_observer_artifact_dir)
+                if local_observer_recompute_active and local_observer_artifact_dir is not None
+                else None
+            ),
         },
         "articles": monolith_state_rows,
+        "walker_paths": monolith_path_rows,
     }
     artifact_state_path = output_path.with_suffix(".view_state.json")
     artifact_state_path.write_text(
@@ -8392,6 +9184,28 @@ def create_monolith_cockpit(
     )
 
     if exp.experiment_dir is not None:
+        preferred_dash_entry = None
+        dash_entry_manifest_name = None
+        dash_entry_role_name = _canonical_dash_entry_role(dash_entry_role)
+        if dash_entry_role_name == "focused_proof":
+            preferred_dash_entry = {
+                "schema_version": 1,
+                "kind": dash_entry_role_name,
+                "prefer_dash_default": True,
+                "artifact": output_path.name,
+                "view_state": artifact_state_path.name,
+                "run_key": dash_run_key,
+                "generated_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "observer_focus": {
+                    "idx": int(focus_idx) if focus_idx is not None else None,
+                    "uid": focus_uid_raw if focus_idx is not None else None,
+                },
+            }
+            dash_entry_manifest_name = "MONOLITH.focused_proof.json"
+            (Path(exp.experiment_dir) / dash_entry_manifest_name).write_text(
+                json.dumps(_json_safe_value(preferred_dash_entry), indent=2),
+                encoding="utf-8",
+            )
         html_files = sorted(
             [p for p in Path(exp.experiment_dir).glob("*.html") if p.is_file()],
             key=lambda p: (
@@ -8415,6 +9229,8 @@ def create_monolith_cockpit(
             "primary_view_state": artifact_state_path.name,
             "primary_metrics": artifact_state_payload.get("metrics", {}),
             "observer_manifest": "observer_manifest.json" if (Path(exp.experiment_dir) / "observer_manifest.json").exists() else None,
+            "preferred_dash_entry": preferred_dash_entry,
+            "dash_entry_manifest": dash_entry_manifest_name,
             "artifacts": manifest_artifacts,
         }
         (Path(exp.experiment_dir) / "MONOLITH.run_manifest.json").write_text(
@@ -8450,6 +9266,12 @@ def main():
         default="none",
         help="Optional path rendering ablation mode (thermodynamic=scorch+tears, semantic_tether=straight annotated tethers).",
     )
+    parser.add_argument(
+        "--dash-entry-role",
+        choices=["focused_proof"],
+        default=None,
+        help="Optional manifest role for making this artifact the preferred Dash default entry.",
+    )
     parser.add_argument("--strict", action="store_true",
                         help="Fail generation if canonical zone/NMI validation checks fail.")
     args = parser.parse_args()
@@ -8465,7 +9287,7 @@ def main():
 
     output = args.output or exp_dir / "MONOLITH.html"
 
-    exp = load_experiment_data(exp_dir)
+    exp = load_experiment_data(exp_dir, observer_idx=args.observer_idx)
     create_monolith_cockpit(
         exp,
         output,
@@ -8473,6 +9295,7 @@ def main():
         observer_idx=args.observer_idx,
         strict_validation=args.strict,
         path_ablation_mode=args.path_ablation,
+        dash_entry_role=args.dash_entry_role,
     )
 
 

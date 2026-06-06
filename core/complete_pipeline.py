@@ -60,6 +60,7 @@ import time
 import hashlib
 import math
 import subprocess
+import gc
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -75,7 +76,13 @@ from .cross_article_attention import CrossArticleAttention
 from .pca_removal import remove_top_pca_component, fit_whitening_matrix, apply_whitening_fixed
 from .attention_recorder import AttentionRecorder
 from .provenance_tracker import ProvenanceTracker, PipelineProvenanceEntry
-from .pipeline_config import DEFAULT_PIPELINE_RUNTIME_CONFIG, PipelineRuntimeConfig
+from .pipeline_config import (
+    DEFAULT_PIPELINE_RUNTIME_CONFIG,
+    PipelineRuntimeConfig,
+    TRACK5_ASSEMBLY_MODE_HADAMARD,
+    TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN,
+    normalize_track5_assembly_mode,
+)
 
 # Try to import Dirichlet fusion (optional, for new pipeline)
 try:
@@ -245,6 +252,184 @@ def _serialize_rks_basis_state(basis: Any) -> Optional[Dict[str, Any]]:
         "hash": str(getattr(basis, "basis_hash", getattr(basis, "_hash", ""))),
         "sigma_diagnostics": getattr(basis, "_sigma_diagnostics", {}),
     }
+
+
+def _compact_walker_path_record(record: Any) -> Any:
+    """Strip bulky coordinate arrays from inline walker path records.
+
+    Full path coordinates are already persisted to sidecar NPZ artifacts. Keeping
+    them embedded in the per-seed observer payload inflates serialization size and
+    exacerbates cross-seed memory pressure without adding unique information for
+    most downstream readers.
+    """
+    if not isinstance(record, dict):
+        return record
+    compact = dict(record)
+    for key in ("path_xyz", "path_hd", "trajectory", "coords"):
+        compact.pop(key, None)
+    return compact
+
+
+TRACK4_BASIS_DEFAULT = "track2"
+TRACK4_BASIS_ALIASES = {
+    "track2": "track2",
+    "hologram_t2": "track2",
+    "t2": "track2",
+    "logits": "logits_flat",
+    "logits_flat": "logits_flat",
+    "nli_logits": "logits_flat",
+    "bot_norms": "bot_norms",
+    "observer_norms": "bot_norms",
+    "cls": "cls_stacked",
+    "cls_stacked": "cls_stacked",
+    "cls_per_bot": "cls_stacked",
+    "cls_per_bot_flat": "cls_stacked",
+    "spectral": "spectral_pc1",
+    "spectral_pc1": "spectral_pc1",
+    "d_spectral": "spectral_pc1",
+}
+TRACK4_BASIS_CHOICES = tuple(sorted(set(TRACK4_BASIS_ALIASES.values())))
+
+
+def _normalize_track4_basis_mode(value: Any) -> str:
+    raw = str(value or TRACK4_BASIS_DEFAULT).strip().lower().replace("-", "_")
+    return TRACK4_BASIS_ALIASES.get(raw, TRACK4_BASIS_DEFAULT)
+
+
+def _track4_float_tensor(value: Any) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    try:
+        tensor = value.detach() if torch.is_tensor(value) else torch.as_tensor(value)
+        tensor = tensor.to(dtype=torch.float32)
+        if tensor.ndim == 1:
+            tensor = tensor.reshape(-1, 1)
+        elif tensor.ndim > 2:
+            tensor = tensor.reshape(tensor.shape[0], -1)
+        if tensor.ndim != 2 or tensor.shape[0] == 0 or tensor.shape[1] == 0:
+            return None
+        if not torch.isfinite(tensor).all():
+            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        return tensor
+    except Exception:
+        return None
+
+
+def _stack_track4_logits(nli_pairs: Any, expected_n: Optional[int] = None) -> Optional[torch.Tensor]:
+    if not nli_pairs:
+        return None
+
+    rows = []
+    for pair in nli_pairs:
+        if not isinstance(pair, dict):
+            return None
+        value = pair.get("logits_raw")
+        if value is None:
+            value = pair.get("logits")
+        if value is None:
+            return None
+        tensor = _track4_float_tensor(value)
+        if tensor is None:
+            return None
+        rows.append(tensor.reshape(-1))
+
+    if expected_n is not None and len(rows) != int(expected_n):
+        return None
+    if not rows:
+        return None
+    try:
+        width = int(rows[0].numel())
+        if width <= 0 or any(int(row.numel()) != width for row in rows):
+            return None
+        return torch.stack(rows, dim=0).to(dtype=torch.float32)
+    except Exception:
+        return None
+
+
+def _select_track4_embedding_basis(
+    requested_basis: Any,
+    *,
+    hologram_t2: Any = None,
+    nli_pairs: Any = None,
+    cls_per_bot_tensor: Any = None,
+    d_spectral: Any = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+    """
+    Select the feature coordinates used by the Track 4 metric-graph walker.
+
+    The production/default thesis path remains Track 2 geometry. Other bases
+    are opt-in ablation/probe coordinates so Track 4 can ask which feature
+    field actually carries traversal signal without changing downstream
+    walker contracts.
+    """
+    requested = _normalize_track4_basis_mode(requested_basis)
+    t2_tensor = _track4_float_tensor(hologram_t2)
+    expected_n = int(t2_tensor.shape[0]) if t2_tensor is not None else None
+
+    selected = None
+    effective = requested
+    warning = None
+
+    if requested == "track2":
+        selected = t2_tensor
+    elif requested == "logits_flat":
+        selected = _stack_track4_logits(nli_pairs, expected_n=expected_n)
+    elif requested == "bot_norms":
+        cls_tensor = _track4_float_tensor(cls_per_bot_tensor)
+        if cls_per_bot_tensor is not None and torch.is_tensor(cls_per_bot_tensor) and cls_per_bot_tensor.ndim >= 3:
+            selected = torch.nan_to_num(cls_per_bot_tensor.detach().float().norm(dim=-1), nan=0.0)
+        elif cls_per_bot_tensor is not None and np.asarray(cls_per_bot_tensor).ndim >= 3:
+            selected = _track4_float_tensor(np.linalg.norm(np.asarray(cls_per_bot_tensor), axis=-1))
+        elif cls_tensor is not None:
+            selected = cls_tensor
+    elif requested == "cls_stacked":
+        selected = _track4_float_tensor(cls_per_bot_tensor)
+    elif requested == "spectral_pc1":
+        selected = _track4_float_tensor(d_spectral)
+
+    if selected is None:
+        selected = t2_tensor
+        effective = "track2"
+        warning = f"requested Track 4 basis '{requested}' unavailable; fell back to Track 2 geometry"
+
+    if selected is not None and t2_tensor is not None and selected.device != t2_tensor.device:
+        selected = selected.to(device=t2_tensor.device)
+
+    info = {
+        "requested_basis": requested,
+        "effective_basis": effective,
+        "basis_warning": warning,
+        "embedding_dim": int(selected.shape[1]) if selected is not None and selected.ndim == 2 else 0,
+        "n_articles": int(selected.shape[0]) if selected is not None and selected.ndim >= 1 else 0,
+    }
+    return selected, info
+
+
+def _track4_pca_coords_2d(track4_embeddings: torch.Tensor) -> torch.Tensor:
+    """Produce stable 2D display coordinates even for scalar ablation bases."""
+    tensor = _track4_float_tensor(track4_embeddings)
+    if tensor is None:
+        return torch.zeros((0, 2), dtype=torch.float32)
+
+    device = tensor.device
+    arr = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    n_rows, n_cols = arr.shape
+    coords = np.zeros((n_rows, 2), dtype=np.float32)
+
+    if n_rows >= 2 and n_cols >= 2:
+        try:
+            from sklearn.decomposition import PCA
+
+            n_components = max(1, min(2, n_rows, n_cols))
+            projected = PCA(n_components=n_components, random_state=42).fit_transform(arr)
+            coords[:, :projected.shape[1]] = projected.astype(np.float32, copy=False)
+        except Exception:
+            coords[:, 0] = arr[:, 0]
+            coords[:, 1] = arr[:, 1]
+    elif n_rows > 0 and n_cols > 0:
+        coords[:, 0] = arr[:, 0]
+
+    return torch.as_tensor(coords, device=device, dtype=torch.float32)
 
 
 def _construct_spectral_poles(
@@ -1228,6 +1413,7 @@ def initialize_full_pipeline(
     kernel_nu: float = 1.5,
     kernel_roughness: int = 3,
     mix_in_rkhs: bool = DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs,         # Mode B for Dirichlet fusion
+    track5_assembly_mode: str = DEFAULT_PIPELINE_RUNTIME_CONFIG.track5_assembly_mode,
 ):
     """
     Initialize the full belief transformer pipeline components.
@@ -1367,6 +1553,10 @@ def initialize_full_pipeline(
     # - If geometry_mode == "rks": final_dim is the RKS output dim.
     # - If geometry_mode != "rks": final_dim starts as output_dim, but may be capped at runtime (<= N-1 for exact kernel PCA).
     final_dim = int(rks_output_dim or output_dim)
+    track5_assembly_mode = normalize_track5_assembly_mode(
+        track5_assembly_mode,
+        default=TRACK5_ASSEMBLY_MODE_HADAMARD,
+    )
 
     geometry_mode = (geometry_mode or "rks").lower().strip()
     if geometry_mode not in ("rks", "kernel_pca", "nystrom"):
@@ -1508,6 +1698,8 @@ def initialize_full_pipeline(
         "kernel_nu": float(kernel_nu),
         "kernel_roughness": int(kernel_roughness),
         "mix_in_rkhs": mix_in_rkhs,
+        "track5_assembly_mode": track5_assembly_mode,
+        "device": device,
     }
 
 
@@ -1552,6 +1744,16 @@ class BeliefTransformerPipeline:
         self.rks_map = components["rks_map"]
         self.attention_model = components["attention_model"]
         self.recorder = components["recorder"]
+        requested_device = str(components.get("device", "cuda"))
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            requested_device = "cpu"
+        self.device = torch.device(requested_device)
+        for module in (self.gru_model, self.rks_map, self.attention_model):
+            if hasattr(module, "to"):
+                try:
+                    module.to(self.device)
+                except Exception:
+                    pass
 
         self.normalize_features = components.get(
             "normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features
@@ -1576,6 +1778,11 @@ class BeliefTransformerPipeline:
         # NEW: Dirichlet fusion components
         self.dirichlet_fusion = components.get("dirichlet_fusion", None)
         self.dirichlet_config = components.get("dirichlet_config", None)
+        if hasattr(self.dirichlet_fusion, "to"):
+            try:
+                self.dirichlet_fusion.to(self.device)
+            except Exception:
+                pass
         
         # NEW: Rep kind for contract enforcement
         self.primary_rep_kind = components.get("primary_rep_kind", RepKind.LOGITS_RAW)
@@ -1584,6 +1791,10 @@ class BeliefTransformerPipeline:
         # NEW: KernelContext for provenance
         self.kernel_ctx = components.get("kernel_ctx", None)
         self.mix_in_rkhs = components.get("mix_in_rkhs", False)
+        self.track5_assembly_mode = normalize_track5_assembly_mode(
+            components.get("track5_assembly_mode", TRACK5_ASSEMBLY_MODE_HADAMARD),
+            default=TRACK5_ASSEMBLY_MODE_HADAMARD,
+        )
 
         self.enable_provenance = enable_provenance
         self.provenance_dir = provenance_dir
@@ -1786,6 +1997,7 @@ class BeliefTransformerPipeline:
             "steps": [],
             "timing": {},
             "variance": {},
+            "track5_assembly_mode": self.track5_assembly_mode,
         }
 
         diagnostics["timestamp_coverage"] = timestamp_coverage
@@ -1804,6 +2016,18 @@ class BeliefTransformerPipeline:
             diagnostics["steps"].append("nli_extraction")
 
         diagnostics["timing"]["nli_extraction"] = time.time() - step_start
+
+        def _to_pipeline_device(value):
+            if torch.is_tensor(value):
+                return value.to(self.device, non_blocking=True)
+            return value
+
+        # Cached NLI payloads are loaded on CPU for portability. Move every tensor
+        # back to the active pipeline device before Track 2/3/4 consume them.
+        nli_pairs = [
+            {key: _to_pipeline_device(value) for key, value in pair.items()}
+            for pair in nli_pairs
+        ]
 
         # Convert to tensor(s)
         base_by_channel: Dict[str, torch.Tensor] = {}
@@ -2581,8 +2805,10 @@ class BeliefTransformerPipeline:
                     print(f"[Track 1.5] Weighted spectral distance: mean_d={d_spectral.mean():.3f}, "
                           f"dynamic_K={mean_k:.1f}, pole_fallback={n_fallback}/{len(G)}")
 
-                # Track 4: corpus-level article walker on Track 2 geometry
+                # Track 4: corpus-level article walker.
+                # Default basis is Track 2 geometry; alternate bases are opt-in ablation probes.
                 walker_t4 = None
+                walker_t4_metadata = {}
 
                 # Persist run-level artifacts needed by downstream visualizers/loaders.
                 run_output_dir = None
@@ -2596,24 +2822,31 @@ class BeliefTransformerPipeline:
 
                 if hologram_t2 is not None and hasattr(self, 'dirichlet_fusion') and self.dirichlet_fusion is not None:
                     try:
-                        from sklearn.decomposition import PCA
                         from .physarum_walk import compute_corpus_walker_resistance
 
-                        track4_embeddings = hologram_t2
-                        if isinstance(track4_embeddings, np.ndarray):
-                            track4_embeddings = torch.from_numpy(track4_embeddings)
-                        track4_embeddings = track4_embeddings.to(dtype=torch.float32)
-
-                        coords_2d = torch.as_tensor(
-                            PCA(n_components=2, random_state=42).fit_transform(track4_embeddings.detach().cpu().numpy()),
-                            device=track4_embeddings.device,
-                            dtype=torch.float32,
+                        requested_track4_basis = (config or {}).get("track4_basis", TRACK4_BASIS_DEFAULT)
+                        track4_embeddings, track4_basis_info = _select_track4_embedding_basis(
+                            requested_track4_basis,
+                            hologram_t2=hologram_t2,
+                            nli_pairs=nli_pairs,
+                            cls_per_bot_tensor=cls_per_bot_tensor,
+                            d_spectral=d_spectral,
                         )
+                        if track4_embeddings is None:
+                            raise RuntimeError("Track 4 basis selection produced no usable embedding matrix.")
+                        basis_warning = track4_basis_info.get("basis_warning")
+                        if basis_warning:
+                            print(f"[Track 4] Basis warning: {basis_warning}")
+
+                        coords_2d = _track4_pca_coords_2d(track4_embeddings)
 
                         walker_seed = int((config or {}).get("walker_seed", getattr(self, "random_seed", 0)))
                         walker_n_walkers = int((config or {}).get("walker_n_walkers", 10))
                         walker_gamma = float((config or {}).get("walker_gamma", 5.0))
                         walker_k_neighbors = int((config or {}).get("walker_k_neighbors", 10))
+                        walker_temperature = float((config or {}).get("walker_temperature", 0.5))
+                        walker_proposal_mode = str((config or {}).get("track4_proposal_mode", "metric_softmax"))
+                        walker_adaptive_tpt = bool((config or {}).get("track4_adaptive_tpt_connectivity", False))
 
                         result_t4 = compute_corpus_walker_resistance(
                             embeddings=track4_embeddings,
@@ -2623,7 +2856,7 @@ class BeliefTransformerPipeline:
                             metric_stress=d_spectral if d_spectral is not None else None,
                             article_coords_2d=coords_2d,
                             article_ids=bt_uids,
-                            temperature=0.5,
+                            temperature=walker_temperature,
                             n_walkers=walker_n_walkers,
                             max_steps=walker_n_steps,
                             gamma=walker_gamma,
@@ -2632,9 +2865,25 @@ class BeliefTransformerPipeline:
                             thermo_config=getattr(self, "thermo_config", None),
                             start_seed=walker_seed,
                             output_dir=str(run_output_dir) if run_output_dir is not None else None,
+                            proposal_mode=walker_proposal_mode,
+                            adaptive_tpt_connectivity=walker_adaptive_tpt,
+                            feature_basis=str(track4_basis_info.get("effective_basis", TRACK4_BASIS_DEFAULT)),
                         )
 
                         walker_t4 = result_t4.get("walker_output")
+                        walker_t4_metadata = {
+                            "requested_basis": track4_basis_info.get("requested_basis", TRACK4_BASIS_DEFAULT),
+                            "effective_basis": track4_basis_info.get("effective_basis", TRACK4_BASIS_DEFAULT),
+                            "basis_warning": track4_basis_info.get("basis_warning"),
+                            "basis_embedding_dim": int(track4_basis_info.get("embedding_dim", 0)),
+                            "proposal_mode": result_t4.get("proposal_mode", walker_proposal_mode),
+                            "adaptive_tpt_connectivity": bool(result_t4.get("adaptive_tpt_connectivity", walker_adaptive_tpt)),
+                            "requested_k_neighbors": int(result_t4.get("requested_k_neighbors", walker_k_neighbors)),
+                            "effective_k_neighbors": int(result_t4.get("effective_k_neighbors", walker_k_neighbors)),
+                            "walker_temperature": float(walker_temperature),
+                            "walker_gamma": float(walker_gamma),
+                            "markov_observables": result_t4.get("markov_observables", {}),
+                        }
                         walker_work_integrals.extend(result_t4.get("work_integrals", []))
                         walker_states.extend(result_t4.get("states", []))
                         walker_state_records.extend(result_t4.get("state_records", []))
@@ -2646,7 +2895,7 @@ class BeliefTransformerPipeline:
                             n_open = sum(1 for s in walker_states if s == "open_loop")
                             mean_work = float(np.mean(walker_work_integrals)) if walker_work_integrals else 0.0
                             print(
-                                f"[Track 4] Corpus walker: W={mean_work:.3f}, "
+                                f"[Track 4] Corpus walker ({track4_basis_info.get('effective_basis')}): W={mean_work:.3f}, "
                                 f"closure={{closed:{n_closed}, open:{n_open}}}"
                             )
                     except Exception as e:
@@ -2755,6 +3004,11 @@ class BeliefTransformerPipeline:
                         track_samples['hologram'] = hologram_t2
                     if blinker_t3 is not None:
                         track_samples['blinker'] = blinker_t3
+                    if (
+                        self.track5_assembly_mode == TRACK5_ASSEMBLY_MODE_STRICT_RIEMANNIAN
+                        and antagonism_t15 is not None
+                    ):
+                        track_samples['antagonism'] = antagonism_t15
 
                     if track_samples:
                         self._phase_integrator.fit(track_samples)
@@ -2762,7 +3016,7 @@ class BeliefTransformerPipeline:
                 # Integrate particles (ASTER v3.2: Hadamard fusion enabled)
                 print(f"[Track 5] Integrator is_fit={self._phase_integrator.is_fit}, "
                       f"hologram={hologram_t2 is not None}, antagonism={antagonism_t15 is not None}, "
-                      f"blinker={blinker_t3 is not None}")
+                      f"blinker={blinker_t3 is not None}, mode={self.track5_assembly_mode}")
                 if self._phase_integrator.is_fit:
                     particles = self._phase_integrator.integrate(
                         logits=logits_t1,
@@ -2771,7 +3025,8 @@ class BeliefTransformerPipeline:
                         blinker=blinker_t3,
                         walker=walker_t4,
                         article_ids=bt_uids,
-                        use_hadamard_fusion=True,  # ASTER v3.2: K_final = K_rks * K_spectral
+                        use_hadamard_fusion=(self.track5_assembly_mode == TRACK5_ASSEMBLY_MODE_HADAMARD),
+                        track5_assembly_mode=self.track5_assembly_mode,
                     )
 
                     if particles:
@@ -2813,13 +3068,17 @@ class BeliefTransformerPipeline:
                         diagnostics["phase_space"] = {
                             "n_particles": len(particles),
                             "integrated_dim": int(integrated_vectors.shape[-1]),
+                            "track5_assembly_mode": self.track5_assembly_mode,
                             "singularity_counts": phase_space_results["singularity_counts"],
                             "phantom_counts": phantom_counts,
                         }
 
-                        # ASTER v3.2: Hadamard fusion diagnostics
+                        # Preserve the historical diagnostics payload while allowing
+                        # non-Hadamard Track 5 ablations to annotate the same slot.
                         if particles and particles[0].hadamard_diagnostics is not None:
-                            diagnostics["phase_space"]["hadamard_fusion"] = particles[0].hadamard_diagnostics
+                            diagnostics["phase_space"]["track5_assembly"] = particles[0].hadamard_diagnostics
+                            if self.track5_assembly_mode == TRACK5_ASSEMBLY_MODE_HADAMARD:
+                                diagnostics["phase_space"]["hadamard_fusion"] = particles[0].hadamard_diagnostics
 
             except Exception as e:
                 diagnostics.setdefault("warnings", []).append(f"phase_space_error: {e}")
@@ -2961,6 +3220,13 @@ class BeliefTransformerPipeline:
             out["hysteresis_stats"] = hysteresis_stats_last
         if walker_step_diagnostics:
             out["walker_step_diagnostics"] = walker_step_diagnostics
+        if walker_t4_metadata:
+            out["track4_runtime_config"] = {
+                key: value
+                for key, value in walker_t4_metadata.items()
+                if key != "markov_observables"
+            }
+            out["track4_markov_observables"] = walker_t4_metadata.get("markov_observables", {})
 
         # Persist run-level artifacts needed by downstream visualizers/loaders.
         run_output_dir = None
@@ -2988,6 +3254,12 @@ class BeliefTransformerPipeline:
                     np.save(run_output_dir / artifact_name, artifact_value)
                 except Exception as e:
                     print(f"[Track 1.5] Warning: failed to persist {artifact_name}: {e}")
+
+        if run_output_dir is not None and 'track3_density_rho' in locals() and track3_density_rho is not None:
+            try:
+                np.save(run_output_dir / "track3_density_rho.npy", track3_density_rho.detach().cpu().numpy())
+            except Exception as e:
+                print(f"[Track 3] Warning: failed to persist track3_density_rho.npy: {e}")
 
         if run_output_dir is not None and walker_path_records:
             try:
@@ -3364,6 +3636,7 @@ def run_multi_observer_experiment_simple(
     corpus_name: str = 'unknown',
     nli_cache_path: str = None,
     emit_label_validation: bool = True,
+    retain_full_results: bool = True,
     **kwargs
 ):
     """
@@ -3426,6 +3699,13 @@ def run_multi_observer_experiment_simple(
             geometry_mode=str(kwargs.get("geometry_mode", DEFAULT_PIPELINE_RUNTIME_CONFIG.geometry_mode)),
             kernel_type=kernel_type,
             mix_in_rkhs=bool(kwargs.get("mix_in_rkhs", DEFAULT_PIPELINE_RUNTIME_CONFIG.mix_in_rkhs)),
+            track5_assembly_mode=normalize_track5_assembly_mode(
+                kwargs.get(
+                    "track5_assembly_mode",
+                    DEFAULT_PIPELINE_RUNTIME_CONFIG.track5_assembly_mode,
+                ),
+                default=DEFAULT_PIPELINE_RUNTIME_CONFIG.track5_assembly_mode,
+            ),
             dirichlet_rks_dim=int(kwargs.get("dirichlet_rks_dim", 2048)),
             dirichlet_n_observers=int(kwargs.get("dirichlet_n_observers", 50)),
             dirichlet_alpha=float(kwargs.get("dirichlet_alpha", 1.0)),
@@ -3465,6 +3745,12 @@ def run_multi_observer_experiment_simple(
             "enable_checkpoints": bool(kwargs.get("enable_checkpoints", False)),
             "output_dir": str(output_dir) if output_dir else "outputs",
             "checkpoint_dir": str(output_dir) if output_dir else "outputs",
+            "walker_temperature": float(kwargs.get("walker_temperature", 0.5)),
+            "walker_gamma": float(kwargs.get("walker_gamma", 5.0)),
+            "walker_k_neighbors": int(kwargs.get("walker_k_neighbors", 10)),
+            "track4_basis": str(kwargs.get("track4_basis", TRACK4_BASIS_DEFAULT)),
+            "track4_proposal_mode": str(kwargs.get("track4_proposal_mode", "metric_softmax")),
+            "track4_adaptive_tpt_connectivity": bool(kwargs.get("track4_adaptive_tpt_connectivity", False)),
         }
         
         result = pipeline.process_month(articles, month_name="batch", config=pipeline_config)
@@ -3504,6 +3790,7 @@ def run_multi_observer_experiment_simple(
             # Primary features (backward compatible)
             'embeddings': result['embeddings'],
             'features': result.get('features'),
+            'integrated_vectors': result.get('integrated_vectors'),
             'embeddings_cli': result.get('embeddings_cli'),
             'features_cli': result.get('features_cli'),
             
@@ -3532,6 +3819,13 @@ def run_multi_observer_experiment_simple(
                 'kernel_params': kernel_params or {},
                 'kernel_nu': kernel_nu,
                 'kernel_roughness': kernel_roughness,
+                'track5_assembly_mode': runtime_cfg.track5_assembly_mode,
+                'track4_basis': str(kwargs.get("track4_basis", TRACK4_BASIS_DEFAULT)),
+                'track4_proposal_mode': str(kwargs.get("track4_proposal_mode", "metric_softmax")),
+                'track4_adaptive_tpt_connectivity': bool(kwargs.get("track4_adaptive_tpt_connectivity", False)),
+                'walker_temperature': float(kwargs.get("walker_temperature", 0.5)),
+                'walker_gamma': float(kwargs.get("walker_gamma", 5.0)),
+                'walker_k_neighbors': int(kwargs.get("walker_k_neighbors", 10)),
                 # NEW: Reproducibility info
                 'git_hash': git_hash,
                 'git_dirty': git_dirty,
@@ -3556,6 +3850,7 @@ def run_multi_observer_experiment_simple(
             'walker_states', 'walker_work_integrals', 
             'spectral_evr', 'spectral_u_axis', 'spectral_antagonism', 'spectral_probe_magnitudes',
             'article_metadata', 'phantom_verdicts', 'walker_paths',
+            'track4_runtime_config', 'track4_markov_observables',
             'T0_substrate', 'T1_embeddings', 'T1.5_spectral', 'T2_kernels', 'T3_topology',
             'cls_per_bot', 'cls_per_bot_contract', 'rks_basis_state'
         ]
@@ -3566,10 +3861,16 @@ def run_multi_observer_experiment_simple(
         for k in physics_keys:
             if k in result:
                 val = result[k]
-                output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
+                if k == "walker_paths" and isinstance(val, list):
+                    output_artifact[k] = [_compact_walker_path_record(item) for item in val]
+                else:
+                    output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
             elif k in pipeline_checkpoints:
                 val = pipeline_checkpoints[k]
-                output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
+                if k == "walker_paths" and isinstance(val, list):
+                    output_artifact[k] = [_compact_walker_path_record(item) for item in val]
+                else:
+                    output_artifact[k] = val if not torch.is_tensor(val) else val.cpu()
                 
         # Save directly to output_dir (caller already creates structured path)
         # NOTE: Do NOT use build_structured_output_path here - that causes double-nesting
@@ -3618,7 +3919,28 @@ def run_multi_observer_experiment_simple(
         
         print(f"[OK] Saved: {output_file}")
         print(f"  -> {len(result.get('bt_uid_list', []))} articles with stable IDs")
-        results[seed] = result
+        if retain_full_results:
+            results[seed] = result
+        else:
+            results[seed] = {
+                "seed": int(seed),
+                "output_file": str(output_file),
+                "n_articles": int(len(articles)),
+                "bt_uid_count": int(len(result.get("bt_uid_list", []))),
+                "meta": dict(output_artifact.get("meta", {})),
+            }
+
+        # Release heavyweight per-seed state before moving to the next observer.
+        del output_artifact
+        del variance_tracker
+        del pipeline_checkpoints
+        del pipeline
+        del components
+        if not retain_full_results:
+            del result
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if emit_label_validation and validation_records:
         available_nmi = [float(v["nmi"]) for v in validation_records if isinstance(v.get("nmi"), (int, float))]

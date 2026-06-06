@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from analysis.verification.verify_run import discover_all_layers, resolve_validation_path
+from analysis.verification.verify_run import check_control_ordering, discover_all_layers, resolve_validation_path
 
 
 def _write_observer_payload(path: Path) -> None:
@@ -61,3 +61,95 @@ def test_resolve_validation_path_prefers_real_leaf_validation(tmp_path):
     resolved = resolve_validation_path(layer_dir, corpus="real")
 
     assert resolved == real_validation
+
+
+def test_check_control_ordering_uses_control_metric_fallback_for_collapsed_primary_scores(tmp_path):
+    layer_dir = tmp_path / "matern" / "cls"
+    (layer_dir / "real").mkdir(parents=True, exist_ok=True)
+    (layer_dir / "real" / "control_metrics.comprehensive_results.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "procrustes_min_control_ratio": 2.4,
+                    "simple_variance_stochastic_ratio": 1.3,
+                    "separates_count": 5,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifacts = {
+        "real": {
+            "42": {
+                "features": np.array([[0.0, 0.0], [1.0e-5, 0.0]], dtype=np.float64),
+            }
+        },
+        "control_shuffled": {
+            "42": {
+                "features": np.array([[0.0, 0.0], [2.0e-5, 0.0]], dtype=np.float64),
+            }
+        },
+        "control_random": {
+            "42": {
+                "features": np.array([[0.0, 0.0], [3.0e-5, 0.0]], dtype=np.float64),
+            }
+        },
+        "control_constant": {
+            "42": {
+                "features": np.ones((2, 2), dtype=np.float64),
+            }
+        },
+    }
+
+    result = check_control_ordering(artifacts, is_comparable=True, layer_dir=layer_dir)
+
+    assert result["pass"] is True
+    assert result["values"]["numeric_collapse_detected"] is True
+    assert result["values"]["used_fallback"] is True
+    assert result["values"]["fallback"]["metric"] == "comprehensive_control_metrics"
+
+
+def test_check_control_ordering_keeps_failure_when_fallback_is_not_supportive(tmp_path):
+    layer_dir = tmp_path / "matern" / "cls"
+    (layer_dir / "real").mkdir(parents=True, exist_ok=True)
+    (layer_dir / "real" / "control_metrics.comprehensive_results.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "procrustes_min_control_ratio": 0.9,
+                    "simple_variance_stochastic_ratio": 0.95,
+                    "separates_count": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifacts = {
+        "real": {
+            "42": {
+                "features": np.array([[0.0, 0.0], [1.0e-5, 0.0]], dtype=np.float64),
+            }
+        },
+        "control_shuffled": {
+            "42": {
+                "features": np.array([[0.0, 0.0], [2.0e-5, 0.0]], dtype=np.float64),
+            }
+        },
+        "control_random": {
+            "42": {
+                "features": np.array([[0.0, 0.0], [3.0e-5, 0.0]], dtype=np.float64),
+            }
+        },
+        "control_constant": {
+            "42": {
+                "features": np.ones((2, 2), dtype=np.float64),
+            }
+        },
+    }
+
+    result = check_control_ordering(artifacts, is_comparable=True, layer_dir=layer_dir)
+
+    assert result["pass"] is False
+    assert result["values"]["numeric_collapse_detected"] is True
+    assert result["values"]["used_fallback"] is False
+    assert result["values"]["fallback"]["pass"] is False

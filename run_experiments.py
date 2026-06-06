@@ -28,10 +28,22 @@ Usage:
 # WINDOWS UNICODE FIX - Must be before all other imports
 # ============================================================================
 import sys
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+
+def _ensure_utf8_console_streams() -> None:
+    if sys.platform != "win32":
+        return
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_console_streams()
 # ============================================================================
 
 from pathlib import Path
@@ -56,7 +68,7 @@ if str(ROOT) not in sys.path:
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "outputs"
 
-from core.complete_pipeline import run_multi_observer_experiment
+from core.complete_pipeline import TRACK4_BASIS_CHOICES, run_multi_observer_experiment
 from core.pipeline_config import PipelineRuntimeConfig
 
 
@@ -491,7 +503,17 @@ def _ensure_verification_provenance(artifact: dict, mode_config: dict, seed: int
 # EXPERIMENT RUNNERS
 # =========================================================================
 
-def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *, output_root: str = None, gru_mode: str = 'intra'):
+def run_standard_experiment(
+    articles,
+    mode_config,
+    seeds,
+    corpus_name='real',
+    *,
+    output_root: str = None,
+    gru_mode: str = 'intra',
+    walker_n_walkers: int = 10,
+    walker_n_steps: int = 150,
+):
     """
     Run a standard experiment (single kernel type, multiple seeds).
 
@@ -513,6 +535,10 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
     gru_mode : str, optional
         Indicates the GRU aggregation mode (``'intra'`` or ``'inter'``). Used
         only when ``output_root`` is ``None`` to organise the output files.
+    walker_n_walkers : int, optional
+        Number of Track 4 walkers to launch. Defaults to 10.
+    walker_n_steps : int, optional
+        Maximum Track 4 steps per walker. Defaults to 150.
     """
     print_experiment_header(mode_config['name'], mode_config)
     
@@ -560,6 +586,15 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         kernel_type=pipeline_config.get('kernel_type', 'rbf'),
         kernel_types=pipeline_config.get('kernel_types'),
         kernel_params=pipeline_config.get('kernel_params', {}),
+        track5_assembly_mode=runtime_config.track5_assembly_mode,
+        track4_basis=getattr(args, 'track4_basis', 'track2'),
+        track4_proposal_mode=getattr(args, 'track4_proposal_mode', 'metric_softmax'),
+        track4_adaptive_tpt_connectivity=bool(getattr(args, 'track4_adaptive_tpt_connectivity', False)),
+        walker_temperature=float(getattr(args, 'walker_temperature', 0.5)),
+        walker_gamma=float(getattr(args, 'walker_gamma', 5.0)),
+        walker_k_neighbors=int(getattr(args, 'walker_k_neighbors', 10)),
+        walker_n_walkers=int(walker_n_walkers),
+        walker_n_steps=int(walker_n_steps),
         normalize_features=pipeline_config.get('normalize_features', True),
         use_gru=pipeline_config['use_gru'],
         use_multi_framing_rks=pipeline_config['use_multi_framing_rks'],
@@ -569,6 +604,7 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         corpus_name=corpus_name,
         nli_cache_path=getattr(args, 'nli_cache_path', None),
         enable_checkpoints=True, # Always capture data lineage
+        retain_full_results=(output_root is None),
     )
     
     # Save results - BUT only if output_root is NOT provided
@@ -886,10 +922,11 @@ def run_unified_pipeline_experiment(articles, mode_config, seeds, corpus_name='r
             UnifiedExtractionConfig,
             run_unified_pipeline,
         )
-    except ImportError:
-        print("ERROR: unified_extraction.py not found in core/")
-        print("Copy it from the provided files.")
-        return {}
+    except ImportError as exc:
+        raise RuntimeError(
+            "mode='unified' is configured but core.unified_extraction is not installed; "
+            "use a maintained mode or restore the module before running this branch"
+        ) from exc
     
     output_dir = Path(output_root) if output_root else OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1139,10 +1176,22 @@ def main():
         help='Mode B: Map to RKHS before Dirichlet mixing (born-aligned)'
     )
     parser.add_argument(
+        '--track5-assembly-mode',
+        type=str,
+        default=None,
+        choices=['hadamard', 'hadamard_strict', 'strict_riemannian', 'riemannian', 'riemannian_strict', 'concatenate', 'concat'],
+        help='Override Track 5 synthesis assembly mode for this run.'
+    )
+    parser.add_argument(
         '--nli-cache-path',
         type=str,
         default=None,
         help='Path to NLI embedding cache file (for reuse across kernel runs)'
+    )
+    parser.add_argument(
+        '--require-cuda',
+        action='store_true',
+        help='Fail fast if CUDA is unavailable instead of falling back to CPU.'
     )
     parser.add_argument(
         '--nu',
@@ -1172,6 +1221,55 @@ def main():
         '--freeze-require-success',
         action='store_true',
         help='Fail run if post-run tuple freeze cannot be completed.'
+    )
+    parser.add_argument(
+        '--track4-basis',
+        type=str,
+        default='track2',
+        choices=list(TRACK4_BASIS_CHOICES),
+        help='Feature basis for the Track 4 walker. Default track2 preserves the production geometry.'
+    )
+    parser.add_argument(
+        '--track4-proposal-mode',
+        type=str,
+        default='metric_softmax',
+        choices=['metric_softmax', 'stress_biased', 'committor_guided', 'deterministic_low_cost'],
+        help='Track 4 proposal mode. Default preserves the production metric-softmax walker.'
+    )
+    parser.add_argument(
+        '--track4-adaptive-tpt-connectivity',
+        action='store_true',
+        help='Allow Track 4 to raise k-neighbors until Bridge/Void TPT flux is communicative.'
+    )
+    parser.add_argument(
+        '--walker-temperature',
+        type=float,
+        default=0.5,
+        help='Track 4 walker transition temperature (default: 0.5).'
+    )
+    parser.add_argument(
+        '--walker-gamma',
+        type=float,
+        default=5.0,
+        help='Track 4 retreat homing penalty gamma (default: 5.0).'
+    )
+    parser.add_argument(
+        '--walker-k-neighbors',
+        type=int,
+        default=10,
+        help='Track 4 metric-graph neighbor count (default: 10).'
+    )
+    parser.add_argument(
+        '--walker-n-walkers',
+        type=int,
+        default=10,
+        help='Track 4 walker count (default: 10).'
+    )
+    parser.add_argument(
+        '--walker-n-steps',
+        type=int,
+        default=150,
+        help='Track 4 maximum steps per walker (default: 150).'
     )
     
     # Dirichlet fusion flags
@@ -1219,6 +1317,9 @@ def main():
     
     global args
     args = parser.parse_args()
+
+    if args.require_cuda and not torch.cuda.is_available():
+        raise RuntimeError("--require-cuda was set, but torch.cuda.is_available() is false.")
     
     # Resolve corpus name for custom paths
     corpus_name = Path(args.corpus).stem if os.path.exists(args.corpus) else args.corpus
@@ -1292,6 +1393,10 @@ def main():
     if args.mix_in_rkhs:
         mode_config['mix_in_rkhs'] = True
         print("[CONFIG] Mode B enabled: map-then-mix (born-aligned RKHS)")
+
+    if args.track5_assembly_mode:
+        mode_config['track5_assembly_mode'] = args.track5_assembly_mode
+        print(f"[CONFIG] Track 5 assembly mode: {args.track5_assembly_mode}")
     
     # NEW: Dirichlet fusion config
     if args.dirichlet_fusion:
@@ -1364,7 +1469,9 @@ def main():
                     args.seeds,
                     corpus_name,
                     output_root=args.output_root,
-                    gru_mode=args.gru_mode
+                    gru_mode=args.gru_mode,
+                    walker_n_walkers=args.walker_n_walkers,
+                    walker_n_steps=args.walker_n_steps,
                 )
             
             print(f"\n[OK] Batch {date_range} complete\n")
@@ -1401,13 +1508,15 @@ def main():
 
     # NEW: Handle unified pipeline mode (single inference for all outputs)
     if mode_config.get('use_unified_pipeline', False):
-        run_unified_pipeline_experiment(
+        unified_result = run_unified_pipeline_experiment(
             articles,
             mode_config,
             args.seeds,
             corpus_name=corpus_name,
             output_root=args.output_root,
         )
+        if not unified_result:
+            raise RuntimeError("unified pipeline produced no result; refusing to mark run successful")
     # Handle Dirichlet fusion standalone mode (only if strictly specified as the mode)
     elif args.mode == 'dirichlet':
         run_dirichlet_fusion_experiment(
@@ -1431,7 +1540,9 @@ def main():
             args.seeds,
             corpus_name=corpus_name,
             output_root=args.output_root,
-            gru_mode=getattr(args, "gru_mode", "intra")
+            gru_mode=getattr(args, "gru_mode", "intra"),
+            walker_n_walkers=args.walker_n_walkers,
+            walker_n_steps=args.walker_n_steps,
         )
 
     print(f"\nResults saved to: {OUTPUT_DIR}")

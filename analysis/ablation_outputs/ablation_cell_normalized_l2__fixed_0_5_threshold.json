@@ -1,0 +1,21 @@
+{
+  "stress_mode": "normalized_l2",
+  "zone_rule": "fixed_0_5_threshold",
+  "n_rows": 80,
+  "density_min": 0.0,
+  "density_max": 0.9999999502545044,
+  "stress_min": 15.468079566955566,
+  "stress_max": 49.74528503417969,
+  "stress_view_min": 0.0,
+  "stress_view_max": 1.0,
+  "scalar_min": 0.1630232013454157,
+  "scalar_max": 0.908756810841195,
+  "scalar_bin_coverage": 0.875,
+  "zone_counts": {
+    "Bridge": 22,
+    "Swamp": 32,
+    "Tightrope": 10,
+    "Void": 16
+  },
+  "missing_zone_count": 0
+}

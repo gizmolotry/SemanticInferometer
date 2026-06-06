@@ -1,22 +1,25 @@
-# SemanticInferometer
+# Belief Transformer V3
 
-Curated source dump of the current Semantic Interferometer stack: the active pipeline, Dash/Monolith analysis layer, verification flow, controls, and thesis-facing runner scripts, without heavyweight generated artifacts.
+Thesis-oriented experimental workspace for studying framing-sensitive geometry in news representations.
 
-## Included
-- `core/`: active pipeline, fusion, geometry, walker, and support modules
-- `analysis/`: Dash shell, Monolith renderer, waterfall tooling, verification helpers
-- `config/`: framing query configuration
-- `controls/`: control corpus generator and small manifests / seed corpora
-- `run_experiments.py`: single-run entry point
-- `run_full_experiment_suite.py`: matrix runner for real/control/synthetic suites
-- `METHODS.md`, `RESULTS.md`, `THESIS_CHECKLIST.md`: thesis-facing workflow docs
-- `test_*.py`: regression and contract tests for the current stack
+## Current Status (as of 2026-02-26)
+- Project outputs and archives have been reorganized:
+  - Generated artifacts live under `outputs/`
+  - Historical material lives under `archive/`
+- Core pipeline code is active and under ongoing iteration.
+- Thesis packaging docs are now present:
+  - `METHODS.md`
+  - `RESULTS.md`
+  - `THESIS_CHECKLIST.md`
 
-## Intentionally Excluded
-- generated run artifacts under `outputs/`
-- historical material under `archive/`
-- heavyweight local datasets and scratch experiment directories
-- cached HTML, tensors, screenshots, and other build/runtime byproducts
+## Repo Structure
+- `core/`: pipeline, feature extraction, fusion, geometry, diagnostics
+- `run_experiments.py`: single-run / mode-focused experimental runner
+- `run_full_experiment_suite.py`: full matrix runner (real + controls, synthetic mode, probes, optional analyses)
+- `analysis/`: visualization and analysis scripts
+- `outputs/`: generated run artifacts, logs, reports, monolith snapshots
+- `archive/`: legacy snapshots and historical outputs
+- `data/`, `config/`, `controls/`, `diag/`: datasets/config/supporting materials
 
 ## Thesis-Facing Workflow
 1. Lock canonical settings in `METHODS.md`.
@@ -35,6 +38,9 @@ python run_full_experiment_suite.py --mode enhanced --seeds 42 420 4200 --kernel
 python run_full_experiment_suite.py --synthetic --mode enhanced --seeds 42 420 4200 --kernels rbf laplacian rq imq --channels cls --limit 60
 ```
 
+Note: `run_full_experiment_suite.py` now auto-syncs the `RESULTS.md` run registry after completion.
+Use `--no-post-sync-results` to disable, and `--post-validate-thesis` to also run thesis artifact validation.
+
 ## Notes
 - Keep exploratory runs out of thesis claims unless promoted to canonical.
-- Generated artifacts should live outside this source repo or remain gitignored.
+- Keep the root clean; write generated files to `outputs/`.

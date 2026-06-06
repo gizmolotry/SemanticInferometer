@@ -1,0 +1,36 @@
+{
+  "created_at_utc": "2026-02-20T14:34:43.415772+00:00",
+  "baseline": {
+    "html_path": "D:\\belief-transformer\\V3\\monolith_cockpit_restored_exact.html",
+    "size_bytes": 1892319,
+    "sha256": "ddae55292e8290ab298ea8071b489804bad4c1ae4e8d877037e8308b1e415eb8",
+    "trace_count": 573,
+    "mode_bounds": {
+      "SYNTHESIS_START": 0,
+      "SYNTHESIS_END": 191,
+      "DIAGNOSTICS_START": 191,
+      "DIAGNOSTICS_END": 438,
+      "ANALYSIS_START": 438,
+      "ANALYSIS_END": 573
+    },
+    "key_trace_counts": {
+      "Energy Terrain": 1,
+      "Articles": 1,
+      "Phantom (Magenta Knot)": 42,
+      "Honest (Cyan River)": 12,
+      "Rupture (Red Spark)": 0,
+      "Tautology (Spinning)": 6
+    },
+    "contains_fault_label": false,
+    "zone_presence": {
+      "Bridge": true,
+      "Swamp": true,
+      "Tightrope": true,
+      "Void": true
+    },
+    "contains_hott_obstruction_icon": false,
+    "contains_hott_nonequivalence_icon": false,
+    "contains_mode_buttons": true,
+    "hud_nmi": 0.733
+  }
+}

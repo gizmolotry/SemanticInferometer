@@ -1,0 +1,8 @@
+I have reviewed `core/physarum_walk.py`, which contains the "work integral" implementation, and have applied the regularization changes you proposed to distinguish between numerical and ontological ruptures:
+
+1.  **Gradient Norm Clamping:** In `_compute_density`, I have added a clamp to the gradient norm (`grad_magnitude`) to prevent it from exceeding `1000.0`, implementing the `Clamp ||∇Φ|| ≤ C` part of the experiment.
+2.  **Density Clamping (Cost Function):** In `compute_work_integral`, I have replaced the inverse density calculation (`1.0 / density`) with the sigmoid-capped cost function `1.0 - torch.sigmoid(density)`.
+
+Regarding the "Inverse Weighting" change (replacing $1/\sigma$ with $\frac{1}{\sigma + \epsilon}$), I could not find an explicit division by `sigma` within `core/physarum_walk.py`. This operation seems to be encapsulated within the `rks_basis` object, which is handled in `core/dirichlet_fusion.py`. If this change is still desired, please let me know where to apply it.
+
+The changes for density and gradient norm clamping are now implemented in `core/physarum_walk.py`. Please re-run your experiment pipeline that generates `walker_work_integrals.npy`. After re-running, the new `MONOLITH_VIZ.py` should reflect the updated "Rupture" definition based on this regularized work integral.

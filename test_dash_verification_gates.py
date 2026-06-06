@@ -2,7 +2,6 @@ from pathlib import Path
 import importlib
 import sys
 import types
-import shutil
 
 import pytest
 from analysis.verification import verify_run as verify_mod
@@ -71,18 +70,6 @@ BADGE_STYLE_IDX = 8
 T1_TEXT_IDX = 9
 WATERMARK_TEXT_IDX = 22
 WATERMARK_STYLE_IDX = 23
-
-
-@pytest.fixture
-def tmp_path(request):
-    """Workspace-local tmp_path override for restricted Windows temp directories."""
-    root = Path.cwd() / ".pytest_local_tmp"
-    root.mkdir(parents=True, exist_ok=True)
-    case_dir = root / request.node.name
-    if case_dir.exists():
-        shutil.rmtree(case_dir, ignore_errors=True)
-    case_dir.mkdir(parents=True, exist_ok=True)
-    return case_dir
 
 
 def _seed_index(tmp_path: Path) -> dict:

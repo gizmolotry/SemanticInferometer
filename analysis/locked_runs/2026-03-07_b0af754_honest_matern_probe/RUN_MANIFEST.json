@@ -1,0 +1,80 @@
+{
+  "snapshot_name": "2026-03-07_b0af754_honest_matern_probe",
+  "created_at_utc": "2026-03-07T18:01:35.077825+00:00",
+  "viz_code_commit": "b0af754",
+  "command": "python -m analysis._probe_b0af754 outputs/honest_matern -o outputs/honest_matern/MONOLITH_PROBE_b0af754.html",
+  "source": {
+    "html": "outputs/honest_matern/MONOLITH_PROBE_b0af754.html",
+    "log": "outputs/honest_matern/MONOLITH_PROBE_b0af754.log",
+    "input_dir": "outputs/honest_matern"
+  },
+  "snapshot_files": {
+    "html": {
+      "file": "MONOLITH_PROBE_b0af754.html",
+      "bytes": 1573462,
+      "sha256": "7603d9881570106bede362f12c5f9e85f4ca259faa25ac4d6c6ce65d8ff386bd"
+    },
+    "log": {
+      "file": "MONOLITH_PROBE_b0af754.log",
+      "bytes": 4470,
+      "sha256": "608581be5d9decf8eac1a028e66eccd973cbadb31885495c4ba500fb421e5115"
+    },
+    "viz_runtime": {
+      "file": "MONOLITH_VIZ_runtime.py",
+      "bytes": 199414,
+      "sha256": "ea1c02b0b4c662bb4d8f1ecab1e2c2c0f5ad1bbd3fecd80878999cbd0a55a241"
+    },
+    "viz_git": {
+      "file": "MONOLITH_VIZ_git.py",
+      "bytes": 203968,
+      "sha256": "7aa5cef3295aae0c60865a80e61e0e1df6e17560956afce25f63753d6b6a661f"
+    }
+  },
+  "inputs": [
+    {
+      "file": "MONOLITH_DATA.csv",
+      "bytes": 22287,
+      "sha256": "4c1b71ef0f98e657790c53779814f9ef44a998f6a1986d539fe0487e9824adf7"
+    },
+    {
+      "file": "phantom_verdicts.json",
+      "bytes": 16643,
+      "sha256": "d143c00d9f359151b5d8055f57f4e78f90f2b7ff29e822b66945920d0b3bf07c"
+    },
+    {
+      "file": "walker_states.json",
+      "bytes": 12167,
+      "sha256": "286f4ef4139cde3fb5729b9ed09d88d169286dba1d8473f5d1c18048f03c30ba"
+    },
+    {
+      "file": "spectral_probe_magnitudes.npy",
+      "bytes": 2688,
+      "sha256": "7aa34e939c08f7310d330249e0378fc8844e1d365c85f7f71b02deb4a02de20b"
+    },
+    {
+      "file": "spectral_u_axis.npy",
+      "bytes": 491648,
+      "sha256": "686e2def18f659b9da3951ba9bbbb043a108904e6e3a1f45603fbd343f076226"
+    },
+    {
+      "file": "features.npy",
+      "bytes": 655488,
+      "sha256": "8e86f2d5187f3ee71404306f63ad9a860f835b0ac4b227cfdc2ad99da75f9554"
+    },
+    {
+      "file": "run_meta.json",
+      "bytes": 367,
+      "sha256": "36d1077c96d152aab75ae803f09a91b63778559ad865dcf7ad1d3ecd7a896cb7"
+    },
+    {
+      "file": "variance_tracking.json",
+      "bytes": 846,
+      "sha256": "2547041979601d95d1128bd377a65f24d9c895e02c5a95f74f1e7333b43dbcf8"
+    },
+    {
+      "file": "walker_paths.npz",
+      "bytes": 89391525,
+      "sha256": "881130ec09ad356114132a9b22e56a08d11e1269a777b26a870b60218eaeb278"
+    }
+  ]
+}

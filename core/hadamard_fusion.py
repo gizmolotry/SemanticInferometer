@@ -4,7 +4,11 @@ hadamard_fusion.py — Track 5: Hadamard Kernel Fusion (ASTER v3.2)
 THE METRIC TENSOR ASSEMBLY:
 ===========================
 This module is Track 5 of the ASTER architecture — the true fusion layer that
-assembles the metric tensor g_μν from its constituent tracks:
+assembles the metric tensor g_μν from its constituent tracks.
+
+Production default remains the strict Hadamard assembly. For ablations we also
+support a strict Riemannian path that builds a data-derived pairwise distance
+from Tracks 2, 1.5, and 3 without introducing any learned potential network.
 
     g_μν = (1/ρ)·δ_μν + ∇_μΦ·∇_νΦ
 
@@ -120,6 +124,7 @@ class HadamardFusionResult:
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for logging/storage."""
         return {
+            'assembly_mode': 'hadamard',
             'n_samples': self.K_final.shape[0],
             'output_dim': self.embeddings.shape[1],
             'n_isolated_rescued': self.n_isolated_rescued,
@@ -208,9 +213,15 @@ class HadamardFusion:
             n_rescued: Always 0 under the strict contract
             isolated_indices: Indices of isolated nodes (or None)
         """
-        # Strict logical AND in kernel space. No softening and no dark-manifold
-        # rescue: if cross-track support vanishes, the node remains isolated.
         K_hadamard = K_rks * K_spectral
+        softening = float(self.config.hadamard_softening)
+        if softening > 0.0:
+            # Compatibility mode: lift the strict intersection toward the
+            # per-edge upper bound shared by both kernels without exceeding 1.
+            # This preserves the historical "softening recovers connectivity"
+            # behavior while leaving the default strict path unchanged.
+            support_envelope = torch.minimum(K_rks, K_spectral)
+            K_hadamard = (1.0 - softening) * K_hadamard + softening * support_envelope
         K_hadamard = K_hadamard.clamp(min=0.0, max=1.0)
 
         row_sums = K_hadamard.sum(dim=1)
@@ -509,11 +520,125 @@ def compute_hadamard_fusion_simple(
     embeddings, eigenvalues = hf.spectral_embedding(K_hadamard, config.output_dim)
 
     diagnostics = {
+        'assembly_mode': 'hadamard',
         'n_samples': track2.shape[0],
         'n_isolated_rescued': n_rescued,
         'K_hadamard_sparsity': float((K_hadamard < 0.01).sum() / K_hadamard.numel()),
         'top_eigenvalues': eigenvalues[:5].tolist() if eigenvalues is not None else None,
         'eigenvalue_ratio': float(eigenvalues[0] / eigenvalues[-1]) if eigenvalues is not None else None,
+    }
+
+    return embeddings, diagnostics
+
+
+def _pairwise_distance_matrix(X: torch.Tensor) -> torch.Tensor:
+    """Compute a symmetric Euclidean distance matrix."""
+    if X.shape[0] <= 1:
+        return torch.zeros((X.shape[0], X.shape[0]), device=X.device, dtype=X.dtype)
+    return torch.cdist(X, X, p=2)
+
+
+def _median_distance(distance_matrix: torch.Tensor, floor: float) -> float:
+    """Estimate a robust scale from the upper triangle of a distance matrix."""
+    if distance_matrix.shape[0] <= 1:
+        return 1.0
+    triu_idx = torch.triu_indices(distance_matrix.shape[0], distance_matrix.shape[1], offset=1)
+    distances = distance_matrix[triu_idx[0], triu_idx[1]]
+    if distances.numel() == 0:
+        return 1.0
+    return max(float(distances.median()), max(float(floor), 1e-6))
+
+
+def _classical_mds_embedding(
+    distance_matrix: torch.Tensor,
+    output_dim: int,
+    eigenvalue_floor: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Recover an embedding from pairwise distances via classical MDS."""
+    n_samples = distance_matrix.shape[0]
+    if n_samples == 0:
+        empty = distance_matrix.new_zeros((0, 0))
+        return empty, distance_matrix.new_zeros((0,))
+
+    distance_sq = distance_matrix.pow(2)
+    eye = torch.eye(n_samples, device=distance_matrix.device, dtype=distance_matrix.dtype)
+    center = eye - distance_matrix.new_full((n_samples, n_samples), 1.0 / max(n_samples, 1))
+    gram = -0.5 * center @ distance_sq @ center
+    gram = (gram + gram.T) / 2
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(gram)
+    idx = torch.argsort(eigenvalues, descending=True)
+    eigenvalues = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx]
+
+    k = min(output_dim, n_samples)
+    top_eigenvalues = eigenvalues[:k].clamp(min=eigenvalue_floor)
+    top_eigenvectors = eigenvectors[:, :k]
+    embeddings = top_eigenvectors * torch.sqrt(top_eigenvalues).unsqueeze(0)
+    return embeddings, top_eigenvalues
+
+
+def compute_strict_riemannian_fusion(
+    track2: torch.Tensor,
+    track15: torch.Tensor,
+    track3: Optional[torch.Tensor] = None,
+    config: Optional[HadamardFusionConfig] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Assemble Track 5 from a metric-respecting pairwise distance.
+
+    Approximation:
+        ds^2 ~= ||ΔT2||^2 / (rho_i * rho_j) + ||ΔT1.5||^2
+
+    The Track 2 terrain is stretched by the Track 3 conformal density, while
+    the Track 1.5 stress term contributes directly as a data-derived distance.
+    The resulting pairwise metric is embedded back into vector space with
+    classical MDS for downstream Track 4/phase-space compatibility.
+    """
+    config = config or HadamardFusionConfig()
+    conformal = ConformalMetric(temperature_scale=config.temperature_scale)
+
+    dist_rks = _pairwise_distance_matrix(track2)
+    dist_spectral = _pairwise_distance_matrix(track15)
+
+    sigma_rks = config.sigma_rks or _median_distance(dist_rks, config.kernel_floor)
+    sigma_spectral = config.sigma_spectral or _median_distance(dist_spectral, config.kernel_floor)
+
+    dist_rks_sq = (dist_rks / sigma_rks).pow(2)
+    dist_spectral_sq = (dist_spectral / sigma_spectral).pow(2)
+
+    if track3 is not None:
+        rho = conformal.compute_density(track3)
+    else:
+        rho = torch.ones(track2.shape[0], device=track2.device, dtype=track2.dtype)
+
+    rho_outer = torch.outer(rho, rho).clamp(min=1e-6)
+    riemann_distance_sq = dist_rks_sq / rho_outer + dist_spectral_sq
+    riemann_distance_sq.fill_diagonal_(0.0)
+    riemann_distance = torch.sqrt(riemann_distance_sq.clamp(min=0.0))
+
+    embeddings, eigenvalues = _classical_mds_embedding(
+        riemann_distance,
+        output_dim=config.output_dim,
+        eigenvalue_floor=config.eigenvalue_floor,
+    )
+
+    sigma_riemann = config.sigma_conformal or _median_distance(riemann_distance, config.kernel_floor)
+    kernel_proxy = torch.exp(-riemann_distance_sq / (2 * sigma_riemann**2 + config.kernel_floor))
+
+    diagnostics = {
+        "assembly_mode": "strict_riemannian",
+        "n_samples": int(track2.shape[0]),
+        "output_dim": int(embeddings.shape[1]) if embeddings.dim() == 2 else 0,
+        "rho_mean": float(rho.mean()),
+        "rho_std": float(rho.std()),
+        "distance_median": float(riemann_distance.median()) if riemann_distance.numel() else 0.0,
+        "distance_max": float(riemann_distance.max()) if riemann_distance.numel() else 0.0,
+        "sigma_rks": float(sigma_rks),
+        "sigma_spectral": float(sigma_spectral),
+        "sigma_riemann": float(sigma_riemann),
+        "top_eigenvalues": eigenvalues[:5].tolist() if eigenvalues is not None else None,
+        "kernel_proxy_sparsity": float((kernel_proxy < 0.01).sum() / kernel_proxy.numel()) if kernel_proxy.numel() else 0.0,
     }
 
     return embeddings, diagnostics
