@@ -6,6 +6,7 @@ import pytest
 
 from scripts.run_observer_recenter_robustness_suite import (
     LOCAL_VARIANT_BASELINES,
+    SOURCE_PROXY_METRIC_BASELINE,
     aggregate_results,
     evaluate_baseline,
     run_suite,
@@ -123,6 +124,25 @@ def test_local_variant_baseline_runs_and_preserves_variant_key(tmp_path: Path) -
         row.get("local_recompute_variant")
         for row in result.get("observers", [])
     } == {"local_tangent_pca"}
+
+
+def test_source_proxy_metric_is_oracle_and_never_safe_recenter_claim(tmp_path: Path) -> None:
+    run_dir = tmp_path / "synthetic" / "rbf_seed42"
+    _write_small_synthetic_run(run_dir)
+
+    result = evaluate_baseline(
+        run_dir,
+        SOURCE_PROXY_METRIC_BASELINE,
+        min_label_count=2,
+        preferred_label_column="perspective_tag",
+        label_mode="auto",
+    )
+
+    assert result["status"] == "OK"
+    assert result["local_recompute_variant"] == "source_proxy_metric"
+    assert result["proxy_oracle_baseline"] is True
+    assert result["safe_for_recenter_claim"] is False
+    assert "not_pure_local_recompute" in result["claim_boundary"]
 
 
 def test_robustness_suite_writes_json_and_csv(tmp_path: Path) -> None:
