@@ -348,6 +348,379 @@ def summarize_observer_slice_transport(
     )
 
 
+def _availability_thresholds(
+    action_matrix: np.ndarray,
+    *,
+    availability_quantile: float,
+    availability_action_cutoff: Optional[float],
+) -> np.ndarray:
+    if availability_action_cutoff is not None:
+        if float(availability_action_cutoff) < 0.0:
+            raise ValueError("availability_action_cutoff must be nonnegative")
+        return np.full(action_matrix.shape[1], float(availability_action_cutoff), dtype=np.float64)
+    if not 0.0 <= float(availability_quantile) <= 1.0:
+        raise ValueError("availability_quantile must be in [0, 1]")
+    q = min(max(float(availability_quantile), 0.0), 1.0)
+    return np.quantile(action_matrix, q, axis=0).astype(np.float64)
+
+
+def _edge_cv(values: np.ndarray) -> float:
+    mean = float(np.mean(values))
+    if abs(mean) <= 1e-12:
+        return 0.0
+    return float(np.std(values) / abs(mean))
+
+
+def _classify_path(
+    *,
+    support_count: int,
+    observer_count: int,
+    edge_action_cv: float,
+    consensus_fraction: float,
+    stable_cv_threshold: float,
+) -> str:
+    if support_count <= 0:
+        return "universal_barrier"
+    consensus_cutoff = max(1, int(math.ceil(float(consensus_fraction) * int(observer_count))))
+    if support_count >= consensus_cutoff and float(edge_action_cv) <= float(stable_cv_threshold):
+        return "consensus_path"
+    if support_count >= consensus_cutoff:
+        return "consensus_but_warped"
+    return "observer_contingent_path"
+
+
+def _is_consensus_class(path_class: str) -> bool:
+    return path_class in {"consensus_path", "consensus_but_warped"}
+
+
+def _removal_effect(
+    *,
+    base_class: str,
+    removed_class: str,
+    base_support_count: int,
+    removed_support_count: int,
+    base_support_fraction: float,
+    removed_support_fraction: float,
+) -> str:
+    if base_support_count > 0 and removed_support_count <= 0:
+        return "removes_last_path"
+    if not _is_consensus_class(base_class) and _is_consensus_class(removed_class):
+        return "unblocks_consensus"
+    if _is_consensus_class(base_class) and not _is_consensus_class(removed_class):
+        return "breaks_consensus"
+    if removed_class != base_class:
+        return "changes_path_class"
+    if removed_support_fraction > base_support_fraction + 1e-12:
+        return "removes_blocker"
+    if removed_support_fraction < base_support_fraction - 1e-12:
+        return "removes_enabler"
+    return "neutral"
+
+
+def _null_path_stats(
+    action_row: np.ndarray,
+    thresholds: np.ndarray,
+    *,
+    consensus_fraction: float,
+    stable_cv_threshold: float,
+) -> Dict[str, Any]:
+    observer_count = int(action_row.shape[0])
+    if observer_count <= 1:
+        shifts = [0]
+    else:
+        shifts = list(range(1, observer_count))
+    class_counts: Dict[str, int] = {}
+    support_fractions = []
+    subset_required = 0
+    contingent = 0
+    for shift in shifts:
+        shifted = np.roll(action_row, int(shift))
+        row = shifted <= thresholds
+        support_count = int(np.sum(row))
+        support_fractions.append(float(support_count / observer_count))
+        path_class = _classify_path(
+            support_count=support_count,
+            observer_count=observer_count,
+            edge_action_cv=_edge_cv(shifted),
+            consensus_fraction=consensus_fraction,
+            stable_cv_threshold=stable_cv_threshold,
+        )
+        class_counts[path_class] = class_counts.get(path_class, 0) + 1
+        if path_class == "observer_contingent_path":
+            contingent += 1
+        if 0 < support_count < observer_count:
+            subset_required += 1
+    denom = max(1, len(shifts))
+    modal_class = sorted(class_counts.items(), key=lambda item: (-int(item[1]), item[0]))[0][0] if class_counts else "universal_barrier"
+    return {
+        "null_shift_count": int(len(shifts)),
+        "null_path_class": modal_class,
+        "null_path_class_counts": class_counts,
+        "null_observer_contingent_probability": float(contingent / denom),
+        "null_subset_required_probability": float(subset_required / denom),
+        "null_support_fraction": float(np.mean(support_fractions)) if support_fractions else 0.0,
+    }
+
+
+def summarize_observer_path_contingency(
+    slices: Mapping[str, Any],
+    *,
+    article_pairs: Sequence[Tuple[int, int]],
+    density: Any | None = None,
+    stress: Any | None = None,
+    config: ObserverSliceTransportConfig | None = None,
+    row_to_article_index: Any | None = None,
+    availability_quantile: float = 0.35,
+    availability_action_cutoff: Optional[float] = None,
+    consensus_fraction: float = 0.75,
+    stable_cv_threshold: float = 0.25,
+) -> Dict[str, Any]:
+    """Classify paths by which observers make them traversable.
+
+    This is intentionally not an optimizer.  It preserves a Track 4 nuance:
+    some article-to-article moves only exist as low-action paths inside a subset
+    of observer slices.  Those failures are semantic evidence, not just noise.
+    """
+
+    cfg = config or ObserverSliceTransportConfig()
+    if not 0.0 < float(consensus_fraction) <= 1.0:
+        raise ValueError("consensus_fraction must be in (0, 1]")
+    if float(stable_cv_threshold) < 0.0:
+        raise ValueError("stable_cv_threshold must be nonnegative")
+    slice_arrays = _coerce_slices(slices)
+    names = list(slice_arrays)
+    n_items = int(next(iter(slice_arrays.values())).shape[0])
+    density_vec = _coerce_vector(density, n_items, default=1.0)
+    stress_vec = _coerce_vector(stress, n_items, default=0.0)
+    pairs = [(int(left), int(right)) for left, right in article_pairs if int(left) != int(right)]
+    if not pairs:
+        empty_counts = {
+            "consensus_path": 0,
+            "consensus_but_warped": 0,
+            "observer_contingent_path": 0,
+            "universal_barrier": 0,
+        }
+        return _json_safe(
+            {
+                "summary_type": "observer_path_contingency_summary",
+                "status": "NO_RECORDS",
+                "slice_count": len(names),
+                "article_pair_count": 0,
+                "record_count": 0,
+                "availability_quantile": float(availability_quantile),
+                "availability_action_cutoff": availability_action_cutoff,
+                "consensus_fraction": float(consensus_fraction),
+                "stable_cv_threshold": float(stable_cv_threshold),
+                "observer_names": names,
+                "observer_thresholds": {name: None for name in names},
+                "path_class_counts": dict(empty_counts),
+                "null_path_class_counts": dict(empty_counts),
+                "observer_contingent_rate": 0.0,
+                "null_observer_contingent_rate": 0.0,
+                "excess_observer_contingent_rate": 0.0,
+                "observer_subset_required_count": 0,
+                "observer_subset_required_rate": 0.0,
+                "null_observer_subset_required_rate": 0.0,
+                "excess_observer_subset_required_rate": 0.0,
+                "mean_support_fraction": None,
+                "mean_null_support_fraction": None,
+                "mean_edge_action_cv": None,
+                "observer_enabler_counts": {name: 0 for name in names},
+                "observer_blocker_counts": {name: 0 for name in names},
+                "leave_one_out_observer_effects": {},
+                "top_consensus_unblockers": [],
+                "top_consensus_dependencies": [],
+                "top_gatekeeping_paths": [],
+                "records": [],
+            }
+        )
+    actions = np.zeros((len(pairs), len(names)), dtype=np.float64)
+    for pair_idx, (source_idx, target_idx) in enumerate(pairs):
+        if not (0 <= source_idx < n_items and 0 <= target_idx < n_items):
+            raise ValueError(f"source/target out of bounds for n_items={n_items}")
+        for slice_idx, name in enumerate(names):
+            actions[pair_idx, slice_idx] = _semantic_action(
+                slice_arrays[name],
+                source_idx,
+                target_idx,
+                density=density_vec,
+                stress=stress_vec,
+                config=cfg,
+            )
+    thresholds = _availability_thresholds(
+        actions,
+        availability_quantile=availability_quantile,
+        availability_action_cutoff=availability_action_cutoff,
+    )
+    available = actions <= thresholds.reshape(1, -1)
+    records: List[Dict[str, Any]] = []
+    null_class_counts: Dict[str, float] = {}
+    enabler_counts = {name: 0 for name in names}
+    blocker_counts = {name: 0 for name in names}
+    removal_effect_counts = {
+        name: {
+            "unblocks_consensus": 0,
+            "breaks_consensus": 0,
+            "removes_last_path": 0,
+            "changes_path_class": 0,
+            "removes_blocker": 0,
+            "removes_enabler": 0,
+            "neutral": 0,
+        }
+        for name in names
+    }
+    class_counts: Dict[str, int] = {}
+    subset_required_count = 0
+    null_subset_required_total = 0.0
+    null_contingent_total = 0.0
+    for pair_idx, (source_idx, target_idx) in enumerate(pairs):
+        row = available[pair_idx]
+        enabled = [names[idx] for idx, flag in enumerate(row.tolist()) if bool(flag)]
+        blocked = [names[idx] for idx, flag in enumerate(row.tolist()) if not bool(flag)]
+        for name in enabled:
+            enabler_counts[name] += 1
+        for name in blocked:
+            blocker_counts[name] += 1
+        support_count = len(enabled)
+        support_fraction = float(support_count / len(names))
+        cv = _edge_cv(actions[pair_idx])
+        path_class = _classify_path(
+            support_count=support_count,
+            observer_count=len(names),
+            edge_action_cv=cv,
+            consensus_fraction=consensus_fraction,
+            stable_cv_threshold=stable_cv_threshold,
+        )
+        class_counts[path_class] = class_counts.get(path_class, 0) + 1
+        null_stats = _null_path_stats(
+            actions[pair_idx],
+            thresholds,
+            consensus_fraction=consensus_fraction,
+            stable_cv_threshold=stable_cv_threshold,
+        )
+        for class_name, count in (null_stats.get("null_path_class_counts") or {}).items():
+            null_class_counts[str(class_name)] = null_class_counts.get(str(class_name), 0.0) + float(count) / float(max(1, null_stats["null_shift_count"]))
+        if 0 < support_count < len(names):
+            subset_required_count += 1
+        null_subset_required_total += float(null_stats["null_subset_required_probability"])
+        null_contingent_total += float(null_stats["null_observer_contingent_probability"])
+        source_article_idx = _article_idx_for_row(source_idx, row_to_article_index)
+        target_article_idx = _article_idx_for_row(target_idx, row_to_article_index)
+        leave_one_out = []
+        for observer_idx, observer_name in enumerate(names):
+            remaining_actions = np.delete(actions[pair_idx], observer_idx)
+            removed_support_count = int(support_count - (1 if bool(row[observer_idx]) else 0))
+            remaining_count = max(1, len(names) - 1)
+            removed_support_fraction = float(removed_support_count / remaining_count)
+            removed_cv = _edge_cv(remaining_actions)
+            removed_class = _classify_path(
+                support_count=removed_support_count,
+                observer_count=remaining_count,
+                edge_action_cv=removed_cv,
+                consensus_fraction=consensus_fraction,
+                stable_cv_threshold=stable_cv_threshold,
+            )
+            effect = _removal_effect(
+                base_class=path_class,
+                removed_class=removed_class,
+                base_support_count=support_count,
+                removed_support_count=removed_support_count,
+                base_support_fraction=support_fraction,
+                removed_support_fraction=removed_support_fraction,
+            )
+            removal_effect_counts[observer_name][effect] += 1
+            leave_one_out.append(
+                {
+                    "removed_observer": observer_name,
+                    "observer_was_enabler": bool(row[observer_idx]),
+                    "path_class_without_observer": removed_class,
+                    "support_count_without_observer": int(removed_support_count),
+                    "support_fraction_without_observer": removed_support_fraction,
+                    "edge_action_cv_without_observer": removed_cv,
+                    "removal_effect": effect,
+                }
+            )
+        records.append(
+            {
+                "diagnostic_type": "observer_path_contingency_record",
+                "source_idx": int(source_idx),
+                "target_idx": int(target_idx),
+                "source_row_index": int(source_idx),
+                "target_row_index": int(target_idx),
+                "source_article_idx": int(source_article_idx),
+                "target_article_idx": int(target_article_idx),
+                "path_class": path_class,
+                "support_count": int(support_count),
+                "support_fraction": support_fraction,
+                "edge_action_cv": cv,
+                "enabled_by_observers": enabled,
+                "blocked_by_observers": blocked,
+                "observer_actions": {name: float(actions[pair_idx, idx]) for idx, name in enumerate(names)},
+                "observer_thresholds": {name: float(thresholds[idx]) for idx, name in enumerate(names)},
+                "path_exists_for_some_observers": bool(support_count > 0),
+                "path_requires_observer_subset": bool(0 < support_count < len(names)),
+                "observer_gate_score": float(1.0 - support_fraction),
+                "null_path_class": null_stats["null_path_class"],
+                "null_shift_count": int(null_stats["null_shift_count"]),
+                "null_observer_contingent_probability": float(null_stats["null_observer_contingent_probability"]),
+                "null_subset_required_probability": float(null_stats["null_subset_required_probability"]),
+                "null_support_fraction": float(null_stats["null_support_fraction"]),
+                "leave_one_out": leave_one_out,
+            }
+        )
+    contingent = class_counts.get("observer_contingent_path", 0)
+    null_contingent = float(null_contingent_total)
+    records_sorted = sorted(records, key=lambda row: (-float(row["observer_gate_score"]), -float(row["edge_action_cv"])))
+    top_consensus_unblockers = sorted(
+        (
+            {"observer": name, "unblocks_consensus": counts["unblocks_consensus"]}
+            for name, counts in removal_effect_counts.items()
+        ),
+        key=lambda row: (-int(row["unblocks_consensus"]), row["observer"]),
+    )
+    top_consensus_dependencies = sorted(
+        (
+            {"observer": name, "breaks_consensus": counts["breaks_consensus"], "removes_last_path": counts["removes_last_path"]}
+            for name, counts in removal_effect_counts.items()
+        ),
+        key=lambda row: (-(int(row["breaks_consensus"]) + int(row["removes_last_path"])), row["observer"]),
+    )
+    return _json_safe(
+        {
+            "summary_type": "observer_path_contingency_summary",
+            "status": "OK",
+            "slice_count": len(names),
+            "article_pair_count": len(pairs),
+            "record_count": len(records),
+            "availability_quantile": float(availability_quantile),
+            "availability_action_cutoff": availability_action_cutoff,
+            "consensus_fraction": float(consensus_fraction),
+            "stable_cv_threshold": float(stable_cv_threshold),
+            "observer_names": names,
+            "observer_thresholds": {name: float(thresholds[idx]) for idx, name in enumerate(names)},
+            "path_class_counts": class_counts,
+            "null_path_class_counts": null_class_counts,
+            "observer_contingent_rate": float(contingent / len(records)),
+            "null_observer_contingent_rate": float(null_contingent / len(records)),
+            "excess_observer_contingent_rate": float((contingent - null_contingent) / len(records)),
+            "observer_subset_required_count": int(subset_required_count),
+            "observer_subset_required_rate": float(subset_required_count / len(records)),
+            "null_observer_subset_required_rate": float(null_subset_required_total / len(records)),
+            "excess_observer_subset_required_rate": float((subset_required_count - null_subset_required_total) / len(records)),
+            "mean_support_fraction": float(np.mean([row["support_fraction"] for row in records])),
+            "mean_null_support_fraction": float(np.mean([row["null_support_fraction"] for row in records])),
+            "mean_edge_action_cv": float(np.mean([row["edge_action_cv"] for row in records])),
+            "observer_enabler_counts": enabler_counts,
+            "observer_blocker_counts": blocker_counts,
+            "leave_one_out_observer_effects": removal_effect_counts,
+            "top_consensus_unblockers": top_consensus_unblockers,
+            "top_consensus_dependencies": top_consensus_dependencies,
+            "top_gatekeeping_paths": records_sorted[: min(25, len(records_sorted))],
+            "records": records,
+        }
+    )
+
+
 def write_observer_slice_transport_summary(summary: Mapping[str, Any], output_dir: str | Path) -> Dict[str, str]:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)

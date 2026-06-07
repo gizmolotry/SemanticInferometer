@@ -503,7 +503,17 @@ def _ensure_verification_provenance(artifact: dict, mode_config: dict, seed: int
 # EXPERIMENT RUNNERS
 # =========================================================================
 
-def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *, output_root: str = None, gru_mode: str = 'intra'):
+def run_standard_experiment(
+    articles,
+    mode_config,
+    seeds,
+    corpus_name='real',
+    *,
+    output_root: str = None,
+    gru_mode: str = 'intra',
+    walker_n_walkers: int = 10,
+    walker_n_steps: int = 150,
+):
     """
     Run a standard experiment (single kernel type, multiple seeds).
 
@@ -525,6 +535,10 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
     gru_mode : str, optional
         Indicates the GRU aggregation mode (``'intra'`` or ``'inter'``). Used
         only when ``output_root`` is ``None`` to organise the output files.
+    walker_n_walkers : int, optional
+        Number of Track 4 walkers to launch. Defaults to 10.
+    walker_n_steps : int, optional
+        Maximum Track 4 steps per walker. Defaults to 150.
     """
     print_experiment_header(mode_config['name'], mode_config)
     
@@ -579,6 +593,8 @@ def run_standard_experiment(articles, mode_config, seeds, corpus_name='real', *,
         walker_temperature=float(getattr(args, 'walker_temperature', 0.5)),
         walker_gamma=float(getattr(args, 'walker_gamma', 5.0)),
         walker_k_neighbors=int(getattr(args, 'walker_k_neighbors', 10)),
+        walker_n_walkers=int(walker_n_walkers),
+        walker_n_steps=int(walker_n_steps),
         normalize_features=pipeline_config.get('normalize_features', True),
         use_gru=pipeline_config['use_gru'],
         use_multi_framing_rks=pipeline_config['use_multi_framing_rks'],
@@ -1173,6 +1189,11 @@ def main():
         help='Path to NLI embedding cache file (for reuse across kernel runs)'
     )
     parser.add_argument(
+        '--require-cuda',
+        action='store_true',
+        help='Fail fast if CUDA is unavailable instead of falling back to CPU.'
+    )
+    parser.add_argument(
         '--nu',
         type=float,
         default=None,
@@ -1238,6 +1259,18 @@ def main():
         default=10,
         help='Track 4 metric-graph neighbor count (default: 10).'
     )
+    parser.add_argument(
+        '--walker-n-walkers',
+        type=int,
+        default=10,
+        help='Track 4 walker count (default: 10).'
+    )
+    parser.add_argument(
+        '--walker-n-steps',
+        type=int,
+        default=150,
+        help='Track 4 maximum steps per walker (default: 150).'
+    )
     
     # Dirichlet fusion flags
     parser.add_argument(
@@ -1284,6 +1317,9 @@ def main():
     
     global args
     args = parser.parse_args()
+
+    if args.require_cuda and not torch.cuda.is_available():
+        raise RuntimeError("--require-cuda was set, but torch.cuda.is_available() is false.")
     
     # Resolve corpus name for custom paths
     corpus_name = Path(args.corpus).stem if os.path.exists(args.corpus) else args.corpus
@@ -1433,7 +1469,9 @@ def main():
                     args.seeds,
                     corpus_name,
                     output_root=args.output_root,
-                    gru_mode=args.gru_mode
+                    gru_mode=args.gru_mode,
+                    walker_n_walkers=args.walker_n_walkers,
+                    walker_n_steps=args.walker_n_steps,
                 )
             
             print(f"\n[OK] Batch {date_range} complete\n")
@@ -1502,7 +1540,9 @@ def main():
             args.seeds,
             corpus_name=corpus_name,
             output_root=args.output_root,
-            gru_mode=getattr(args, "gru_mode", "intra")
+            gru_mode=getattr(args, "gru_mode", "intra"),
+            walker_n_walkers=args.walker_n_walkers,
+            walker_n_steps=args.walker_n_steps,
         )
 
     print(f"\nResults saved to: {OUTPUT_DIR}")

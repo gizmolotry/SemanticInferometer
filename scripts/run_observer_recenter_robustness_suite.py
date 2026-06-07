@@ -48,6 +48,7 @@ LOCAL_VARIANT_BASELINES = {
     for variant in LOCAL_RECOMPUTE_VARIANTS
     if variant != LOCAL_RECOMPUTE_DEFAULT_VARIANT
 }
+SOURCE_PROXY_METRIC_BASELINE = f"{LOCAL_RECOMPUTE_MODE}:source_proxy_metric"
 BASELINES = (
     "translation_only",
     "artifact_view",
@@ -55,6 +56,7 @@ BASELINES = (
     "cls_mean_pca",
     LOCAL_RECOMPUTE_MODE,
     *LOCAL_VARIANT_BASELINES.keys(),
+    SOURCE_PROXY_METRIC_BASELINE,
 )
 
 
@@ -302,8 +304,87 @@ def _load_cls_mean_projection(run_dir: Path) -> Tuple[Optional[np.ndarray], Dict
     return projection, diag
 
 
+def _load_source_proxy_projection(
+    run_dir: Path,
+    *,
+    preferred_label_column: Optional[str],
+    min_label_count: int,
+    label_mode: str,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    global_state = _load_json(run_dir / "MONOLITH.view_state.json")
+    global_articles = _article_map(global_state)
+    metadata, metadata_path = _metadata_by_idx(run_dir)
+    label_col, label_counts, label_diagnostics = select_label_column(
+        metadata,
+        global_articles.keys(),
+        min_label_count=min_label_count,
+        preferred_label_column=preferred_label_column,
+        label_mode=label_mode,
+    )
+    if not label_col:
+        return None, {
+            "status": "NO_LABEL_COLUMN",
+            "metadata_path": metadata_path,
+            "label_diagnostics": label_diagnostics,
+        }
+    usable_labels = [
+        label
+        for label, count in sorted(label_counts.items())
+        if int(count) >= int(min_label_count)
+    ]
+    if len(usable_labels) < 2:
+        return None, {
+            "status": "INSUFFICIENT_LABELS",
+            "metadata_path": metadata_path,
+            "label_column": label_col,
+            "label_counts": label_counts,
+        }
+    label_to_pos = {
+        label: (
+            math.cos((2.0 * math.pi * idx) / float(len(usable_labels))),
+            math.sin((2.0 * math.pi * idx) / float(len(usable_labels))),
+        )
+        for idx, label in enumerate(usable_labels)
+    }
+    rows: List[List[float]] = []
+    for idx in sorted(global_articles):
+        label = _clean_label(metadata.get(int(idx), {}).get(label_col))
+        if label in label_to_pos:
+            x, y = label_to_pos[label]
+        else:
+            x, y = 0.0, 0.0
+        rows.append([float(x), float(y)])
+    return np.asarray(rows, dtype=np.float64), {
+        "status": "OK",
+        "basis": "source_proxy_oracle_metric_circle",
+        "metadata_path": metadata_path,
+        "label_column": label_col,
+        "label_counts": label_counts,
+        "claim_boundary": "ablation_upper_bound_uses_registered_label_proxy_not_pure_local_recompute",
+    }
+
+
 def evaluate_baseline(run_dir: Path, baseline: str, *, min_label_count: int, preferred_label_column: Optional[str], label_mode: str) -> Dict[str, Any]:
     run_dir = Path(run_dir)
+    if baseline == SOURCE_PROXY_METRIC_BASELINE:
+        projection, diag = _load_source_proxy_projection(
+            run_dir,
+            preferred_label_column=preferred_label_column,
+            min_label_count=min_label_count,
+            label_mode=label_mode,
+        )
+        result = _evaluate_matrix_baseline(
+            run_dir,
+            baseline_name=baseline,
+            projection=projection,
+            projection_diagnostics=diag,
+            min_label_count=min_label_count,
+            preferred_label_column=preferred_label_column,
+            label_mode=label_mode,
+        )
+        result["local_recompute_variant"] = "source_proxy_metric"
+        result["claim_boundary"] = "proxy_assisted_upper_bound_not_pure_local_recompute"
+        return result
     if baseline == LOCAL_RECOMPUTE_MODE or baseline in LOCAL_VARIANT_BASELINES:
         local_variant = LOCAL_VARIANT_BASELINES.get(baseline, LOCAL_RECOMPUTE_DEFAULT_VARIANT)
         result = evaluate_run_dir(

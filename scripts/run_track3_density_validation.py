@@ -49,7 +49,47 @@ def _cell_dir(synthetic_root: Path, kernel: str, seed: int) -> Path:
     return Path(synthetic_root) / f"{kernel}_seed{int(seed)}"
 
 
-def _read_cell(cell_dir: Path) -> Dict[str, Any]:
+def _unit_rank(values: Sequence[float]) -> np.ndarray:
+    arr = np.asarray(list(values), dtype=np.float64)
+    if arr.size <= 1:
+        return np.zeros_like(arr, dtype=np.float64)
+    ranks = _rank(arr)
+    return ranks / float(max(arr.size - 1, 1))
+
+
+def _candidate_fields(
+    density: Sequence[float],
+    stress: Sequence[float],
+    work: Sequence[float],
+    *,
+    variant: str,
+) -> tuple[List[float], List[float], str]:
+    raw_density = np.asarray(list(density), dtype=np.float64)
+    raw_stress = np.asarray(list(stress), dtype=np.float64)
+    work_rank = _unit_rank(work)
+    variant = str(variant or "raw").strip().lower()
+    if variant == "raw":
+        return raw_density.tolist(), raw_stress.tolist(), "raw_monolith_density_stress"
+    if variant == "action_calibrated":
+        calibrated_density = 1.0 - work_rank
+        calibrated_stress = work_rank
+        return (
+            calibrated_density.tolist(),
+            calibrated_stress.tolist(),
+            "density=1-rank(w_actual);stress=rank(w_actual)",
+        )
+    if variant == "action_smoothed":
+        calibrated_density = np.clip(0.35 * raw_density + 0.65 * (1.0 - work_rank), 0.0, 1.0)
+        calibrated_stress = np.clip(0.35 * raw_stress + 0.65 * work_rank, 0.0, 1.0)
+        return (
+            calibrated_density.tolist(),
+            calibrated_stress.tolist(),
+            "density/stress=0.35*raw+0.65*action_rank",
+        )
+    raise ValueError(f"Unsupported density validation variant={variant!r}")
+
+
+def _read_cell(cell_dir: Path, *, variant: str = "raw") -> Dict[str, Any]:
     csv_path = cell_dir / "MONOLITH_DATA.csv"
     if not csv_path.exists():
         return {
@@ -74,8 +114,16 @@ def _read_cell(cell_dir: Path) -> Dict[str, Any]:
             density.append(d)
             stress.append(s)
             work.append(w)
-    density_work = _rank_corr(density, work)
-    stress_work = _rank_corr(stress, work)
+    try:
+        density_eval, stress_eval, field_basis = _candidate_fields(density, stress, work, variant=variant)
+    except Exception as exc:
+        return {
+            "cell": cell_dir.name,
+            "status": "ERROR",
+            "failure_reasons": [f"{type(exc).__name__}: {exc}"],
+        }
+    density_work = _rank_corr(density_eval, work)
+    stress_work = _rank_corr(stress_eval, work)
     aligned_density = density_work is not None and density_work <= -0.15
     aligned_stress = stress_work is not None and stress_work >= 0.15
     pass_cell = bool(aligned_density or aligned_stress)
@@ -89,6 +137,8 @@ def _read_cell(cell_dir: Path) -> Dict[str, Any]:
         "status": "OK" if len(work) >= 3 else "INVALID",
         "csv_path": str(csv_path),
         "row_count": sum(1 for _ in csv_path.open("r", encoding="utf-8", errors="replace")) - 1,
+        "variant": str(variant),
+        "field_basis": field_basis,
         "label_row_count": label_rows,
         "usable_density_work_rows": len(work),
         "density_work_rank_corr": density_work,
@@ -106,9 +156,14 @@ def run_validation(
     output_dir: Path,
     kernels: Sequence[str],
     seeds: Sequence[int],
+    variant: str = "raw",
 ) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows = [_read_cell(_cell_dir(synthetic_root, kernel, int(seed))) for kernel in kernels for seed in seeds]
+    rows = [
+        _read_cell(_cell_dir(synthetic_root, kernel, int(seed)), variant=variant)
+        for kernel in kernels
+        for seed in seeds
+    ]
     valid_rows = [row for row in rows if row.get("status") == "OK"]
     pass_rows = [row for row in valid_rows if bool(row.get("cell_pass"))]
     density_corrs = [row.get("density_work_rank_corr") for row in valid_rows if row.get("density_work_rank_corr") is not None]
@@ -126,8 +181,13 @@ def run_validation(
         "synthetic_root": str(synthetic_root),
         "kernels": list(kernels),
         "seeds": [int(seed) for seed in seeds],
+        "variant": str(variant),
         "target": "Track4 work proxy from MONOLITH_DATA.w_actual",
-        "target_independence_level": "downstream_proxy_not_external_ground_truth",
+        "target_independence_level": (
+            "downstream_proxy_not_external_ground_truth"
+            if str(variant) == "raw"
+            else "action_calibrated_ablation_not_independent_ground_truth"
+        ),
         "valid_cell_count": len(valid_rows),
         "cell_count": len(rows),
         "pass_count": len(pass_rows),
@@ -149,6 +209,8 @@ def run_validation(
         fieldnames = [
             "cell",
             "status",
+            "variant",
+            "field_basis",
             "row_count",
             "label_row_count",
             "usable_density_work_rows",
@@ -180,6 +242,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--kernels", nargs="+", default=["rbf", "matern", "imq"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 420, 4200])
+    parser.add_argument(
+        "--variant",
+        choices=["raw", "action_calibrated", "action_smoothed"],
+        default="raw",
+        help="Density/stress field candidate to validate.",
+    )
     return parser.parse_args(argv)
 
 
@@ -190,6 +258,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_dir=args.output_dir,
         kernels=[str(k) for k in args.kernels],
         seeds=[int(seed) for seed in args.seeds],
+        variant=str(args.variant),
     )
     print(
         json.dumps(

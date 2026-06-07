@@ -15,6 +15,7 @@ LOCAL_RECOMPUTE_VARIANTS = (
     "focus_weighted_rks",
     "local_tangent_pca",
     "cls_mean_pca",
+    "graph_whitened_hybrid",
 )
 
 
@@ -97,6 +98,80 @@ def _pca_project(features: np.ndarray, *, n_components: int = 3) -> Tuple[np.nda
         "explained_variance_ratio": evr,
         "singular_values": [float(v) for v in singular_values[:k]],
     }
+
+
+def _standardize_columns(features: np.ndarray) -> np.ndarray:
+    arr = np.asarray(features, dtype=np.float64)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    mean = np.mean(arr, axis=0, keepdims=True)
+    std = np.std(arr, axis=0, keepdims=True)
+    return (arr - mean) / np.clip(std, 1e-8, None)
+
+
+def _kernel_pca_features(features: np.ndarray, *, n_components: int = 6, kernel: str = "rbf") -> np.ndarray:
+    """Small deterministic nonlinear chart used only by local recenter ablations."""
+
+    x = _standardize_columns(features)
+    n_items = int(x.shape[0])
+    if n_items < 3:
+        return np.zeros((n_items, int(n_components)), dtype=np.float64)
+    diff = x[:, None, :] - x[None, :, :]
+    dist2 = np.sum(diff * diff, axis=-1)
+    positive = dist2[dist2 > 1e-12]
+    scale = float(np.median(positive)) if positive.size else 1.0
+    scale = max(scale, 1e-8)
+    if kernel == "imq":
+        affinity = 1.0 / np.sqrt(1.0 + dist2 / scale)
+    else:
+        affinity = np.exp(-dist2 / scale)
+    h = np.eye(n_items, dtype=np.float64) - (np.ones((n_items, n_items), dtype=np.float64) / float(n_items))
+    centered = h @ affinity @ h
+    try:
+        values, vectors = np.linalg.eigh(centered)
+    except np.linalg.LinAlgError:
+        return np.zeros((n_items, int(n_components)), dtype=np.float64)
+    order = np.argsort(values)[::-1]
+    values = values[order]
+    vectors = vectors[:, order]
+    k = int(min(max(n_components, 1), vectors.shape[1]))
+    coords = vectors[:, :k] * np.sqrt(np.clip(values[:k], 0.0, None))[None, :]
+    if k < n_components:
+        coords = np.pad(coords, ((0, 0), (0, int(n_components) - k)), mode="constant")
+    return np.nan_to_num(coords[:, : int(n_components)], nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _diffusion_features(features: np.ndarray, *, n_components: int = 6, k_neighbors: int = 8) -> np.ndarray:
+    x = _standardize_columns(features)
+    n_items = int(x.shape[0])
+    if n_items < 3:
+        return np.zeros((n_items, int(n_components)), dtype=np.float64)
+    distances = np.linalg.norm(x[:, None, :] - x[None, :, :], axis=-1)
+    positive = distances[distances > 1e-12]
+    scale = float(np.median(positive)) if positive.size else 1.0
+    scale = max(scale, 1e-8)
+    affinity = np.exp(-(distances * distances) / (scale * scale))
+    np.fill_diagonal(affinity, 0.0)
+    if 0 < int(k_neighbors) < n_items - 1:
+        keep = np.zeros_like(affinity, dtype=bool)
+        for row_idx in range(n_items):
+            nn = np.argsort(distances[row_idx])[1 : int(k_neighbors) + 1]
+            keep[row_idx, nn] = True
+        keep = keep | keep.T
+        affinity = np.where(keep, affinity, 0.0)
+    degree = np.sum(affinity, axis=1, keepdims=True)
+    transition = affinity / np.clip(degree, 1e-12, None)
+    try:
+        values, vectors = np.linalg.eig(transition)
+    except np.linalg.LinAlgError:
+        return np.zeros((n_items, int(n_components)), dtype=np.float64)
+    order = np.argsort(np.real(values))[::-1]
+    # Skip the stationary vector and use the next smooth graph coordinates.
+    start = 1 if len(order) > 1 else 0
+    selected = order[start : start + int(n_components)]
+    coords = np.real(vectors[:, selected])
+    if coords.shape[1] < n_components:
+        coords = np.pad(coords, ((0, 0), (0, int(n_components) - coords.shape[1])), mode="constant")
+    return np.nan_to_num(coords[:, : int(n_components)], nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _restore_rks_basis(basis_state: Mapping[str, Any]) -> Optional[Any]:
@@ -203,6 +278,32 @@ def _track2_features_for_variant(
         return mean_cls - mean_cls[int(focus_idx) : int(focus_idx) + 1], {
             "track2_basis": "mean_cls_per_bot",
             "variant_projection_policy": "skip_rks_use_mean_observer_cls",
+        }
+    if variant == "graph_whitened_hybrid":
+        mean_cls = np.mean(np.asarray(cls, dtype=np.float64), axis=1)
+        mean_cls = mean_cls - mean_cls[int(focus_idx) : int(focus_idx) + 1]
+        rks_features, rks_diag = _project_track2(local_tangent, payload)
+        spectral = _as_numpy(payload.get("spectral_probe_magnitudes"))
+        blocks = [
+            _kernel_pca_features(mean_cls, n_components=6, kernel="rbf"),
+            _kernel_pca_features(mean_cls, n_components=6, kernel="imq"),
+            _diffusion_features(mean_cls, n_components=6, k_neighbors=8),
+            _kernel_pca_features(rks_features, n_components=6, kernel="rbf"),
+            _diffusion_features(rks_features, n_components=6, k_neighbors=8),
+        ]
+        if spectral is not None and spectral.ndim == 2 and spectral.shape[0] == cls.shape[0]:
+            spectral_delta = np.asarray(spectral, dtype=np.float64) - np.asarray(
+                spectral[int(focus_idx) : int(focus_idx) + 1],
+                dtype=np.float64,
+            )
+            blocks.append(_standardize_columns(spectral_delta))
+        features = np.concatenate([_standardize_columns(block) for block in blocks], axis=1)
+        return features, {
+            "track2_basis": "graph_whitened_hybrid",
+            "variant_projection_policy": "kernel_pca_plus_diffusion_over_mean_cls_and_rks",
+            "rks_basis": rks_diag,
+            "feature_blocks": len(blocks),
+            "hybrid_feature_dim": int(features.shape[1]),
         }
     raise ValueError(f"Unsupported local recompute variant={variant!r}")
 

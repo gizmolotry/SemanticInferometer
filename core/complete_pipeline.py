@@ -1699,6 +1699,7 @@ def initialize_full_pipeline(
         "kernel_roughness": int(kernel_roughness),
         "mix_in_rkhs": mix_in_rkhs,
         "track5_assembly_mode": track5_assembly_mode,
+        "device": device,
     }
 
 
@@ -1743,6 +1744,16 @@ class BeliefTransformerPipeline:
         self.rks_map = components["rks_map"]
         self.attention_model = components["attention_model"]
         self.recorder = components["recorder"]
+        requested_device = str(components.get("device", "cuda"))
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            requested_device = "cpu"
+        self.device = torch.device(requested_device)
+        for module in (self.gru_model, self.rks_map, self.attention_model):
+            if hasattr(module, "to"):
+                try:
+                    module.to(self.device)
+                except Exception:
+                    pass
 
         self.normalize_features = components.get(
             "normalize_features", DEFAULT_PIPELINE_RUNTIME_CONFIG.normalize_features
@@ -1767,6 +1778,11 @@ class BeliefTransformerPipeline:
         # NEW: Dirichlet fusion components
         self.dirichlet_fusion = components.get("dirichlet_fusion", None)
         self.dirichlet_config = components.get("dirichlet_config", None)
+        if hasattr(self.dirichlet_fusion, "to"):
+            try:
+                self.dirichlet_fusion.to(self.device)
+            except Exception:
+                pass
         
         # NEW: Rep kind for contract enforcement
         self.primary_rep_kind = components.get("primary_rep_kind", RepKind.LOGITS_RAW)
@@ -2000,6 +2016,18 @@ class BeliefTransformerPipeline:
             diagnostics["steps"].append("nli_extraction")
 
         diagnostics["timing"]["nli_extraction"] = time.time() - step_start
+
+        def _to_pipeline_device(value):
+            if torch.is_tensor(value):
+                return value.to(self.device, non_blocking=True)
+            return value
+
+        # Cached NLI payloads are loaded on CPU for portability. Move every tensor
+        # back to the active pipeline device before Track 2/3/4 consume them.
+        nli_pairs = [
+            {key: _to_pipeline_device(value) for key, value in pair.items()}
+            for pair in nli_pairs
+        ]
 
         # Convert to tensor(s)
         base_by_channel: Dict[str, torch.Tensor] = {}
