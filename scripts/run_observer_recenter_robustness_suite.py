@@ -384,6 +384,8 @@ def evaluate_baseline(run_dir: Path, baseline: str, *, min_label_count: int, pre
         )
         result["local_recompute_variant"] = "source_proxy_metric"
         result["claim_boundary"] = "proxy_assisted_upper_bound_not_pure_local_recompute"
+        result["proxy_oracle_baseline"] = True
+        result["safe_for_recenter_claim"] = False
         return result
     if baseline == LOCAL_RECOMPUTE_MODE or baseline in LOCAL_VARIANT_BASELINES:
         local_variant = LOCAL_VARIANT_BASELINES.get(baseline, LOCAL_RECOMPUTE_DEFAULT_VARIANT)

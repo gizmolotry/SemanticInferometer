@@ -90,6 +90,7 @@ def _candidate_fields(
 
 
 def _read_cell(cell_dir: Path, *, variant: str = "raw") -> Dict[str, Any]:
+    variant_name = str(variant or "raw").strip().lower()
     csv_path = cell_dir / "MONOLITH_DATA.csv"
     if not csv_path.exists():
         return {
@@ -115,7 +116,7 @@ def _read_cell(cell_dir: Path, *, variant: str = "raw") -> Dict[str, Any]:
             stress.append(s)
             work.append(w)
     try:
-        density_eval, stress_eval, field_basis = _candidate_fields(density, stress, work, variant=variant)
+        density_eval, stress_eval, field_basis = _candidate_fields(density, stress, work, variant=variant_name)
     except Exception as exc:
         return {
             "cell": cell_dir.name,
@@ -137,8 +138,9 @@ def _read_cell(cell_dir: Path, *, variant: str = "raw") -> Dict[str, Any]:
         "status": "OK" if len(work) >= 3 else "INVALID",
         "csv_path": str(csv_path),
         "row_count": sum(1 for _ in csv_path.open("r", encoding="utf-8", errors="replace")) - 1,
-        "variant": str(variant),
+        "variant": variant_name,
         "field_basis": field_basis,
+        "independent_track3_validation": variant_name == "raw",
         "label_row_count": label_rows,
         "usable_density_work_rows": len(work),
         "density_work_rank_corr": density_work,
@@ -158,9 +160,10 @@ def run_validation(
     seeds: Sequence[int],
     variant: str = "raw",
 ) -> Dict[str, Any]:
+    variant_name = str(variant or "raw").strip().lower()
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = [
-        _read_cell(_cell_dir(synthetic_root, kernel, int(seed)), variant=variant)
+        _read_cell(_cell_dir(synthetic_root, kernel, int(seed)), variant=variant_name)
         for kernel in kernels
         for seed in seeds
     ]
@@ -181,13 +184,14 @@ def run_validation(
         "synthetic_root": str(synthetic_root),
         "kernels": list(kernels),
         "seeds": [int(seed) for seed in seeds],
-        "variant": str(variant),
+        "variant": variant_name,
         "target": "Track4 work proxy from MONOLITH_DATA.w_actual",
         "target_independence_level": (
             "downstream_proxy_not_external_ground_truth"
-            if str(variant) == "raw"
+            if variant_name == "raw"
             else "action_calibrated_ablation_not_independent_ground_truth"
         ),
+        "independent_track3_validation": variant_name == "raw",
         "valid_cell_count": len(valid_rows),
         "cell_count": len(rows),
         "pass_count": len(pass_rows),
@@ -211,6 +215,7 @@ def run_validation(
             "status",
             "variant",
             "field_basis",
+            "independent_track3_validation",
             "row_count",
             "label_row_count",
             "usable_density_work_rows",

@@ -3748,6 +3748,8 @@ def run_multi_observer_experiment_simple(
             "walker_temperature": float(kwargs.get("walker_temperature", 0.5)),
             "walker_gamma": float(kwargs.get("walker_gamma", 5.0)),
             "walker_k_neighbors": int(kwargs.get("walker_k_neighbors", 10)),
+            "walker_n_walkers": int(kwargs.get("walker_n_walkers", 10)),
+            "walker_n_steps": int(kwargs.get("walker_n_steps", 150)),
             "track4_basis": str(kwargs.get("track4_basis", TRACK4_BASIS_DEFAULT)),
             "track4_proposal_mode": str(kwargs.get("track4_proposal_mode", "metric_softmax")),
             "track4_adaptive_tpt_connectivity": bool(kwargs.get("track4_adaptive_tpt_connectivity", False)),

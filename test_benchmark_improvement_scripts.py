@@ -45,4 +45,28 @@ def test_track3_density_validation_passes_when_density_tracks_work_proxy(tmp_pat
     assert payload["pass_count"] == 1
     assert payload["track3_density_semantic_pass"] is False
     assert "fewer_than_three_valid_cells" in payload["failure_reasons"]
+    assert payload["independent_track3_validation"] is True
+    assert payload["cells"][0]["independent_track3_validation"] is True
     assert payload["cells"][0]["cell_pass"] is True
+
+
+def test_track3_action_calibrated_variant_is_marked_non_independent(tmp_path: Path) -> None:
+    cell = tmp_path / "synthetic" / "rbf_seed42"
+    cell.mkdir(parents=True)
+    lines = ["index,density,stress,w_actual,perspective_tag"]
+    for idx in range(12):
+        lines.append(f"{idx},0.5,0.5,{float(idx)},label_{idx % 2}")
+    (cell / "MONOLITH_DATA.csv").write_text("\n".join(lines), encoding="utf-8")
+
+    payload = run_validation(
+        synthetic_root=tmp_path / "synthetic",
+        output_dir=tmp_path / "out",
+        kernels=["rbf"],
+        seeds=[42],
+        variant="action_calibrated",
+    )
+
+    assert payload["variant"] == "action_calibrated"
+    assert payload["independent_track3_validation"] is False
+    assert payload["cells"][0]["independent_track3_validation"] is False
+    assert payload["target_independence_level"] == "action_calibrated_ablation_not_independent_ground_truth"
