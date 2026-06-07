@@ -5,6 +5,12 @@ outputs/*
 !outputs/README.md
 output/
 data/real_corpus.jsonl
+data/scraped_articles.jsonl
+data/ancien/scraped_articles.jsonl
+data/temporal_cleaned/
+belief_ingest/**/data/cache/
+belief_ingest/**/data/processed/*.jsonl
+belief_ingest/**/*.tar.gz
 test-results/
 .codex_snapshots/
 tmp/
