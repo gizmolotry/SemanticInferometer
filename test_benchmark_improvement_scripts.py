@@ -1,10 +1,21 @@
 import json
 from pathlib import Path
 
+import pytest
+
+from belief_ingest.belief_ingest_final.data.processed.clean_temporal_data import clean_all_batches
 from core.observer_local_recompute import LOCAL_RECOMPUTE_DEFAULT_VARIANT
 from scripts.run_observer_recenter_robustness_suite import LOCAL_VARIANT_BASELINES
 from scripts.run_prompt_invariance_probe import run_probe
 from scripts.run_track3_density_validation import run_validation
+
+
+def test_temporal_cleaner_fails_when_no_batch_files(tmp_path: Path) -> None:
+    input_dir = tmp_path / "empty"
+    input_dir.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="No files matching 'batch_\\*.jsonl'"):
+        clean_all_batches(input_dir, tmp_path / "out", pattern="batch_*.jsonl")
 
 
 def test_uniform_weighted_rks_is_default_and_focus_remains_ablation() -> None:

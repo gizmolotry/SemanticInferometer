@@ -16,8 +16,8 @@ import json
 from pathlib import Path
 import sys
 
-# Add parent to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add repository root to path for direct script execution.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.complete_pipeline import run_multi_observer_experiment
 

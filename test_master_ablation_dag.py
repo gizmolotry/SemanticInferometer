@@ -93,8 +93,8 @@ def _install_runner_stubs(monkeypatch, counters):
         rel_dir = corpus_dir / "relativity_cache"
         rel_dir.mkdir(parents=True, exist_ok=True)
         torch.save({"features": torch.tensor([[1.0]])}, corpus_dir / "observer_global.pt")
-        if articles:
-            torch.save({"observer_id": 0}, rel_dir / "observer_0.pt")
+        for idx, _article in enumerate(articles):
+            torch.save({"observer_id": idx}, rel_dir / f"observer_{idx}.pt")
         return {
             "status": "success",
             "observer_payloads": len(articles),
@@ -205,6 +205,54 @@ def test_run_single_writes_dag_manifests_and_reuses_completed_nodes(monkeypatch,
     )
     assert track15_manifest["status"] == "completed"
     assert track15_manifest["outputs_present"] is True
+
+
+def test_run_single_records_missing_requested_corpus_without_plain_completed_manifest(tmp_path):
+    config = _build_config(tmp_path)
+    missing_path = tmp_path / "missing.jsonl"
+    config.corpora = ["missing_control"]
+    config.control_paths = {"missing_control": str(missing_path)}
+    runner = AblationRunner(config)
+
+    manifest = runner.run_single(config)
+
+    assert manifest["run_status"] == "completed_with_missing_corpora"
+    assert manifest["corpus_resolution"]["requested"] == ["missing_control"]
+    assert manifest["corpus_resolution"]["resolved"] == {}
+    assert manifest["corpus_resolution"]["missing"] == [
+        {
+            "corpus": "missing_control",
+            "requested_path": str(missing_path),
+            "reason": "path_not_found",
+        }
+    ]
+    assert manifest["results"]["missing_control"]["status"] == "missing_corpus"
+    persisted_manifest = json.loads(
+        (Path(config.output_dir) / config.run_name / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert persisted_manifest["run_status"] == "completed_with_missing_corpora"
+    assert persisted_manifest["results"] == manifest["results"]
+    assert all(result["status"] == "missing_corpus" for result in persisted_manifest["results"].values())
+
+
+def test_run_single_mixed_success_and_missing_corpus_is_not_plain_completed(monkeypatch, tmp_path):
+    counters = {"experiment": 0, "relativity": 0, "diagnostics": 0, "bundle": 0}
+    _install_fake_modules(monkeypatch, counters)
+    _install_runner_stubs(monkeypatch, counters)
+    config = _build_config(tmp_path)
+    missing_path = tmp_path / "missing.jsonl"
+    config.corpora = ["real", "missing_control"]
+    config.control_paths = {"missing_control": str(missing_path)}
+    runner = AblationRunner(config)
+
+    manifest = runner.run_single(config)
+
+    assert counters == {"experiment": 1, "relativity": 1, "diagnostics": 1, "bundle": 1}
+    assert manifest["run_status"] == "completed_with_missing_corpora"
+    assert "real" in manifest["results"]
+    assert manifest["results"]["missing_control"]["status"] == "missing_corpus"
+    assert manifest["corpus_resolution"]["resolved"] == {"real": config.corpus_path}
+    assert manifest["corpus_resolution"]["missing"][0]["corpus"] == "missing_control"
 
 
 def test_run_single_resumes_incomplete_node_without_rerunning_completed_upstream(monkeypatch, tmp_path):

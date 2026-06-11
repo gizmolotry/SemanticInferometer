@@ -414,6 +414,12 @@ class AblationRunner:
         # Save manifest FIRST (audit trail)
         manifest = config.to_manifest()
         manifest['run_status'] = 'running'
+        missing_corpora: List[Dict[str, Any]] = []
+        manifest['corpus_resolution'] = {
+            'requested': list(config.corpora),
+            'resolved': {},
+            'missing': missing_corpora,
+        }
         manifest['dag'] = dag.snapshot()
         manifest_path = run_dir / 'manifest.json'
         self._write_json(manifest_path, manifest)
@@ -425,13 +431,25 @@ class AblationRunner:
             for corpus_name in config.corpora:
                 corpus_path = self._resolve_corpus_path(corpus_name, config)
                 if corpus_path is None:
-                    print(f"[ABLATION] Skipping {corpus_name}: path not found")
+                    requested_path = config.corpus_path if corpus_name == 'real' else config.control_paths.get(corpus_name)
+                    missing = {
+                        'corpus': corpus_name,
+                        'requested_path': requested_path,
+                        'reason': 'path_not_found' if requested_path else 'unknown_corpus',
+                    }
+                    missing_corpora.append(missing)
+                    results[corpus_name] = {'status': 'missing_corpus', **missing}
+                    manifest['results'] = results
+                    manifest['corpus_resolution']['missing'] = missing_corpora
+                    self._write_json(manifest_path, manifest)
+                    print(f"[ABLATION] Skipping {corpus_name}: {missing['reason']}")
                     continue
 
                 articles = self._load_articles(corpus_path, max_articles=config.max_articles)
                 corpus_dir = run_dir / corpus_name
                 corpus_dir.mkdir(parents=True, exist_ok=True)
                 corpus_fingerprint = fingerprint_path(Path(corpus_path))
+                manifest['corpus_resolution']['resolved'][corpus_name] = corpus_path
 
                 print(
                     f"\n[ABLATION] Corpus={corpus_name} | kernel={config.kernel_type} "
@@ -718,7 +736,8 @@ class AblationRunner:
         manifest['elapsed_seconds'] = elapsed
         manifest['results'] = results
         dag.mark_completed()
-        manifest['run_status'] = 'completed'
+        manifest['corpus_resolution']['missing'] = missing_corpora
+        manifest['run_status'] = 'completed_with_missing_corpora' if missing_corpora else 'completed'
         manifest['dag'] = dag.snapshot()
 
         # Update manifest with timing

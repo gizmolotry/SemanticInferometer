@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import scripts.run_track4_focused_basis_validation as focused_basis
 from scripts.run_track4_focused_basis_validation import (
     CorpusSpec,
     aggregate_validation,
@@ -10,7 +11,19 @@ from scripts.run_track4_focused_basis_validation import (
 )
 
 
-def test_resolve_corpus_specs_uses_existing_real_controls_and_synthetic_microprobe():
+def test_resolve_corpus_specs_uses_existing_real_controls_and_synthetic_microprobe(monkeypatch, tmp_path: Path):
+    data_dir = tmp_path / "data"
+    microprobe_dir = tmp_path / "outputs" / "microprobes" / "property_theft" / "deberta_20260515"
+    data_dir.mkdir(parents=True)
+    microprobe_dir.mkdir(parents=True)
+    for name in ("real_corpus", "control_shuffled", "control_random"):
+        (data_dir / f"{name}.jsonl").write_text(json.dumps({"title": name, "text": "fixture"}) + "\n", encoding="utf-8")
+    (microprobe_dir / "property_theft_corpus.jsonl").write_text(
+        json.dumps({"title": "synthetic", "text": "fixture"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(focused_basis, "ROOT", tmp_path)
+
     specs = resolve_corpus_specs(["real", "control_shuffled", "control_random", "synthetic_microprobe"])
     by_name = {spec.name: spec for spec in specs}
 

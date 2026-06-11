@@ -555,6 +555,7 @@ def _contract_fingerprint(run_dir: Path) -> Tuple[Tuple[str, int, int], ...]:
             "track5_summary.json",
             "leaf_artifact_inventory.json",
             "relativity_deltas.json",
+            "observer_slice_transport_summary.json",
         }
     )
     pieces: List[Tuple[str, int, int]] = []
@@ -1057,6 +1058,7 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
     track5_summary = _safe_json(run_dir / "track5_summary.json", {}) if run_dir else {}
     track4_animation_manifest = _safe_json(run_dir / "track4_animation_manifest.json", {}) if run_dir else {}
     observer_recenter_summary = _safe_json(run_dir / "observer_recenter_summary.json", {}) if run_dir else {}
+    observer_slice_transport_summary = _safe_json(run_dir / "observer_slice_transport_summary.json", {}) if run_dir else {}
     observer_atlas_bundle = _load_observer_atlas_bundle(run_dir) if run_dir else {}
     observer_atlas_readiness = _atlas_readiness(observer_atlas_bundle, observer_id)
     leaf_artifact_inventory = _safe_json(run_dir / "leaf_artifact_inventory.json", {}) if run_dir else {}
@@ -1086,6 +1088,7 @@ def load_contract_state(run_key: Optional[str], observer_value: str) -> dict:
         "track5_summary": track5_summary,
         "track4_animation_manifest": track4_animation_manifest,
         "observer_recenter_summary": observer_recenter_summary,
+        "observer_slice_transport_summary": observer_slice_transport_summary,
         "observer_atlas_bundle": observer_atlas_bundle,
         "observer_atlas_readiness": observer_atlas_readiness,
         "leaf_artifact_inventory": leaf_artifact_inventory,
@@ -2131,6 +2134,7 @@ def _build_leaf_artifact_readout_bits(contract: dict) -> Dict[str, List[str]]:
     track5_summary = contract.get("track5_summary", {}) if isinstance(contract.get("track5_summary"), dict) else {}
     track4_manifest = contract.get("track4_animation_manifest", {}) if isinstance(contract.get("track4_animation_manifest"), dict) else {}
     recenter_summary = contract.get("observer_recenter_summary", {}) if isinstance(contract.get("observer_recenter_summary"), dict) else {}
+    observer_transport = contract.get("observer_slice_transport_summary", {}) if isinstance(contract.get("observer_slice_transport_summary"), dict) else {}
     atlas_readiness = contract.get("observer_atlas_readiness", {}) if isinstance(contract.get("observer_atlas_readiness"), dict) else {}
     inventory = contract.get("leaf_artifact_inventory", {}) if isinstance(contract.get("leaf_artifact_inventory"), dict) else {}
 
@@ -2248,6 +2252,45 @@ def _build_leaf_artifact_readout_bits(contract: dict) -> Dict[str, List[str]]:
             fallback_count = local_track.get("global_validation_fallback_count")
             if _is_number(fallback_count):
                 provenance_bits.append(f"observer_track_fallback={int(fallback_count)}")
+
+    if observer_transport:
+        transport_status = str(observer_transport.get("status", "") or "").strip().lower()
+        transport_source = str(observer_transport.get("source", "") or "").strip()
+        transport_type = str(
+            observer_transport.get("summary_type", observer_transport.get("transport_type", ""))
+            or ""
+        ).strip()
+        record_count = observer_transport.get(
+            "record_count",
+            observer_transport.get("records_count", observer_transport.get("path_count")),
+        )
+        if not _is_number(record_count) and isinstance(observer_transport.get("records"), list):
+            record_count = len(observer_transport.get("records") or [])
+        null_count = observer_transport.get(
+            "null_record_count",
+            observer_transport.get("null_records_count", observer_transport.get("null_path_count")),
+        )
+        if not _is_number(null_count) and isinstance(observer_transport.get("null_records"), list):
+            null_count = len(observer_transport.get("null_records") or [])
+        route_count = observer_transport.get("route_count", observer_transport.get("observer_route_count"))
+        if _is_number(record_count) and _is_number(null_count):
+            coverage_bits.append(f"observer_transport={int(record_count)}/{int(null_count)}n")
+        elif _is_number(record_count):
+            coverage_bits.append(f"observer_transport={int(record_count)}")
+        if _is_number(route_count):
+            coverage_bits.append(f"observer_routes={int(route_count)}")
+        if transport_status:
+            provenance_bits.append(f"observer_transport_status={transport_status}")
+        if transport_source:
+            provenance_bits.append(f"observer_transport_source={transport_source}")
+        if transport_type:
+            provenance_bits.append(f"observer_transport_type={transport_type}")
+        mean_excess = observer_transport.get(
+            "mean_excess_holonomy_action",
+            observer_transport.get("mean_excess_holonomy", observer_transport.get("mean_excess_action")),
+        )
+        if _is_number(mean_excess):
+            provenance_bits.append(f"observer_transport_excess={_fmt_metric(mean_excess)}")
 
     return {
         "run_score": run_score_bits,

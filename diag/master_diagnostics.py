@@ -29,9 +29,9 @@ try:
     from scipy.spatial.distance import pdist
     from scipy.stats import kendalltau
     from sklearn.cluster import KMeans
-    print("✓ All dependencies available")
+    print("[OK] All dependencies available")
 except ImportError as e:
-    print(f"✗ Missing dependency: {e}")
+    print(f"[ERROR] Missing dependency: {e}")
     print("\nInstall with:")
     print("  pip install torch numpy pandas scipy scikit-learn")
     sys.exit(1)
@@ -57,7 +57,7 @@ def run_comprehensive_diagnostics():
         )
         return results
     except Exception as e:
-        print(f"✗ Error running diagnostics: {e}")
+        print(f"[ERROR] Error running diagnostics: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -87,7 +87,7 @@ def run_component_tests():
         )
         return results
     except Exception as e:
-        print(f"✗ Error running component tests: {e}")
+        print(f"[ERROR] Error running component tests: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -101,7 +101,7 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
     print("="*70)
     
     if diagnostic_results is None:
-        print("\n✗ Cannot generate verdict - diagnostics failed")
+        print("\n[ERROR] Cannot generate verdict - diagnostics failed")
         return
     
     summary = diagnostic_results['summary']
@@ -120,15 +120,15 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
     
     print(f"\n1. Attention Variance:      {attn_var:.6f}")
     print(f"   Target: > 0.001 for diversity")
-    print(f"   Status: {'✓ PASS' if attn_var > 0.001 else '✗ FAIL'}")
+    print(f"   Status: {'PASS' if attn_var > 0.001 else 'FAIL'}")
     
     print(f"\n2. Procrustes Distance:     {proc_dist:.4f}")
     print(f"   Target: > 0.1 for different geometries")
-    print(f"   Status: {'✓ PASS' if proc_dist > 0.1 else '✗ FAIL'}")
+    print(f"   Status: {'PASS' if proc_dist > 0.1 else 'FAIL'}")
     
     print(f"\n3. NN Disagreement:         {nn_disagree:.4f}")
     print(f"   Target: > 0.2 for structural differences")
-    print(f"   Status: {'✓ PASS' if nn_disagree > 0.2 else '✗ FAIL'}")
+    print(f"   Status: {'PASS' if nn_disagree > 0.2 else 'FAIL'}")
     
     # Count passes
     passes = sum([
@@ -143,7 +143,7 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
     print("="*70)
     
     if passes >= 2:
-        print("\n✓✓ THESIS VIABLE")
+        print("\n[OK] THESIS VIABLE")
         print("\nMultiple metrics show observer-dependent geometry.")
         print("You have evidence that different observers create")
         print("measurably different semantic structures.")
@@ -155,15 +155,15 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
             print("  MODERATE: Two of three metrics show diversity")
         
     elif passes == 1:
-        print("\n⚠ THESIS WEAK")
+        print("\n[WARN] THESIS WEAK")
         print("\nOnly one metric shows observer diversity.")
         print("Evidence is marginal - consider:")
-        print("  1. Increasing observer diversity (tune σ, increase D)")
+        print("  1. Increasing observer diversity (tune sigma, increase D)")
         print("  2. Using more polarized corpus")
         print("  3. Reframing thesis to focus on metric that works")
         
     else:
-        print("\n✗ THESIS NOT SUPPORTED")
+        print("\n[FAIL] THESIS NOT SUPPORTED")
         print("\nNo metrics show observer diversity.")
         print("Observers produce nearly identical results.")
         
@@ -171,7 +171,7 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
             print(f"\nLikely cause: {summary['failure_mode']}")
         
         print("\nRecommended actions:")
-        print("  1. Check RKS σ auto-estimation")
+        print("  1. Check RKS sigma auto-estimation")
         print("  2. Run component isolation tests")
         print("  3. Test on synthetic corpus with known structure")
         print("  4. Consider pivot: maybe this domain HAS platonic center")
@@ -189,13 +189,13 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
         print(f"Full pipeline:  {full_var:.6f}")
         
         if rks_var < 0.0001:
-            print("\n✗ RKS is not creating variance")
-            print("  Check: σ auto-estimation and RKS correlation")
+            print("\n[FAIL] RKS is not creating variance")
+            print("  Check: sigma auto-estimation and RKS correlation")
         elif full_var < rks_var:
-            print("\n⚠ Pipeline is REDUCING variance")
+            print("\n[WARN] Pipeline is REDUCING variance")
             print("  Problem: GRU or RoPE might be collapsing features")
         else:
-            print("\n✓ Components are working as expected")
+            print("\n[OK] Components are working as expected")
     
     # Recommendations
     print("\n" + "="*70)
@@ -203,7 +203,7 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
     print("="*70)
     
     if passes >= 2:
-        print("\n1. ✓ Proceed with analysis")
+        print("\n1. Proceed with analysis")
         print("2. Identify which articles drive divergence")
         print("3. Analyze semantic patterns in high-variance articles")
         print("4. Generate visualizations for thesis")
@@ -211,14 +211,14 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
         
     elif passes == 1:
         print("\n1. Investigate why two metrics fail")
-        print("2. Try different σ values manually: [0.5, 2.0, 5.0, 10.0]")
-        print("3. Increase RKS dimensions: 512 → 1024")
+        print("2. Try different sigma values manually: [0.5, 2.0, 5.0, 10.0]")
+        print("3. Increase RKS dimensions: 512 -> 1024")
         print("4. Test on different corpus (more polarized sources)")
         
     else:
         print("\n1. Run component isolation tests:")
         print("   python component_isolation_tests.py")
-        print("2. Check σ auto-estimation in logs")
+        print("2. Check sigma auto-estimation in logs")
         print("3. Test on synthetic corpus:")
         print("   python test_synthetic_corpus.py")
         print("4. Consider thesis pivot")
@@ -230,7 +230,7 @@ def generate_final_verdict(diagnostic_results, isolation_results=None):
     
     print("\nGenerated files:")
     print("  outputs/diagnostics/diagnostic_results.json")
-    print("  outputs/diagnostics/diagnostic_report.html  ← OPEN THIS")
+    print("  outputs/diagnostics/diagnostic_report.html  <- OPEN THIS")
     
     if isolation_results:
         print("  outputs/isolation_tests/isolation_summary.json")
@@ -267,12 +267,12 @@ Examples:
         files = check_observer_files('outputs/real_observer_*.pt')
         
         if not files:
-            print("✗ No observer files found!")
+            print("[ERROR] No observer files found!")
             print("\nYou need to run the experiment first:")
             print("  python run_experiments.py --mode real")
             sys.exit(1)
         
-        print(f"✓ Found {len(files)} observer files")
+        print(f"[OK] Found {len(files)} observer files")
     else:
         print("\n[1/4] Skipping file check...")
     
@@ -293,7 +293,11 @@ Examples:
     generate_final_verdict(diagnostic_results, isolation_results)
     
     print("\n" + "="*70)
-    print("✓ DIAGNOSTIC WORKFLOW COMPLETE")
+    if diagnostic_results is None or (args.with_isolation and isolation_results is None):
+        print("[WARN] DIAGNOSTIC WORKFLOW FINISHED WITH FAILURES")
+        sys.exit(1)
+    else:
+        print("[OK] DIAGNOSTIC WORKFLOW COMPLETE")
     print("="*70)
 
 
@@ -304,7 +308,7 @@ if __name__ == '__main__':
         print("\n\nInterrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n\n✗ Fatal error: {e}")
+        print(f"\n\n[ERROR] Fatal error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

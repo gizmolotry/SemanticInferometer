@@ -82,6 +82,17 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def test_dash_launchers_do_not_hardcode_repo_root():
+    repo_root = Path(__file__).resolve().parent
+    vbs = (repo_root / "launch_dash.vbs").read_text(encoding="utf-8")
+    cmd = (repo_root / "start_dash_server.cmd").read_text(encoding="utf-8")
+
+    assert "D:\\belief-transformer\\V3" not in vbs
+    assert "D:\\belief-transformer\\V3" not in cmd
+    assert "WScript.ScriptFullName" in vbs
+    assert "%~dp0" in cmd
+
+
 def _valid_provenance(mod) -> dict:
     return {
         "schema_version": "1",
@@ -1320,6 +1331,45 @@ def test_load_contract_state_loads_observer_recenter_summary(monkeypatch, mod, t
     assert "observer_recenter_summary.json" not in state["missing_optional_artifacts"]
 
 
+def test_load_contract_state_loads_observer_slice_transport_summary(monkeypatch, mod, tmp_path):
+    run_dir = tmp_path / "contract_observer_transport"
+    (run_dir / "labels" / "derived").mkdir(parents=True, exist_ok=True)
+    _write_json(run_dir / "baseline_meta.json", _valid_provenance(mod))
+    _write_json(run_dir / "baseline_state.json", {"articles": [], "paths": [], "axes": {}, "metrics": {}})
+    _write_json(
+        run_dir / "verification_report.json",
+        {
+            "run_id": "rk",
+            "timestamp": "2026-02-28T00:00:00Z",
+            "layers": [
+                {"layer_id": "x", "layer_name": "x", "status": "VERIFIED", "checks": [], "fail_reasons": []}
+            ],
+            "global_pass": True,
+        },
+    )
+    _write_json(run_dir / "validation.json", {"nmi": 0.5})
+    _write_json(
+        run_dir / "observer_slice_transport_summary.json",
+        {
+            "status": "OK",
+            "source": "observer_slice_transport_summary.json",
+            "summary_type": "observer_slice_transport_summary",
+            "record_count": 12,
+            "null_record_count": 3,
+            "route_count": 4,
+            "mean_excess_holonomy_action": 0.417,
+        },
+    )
+    monkeypatch.setattr(mod, "_resolve_run_dir", lambda _rk: run_dir)
+
+    state = mod.load_contract_state("rk", "global")
+
+    assert state["status"] == "OK"
+    assert state["observer_slice_transport_summary"]["record_count"] == 12
+    assert state["observer_slice_transport_summary"]["mean_excess_holonomy_action"] == 0.417
+    assert "observer_slice_transport_summary.json" not in state["missing_optional_artifacts"]
+
+
 def test_load_control_state_legacy_explanation_matches_available_controls(monkeypatch, mod, tmp_path):
     run_dir = tmp_path / "legacy_control_explanation"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1853,11 +1903,21 @@ def test_render_dashboard_impl_hydrates_observer_view_state_over_global_conflict
         "replay_path_observer_count": 1,
         "z_origin_policy": "xy_origin_preserve_canonical_z",
     }
+    transport_summary = {
+        "status": "OK",
+        "source": "observer_slice_transport_summary.json",
+        "summary_type": "observer_slice_transport_summary",
+        "record_count": 12,
+        "null_record_count": 3,
+        "route_count": 4,
+        "mean_excess_holonomy_action": 0.417,
+    }
     original_load_contract_state = mod.load_contract_state
 
     def load_contract_state_with_recenter(run_key, observer_value):
         contract = original_load_contract_state(run_key, observer_value)
         contract["observer_recenter_summary"] = recenter_summary
+        contract["observer_slice_transport_summary"] = transport_summary
         return contract
 
     monkeypatch.setattr(mod, "load_contract_state", load_contract_state_with_recenter)
@@ -1904,8 +1964,13 @@ def test_render_dashboard_impl_hydrates_observer_view_state_over_global_conflict
     assert "observer_recenter=1/1" in out[6]
     assert "recenter_path_starts=1/1" in out[6]
     assert "observer_replays=1" in out[6]
+    assert "observer_transport=12/3n" in out[6]
+    assert "observer_routes=4" in out[6]
     assert "recenter_status=ok" in out[15]
     assert "recenter_z=xy_origin_preserve_canonical_z" in out[15]
+    assert "observer_transport_status=ok" in out[15]
+    assert "observer_transport_source=observer_slice_transport_summary.json" in out[15]
+    assert "observer_transport_excess=0.417" in out[15]
     observer_snapshot = next(state for observer, state in captured_snapshots if observer == "article:7")
     assert observer_snapshot["walker_paths"][0]["focused_observer_replay"] is True
     assert observer_snapshot["walker_paths"][0]["start_x"] == pytest.approx(0.0)
@@ -2199,6 +2264,15 @@ def test_build_leaf_artifact_readout_bits_surfaces_new_leaf_contracts(mod):
                 "global_validation_fallback_count": 1,
             },
         },
+        "observer_slice_transport_summary": {
+            "status": "OK",
+            "source": "observer_slice_transport_summary.json",
+            "summary_type": "observer_slice_transport_summary",
+            "record_count": 12,
+            "null_record_count": 3,
+            "route_count": 4,
+            "mean_excess_holonomy_action": 0.417,
+        },
     }
 
     bits = mod._build_leaf_artifact_readout_bits(contract)
@@ -2214,6 +2288,8 @@ def test_build_leaf_artifact_readout_bits_surfaces_new_leaf_contracts(mod):
     assert "recenter_path_starts=30/30" in bits["coverage"]
     assert "observer_replays=4" in bits["coverage"]
     assert "observer_local_tracks=29/30" in bits["coverage"]
+    assert "observer_transport=12/3n" in bits["coverage"]
+    assert "observer_routes=4" in bits["coverage"]
     assert "t5_safe=yes" in bits["provenance"]
     assert "t5_geom=integrated_vectors" in bits["provenance"]
     assert "t4_stepwise=yes" in bits["provenance"]
@@ -2221,6 +2297,16 @@ def test_build_leaf_artifact_readout_bits_surfaces_new_leaf_contracts(mod):
     assert "recenter_z=xy_origin_preserve_canonical_z" in bits["provenance"]
     assert "observer_track_frame=observer_xyz" in bits["provenance"]
     assert "observer_track_fallback=1" in bits["provenance"]
+    assert "observer_transport_status=ok" in bits["provenance"]
+    assert "observer_transport_source=observer_slice_transport_summary.json" in bits["provenance"]
+    assert "observer_transport_type=observer_slice_transport_summary" in bits["provenance"]
+    assert "observer_transport_excess=0.417" in bits["provenance"]
+
+
+def test_build_leaf_artifact_readout_bits_handles_recenter_without_local_track(mod):
+    bits = mod._build_leaf_artifact_readout_bits({"observer_recenter_summary": {"status": "OK"}})
+
+    assert "recenter_status=ok" in bits["provenance"]
 
 
 def test_build_leaf_artifact_readout_bits_prefers_materialized_relativity_cache_coverage(mod):

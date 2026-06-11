@@ -238,10 +238,10 @@ class TemporalDataCleaner:
                         print(f"    Processed {line_num} articles, kept {len(cleaned_articles)}")
                 
                 except json.JSONDecodeError:
-                    print(f"    ✗ JSON error on line {line_num}")
+                    print(f"    [ERROR] JSON error on line {line_num}")
                     continue
                 except Exception as e:
-                    print(f"    ✗ Error on line {line_num}: {e}")
+                    print(f"    [ERROR] Error on line {line_num}: {e}")
                     continue
         
         # Write cleaned batch
@@ -251,7 +251,7 @@ class TemporalDataCleaner:
             for article in cleaned_articles:
                 f.write(json.dumps(article) + '\n')
         
-        print(f"  ✓ Wrote {len(cleaned_articles)} articles to {output_path.name}")
+        print(f"  [OK] Wrote {len(cleaned_articles)} articles to {output_path.name}")
         
         return {
             'input_file': input_path.name,
@@ -277,7 +277,7 @@ class TemporalDataCleaner:
         print(f"  - Non-English: {self.stats['non_english']} ({self.stats['non_english']/total*100:.1f}%)")
         print(f"  - Nonsense: {self.stats['nonsense']} ({self.stats['nonsense']/total*100:.1f}%)")
         
-        print(f"\n✓ Kept: {self.stats['kept']} ({self.stats['kept']/total*100:.1f}%)")
+        print(f"\n[OK] Kept: {self.stats['kept']} ({self.stats['kept']/total*100:.1f}%)")
         print("="*70)
 
 
@@ -300,8 +300,7 @@ def clean_all_batches(input_dir: Path,
     batch_files = sorted(input_dir.glob(pattern))
     
     if not batch_files:
-        print(f"✗ No files matching '{pattern}' in {input_dir}")
-        return
+        raise FileNotFoundError(f"No files matching {pattern!r} in {input_dir}")
     
     print("="*70)
     print("TEMPORAL DATA CLEANING")
@@ -331,9 +330,9 @@ def clean_all_batches(input_dir: Path,
     
     print("\nPer-batch results:")
     for result in batch_results:
-        print(f"  {result['input_file']} → {result['output_file']}: {result['kept']} articles")
+        print(f"  {result['input_file']} -> {result['output_file']}: {result['kept']} articles")
     
-    print(f"\n✓ Cleaned batches saved to: {output_dir}")
+    print(f"\n[OK] Cleaned batches saved to: {output_dir}")
     
     return batch_results
 
@@ -345,11 +344,13 @@ if __name__ == "__main__":
         description="Clean temporal Gaza/Israel article batches"
     )
     
+    repo_root = Path(__file__).resolve().parents[4]
+
     parser.add_argument('--input_dir', type=str,
-                       default='D:/belief-transformer/V3/belief_ingest/belief_ingest_final/data/processed',
+                       default=str(repo_root / 'belief_ingest' / 'belief_ingest_final' / 'data' / 'processed'),
                        help='Directory with raw batch files')
     parser.add_argument('--output_dir', type=str,
-                       default='D:/belief-transformer/V3/data/temporal_cleaned',
+                       default=str(repo_root / 'data' / 'temporal_cleaned'),
                        help='Directory for cleaned batches')
     parser.add_argument('--pattern', type=str, default='batch_*.jsonl',
                        help='File pattern to match')
